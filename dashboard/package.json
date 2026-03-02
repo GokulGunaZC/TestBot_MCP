@@ -1,0 +1,17 @@
+{
+  "name": "@testbot/dashboard",
+  "version": "1.0.0",
+  "description": "Dashboard UI for Testbot MCP test results",
+  "main": "src/reporter.js",
+  "scripts": {
+    "start": "open public/index.html"
+  },
+  "keywords": [
+    "testbot",
+    "dashboard",
+    "playwright",
+    "testing"
+  ],
+  "author": "",
+  "license": "MIT"
+}

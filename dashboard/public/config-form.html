@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TestBot - Configure Test Generation</title>
+    <link rel="stylesheet" href="../src/styles/dashboard.css">
+    <link rel="stylesheet" href="config-form.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+</head>
+<body class="config-body">
+    <!-- Header -->
+    <header class="config-header">
+        <div class="container">
+            <div class="header-content">
+                <h1><i class="fas fa-robot"></i> TestBot Configuration</h1>
+                <div class="header-meta">
+                    <span class="project-name" id="projectName">Loading project...</span>
+                    <span class="header-badge">AI-Powered Test Generation</span>
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <!-- Main Content -->
+    <main class="config-main">
+        <div class="container">
+            <!-- Progress Steps -->
+            <div class="progress-steps">
+                <div class="step active" data-step="1">
+                    <span class="step-number">1</span>
+                    <span class="step-label">Project Info</span>
+                </div>
+                <div class="step-connector"></div>
+                <div class="step" data-step="2">
+                    <span class="step-number">2</span>
+                    <span class="step-label">Requirements</span>
+                </div>
+                <div class="step-connector"></div>
+                <div class="step" data-step="3">
+                    <span class="step-number">3</span>
+                    <span class="step-label">Test Options</span>
+                </div>
+                <div class="step-connector"></div>
+                <div class="step" data-step="4">
+                    <span class="step-number">4</span>
+                    <span class="step-label">Generate</span>
+                </div>
+            </div>
+
+            <!-- Form -->
+            <form id="configForm" class="config-form">
+                <!-- Step 1: Project Info -->
+                <section class="form-section active" data-section="1">
+                    <div class="section-header">
+                        <h2><i class="fas fa-folder-open"></i> Project Information</h2>
+                        <p>Review and confirm the detected project settings</p>
+                    </div>
+
+                    <div class="form-group">
+                        <label for="projectPath">Project Path</label>
+                        <input type="text" id="projectPath" name="projectPath" readonly class="input-readonly">
+                        <small>Auto-detected project directory</small>
+                    </div>
+
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="framework">Framework</label>
+                            <select id="framework" name="framework">
+                                <option value="auto">Auto-detect</option>
+                                <option value="nextjs">Next.js</option>
+                                <option value="react">React</option>
+                                <option value="vue">Vue.js</option>
+                                <option value="angular">Angular</option>
+                                <option value="express">Express.js</option>
+                                <option value="fastify">Fastify</option>
+                                <option value="other">Other</option>
+                            </select>
+                        </div>
+
+                        <div class="form-group">
+                            <label for="baseURL">Base URL</label>
+                            <input type="url" id="baseURL" name="baseURL" placeholder="http://localhost:3000">
+                            <small>The URL where your app runs</small>
+                        </div>
+                    </div>
+
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label for="port">Port</label>
+                            <input type="number" id="port" name="port" placeholder="3000">
+                        </div>
+
+                        <div class="form-group">
+                            <label for="startCommand">Start Command</label>
+                            <input type="text" id="startCommand" name="startCommand" placeholder="npm run dev">
+                            <small>Command to start your application</small>
+                        </div>
+                    </div>
+
+                    <div class="form-actions">
+                        <button type="button" class="btn btn-next" onclick="nextStep()">
+                            Next: Requirements <i class="fas fa-arrow-right"></i>
+                        </button>
+                    </div>
+                </section>
+
+                <!-- Step 2: Requirements/PRD -->
+                <section class="form-section" data-section="2">
+                    <div class="section-header">
+                        <h2><i class="fas fa-file-alt"></i> Product Requirements</h2>
+                        <p>Describe your application and what you want to test</p>
+                    </div>
+
+                    <div class="form-group prd-group">
+                        <label for="prd">Requirements / PRD (Markdown supported)</label>
+                        <div class="prd-container">
+                            <div class="prd-tabs">
+                                <button type="button" class="prd-tab active" data-tab="edit">
+                                    <i class="fas fa-edit"></i> Edit
+                                </button>
+                                <button type="button" class="prd-tab" data-tab="preview">
+                                    <i class="fas fa-eye"></i> Preview
+                                </button>
+                            </div>
+                            <textarea id="prd" name="prd" rows="15" placeholder="# My Application
+
+## Overview
+Describe your application here...
+
+## User Flows
+1. User authentication (login/signup)
+2. Dashboard with analytics
+3. CRUD operations for resources
+
+## Key Features
+- Feature 1: Description
+- Feature 2: Description
+
+## Critical Paths to Test
+- Login flow should validate credentials
+- Dashboard should load within 3 seconds
+- Form submissions should show validation errors"></textarea>
+                            <div id="prdPreview" class="prd-preview" style="display: none;"></div>
+                        </div>
+                        <div class="prd-help">
+                            <small><i class="fas fa-info-circle"></i> Tip: The more detailed your requirements, the better tests will be generated</small>
+                        </div>
+                    </div>
+
+                    <div class="form-group">
+                        <label>Quick Templates</label>
+                        <div class="template-buttons">
+                            <button type="button" class="btn btn-outline btn-sm" onclick="loadTemplate('ecommerce')">
+                                <i class="fas fa-shopping-cart"></i> E-commerce
+                            </button>
+                            <button type="button" class="btn btn-outline btn-sm" onclick="loadTemplate('dashboard')">
+                                <i class="fas fa-chart-bar"></i> Dashboard
+                            </button>
+                            <button type="button" class="btn btn-outline btn-sm" onclick="loadTemplate('saas')">
+                                <i class="fas fa-cloud"></i> SaaS App
+                            </button>
+                            <button type="button" class="btn btn-outline btn-sm" onclick="loadTemplate('api')">
+                                <i class="fas fa-server"></i> API Backend
+                            </button>
+                        </div>
+                    </div>
+
+                    <div class="form-actions">
+                        <button type="button" class="btn btn-secondary" onclick="prevStep()">
+                            <i class="fas fa-arrow-left"></i> Back
+                        </button>
+                        <button type="button" class="btn btn-next" onclick="nextStep()">
+                            Next: Test Options <i class="fas fa-arrow-right"></i>
+                        </button>
+                    </div>
+                </section>
+
+                <!-- Step 3: Test Options -->
+                <section class="form-section" data-section="3">
+                    <div class="section-header">
+                        <h2><i class="fas fa-cogs"></i> Test Configuration</h2>
+                        <p>Choose what types of tests to generate</p>
+                    </div>
+
+                    <div class="form-group">
+                        <label>Test Type</label>
+                        <div class="radio-cards">
+                            <label class="radio-card">
+                                <input type="radio" name="testType" value="frontend" checked>
+                                <div class="radio-card-content">
+                                    <i class="fas fa-desktop"></i>
+                                    <span class="radio-card-title">Frontend</span>
+                                    <span class="radio-card-desc">UI tests, page navigation, forms</span>
+                                </div>
+                            </label>
+                            <label class="radio-card">
+                                <input type="radio" name="testType" value="backend">
+                                <div class="radio-card-content">
+                                    <i class="fas fa-server"></i>
+                                    <span class="radio-card-title">Backend</span>
+                                    <span class="radio-card-desc">API endpoints, responses, auth</span>
+                                </div>
+                            </label>
+                            <label class="radio-card">
+                                <input type="radio" name="testType" value="both">
+                                <div class="radio-card-content">
+                                    <i class="fas fa-layer-group"></i>
+                                    <span class="radio-card-title">Both</span>
+                                    <span class="radio-card-desc">Full-stack E2E testing</span>
+                                </div>
+                            </label>
+                        </div>
+                    </div>
+
+                    <div class="form-group">
+                        <label>Test Coverage Options</label>
+                        <div class="checkbox-group">
+                            <label class="checkbox-item">
+                                <input type="checkbox" name="includeSmoke" checked>
+                                <span class="checkbox-label">
+                                    <i class="fas fa-fire"></i> Smoke Tests
+                                    <small>Basic app load and navigation</small>
+                                </span>
+                            </label>
+                            <label class="checkbox-item">
+                                <input type="checkbox" name="includeWorkflows" checked>
+                                <span class="checkbox-label">
+                                    <i class="fas fa-project-diagram"></i> Workflow Tests
+                                    <small>Complete user journeys</small>
+                                </span>
+                            </label>
+                            <label class="checkbox-item">
+                                <input type="checkbox" name="includeAccessibility">
+                                <span class="checkbox-label">
+                                    <i class="fas fa-universal-access"></i> Accessibility Tests
+                                    <small>WCAG compliance checks</small>
+                                </span>
+                            </label>
+                            <label class="checkbox-item">
+                                <input type="checkbox" name="includeErrorStates" checked>
+                                <span class="checkbox-label">
+                                    <i class="fas fa-exclamation-triangle"></i> Error State Tests
+                                    <small>Validation and error handling</small>
+                                </span>
+                            </label>
+                        </div>
+                    </div>
+
+                    <div class="form-group">
+                        <label>Priority Pages/Features (optional)</label>
+                        <textarea id="priorityFeatures" name="priorityFeatures" rows="4" placeholder="Enter specific pages or features to prioritize, one per line:
+/login
+/dashboard
+/api/users
+Checkout flow"></textarea>
+                        <small>Leave empty to auto-detect from codebase</small>
+                    </div>
+
+                    <div class="form-actions">
+                        <button type="button" class="btn btn-secondary" onclick="prevStep()">
+                            <i class="fas fa-arrow-left"></i> Back
+                        </button>
+                        <button type="button" class="btn btn-next" onclick="nextStep()">
+                            Next: Generate <i class="fas fa-arrow-right"></i>
+                        </button>
+                    </div>
+                </section>
+
+                <!-- Step 4: Generate -->
+                <section class="form-section" data-section="4">
+                    <div class="section-header">
+                        <h2><i class="fas fa-magic"></i> Ready to Generate Tests</h2>
+                        <p>Review your configuration and start test generation</p>
+                    </div>
+
+                    <div class="summary-card">
+                        <h3><i class="fas fa-clipboard-list"></i> Configuration Summary</h3>
+                        <div class="summary-grid">
+                            <div class="summary-item">
+                                <span class="summary-label">Project</span>
+                                <span class="summary-value" id="summaryProject">-</span>
+                            </div>
+                            <div class="summary-item">
+                                <span class="summary-label">Framework</span>
+                                <span class="summary-value" id="summaryFramework">-</span>
+                            </div>
+                            <div class="summary-item">
+                                <span class="summary-label">Base URL</span>
+                                <span class="summary-value" id="summaryBaseURL">-</span>
+                            </div>
+                            <div class="summary-item">
+                                <span class="summary-label">Test Type</span>
+                                <span class="summary-value" id="summaryTestType">-</span>
+                            </div>
+                            <div class="summary-item full-width">
+                                <span class="summary-label">PRD Length</span>
+                                <span class="summary-value" id="summaryPRDLength">0 characters</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="ai-info-card">
+                        <div class="ai-info-icon">
+                            <i class="fas fa-brain"></i>
+                        </div>
+                        <div class="ai-info-content">
+                            <h4>Powered by OpenAI GPT</h4>
+                            <p>TestBot will analyze your codebase and PRD to generate intelligent, comprehensive Playwright tests tailored to your application.</p>
+                        </div>
+                    </div>
+
+                    <div id="generatingIndicator" class="generating-indicator" style="display: none;">
+                        <div class="spinner"></div>
+                        <div class="generating-text">
+                            <h4>Generating Tests...</h4>
+                            <p id="generatingStatus">Analyzing codebase context...</p>
+                        </div>
+                    </div>
+
+                    <div id="successMessage" class="success-message" style="display: none;">
+                        <i class="fas fa-check-circle"></i>
+                        <h4>Tests Generated Successfully!</h4>
+                        <p>Your tests have been created. The window will close automatically.</p>
+                    </div>
+
+                    <div id="errorMessage" class="error-message" style="display: none;">
+                        <i class="fas fa-exclamation-circle"></i>
+                        <h4>Generation Failed</h4>
+                        <p id="errorText">An error occurred during test generation.</p>
+                    </div>
+
+                    <div class="form-actions" id="generateActions">
+                        <button type="button" class="btn btn-secondary" onclick="prevStep()">
+                            <i class="fas fa-arrow-left"></i> Back
+                        </button>
+                        <button type="submit" class="btn btn-primary btn-large">
+                            <i class="fas fa-play"></i> Generate Tests
+                        </button>
+                    </div>
+                </section>
+            </form>
+        </div>
+    </main>
+
+    <!-- Footer -->
+    <footer class="config-footer">
+        <div class="container">
+            <p><i class="fas fa-robot"></i> TestBot MCP - AI-Powered Test Generation</p>
+        </div>
+    </footer>
+
+    <script src="config-form.js"></script>
+</body>
+</html>

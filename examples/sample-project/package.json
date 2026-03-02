@@ -1,0 +1,24 @@
+{
+  "name": "sample-express-app",
+  "version": "1.0.0",
+  "description": "Sample Express app for testing with Testbot MCP",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node src/index.js",
+    "test": "npx playwright test"
+  },
+  "keywords": [
+    "sample",
+    "testbot",
+    "express"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.18.2"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.57.0"
+  }
+}

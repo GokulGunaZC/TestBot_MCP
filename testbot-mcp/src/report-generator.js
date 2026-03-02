@@ -81,74 +81,15 @@ class ReportGenerator {
 
     // Copy artifacts if present
     await this.copyArtifacts(testResults, reportsDir);
-
+    
     // Copy Playwright HTML report if it exists
     await this.copyPlaywrightHTMLReport(projectPath, reportsDir);
-
-    // Post results to web dashboard (non-blocking)
-    try {
-      await this.postToWebDashboard(report);
-    } catch (dashboardError) {
-      // Never block local flow due to dashboard sync failure
-      console.error(`[Report] Dashboard sync error: ${dashboardError.message}`);
-    }
 
     return {
       path: reportPath,
       latestPath,
       url: `file://${reportPath}`,
     };
-  }
-
-  /**
-   * Post report to the TestBot web dashboard
-   * Uses TESTBOT_API_KEY and TESTBOT_DASHBOARD_URL env vars.
-   * Silently skips if TESTBOT_API_KEY is not set.
-   */
-  async postToWebDashboard(report) {
-    const apiKey = process.env.TESTBOT_API_KEY;
-    if (!apiKey) {
-      // Skip silently when no API key is configured
-      return;
-    }
-
-    const dashboardUrl =
-      process.env.TESTBOT_DASHBOARD_URL || 'https://testbot-mcp.vercel.app';
-
-    const endpoint = `${dashboardUrl}/api/test-runs/ingest`;
-
-    try {
-      // Use dynamic import to support both Node 18+ native fetch and older Node via node-fetch
-      const fetchFn =
-        typeof fetch !== 'undefined'
-          ? fetch
-          : (await import('node-fetch').catch(() => null))?.default;
-
-      if (!fetchFn) {
-        console.error('[Report] fetch is not available — skipping dashboard sync');
-        return;
-      }
-
-      const response = await fetchFn(endpoint, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          api_key: apiKey,
-          creation_name: report.metadata?.projectName,
-          report,
-        }),
-      });
-
-      if (response.ok) {
-        const data = await response.json();
-        console.error(`[Report] Results synced to web dashboard (run id: ${data.test_run_id})`);
-      } else {
-        const text = await response.text().catch(() => '');
-        console.error(`[Report] Could not sync to web dashboard (HTTP ${response.status}): ${text}`);
-      }
-    } catch (err) {
-      console.error(`[Report] Could not sync to web dashboard (offline or invalid API key): ${err.message}`);
-    }
   }
 
   /**
@@ -466,6 +407,8 @@ class ReportGenerator {
       // Check for Playwright HTML report in common locations
       const possibleLocations = [
         path.join(projectPath, 'playwright-report'),
+        path.join(projectPath, 'examples', 'sample-project', 'playwright-report'),
+        path.join(projectPath, 'sample-project', 'playwright-report'),
       ];
       
       let sourceReportDir = null;
