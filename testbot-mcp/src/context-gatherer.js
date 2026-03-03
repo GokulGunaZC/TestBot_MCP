@@ -12,11 +12,33 @@ class ContextGatherer {
   constructor(config = {}) {
     this.config = {
       projectPath: config.projectPath || process.cwd(),
+      language: config.language || 'javascript',
       maxFiles: config.maxFiles || 50,
       maxFileSize: config.maxFileSize || 50000, // 50KB max per file
       includeFileContents: config.includeFileContents !== false,
       ...config,
     };
+  }
+
+  /**
+   * Get source file extensions based on project language
+   */
+  getSourceExtensions() {
+    const extensionMap = {
+      javascript: ['.js', '.jsx', '.ts', '.tsx', '.mjs'],
+      python: ['.py'],
+      java: ['.java', '.kt'],
+      kotlin: ['.java', '.kt'],
+      go: ['.go'],
+      rust: ['.rs'],
+      ruby: ['.rb', '.erb'],
+      php: ['.php'],
+      elixir: ['.ex', '.exs'],
+      csharp: ['.cs'],
+      swift: ['.swift'],
+      unknown: ['.js', '.jsx', '.ts', '.tsx', '.py', '.java', '.go', '.rb', '.php'],
+    };
+    return extensionMap[this.config.language] || extensionMap.unknown;
   }
 
   /**
@@ -729,7 +751,11 @@ class ContextGatherer {
     // Vue Router
     const vuePages = await this.findVueRoutes(projectPath);
     pages.push(...vuePages);
-    
+
+    // Multi-language route detection
+    const langRoutes = await this.findMultiLangRoutes(projectPath);
+    pages.push(...langRoutes);
+
     // If no pages found, create default
     if (pages.length === 0) {
       pages.push({
@@ -936,7 +962,11 @@ class ContextGatherer {
     // Express/Node.js routes
     const expressEndpoints = await this.findExpressRoutes(projectPath);
     endpoints.push(...expressEndpoints);
-    
+
+    // Multi-language API endpoint detection
+    const langEndpoints = await this.findMultiLangEndpoints(projectPath);
+    endpoints.push(...langEndpoints);
+
     // If no endpoints found, add health check
     if (endpoints.length === 0) {
       endpoints.push({
@@ -1037,6 +1067,171 @@ class ContextGatherer {
       }
     }
     
+    return endpoints;
+  }
+
+  /**
+   * Find routes/pages in non-JS projects (Python, Java, Go, Ruby, PHP)
+   */
+  async findMultiLangRoutes(projectPath) {
+    const pages = [];
+    const lang = this.config.language;
+    if (lang === 'javascript') return pages; // Already handled
+
+    const extensions = this.getSourceExtensions();
+    const srcDir = path.join(projectPath, 'src');
+    const searchDir = fs.existsSync(srcDir) ? srcDir : projectPath;
+    const files = this.findFiles(searchDir, extensions);
+
+    const routePatterns = {
+      python: [
+        // Flask: @app.route('/path')
+        /@(?:app|blueprint|bp)\s*\.\s*route\s*\(\s*["']([^"']+)["']/g,
+        // FastAPI: @app.get('/path')
+        /@(?:app|router)\s*\.\s*(?:get|post|put|delete|patch)\s*\(\s*["']([^"']+)["']/g,
+        // Django: path('url/', view)
+        /path\s*\(\s*["']([^"']+)["']/g,
+      ],
+      java: [
+        // Spring: @RequestMapping("/path"), @GetMapping("/path")
+        /@(?:Request|Get|Post|Put|Delete|Patch)Mapping\s*\(\s*(?:value\s*=\s*)?["']([^"']+)["']/g,
+      ],
+      go: [
+        // http.HandleFunc("/path", handler)
+        /(?:HandleFunc|Handle)\s*\(\s*["']([^"']+)["']/g,
+        // Gin: r.GET("/path", handler)
+        /\.\s*(?:GET|POST|PUT|DELETE|PATCH)\s*\(\s*["']([^"']+)["']/g,
+      ],
+      ruby: [
+        // Rails: get '/path', to: 'controller#action'
+        /(?:get|post|put|patch|delete|root)\s+["']([^"']+)["']/g,
+        // resources :users
+        /resources?\s+:(\w+)/g,
+      ],
+      php: [
+        // Laravel: Route::get('/path', ...)
+        /Route::(?:get|post|put|patch|delete)\s*\(\s*["']([^"']+)["']/g,
+      ],
+    };
+
+    const patterns = routePatterns[lang] || [];
+    if (patterns.length === 0) return pages;
+
+    for (const file of files.slice(0, this.config.maxFiles)) {
+      if (file.includes('node_modules') || file.includes('test') || file.includes('spec')) continue;
+      try {
+        const content = fs.readFileSync(file, 'utf-8');
+        for (const pattern of patterns) {
+          let match;
+          // Reset lastIndex for reuse
+          pattern.lastIndex = 0;
+          while ((match = pattern.exec(content)) !== null) {
+            const routePath = match[1].startsWith('/') ? match[1] : `/${match[1]}`;
+            if (!pages.some(p => p.path === routePath)) {
+              pages.push({
+                path: routePath,
+                description: this.formatPageName(routePath),
+                components: [],
+                interactions: ['navigation'],
+                source: path.relative(projectPath, file),
+              });
+            }
+          }
+        }
+      } catch (e) { /* ignore */ }
+    }
+
+    return pages;
+  }
+
+  /**
+   * Find API endpoints in non-JS projects (Python, Java, Go, Ruby, PHP)
+   */
+  async findMultiLangEndpoints(projectPath) {
+    const endpoints = [];
+    const lang = this.config.language;
+    if (lang === 'javascript') return endpoints; // Already handled
+
+    const extensions = this.getSourceExtensions();
+    const srcDir = path.join(projectPath, 'src');
+    const searchDir = fs.existsSync(srcDir) ? srcDir : projectPath;
+    const files = this.findFiles(searchDir, extensions);
+
+    const endpointPatterns = {
+      python: [
+        // Flask/FastAPI with method
+        { regex: /@(?:app|router|bp)\s*\.\s*(get|post|put|delete|patch)\s*\(\s*["']([^"']+)["']/gi, methodIdx: 1, pathIdx: 2 },
+        // Flask @app.route with methods=['GET', 'POST']
+        { regex: /@(?:app|bp)\s*\.route\s*\(\s*["']([^"']+)["'][^)]*methods\s*=\s*\[([^\]]+)\]/gi, methodIdx: 2, pathIdx: 1, parseMethodList: true },
+      ],
+      java: [
+        { regex: /@GetMapping\s*\(\s*(?:value\s*=\s*)?["']([^"']+)["']/gi, method: 'GET', pathIdx: 1 },
+        { regex: /@PostMapping\s*\(\s*(?:value\s*=\s*)?["']([^"']+)["']/gi, method: 'POST', pathIdx: 1 },
+        { regex: /@PutMapping\s*\(\s*(?:value\s*=\s*)?["']([^"']+)["']/gi, method: 'PUT', pathIdx: 1 },
+        { regex: /@DeleteMapping\s*\(\s*(?:value\s*=\s*)?["']([^"']+)["']/gi, method: 'DELETE', pathIdx: 1 },
+        { regex: /@PatchMapping\s*\(\s*(?:value\s*=\s*)?["']([^"']+)["']/gi, method: 'PATCH', pathIdx: 1 },
+      ],
+      go: [
+        { regex: /\.\s*(GET|POST|PUT|DELETE|PATCH)\s*\(\s*["']([^"']+)["']/gi, methodIdx: 1, pathIdx: 2 },
+        { regex: /HandleFunc\s*\(\s*["']([^"']+)["']/gi, method: 'GET', pathIdx: 1 },
+      ],
+      ruby: [
+        { regex: /(get|post|put|patch|delete)\s+["']([^"']+)["']/gi, methodIdx: 1, pathIdx: 2 },
+      ],
+      php: [
+        { regex: /Route::(get|post|put|patch|delete)\s*\(\s*["']([^"']+)["']/gi, methodIdx: 1, pathIdx: 2 },
+      ],
+    };
+
+    const patterns = endpointPatterns[lang] || [];
+    if (patterns.length === 0) return endpoints;
+
+    for (const file of files.slice(0, this.config.maxFiles)) {
+      if (file.includes('node_modules') || file.includes('test') || file.includes('spec') || file.includes('migration')) continue;
+      try {
+        const content = fs.readFileSync(file, 'utf-8');
+        const hasAuth = content.includes('auth') || content.includes('token') || content.includes('permission');
+
+        for (const patternDef of patterns) {
+          let match;
+          patternDef.regex.lastIndex = 0;
+          while ((match = patternDef.regex.exec(content)) !== null) {
+            let method = patternDef.method || match[patternDef.methodIdx].toUpperCase();
+            const routePath = match[patternDef.pathIdx];
+
+            if (patternDef.parseMethodList) {
+              // Parse methods=['GET', 'POST'] style
+              const methods = routePath; // In this pattern pathIdx=1, methodIdx=2
+              const methodList = match[patternDef.methodIdx].replace(/["'\s]/g, '').split(',');
+              for (const m of methodList) {
+                if (!endpoints.some(e => e.method === m.toUpperCase() && e.path === match[patternDef.pathIdx])) {
+                  endpoints.push({
+                    method: m.toUpperCase(),
+                    path: match[patternDef.pathIdx],
+                    description: `${m.toUpperCase()} ${match[patternDef.pathIdx]}`,
+                    requiresAuth: hasAuth,
+                    source: path.relative(projectPath, file),
+                  });
+                }
+              }
+              continue;
+            }
+
+            const fullPath = routePath.startsWith('/') ? routePath : `/${routePath}`;
+            if (!endpoints.some(e => e.method === method && e.path === fullPath)) {
+              endpoints.push({
+                method,
+                path: fullPath,
+                description: `${method} ${fullPath}`,
+                requiresAuth: hasAuth,
+                source: path.relative(projectPath, file),
+              });
+            }
+          }
+        }
+      } catch (e) { /* ignore */ }
+    }
+
     return endpoints;
   }
 

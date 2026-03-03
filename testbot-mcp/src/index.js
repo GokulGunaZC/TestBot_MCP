@@ -1,7 +1,7 @@
 /**
  * Testbot MCP Server
  * One-command testing with AI-powered analysis for any project
- * 
+ *
  * Usage: User says "test my app using testbot mcp" in Cursor/Windsurf
  */
 
@@ -18,6 +18,7 @@ for (const envPath of dotenvPaths) {
   if (!error) { break; } // stop at first working .env
 }
 
+const { fork } = require('child_process');
 const { Server } = require('@modelcontextprotocol/sdk/server/index.js');
 const { StdioServerTransport } = require('@modelcontextprotocol/sdk/server/stdio.js');
 const {
@@ -27,23 +28,16 @@ const {
 
 const AutoDetector = require('./auto-detector');
 const PlaywrightIntegration = require('./playwright-integration');
-const PlaywrightMCPClient = require('./playwright-mcp-client');
-const PlaywrightMCPIntegration = require('./playwright-mcp-integration');
-const ResultsMerger = require('./results-merger');
-const ContextGatherer = require('./context-gatherer');
 const AIAnalyzer = require('./ai-providers/index');
-const JiraClient = require('./jira/client');
 const ReportGenerator = require('./report-generator');
 const DashboardLauncher = require('./dashboard-launcher');
-const ConfigUILauncher = require('./config-ui-launcher');
-const AgentContextRequester = require('./agent-context-requester');
 
 class TestbotMCPServer {
   constructor() {
     this.server = new Server(
       {
         name: 'testbot-mcp',
-        version: '1.0.0',
+        version: '1.1.0',
       },
       {
         capabilities: {
@@ -54,6 +48,39 @@ class TestbotMCPServer {
 
     this.setupToolHandlers();
     this.setupErrorHandling();
+  }
+
+  /**
+   * Fork a background worker to run the full test pipeline.
+   * Returns immediately so the MCP request handler can respond fast.
+   */
+  runPipelineInBackground(config, runId) {
+    const workerPath = path.join(__dirname, 'pipeline-worker.js');
+
+    const child = fork(workerPath, [], {
+      detached: true,
+      stdio: ['ignore', 'ignore', 'pipe', 'ipc'],
+      env: { ...process.env },
+    });
+
+    // Pipe worker stderr to our stderr for debugging
+    if (child.stderr) {
+      child.stderr.on('data', (data) => {
+        process.stderr.write(data);
+      });
+    }
+
+    // Send config to worker via IPC
+    child.send({ config, runId });
+
+    // Disconnect IPC and unref so MCP server is not blocked
+    child.on('message', () => {}); // drain any messages
+    setTimeout(() => {
+      try { child.disconnect(); } catch (e) { /* already disconnected */ }
+    }, 1000);
+    child.unref();
+
+    console.error(`[Testbot] Pipeline worker forked (PID: ${child.pid}, runId: ${runId})`);
   }
 
   setupToolHandlers() {
@@ -75,7 +102,7 @@ class TestbotMCPServer {
         },
         {
           name: 'testbot_test_my_app',
-          description: 'Test your application end-to-end with AI-powered analysis. Generates tests, runs them, analyzes failures with AI, and opens a beautiful dashboard with results. For best results, run testbot_configure first to get recommended settings.',
+          description: 'Test your application end-to-end with AI-powered analysis. Generates tests, runs them, analyzes failures with AI, and opens a beautiful dashboard with results. Returns immediately with a run ID — the pipeline runs in the background and posts results to the dashboard when complete. For best results, run testbot_configure first to get recommended settings.',
           inputSchema: {
             type: 'object',
             properties: {
@@ -247,50 +274,52 @@ class TestbotMCPServer {
 
     try {
       const projectPath = params.projectPath || process.cwd();
-      
+
       log('Analyzing project for configuration...');
-      
+
       // 1. Auto-detect project settings
       const detector = new AutoDetector();
       const context = await detector.detect(projectPath);
-      
-      log(`Detected project: ${context.projectName}`);
+
+      log(`Detected project: ${context.projectName} (${context.language})`);
       log(`Framework detection: ${context.hasPlaywright ? 'Playwright found' : 'No Playwright config'}`);
-      
+
       // 2. Scan for existing tests
       const existingTests = this.scanExistingTests(projectPath);
       log(`Found ${existingTests.count} existing test files`);
-      
+
       // 3. Check for PRD/requirements files
       const prdFiles = this.findPRDFiles(projectPath);
       log(`Found ${prdFiles.length} potential PRD files`);
-      
+
       // 4. Check for Jira configuration
       const hasJiraConfig = context.hasJira || !!(
-        process.env.JIRA_BASE_URL && 
-        process.env.JIRA_API_TOKEN && 
+        process.env.JIRA_BASE_URL &&
+        process.env.JIRA_API_TOKEN &&
         process.env.JIRA_PROJECT_KEY
       );
-      
+
       // 5. Build configuration response with questions
       const config = {
         projectInfo: {
           name: context.projectName,
           path: context.projectPath,
+          language: context.language,
+          ecosystem: context.ecosystem,
           framework: this.detectFramework(context),
           port: context.port,
           baseURL: context.baseURL,
           startCommand: context.startCommand,
           hasPlaywrightConfig: context.hasPlaywright,
           hasExistingTests: existingTests.count > 0,
-          existingTestFiles: existingTests.files.slice(0, 10), // Show first 10
+          existingTestFiles: existingTests.files.slice(0, 10),
           totalTestFiles: existingTests.count,
           testDirectories: context.testDirs,
         },
         prdFiles: prdFiles,
         jiraAvailable: hasJiraConfig,
         aiProviderAvailable: !!(process.env.SARVAM_API_KEY || process.env.AI_API_KEY),
-        
+
         // Questions for the user to answer
         questions: [
           {
@@ -302,20 +331,20 @@ class TestbotMCPServer {
           },
           {
             id: 'generateTests',
-            prompt: existingTests.count > 0 
+            prompt: existingTests.count > 0
               ? `Found ${existingTests.count} existing tests. Generate new tests or use existing?`
               : 'No existing tests found. Should I generate tests?',
-            options: existingTests.count > 0 
+            options: existingTests.count > 0
               ? ['generate_new', 'use_existing', 'both']
               : ['generate_new', 'skip'],
             default: existingTests.count > 0 ? 'use_existing' : 'generate_new',
             description: 'generate_new creates tests from codebase analysis, use_existing runs your current tests'
           },
         ],
-        
+
         // Context prompt for the AI agent to analyze codebase
         contextPrompt: this.buildContextPrompt(projectPath, context),
-        
+
         // Recommended configuration based on detection
         recommendedConfig: {
           projectPath: context.projectPath,
@@ -329,7 +358,7 @@ class TestbotMCPServer {
           openDashboard: true,
         }
       };
-      
+
       // Add PRD question if files found
       if (prdFiles.length > 0) {
         config.questions.push({
@@ -340,7 +369,7 @@ class TestbotMCPServer {
           description: 'PRD files help generate more accurate tests based on requirements'
         });
       }
-      
+
       // Add Jira question if available
       if (hasJiraConfig) {
         config.questions.push({
@@ -351,7 +380,7 @@ class TestbotMCPServer {
           description: 'Fetch active Jira stories and generate tests from acceptance criteria'
         });
       }
-      
+
       // Add AI analysis question
       if (config.aiProviderAvailable) {
         config.questions.push({
@@ -386,10 +415,10 @@ class TestbotMCPServer {
     const testDirs = ['tests', 'test', '__tests__', 'spec', 'specs', 'e2e', 'cypress', 'playwright'];
     const testPatterns = ['.spec.js', '.spec.ts', '.test.js', '.test.ts', '.e2e.js', '.e2e.ts'];
     const files = [];
-    
+
     const scanDir = (dir) => {
       if (!fs.existsSync(dir)) return;
-      
+
       try {
         const entries = fs.readdirSync(dir, { withFileTypes: true });
         for (const entry of entries) {
@@ -406,15 +435,15 @@ class TestbotMCPServer {
         // Ignore permission errors
       }
     };
-    
+
     // Scan test directories
     for (const testDir of testDirs) {
       scanDir(path.join(projectPath, testDir));
     }
-    
+
     // Also check root for test files
     scanDir(projectPath);
-    
+
     return {
       count: files.length,
       files: files
@@ -428,27 +457,26 @@ class TestbotMCPServer {
     const fs = require('fs');
     const path = require('path');
     const prdPatterns = [
-      'prd.md', 'PRD.md', 'plan.md', 'Plan.md', 
+      'prd.md', 'PRD.md', 'plan.md', 'Plan.md',
       'requirements.md', 'Requirements.md', 'REQUIREMENTS.md',
       'spec.md', 'specs.md', 'specification.md',
       'docs/prd.md', 'docs/requirements.md', 'docs/plan.md',
       'documentation/prd.md', 'documentation/requirements.md',
     ];
-    
+
     const found = [];
-    
+
     for (const pattern of prdPatterns) {
       const filePath = path.join(projectPath, pattern);
       if (fs.existsSync(filePath)) {
         found.push(pattern);
       }
     }
-    
+
     // Also check for README if nothing else found
     if (found.length === 0) {
       const readmePath = path.join(projectPath, 'README.md');
       if (fs.existsSync(readmePath)) {
-        // Check if README has requirements/features section
         try {
           const content = fs.readFileSync(readmePath, 'utf-8').toLowerCase();
           if (content.includes('requirements') || content.includes('features') || content.includes('user stories')) {
@@ -459,7 +487,7 @@ class TestbotMCPServer {
         }
       }
     }
-    
+
     return found;
   }
 
@@ -469,14 +497,18 @@ class TestbotMCPServer {
   detectFramework(context) {
     const packageJson = context.packageJson;
     if (!packageJson?.dependencies && !packageJson?.devDependencies) {
+      // For non-Node.js projects, return language-based framework
+      if (context.language && context.language !== 'javascript') {
+        return context.language.charAt(0).toUpperCase() + context.language.slice(1);
+      }
       return 'Unknown';
     }
-    
+
     const allDeps = {
       ...packageJson.dependencies,
       ...packageJson.devDependencies
     };
-    
+
     if (allDeps.next) return 'Next.js';
     if (allDeps.nuxt) return 'Nuxt.js';
     if (allDeps['@angular/core']) return 'Angular';
@@ -487,7 +519,7 @@ class TestbotMCPServer {
     if (allDeps.fastify) return 'Fastify';
     if (allDeps.koa) return 'Koa';
     if (allDeps.nest) return 'NestJS';
-    
+
     return 'Node.js';
   }
 
@@ -500,6 +532,7 @@ Please analyze the codebase at ${projectPath} and provide structured information
 
 **Project Info:**
 - Name: ${context.projectName}
+- Language: ${context.language || 'Unknown'}
 - Framework: ${this.detectFramework(context)}
 - Port: ${context.port}
 - Base URL: ${context.baseURL}
@@ -552,326 +585,85 @@ Return the JSON structure above based on what you find in the codebase.
 
   /**
    * Main tool: Test the app end-to-end
+   * Returns immediately and runs the pipeline in a background worker.
    */
   async handleTestMyApp(params) {
     const log = (msg) => console.error(`[Testbot] ${msg}`);
 
-    try {
-      // 1. Auto-detect project context
-      log('Detecting project settings...');
-      const detector = new AutoDetector();
-      const context = await detector.detect(params.projectPath || process.cwd());
+    // 1. Fast auto-detection (~100ms)
+    log('Detecting project settings...');
+    const detector = new AutoDetector();
+    const context = await detector.detect(params.projectPath || process.cwd());
 
-      log(`Project: ${context.projectName}`);
-      log(`Path: ${context.projectPath}`);
+    log(`Project: ${context.projectName} (${context.language})`);
+    log(`Path: ${context.projectPath}`);
 
-      // Merge params with detected context
-      const config = {
-        projectPath: context.projectPath,
-        projectName: context.projectName,
-        testType: params.testType || 'both',
-        generateTests: params.generateTests !== false,
-        prdFile: params.prdFile,
-        codebaseContext: params.codebaseContext || null,
-        baseURL: params.baseURL || context.baseURL,
-        port: params.port || context.port,
-        startCommand: params.startCommand || context.startCommand,
-        jira: params.jira,
-        openDashboard: params.openDashboard !== false,
-      };
+    // 2. Merge params with detected context
+    const config = {
+      projectPath: context.projectPath,
+      projectName: context.projectName,
+      language: context.language,
+      ecosystem: context.ecosystem,
+      testType: params.testType || 'both',
+      generateTests: params.generateTests !== false,
+      prdFile: params.prdFile,
+      codebaseContext: params.codebaseContext || null,
+      baseURL: params.baseURL || context.baseURL,
+      port: params.port || context.port,
+      startCommand: params.startCommand || context.startCommand,
+      jira: params.jira,
+      openDashboard: params.openDashboard !== false,
+    };
 
-      // 2. Jira integration (optional)
-      let jiraStories = null;
-      if (config.jira?.enabled) {
-        log('Fetching Jira stories...');
-        const jiraClient = new JiraClient(config.jira);
-        jiraStories = await jiraClient.fetchActiveStories();
-        log(`Found ${jiraStories.length} active stories`);
-      }
+    // 3. Generate a unique run ID
+    const runId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const fs = require('fs');
+    const statusDir = path.join(config.projectPath, 'testbot-reports', '.runs', runId);
+    fs.mkdirSync(statusDir, { recursive: true });
 
-      // 3. Check existing tests FIRST
-      const existingTests = this.scanExistingTests(config.projectPath);
-      log(`Found ${existingTests.count} existing test files`);
-
-      // 4. Gather codebase context
-      let codebaseContext = config.codebaseContext;
-      const contextGatherer = new ContextGatherer({ projectPath: config.projectPath });
-      
-      if (config.generateTests && !codebaseContext) {
-        log('Gathering codebase context automatically...');
-        codebaseContext = await contextGatherer.gatherRichContext();
-        log(`Found ${codebaseContext.pages?.length || 0} pages, ${codebaseContext.apiEndpoints?.length || 0} API endpoints`);
-      }
-
-      // 5. Launch configuration UI to get mandatory user preferences and PRD
-      log('Launching configuration UI mandatorily...');
-      const configUI = new ConfigUILauncher({ port: 54321 });
-      
-      let prdContent = null;
-      let userConfig = {
-        includeSmoke: true,
-        includeWorkflows: true, 
-        includeErrorStates: false,
-      };
-      
-      try {
-        // Launch the UI and await User Submission
-        const frameworkStr = codebaseContext && codebaseContext.projectStructure ? codebaseContext.projectStructure.framework : 'auto';
-        const receivedConfig = await configUI.launch({
-          projectPath: config.projectPath,
-          projectName: config.projectName,
-          framework: frameworkStr,
-          baseURL: config.baseURL,
-          port: config.port,
-          startCommand: config.startCommand,
-        });
-        
-        Object.assign(userConfig, receivedConfig);
-        prdContent = userConfig.prd;
-        
-        if (userConfig.testType) config.testType = userConfig.testType;
-        if (userConfig.baseURL) config.baseURL = userConfig.baseURL;
-        
-        log('User configuration received parameters successfully.');
-      } catch (uiError) {
-        log(`Config UI error / timeout: ${uiError.message}`);
-        log('Falling back to default auto-generated test cases...');
-      }
-
-      // If a file was explicitly passed in the MCP tool args instead
-      if (!prdContent && config.prdFile) {
-        const fs = require('fs');
-        try {
-          prdContent = fs.readFileSync(config.prdFile, 'utf-8');
-        } catch (error) {
-          log(`Could not read PRD file: ${error.message}`);
-        }
-      }
-
-      // 6. If NO tests exist, generate via TestBot SaaS backend
-      if (existingTests.count === 0) {
-        const testbotApiKey = process.env.TESTBOT_API_KEY;
-        const dashboardUrl = process.env.TESTBOT_DASHBOARD_URL || 'http://localhost:3000';
-        
-        if (!testbotApiKey) {
-          log('No TESTBOT_API_KEY set — cannot generate tests via SaaS backend.');
-          log('Falling back to template-based test generation...');
-          
-          const playwrightMCP = new PlaywrightMCPClient(config);
-          await playwrightMCP.generateTests({
-            context: codebaseContext || { pages: [], apiEndpoints: [], workflows: [] },
-            testType: config.testType,
-            projectPath: config.projectPath,
-          });
-        } else {
-          log('No existing tests found. Generating tests via TestBot backend...');
-          
-          // Try to get supplemental context from the AI agent
-          const agentRequester = new AgentContextRequester({ projectPath: config.projectPath });
-          const agentContext = await agentRequester.requestContext(codebaseContext);
-          if (agentContext) {
-            log('Merging auto-gathered context with agent insights...');
-            codebaseContext = agentRequester.mergeContexts(codebaseContext, agentContext);
-          }
-          
-          // Call the webapp /api/generate-tests endpoint
-          log(`Calling ${dashboardUrl}/api/generate-tests ...`);
-          
-          const genResponse = await fetch(`${dashboardUrl}/api/generate-tests`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              api_key: testbotApiKey,
-              context: codebaseContext || { pages: [], apiEndpoints: [], workflows: [] },
-              testType: config.testType,
-              prd: prdContent || '',
-              projectInfo: {
-                name: config.projectName,
-                framework: codebaseContext?.projectStructure?.framework || 'Unknown',
-                baseURL: config.baseURL,
-              },
-            }),
-          });
-          
-          if (!genResponse.ok) {
-            const errBody = await genResponse.json().catch(() => ({}));
-            log(`Test generation API error: ${errBody.error || genResponse.status}`);
-            log('Falling back to template-based test generation...');
-            
-            const playwrightMCP = new PlaywrightMCPClient(config);
-            await playwrightMCP.generateTests({
-              context: codebaseContext || { pages: [], apiEndpoints: [], workflows: [] },
-              testType: config.testType,
-              projectPath: config.projectPath,
-            });
-          } else {
-            const genData = await genResponse.json();
-            const generatedTests = genData.tests || [];
-            
-            log(`Received ${generatedTests.length} test file(s) from TestBot backend`);
-            
-            // Write test files to disk
-            const fs = require('fs');
-            const testsDir = path.join(config.projectPath, 'tests', 'generated');
-            if (!fs.existsSync(testsDir)) {
-              fs.mkdirSync(testsDir, { recursive: true });
-            }
-            
-            for (const test of generatedTests) {
-              const filePath = path.join(testsDir, test.filename);
-              fs.writeFileSync(filePath, test.content, 'utf-8');
-              log(`  Wrote: ${test.filename} (${test.type})`);
-            }
-          }
-        }
-      }
-
-      // 6. Generate tests using template generator (if tests exist or OpenAI generation skipped)
-      log('Setting up Playwright...');
-      const playwright = new PlaywrightIntegration(config);
-      const playwrightMCP = new PlaywrightMCPClient(config);
-      
-      // Re-check tests after potential generation
-      const testsAfterGeneration = this.scanExistingTests(config.projectPath);
-      
-      // Generate additional tests if needed and we have context
-      if (config.generateTests && (codebaseContext || config.prdFile || jiraStories) && testsAfterGeneration.count > 0) {
-        log('Generating additional intelligent tests...');
-        
-        // Use PlaywrightMCPClient for additional test generation
-        const generationResult = await playwrightMCP.generateTests({
-          context: codebaseContext,
-          testType: config.testType,
-          projectPath: config.projectPath,
-          prdFile: config.prdFile,
-        });
-        
-        log(`Generated ${generationResult.generated} additional test files`);
-        
-        // Also generate from Jira stories if available
-        if (jiraStories && jiraStories.length > 0) {
-          log('Generating tests from Jira stories...');
-          await playwright.generateTests({
-            prdFile: config.prdFile,
-            jiraStories,
-            testType: config.testType,
-          });
-        }
-      }
-
-      // 5. Run tests (with optional parallel Playwright MCP execution)
-      log('Running tests...');
-      
-      // Check if parallel MCP execution is enabled
-      const mcpParallelEnabled = process.env.PLAYWRIGHT_MCP_PARALLEL === 'true' || 
-                                  process.env.PLAYWRIGHT_MCP_ENABLED === 'true';
-      
-      let testResults;
-      
-      if (mcpParallelEnabled) {
-        log('Parallel execution enabled - running TestBot + Playwright MCP...');
-        
-        // Create Playwright MCP integration
-        const playwrightMCPIntegration = new PlaywrightMCPIntegration({
-          projectPath: config.projectPath,
-          baseURL: config.baseURL,
-        });
-        
-        // Run tests in parallel
-        const [directResults, mcpResults] = await Promise.all([
-          playwright.runTests(),                    // Fast direct execution
-          playwrightMCPIntegration.runTests()       // Full artifact capture
-        ]);
-        
-        log(`Direct execution: ${directResults.total} tests`);
-        log(`MCP execution: ${mcpResults.available !== false ? mcpResults.total : 'unavailable'} tests`);
-        
-        // Merge results from both sources
-        const merger = new ResultsMerger({ projectPath: config.projectPath });
-        testResults = merger.mergeResults(directResults, mcpResults);
-        
-        // Log merged artifacts
-        if (testResults.artifacts) {
-          const artifacts = testResults.artifacts;
-          log(`Collected artifacts: ${artifacts.screenshots?.length || 0} screenshots, ${artifacts.videos?.length || 0} videos, ${artifacts.traces?.length || 0} traces`);
-        }
-      } else {
-        // Standard single execution
-        testResults = await playwright.runTests();
-      }
-
-      log(`Tests completed: ${testResults.total} total, ${testResults.passed} passed, ${testResults.failed} failed`);
-
-      // 5. AI analysis on failures (skipped — analysis can be done on the webapp dashboard)
-      let aiAnalysis = null;
-
-      // 6. Generate report
-      log('Generating report...');
-      const reportGen = new ReportGenerator();
-
-      // Log dashboard sync intent (actual posting happens inside ReportGenerator)
-      const testbotApiKey = process.env.TESTBOT_API_KEY;
-      const testbotDashboardUrl =
-        process.env.TESTBOT_DASHBOARD_URL || 'http://localhost:3000';
-      if (testbotApiKey) {
-        log(`Dashboard sync enabled — will post results to ${testbotDashboardUrl}`);
-      } else {
-        log('TESTBOT_API_KEY not set — skipping web dashboard sync');
-      }
-
-      const report = await reportGen.generate({
-        projectPath: config.projectPath,
-        projectName: config.projectName,
-        testResults,
-        aiAnalysis,
-        jiraData: jiraStories,
-        api_key: testbotApiKey,
-        dashboard_url: testbotDashboardUrl
-      });
-
-      // 7. Open dashboard
-      let dashboardUrl = null;
-      if (config.openDashboard) {
-        log('Opening dashboard...');
-        dashboardUrl = await DashboardLauncher.open(report.path);
-      }
-
-      // Return summary
-      const summary = {
-        success: true,
+    // Write initial status
+    fs.writeFileSync(
+      path.join(statusDir, 'status.json'),
+      JSON.stringify({
+        runId,
+        phase: 'queued',
+        timestamp: new Date().toISOString(),
+        message: 'Pipeline queued, starting background worker...',
         project: config.projectName,
-        summary: {
-          total: testResults.total,
-          passed: testResults.passed,
-          failed: testResults.failed,
-          skipped: testResults.skipped,
-          duration: `${testResults.duration}ms`,
-          passRate: testResults.total > 0
-            ? `${Math.round((testResults.passed / testResults.total) * 100)}%`
-            : '0%',
-        },
-        reportPath: report.path,
-        dashboardUrl,
-        aiAnalysis: aiAnalysis
-          ? {
-              analyzed: aiAnalysis.length,
-              highConfidence: aiAnalysis.filter((a) => a.confidence > 0.8).length,
-            }
-          : null,
-      };
+      }, null, 2)
+    );
 
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify(summary, null, 2),
-          },
-        ],
-      };
-    } catch (error) {
-      log(`Error: ${error.message}`);
-      throw error;
-    }
+    // 4. Fork the background worker
+    log(`Starting pipeline in background (runId: ${runId})...`);
+    this.runPipelineInBackground(config, runId);
+
+    // 5. Return immediately with status
+    const dashboardUrl = process.env.TESTBOT_DASHBOARD_URL || 'http://localhost:3000';
+    const statusFile = path.join(statusDir, 'status.json');
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({
+            success: true,
+            status: 'started',
+            runId,
+            project: config.projectName,
+            language: config.language,
+            message: `TestBot pipeline started for "${config.projectName}". Tests are generating and running in the background.`,
+            statusFile,
+            dashboardUrl,
+            nextSteps: [
+              `Monitor progress: check ${statusFile}`,
+              'Results will be posted to the webapp dashboard automatically when complete.',
+              'The dashboard will open in your browser when tests finish.',
+              `Dashboard URL: ${dashboardUrl}`,
+            ],
+          }, null, 2),
+        },
+      ],
+    };
   }
 
   /**
@@ -938,6 +730,8 @@ Return the JSON structure above based on what you find in the codebase.
       testResults,
       aiAnalysis: null,
       jiraData: null,
+      api_key: process.env.TESTBOT_API_KEY,
+      dashboard_url: process.env.TESTBOT_DASHBOARD_URL || 'http://localhost:3000',
     });
 
     let dashboardUrl = null;
