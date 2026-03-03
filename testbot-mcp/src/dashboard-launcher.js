@@ -94,16 +94,15 @@ console.log('📊 Embedded report data loaded:', {
 
     // Try to open in browser
     try {
-      const open = require('open');
-      // Force new window to avoid cache issues
-      await open(dashboardUrl, { 
-        wait: false,
-        newInstance: true 
-      });
+      const { exec } = require('child_process');
+      const cmd = process.platform === 'win32'
+        ? `start "" "${dashboardUrl}"`
+        : (process.platform === 'darwin' ? `open "${dashboardUrl}"` : `xdg-open "${dashboardUrl}"`);
+      exec(cmd, { windowsHide: true }, () => {});
       console.error('[Dashboard] Opened in browser');
       console.error('[Dashboard] If dashboard shows old data, press Cmd+Shift+R (Mac) or Ctrl+Shift+R (Windows) to hard refresh');
     } catch (error) {
-      // If 'open' package fails, try platform-specific commands
+      // If exec fails, provide fallback instructions
       console.error('[Dashboard] Could not auto-open browser');
       console.error(`[Dashboard] Open manually: ${dashboardUrl}`);
       console.error('[Dashboard] Use hard refresh (Cmd+Shift+R or Ctrl+Shift+R) if data looks stale');

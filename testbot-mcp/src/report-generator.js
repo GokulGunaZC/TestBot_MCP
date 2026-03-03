@@ -85,10 +85,42 @@ class ReportGenerator {
     // Copy Playwright HTML report if it exists
     await this.copyPlaywrightHTMLReport(projectPath, reportsDir);
 
+    // Sync to Web Dashboard if API key is provided
+    let dashboardLink = `file://${reportPath}`;
+    if (arguments[0].api_key && arguments[0].dashboard_url) {
+      try {
+        console.error(`[Report] Syncing to dashboard at ${arguments[0].dashboard_url}...`);
+        
+        // Remove file.io integration
+        
+        const syncResponse = await fetch(`${arguments[0].dashboard_url}/api/test-runs/ingest`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            api_key: arguments[0].api_key,
+            creation_name: projectName || path.basename(projectPath),
+            report: report
+          })
+        });
+
+        if (syncResponse.ok) {
+          const syncData = await syncResponse.json();
+          dashboardLink = `${arguments[0].dashboard_url}${syncData.dashboard_url}`;
+          console.error(`[Report] Successfully synced to dashboard!`);
+        } else {
+          console.error(`[Report] Failed to sync to dashboard: HTTP ${syncResponse.status}`);
+        }
+      } catch (syncError) {
+        console.error(`[Report] Failed to sync to dashboard: ${syncError.message}`);
+      }
+    }
+
     return {
       path: reportPath,
       latestPath,
-      url: `file://${reportPath}`,
+      url: dashboardLink,
     };
   }
 

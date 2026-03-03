@@ -5,8 +5,18 @@
  * Usage: User says "test my app using testbot mcp" in Cursor/Windsurf
  */
 
-// Load environment variables first (silent mode)
-require('dotenv').config();
+// Load environment variables - try multiple paths since CWD varies when launched from IDE
+const path = require('path');
+const dotenvPaths = [
+  path.join(__dirname, '.env'),
+  path.join(__dirname, '..', '.env'),
+  path.join(__dirname, '..', '..', '.env'),
+  path.join(process.cwd(), '.env'),
+];
+for (const envPath of dotenvPaths) {
+  const { error } = require('dotenv').config({ path: envPath });
+  if (!error) { break; } // stop at first working .env
+}
 
 const { Server } = require('@modelcontextprotocol/sdk/server/index.js');
 const { StdioServerTransport } = require('@modelcontextprotocol/sdk/server/stdio.js');
@@ -27,7 +37,6 @@ const ReportGenerator = require('./report-generator');
 const DashboardLauncher = require('./dashboard-launcher');
 const ConfigUILauncher = require('./config-ui-launcher');
 const AgentContextRequester = require('./agent-context-requester');
-const OpenAITestGenerator = require('./test-generator-openai');
 
 class TestbotMCPServer {
   constructor() {
@@ -94,14 +103,17 @@ class TestbotMCPServer {
                   pages: {
                     type: 'array',
                     description: 'Frontend pages/routes with their components and interactions',
+                    items: { type: 'object' }
                   },
                   apiEndpoints: {
                     type: 'array',
                     description: 'Backend API endpoints with methods and schemas',
+                    items: { type: 'object' }
                   },
                   workflows: {
                     type: 'array',
                     description: 'Main user workflows to test',
+                    items: { type: 'string' }
                   },
                 },
               },
@@ -116,19 +128,6 @@ class TestbotMCPServer {
               startCommand: {
                 type: 'string',
                 description: 'Command to start the app server (e.g., "npm start")',
-              },
-              aiProvider: {
-                type: 'string',
-                enum: ['sarvam', 'cascade', 'windsurf', 'openai', 'none'],
-                description: 'AI provider for failure analysis',
-              },
-              openaiApiKey: {
-                type: 'string',
-                description: 'OpenAI API key for test generation (or set OPENAI_API_KEY env var)',
-              },
-              aiApiKey: {
-                type: 'string',
-                description: 'API key for the AI provider',
               },
               jira: {
                 type: 'object',
@@ -577,9 +576,6 @@ Return the JSON structure above based on what you find in the codebase.
         baseURL: params.baseURL || context.baseURL,
         port: params.port || context.port,
         startCommand: params.startCommand || context.startCommand,
-        aiProvider: params.aiProvider || process.env.AI_PROVIDER || 'sarvam',
-        aiApiKey: params.aiApiKey || process.env.SARVAM_API_KEY || process.env.AI_API_KEY,
-        openaiApiKey: params.openaiApiKey || process.env.OPENAI_API_KEY,
         jira: params.jira,
         openDashboard: params.openDashboard !== false,
       };
@@ -607,101 +603,127 @@ Return the JSON structure above based on what you find in the codebase.
         log(`Found ${codebaseContext.pages?.length || 0} pages, ${codebaseContext.apiEndpoints?.length || 0} API endpoints`);
       }
 
-      // 5. If NO tests exist, use OpenAI to generate intelligent tests
-      if (existingTests.count === 0 && config.openaiApiKey) {
-        log('No existing tests found. Using OpenAI to generate intelligent tests...');
+      // 5. Launch configuration UI to get mandatory user preferences and PRD
+      log('Launching configuration UI mandatorily...');
+      const configUI = new ConfigUILauncher({ port: 54321 });
+      
+      let prdContent = null;
+      let userConfig = {
+        includeSmoke: true,
+        includeWorkflows: true, 
+        includeErrorStates: false,
+      };
+      
+      try {
+        // Launch the UI and await User Submission
+        const frameworkStr = codebaseContext && codebaseContext.projectStructure ? codebaseContext.projectStructure.framework : 'auto';
+        const receivedConfig = await configUI.launch({
+          projectPath: config.projectPath,
+          projectName: config.projectName,
+          framework: frameworkStr,
+          baseURL: config.baseURL,
+          port: config.port,
+          startCommand: config.startCommand,
+        });
         
-        // Try to get supplemental context from the AI agent
-        const agentRequester = new AgentContextRequester({ projectPath: config.projectPath });
-        const agentContext = await agentRequester.requestContext(codebaseContext);
+        Object.assign(userConfig, receivedConfig);
+        prdContent = userConfig.prd;
         
-        // Merge auto-gathered context with agent context
-        if (agentContext) {
-          log('Merging auto-gathered context with agent insights...');
-          codebaseContext = agentRequester.mergeContexts(codebaseContext, agentContext);
+        if (userConfig.testType) config.testType = userConfig.testType;
+        if (userConfig.baseURL) config.baseURL = userConfig.baseURL;
+        
+        log('User configuration received parameters successfully.');
+      } catch (uiError) {
+        log(`Config UI error / timeout: ${uiError.message}`);
+        log('Falling back to default auto-generated test cases...');
+      }
+
+      // If a file was explicitly passed in the MCP tool args instead
+      if (!prdContent && config.prdFile) {
+        const fs = require('fs');
+        try {
+          prdContent = fs.readFileSync(config.prdFile, 'utf-8');
+        } catch (error) {
+          log(`Could not read PRD file: ${error.message}`);
         }
+      }
+
+      // 6. If NO tests exist, generate via TestBot SaaS backend
+      if (existingTests.count === 0) {
+        const testbotApiKey = process.env.TESTBOT_API_KEY;
+        const dashboardUrl = process.env.TESTBOT_DASHBOARD_URL || 'http://localhost:3000';
         
-        // Check if we should launch config UI (when no PRD provided)
-        let prdContent = null;
-        let userConfig = {};
-        
-        if (!config.prdFile && !params.codebaseContext) {
-          // Launch configuration UI to get PRD and preferences
-          log('Launching configuration UI...');
-          const configUI = new ConfigUILauncher({ port: 54321 });
+        if (!testbotApiKey) {
+          log('No TESTBOT_API_KEY set — cannot generate tests via SaaS backend.');
+          log('Falling back to template-based test generation...');
           
-          try {
-            userConfig = await configUI.launch({
-              projectPath: config.projectPath,
-              projectName: config.projectName,
-              framework: codebaseContext.projectStructure?.framework || 'auto',
-              baseURL: config.baseURL,
-              port: config.port,
-              startCommand: config.startCommand,
-            });
-            
-            prdContent = userConfig.prd;
-            if (userConfig.testType) config.testType = userConfig.testType;
-            if (userConfig.baseURL) config.baseURL = userConfig.baseURL;
-            
-            log('User configuration received');
-          } catch (uiError) {
-            log(`Config UI not used: ${uiError.message}`);
-            // Continue without user input - will generate basic tests
+          const playwrightMCP = new PlaywrightMCPClient(config);
+          await playwrightMCP.generateTests({
+            context: codebaseContext || { pages: [], apiEndpoints: [], workflows: [] },
+            testType: config.testType,
+            projectPath: config.projectPath,
+          });
+        } else {
+          log('No existing tests found. Generating tests via TestBot backend...');
+          
+          // Try to get supplemental context from the AI agent
+          const agentRequester = new AgentContextRequester({ projectPath: config.projectPath });
+          const agentContext = await agentRequester.requestContext(codebaseContext);
+          if (agentContext) {
+            log('Merging auto-gathered context with agent insights...');
+            codebaseContext = agentRequester.mergeContexts(codebaseContext, agentContext);
           }
-        } else if (config.prdFile) {
-          // Read PRD file
-          const fs = require('fs');
-          try {
-            prdContent = fs.readFileSync(config.prdFile, 'utf-8');
-            log(`Read PRD file: ${config.prdFile}`);
-          } catch (error) {
-            log(`Could not read PRD file: ${error.message}`);
+          
+          // Call the webapp /api/generate-tests endpoint
+          log(`Calling ${dashboardUrl}/api/generate-tests ...`);
+          
+          const genResponse = await fetch(`${dashboardUrl}/api/generate-tests`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              api_key: testbotApiKey,
+              context: codebaseContext || { pages: [], apiEndpoints: [], workflows: [] },
+              testType: config.testType,
+              prd: prdContent || '',
+              projectInfo: {
+                name: config.projectName,
+                framework: codebaseContext?.projectStructure?.framework || 'Unknown',
+                baseURL: config.baseURL,
+              },
+            }),
+          });
+          
+          if (!genResponse.ok) {
+            const errBody = await genResponse.json().catch(() => ({}));
+            log(`Test generation API error: ${errBody.error || genResponse.status}`);
+            log('Falling back to template-based test generation...');
+            
+            const playwrightMCP = new PlaywrightMCPClient(config);
+            await playwrightMCP.generateTests({
+              context: codebaseContext || { pages: [], apiEndpoints: [], workflows: [] },
+              testType: config.testType,
+              projectPath: config.projectPath,
+            });
+          } else {
+            const genData = await genResponse.json();
+            const generatedTests = genData.tests || [];
+            
+            log(`Received ${generatedTests.length} test file(s) from TestBot backend`);
+            
+            // Write test files to disk
+            const fs = require('fs');
+            const testsDir = path.join(config.projectPath, 'tests', 'generated');
+            if (!fs.existsSync(testsDir)) {
+              fs.mkdirSync(testsDir, { recursive: true });
+            }
+            
+            for (const test of generatedTests) {
+              const filePath = path.join(testsDir, test.filename);
+              fs.writeFileSync(filePath, test.content, 'utf-8');
+              log(`  Wrote: ${test.filename} (${test.type})`);
+            }
           }
         }
-        
-        // Generate tests with OpenAI
-        log('Generating tests with OpenAI...');
-        const openaiGenerator = new OpenAITestGenerator({
-          projectPath: config.projectPath,
-          apiKey: config.openaiApiKey,
-          model: process.env.OPENAI_MODEL || 'gpt-4o',
-        });
-        
-        const generatedTests = await openaiGenerator.generateTests({
-          context: codebaseContext,
-          prd: prdContent,
-          testType: config.testType,
-          projectInfo: {
-            name: config.projectName,
-            framework: codebaseContext.projectStructure?.framework,
-            baseURL: config.baseURL,
-            startCommand: config.startCommand,
-          },
-          options: {
-            includeSmoke: userConfig.includeSmoke !== false,
-            includeWorkflows: userConfig.includeWorkflows !== false,
-            includeErrorStates: userConfig.includeErrorStates,
-          },
-        });
-        
-        const summary = openaiGenerator.getSummary();
-        log(`Generated ${summary.totalFiles} test file(s) with OpenAI`);
-        log(`  - Smoke: ${summary.byType.smoke}, Frontend: ${summary.byType.frontend}, API: ${summary.byType.api}, Workflow: ${summary.byType.workflow}`);
-        
-      } else if (existingTests.count === 0 && !config.openaiApiKey) {
-        // No tests and no OpenAI key - provide clear instructions
-        log('No existing tests found and OPENAI_API_KEY not set.');
-        log('To enable AI-powered test generation, add to .env: OPENAI_API_KEY=sk-proj-...');
-        log('Falling back to template-based test generation...');
-        
-        // Fall back to template-based generation
-        const playwrightMCP = new PlaywrightMCPClient(config);
-        await playwrightMCP.generateTests({
-          context: codebaseContext || { pages: [], apiEndpoints: [], workflows: [] },
-          testType: config.testType,
-          projectPath: config.projectPath,
-        });
       }
 
       // 6. Generate tests using template generator (if tests exist or OpenAI generation skipped)
@@ -780,14 +802,8 @@ Return the JSON structure above based on what you find in the codebase.
 
       log(`Tests completed: ${testResults.total} total, ${testResults.passed} passed, ${testResults.failed} failed`);
 
-      // 5. AI analysis on failures
+      // 5. AI analysis on failures (skipped — analysis can be done on the webapp dashboard)
       let aiAnalysis = null;
-      if (testResults.failed > 0 && config.aiProvider !== 'none') {
-        log(`Analyzing ${testResults.failed} failures with ${config.aiProvider}...`);
-        const analyzer = AIAnalyzer.create(config.aiProvider, config.aiApiKey);
-        aiAnalysis = await analyzer.analyzeFailures(testResults.failures);
-        log(`AI analysis complete: ${aiAnalysis.length} failures analyzed`);
-      }
 
       // 6. Generate report
       log('Generating report...');
@@ -796,7 +812,7 @@ Return the JSON structure above based on what you find in the codebase.
       // Log dashboard sync intent (actual posting happens inside ReportGenerator)
       const testbotApiKey = process.env.TESTBOT_API_KEY;
       const testbotDashboardUrl =
-        process.env.TESTBOT_DASHBOARD_URL || 'https://testbot-mcp.vercel.app';
+        process.env.TESTBOT_DASHBOARD_URL || 'http://localhost:3000';
       if (testbotApiKey) {
         log(`Dashboard sync enabled — will post results to ${testbotDashboardUrl}`);
       } else {
@@ -809,6 +825,8 @@ Return the JSON structure above based on what you find in the codebase.
         testResults,
         aiAnalysis,
         jiraData: jiraStories,
+        api_key: testbotApiKey,
+        dashboard_url: testbotDashboardUrl
       });
 
       // 7. Open dashboard

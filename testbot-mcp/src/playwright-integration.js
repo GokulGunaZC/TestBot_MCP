@@ -267,11 +267,12 @@ ${testSteps}
 
       proc.stdout.on('data', (data) => {
         stdout += data.toString();
+        process.stderr.write(`[Playwright Output] ${data.toString()}`);
       });
 
       proc.stderr.on('data', (data) => {
         stderr += data.toString();
-        console.error(data.toString());
+        process.stderr.write(`[Playwright Error] ${data.toString()}`);
       });
 
       proc.on('close', (code) => {
@@ -539,11 +540,11 @@ ${testSteps}
       });
 
       this.serverProcess.stdout.on('data', (data) => {
-        console.error(`[Server] ${data.toString()}`);
+        process.stderr.write(`[Server] ${data.toString()}`);
       });
 
       this.serverProcess.stderr.on('data', (data) => {
-        console.error(`[Server] ${data.toString()}`);
+        process.stderr.write(`[Server] ${data.toString()}`);
       });
 
       // Wait for server to be ready

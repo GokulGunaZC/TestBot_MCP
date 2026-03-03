@@ -1,7 +1,7 @@
 {
   "name": "@testbot/mcp",
   "version": "1.1.0",
-  "description": "One-command testing with AI-powered test generation and analysis for any project",
+  "description": "Testbot MCP Server",
   "main": "src/index.js",
   "bin": {
     "testbot-mcp": "bin/testbot-mcp.js"

@@ -27,7 +27,12 @@ class ConfigUILauncher {
    * @returns {Promise<Object>} User configuration
    */
   async launch(projectInfo = {}) {
-    const log = (msg) => console.error(`[ConfigUI] ${msg}`);
+    const log = (msg) => {
+      console.error(`[ConfigUI] ${msg}`);
+      if (process.stderr && process.stderr.write) {
+        process.stderr.write(`[ConfigUI] ${msg}\n`);
+      }
+    };
     
     return new Promise(async (resolve, reject) => {
       this.resolveConfig = resolve;
@@ -54,11 +59,15 @@ class ConfigUILauncher {
         
         // Open in browser
         try {
-          const open = require('open');
-          await open(configURL);
+          const { exec } = require('child_process');
+          const cmd = process.platform === 'win32'
+            ? `start "" "${configURL}"`
+            : (process.platform === 'darwin' ? `open "${configURL}"` : `xdg-open "${configURL}"`);
+          exec(cmd, { windowsHide: true }, () => {});
           log('Configuration form opened in browser');
         } catch (error) {
-          log(`Could not auto-open browser. Please visit: ${configURL}`);
+          log(`Could not auto-open browser: ${error.message}. Please visit: ${configURL}`);
+          // Don't reject here, let the developer open the URL manually within the 5 minute window
         }
         
         // Set timeout
@@ -70,6 +79,7 @@ class ConfigUILauncher {
         }, this.config.timeout);
         
       } catch (error) {
+        log(`Launch critical error: ${error.stack || error}`);
         this.cleanup();
         reject(error);
       }
@@ -83,6 +93,7 @@ class ConfigUILauncher {
     return new Promise((resolve, reject) => {
       // Find dashboard directory
       const dashboardPaths = [
+        path.join(__dirname, '../dashboard/public'),
         path.join(__dirname, '../../dashboard/public'),
         path.join(__dirname, '../../../dashboard/public'),
         path.join(process.cwd(), 'dashboard/public'),
@@ -97,6 +108,9 @@ class ConfigUILauncher {
       }
       
       if (!dashboardDir) {
+        if (process.stderr && process.stderr.write) {
+          process.stderr.write(`[ConfigUI] CRITICAL: Configuration form not found in any of: ${dashboardPaths.join(', ')}\n`);
+        }
         return reject(new Error('Configuration form not found. Please ensure dashboard/public/config-form.html exists.'));
       }
       

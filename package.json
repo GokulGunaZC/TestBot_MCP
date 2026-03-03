@@ -1,30 +1,21 @@
 {
   "name": "testbot-mcp-workspace",
   "version": "1.0.0",
-  "description": "![img.png](website/public/asset/img.png)",
+  "description": "Testbot MCP",
   "main": "index.js",
   "scripts": {
-    "start": "node scripts/run-complete-workflow.js",
-    "start:server": "node -e \"process.platform === 'win32' ? require('child_process').execSync('powershell -ExecutionPolicy Bypass -File ./start-project.ps1', {stdio: 'inherit'}) : require('child_process').execSync('bash ./start-project.sh', {stdio: 'inherit'})\"",
-    "start:windows": "powershell -ExecutionPolicy Bypass -File ./start-project.ps1",
-    "start:unix": "bash ./start-project.sh",
-    "test": "playwright test",
-    "test:ui": "playwright test --ui",
-    "test:report": "playwright show-report",
-    "test:dashboard": "playwright test && npm run dashboard:build",
-    "dashboard:build": "node scripts/build-dashboard.js",
-    "dashboard": "open custom-report/index.html",
-    "ai-agent": "node ai-agent/index.js",
-    "ai-agent:init": "node ai-agent/index.js --init",
-    "ai-agent:dry-run": "node ai-agent/index.js --dry-run",
-    "ai-agent:no-pr": "node ai-agent/index.js --no-pr",
-    "ai-agent:windsurf": "node ai-agent/index.js --provider windsurf",
-    "workflow": "node scripts/run-complete-workflow.js",
-    "workflow:no-pr": "node scripts/run-complete-workflow.js --no-pr"
+    "dev:webapp": "npm run dev -w webapp",
+    "start:testbot": "npm start -w @testbot/mcp",
+    "test:webapp": "npm run test -w webapp",
+    "test:testbot": "npm run test -w @testbot/mcp"
   },
+  "workspaces": [
+    "testbot-mcp",
+    "webapp"
+  ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/krishsharma1008/ShipCruiseTour_POC.git"
+    "url": "git+https://github.com/krishsharma1008/TestBot_MCP.git"
   },
   "keywords": [],
   "author": "",

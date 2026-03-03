@@ -182,10 +182,12 @@ class PlaywrightMCPIntegration {
       
       testProcess.stdout.on('data', (data) => {
         stdout += data.toString();
+        process.stderr.write(`[Playwright MCP Output] ${data.toString()}`);
       });
       
       testProcess.stderr.on('data', (data) => {
         stderr += data.toString();
+        process.stderr.write(`[Playwright MCP Error] ${data.toString()}`);
       });
       
       const timeout = setTimeout(() => {

@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TestBot Configuration</title>
+    <!-- Google Fonts for Neo-Brutalism -->
+    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&display=swap" rel="stylesheet">
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        :root {
+            --bg-darkest: #000000;
+            --bg-card: #111111;
+            --bg-card-2: #1a1a1a;
+            --text-primary: #ffffff;
+            --text-secondary: #a0a0a0;
+            --font-body: 'Space Grotesk', sans-serif;
+        }
+
+        body {
+            background-color: var(--bg-darkest);
+            color: var(--text-primary);
+            font-family: var(--font-body);
+            -webkit-font-smoothing: antialiased;
+            display: flex;
+            justify-content: center;
+        }
+
+        /* ── Core brutal card ── */
+        .brutal-card {
+            background: #111111;
+            border: 2px solid #333333;
+            border-radius: 8px; /* Slightly rounded for the inner forms matching screenshot */
+            transition: border-color 0.2s ease;
+        }
+        .brutal-card:hover { border-color: #555555; }
+
+        /* ── Input ── */
+        .input-glass {
+            background: #000000;
+            border: 1px solid #333333;
+            color: #ffffff;
+            border-radius: 6px;
+            font-family: inherit;
+            padding: 10px 14px;
+            width: 100%;
+            transition: border-color 0.12s ease;
+        }
+        .input-glass:focus {
+            outline: none;
+            border-color: #ffffff;
+        }
+
+        /* ── Neo-brutal CTA button ── */
+        .btn-gradient {
+            background: #ffffff;
+            color: #000000;
+            padding: 10px 24px;
+            border-radius: 6px;
+            font-weight: 700;
+            font-size: 14px;
+            transition: opacity 0.2s ease;
+            cursor: pointer;
+            border: none;
+        }
+        .btn-gradient:hover { opacity: 0.8; }
+
+        .btn-secondary {
+            background: rgba(255, 255, 255, 0.1);
+            color: #ffffff;
+            padding: 10px 24px;
+            border-radius: 6px;
+            font-weight: 500;
+            font-size: 14px;
+            transition: background 0.2s ease;
+            cursor: pointer;
+            border: none;
+        }
+        .btn-secondary:hover { background: rgba(255, 255, 255, 0.2); }
+
+        /* ── Selectors ── */
+        .toggle-group {
+            display: flex;
+            background: #0a0a0a;
+            border-radius: 8px;
+            border: 1px solid #333333;
+            overflow: hidden;
+            width: 100%;
+        }
+        .toggle-btn {
+            flex: 1;
+            text-align: center;
+            padding: 12px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 500;
+            transition: background 0.2s ease;
+            color: var(--text-secondary);
+        }
+        .toggle-btn.active {
+            background: #222222;
+            color: #ffffff;
+            border-radius: 6px;
+            margin: 2px;
+        }
+
+        .upload-zone {
+            border: 2px dashed #333333;
+            border-radius: 12px;
+            padding: 40px;
+            text-align: center;
+            cursor: pointer;
+            transition: border-color 0.2s ease, background 0.2s ease;
+        }
+        .upload-zone:hover, .upload-zone.dragover {
+            border-color: #ffffff;
+            background: rgba(255, 255, 255, 0.02);
+        }
+
+        .max-w-3xl { max-width: 800px; width: 100%; }
+        .hidden { display: none !important; }
+    </style>
+</head>
+<body class="min-h-screen py-10 px-4">
+    <div class="max-w-3xl">
+        <!-- Header -->
+        <div class="flex items-center gap-3 mb-10">
+            <!-- <svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <path d="M12 2L2 7L12 12L22 7L12 2Z" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                <path d="M2 17L12 22L22 17" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                <path d="M2 12L12 17L22 12" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg> -->
+            <h1 class="text-2xl font-bold tracking-wide">TestBot MCP</h1>
+        </div>
+
+        <h2 class="text-3xl font-bold mb-8">Testing Configuration</h2>
+
+        <form id="configForm" class="space-y-10">
+            
+            <!-- Section 1 -->
+            <div>
+                <h3 class="text-lg font-bold mb-1">Testing Types <span class="text-red-500">*</span></h3>
+                <p class="text-sm text-[#a0a0a0] mb-4">Select your testing types.</p>
+                <div class="brutal-card p-6 space-y-6">
+                    <div class="flex items-center">
+                        <div class="w-1/4 text-sm font-medium">Mode</div>
+                        <div class="w-3/4">
+                            <div class="toggle-group" id="mode-group">
+                                <div class="toggle-btn" data-value="backend">Backend</div>
+                                <div class="toggle-btn active" data-value="frontend">Frontend</div>
+                            </div>
+                            <p class="text-xs text-[#a0a0a0] mt-2">Choose whether to test your backend service or frontend workflows.</p>
+                        </div>
+                    </div>
+                    <div class="flex items-center">
+                        <div class="w-1/4 text-sm font-medium">Scope</div>
+                        <div class="w-3/4">
+                            <div class="toggle-group" id="scope-group">
+                                <div class="toggle-btn active" data-value="codebase">Codebase</div>
+                                <div class="toggle-btn" data-value="diff">Code diff</div>
+                            </div>
+                            <p class="text-xs text-[#a0a0a0] mt-2">Select whether to test against the entire codebase or just recent changes.</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Section 2 -->
+            <div>
+                <h3 class="text-lg font-bold mb-1">Test Account Info <span class="text-[#a0a0a0] font-normal">(Optional)</span></h3>
+                <p class="text-sm text-[#a0a0a0] mb-4">Provide the login credentials for a test account that can be used to access and test your application.</p>
+                <div class="brutal-card p-6 space-y-6">
+                    <div class="flex items-start">
+                        <div class="w-1/4 text-sm font-medium mt-3">Test Account<br>Username</div>
+                        <div class="w-3/4">
+                            <input type="text" id="username" class="input-glass" placeholder="">
+                            <p class="text-xs text-[#a0a0a0] mt-2">Provide a test account username, e.g., test@example.com.</p>
+                        </div>
+                    </div>
+                    <div class="flex items-start">
+                        <div class="w-1/4 text-sm font-medium mt-3">Test Account<br>Password</div>
+                        <div class="w-3/4">
+                            <input type="password" id="password" class="input-glass" placeholder="">
+                            <p class="text-xs text-[#a0a0a0] mt-2">Enter the corresponding password for the test account, e.g., 123456abc.</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div>
+                <h3 class="text-lg font-bold mb-1">Local Server Port <span class="text-red-500">*</span></h3>
+                <p class="text-sm text-[#a0a0a0] mb-4">Port where your local server is running e.g. 3000 in localhost:3000. If there is a specific path that you want to test and not accessible from the root, enter it in the "Path" section. e.g. dashboard for localhost:3000/dashboard</p>
+                <div class="brutal-card p-6 space-y-6">
+                    <div class="flex items-center">
+                        <div class="w-1/4 text-sm font-medium">Port</div>
+                        <div class="w-3/4 flex">
+                            <div class="bg-[#1a1a1a] border border-[#333333] border-r-0 px-4 py-2.5 rounded-l-6px text-sm flex items-center text-[#a0a0a0]">
+                                http://localhost:
+                            </div>
+                            <input type="text" id="port" value="5173" class="input-glass !rounded-l-none border-l-0" style="border-left-width: 0;">
+                        </div>
+                    </div>
+                    <div class="flex items-center">
+                        <div class="w-1/4 text-sm font-medium">Path</div>
+                        <div class="w-3/4">
+                            <input type="text" id="path" value="/" class="input-glass">
+                        </div>
+                    </div>
+                    <div class="bg-[#1a1a1a] border border-[#333333] p-4 rounded-lg mt-4 flex justify-between">
+                        <div class="text-[#a0a0a0] text-sm">Dev servers may crash under concurrent test load — frontend tests will be limited to 15.</div>
+                        <div class="text-[#a0a0a0]">▶</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Section 4 -->
+            <div>
+                <h3 class="text-lg font-bold mb-1">Product Specification Doc <span class="text-red-500">*</span></h3>
+                <p class="text-sm text-[#a0a0a0] mb-4">Upload a document that explains your desired product's features, purpose, and how it should work.</p>
+                <div class="brutal-card p-6">
+                    <div class="upload-zone" id="dropzone">
+                        <svg class="mx-auto mb-4" width="48" height="48" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                            <path d="M22 19C22 20.1046 21.1046 21 20 21H4C2.89543 21 2 20.1046 2 19V5C2 3.89543 2.89543 3 4 3H9.17157C9.70201 3 10.2107 3.21071 10.5858 3.58579L12.4142 5.41421C12.7893 5.78929 13.298 6 13.8284 6H20C21.1046 6 22 6.89543 22 8V19Z" stroke="#707070" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                        </svg>
+                        <p class="text-sm text-[#a0a0a0]">Select your product requirements document (PDF, Markdown, or other formats)</p>
+                        <input type="file" id="fileInput" class="hidden">
+                    </div>
+                    <p class="text-xs text-[#a0a0a0] mt-4 mb-3">Even a draft works — we'll generate a comprehensive, standardized PRD for you later.</p>
+                    
+                    <div id="filePreview" class="hidden mt-4 bg-[#1a1a1a] border border-[#333333] p-3 rounded flex justify-between items-center">
+                        <div class="flex items-center gap-3">
+                            <span id="fileName" class="text-sm font-mono text-white"></span>
+                        </div>
+                        <button type="button" id="removeFile" class="text-[#a0a0a0] hover:text-white transition">×</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Footer Actions -->
+            <div class="flex justify-end gap-3 mt-10 pb-20">
+                <button type="button" id="resetBtn" class="btn-secondary">Reset</button>
+                <button type="button" id="submitBtn" class="btn-gradient bg-[#10b981] !text-white hover:bg-[#059669]">Continue</button>
+            </div>
+            
+        </form>
+    </div>
+
+    <!-- Success Overlay -->
+    <div id="successOverlay" class="fixed inset-0 bg-black/90 hidden flex flex-col items-center justify-center z-50">
+        <h2 class="text-2xl font-bold font-mono text-white">Configuration Sent!</h2>
+        <p class="text-[#a0a0a0] mt-2">You can safely close this window.</p>
+    </div>
+
+    <script>
+        const urlParams = new URLSearchParams(window.location.search);
+        if (urlParams.get('port')) document.getElementById('port').value = urlParams.get('port');
+        
+        let state = { mode: 'frontend', scope: 'codebase', prdContent: null };
+
+        const setupToggles = (groupId, stateKey) => {
+            const group = document.getElementById(groupId);
+            const btns = group.querySelectorAll('.toggle-btn');
+            btns.forEach(btn => {
+                btn.addEventListener('click', () => {
+                    btns.forEach(b => b.classList.remove('active'));
+                    btn.classList.add('active');
+                    state[stateKey] = btn.dataset.value;
+                });
+            });
+        };
+
+        setupToggles('mode-group', 'mode');
+        setupToggles('scope-group', 'scope');
+
+        const dropzone = document.getElementById('dropzone');
+        const fileInput = document.getElementById('fileInput');
+        const filePreview = document.getElementById('filePreview');
+        const fileName = document.getElementById('fileName');
+        const removeFile = document.getElementById('removeFile');
+
+        dropzone.addEventListener('click', () => fileInput.click());
+        dropzone.addEventListener('dragover', (e) => { e.preventDefault(); dropzone.classList.add('dragover'); });
+        dropzone.addEventListener('dragleave', () => dropzone.classList.remove('dragover'));
+        dropzone.addEventListener('drop', (e) => {
+            e.preventDefault();
+            dropzone.classList.remove('dragover');
+            if (e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0]);
+        });
+
+        fileInput.addEventListener('change', (e) => {
+            if (e.target.files.length) handleFile(e.target.files[0]);
+        });
+
+        const handleFile = (file) => {
+            fileName.textContent = file.name;
+            filePreview.classList.remove('hidden');
+            const reader = new FileReader();
+            reader.onload = (e) => { state.prdContent = e.target.result; };
+            reader.readAsText(file);
+        };
+
+        removeFile.addEventListener('click', () => {
+            fileInput.value = '';
+            state.prdContent = null;
+            filePreview.classList.add('hidden');
+        });
+
+        document.getElementById('submitBtn').addEventListener('click', async () => {
+            const payload = {
+                testType: state.mode,
+                scope: state.scope,
+                username: document.getElementById('username').value,
+                password: document.getElementById('password').value,
+                baseURL: `http://localhost:${document.getElementById('port').value}${document.getElementById('path').value}`,
+                prd: state.prdContent || ""
+            };
+
+            const serverPort = urlParams.get('serverPort') || '54321';
+            const submitBtn = document.getElementById('submitBtn');
+            submitBtn.disabled = true; submitBtn.textContent = 'Sending...';
+
+            try {
+                const response = await fetch(`http://localhost:${serverPort}/api/config`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                if(response.ok) {
+                    document.getElementById('successOverlay').classList.remove('hidden');
+                }
+            } catch (err) {
+                alert('Could not send configuration to TestBot server.');
+                submitBtn.disabled = false; submitBtn.textContent = 'Continue';
+            }
+        });
+
+        document.getElementById('resetBtn').addEventListener('click', () => {
+            document.getElementById('configForm').reset();
+            removeFile.click();
+        });
+    </script>
+</body>
+</html>
