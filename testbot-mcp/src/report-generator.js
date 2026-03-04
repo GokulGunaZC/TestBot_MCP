@@ -288,11 +288,28 @@ class ReportGenerator {
         if (typeof test.error === 'string') {
           errorStr = this.stripAnsiAndNormalize(test.error);
         } else if (typeof test.error === 'object') {
-          errorStr = this.stripAnsiAndNormalize(test.error.message || test.error.stack || JSON.stringify(test.error));
+          const callLog = Array.isArray(test.error.callLog)
+            ? test.error.callLog
+              .map((entry) => this.stripAnsiAndNormalize(entry))
+              .filter(Boolean)
+              .slice(0, 25)
+            : null;
+
+          const message = this.stripAnsiAndNormalize(
+            test.error.message || test.error.value || test.error.stack || JSON.stringify(test.error)
+          );
+          const stack = this.stripAnsiAndNormalize(test.error.stack || null);
+          const snippet = this.stripAnsiAndNormalize(test.error.snippet || null);
+          const value = this.stripAnsiAndNormalize(test.error.value || null);
+          const callLogText = callLog?.length ? `\nCall log:\n${callLog.join('\n')}` : '';
+
+          errorStr = this.stripAnsiAndNormalize([message, stack, value].filter(Boolean).join('\n\n') + callLogText);
           errorDetail = {
-            message: this.stripAnsiAndNormalize(test.error.message || null),
-            stack: this.stripAnsiAndNormalize(test.error.stack || null),
-            snippet: this.stripAnsiAndNormalize(test.error.snippet || null),
+            message,
+            stack,
+            snippet,
+            value,
+            callLog,
             location: this.stripAnsiAndNormalize(test.error.location || null),
           };
         }
@@ -368,8 +385,17 @@ class ReportGenerator {
       lowConfidence,
       analyses: aiAnalysis.map((item) => ({
         testName: this.stripAnsiAndNormalize(item.testName || item.failure?.testName),
+        test: this.stripAnsiAndNormalize(item.testName || item.failure?.testName),
+        test_name: this.stripAnsiAndNormalize(item.testName || item.failure?.testName),
         file: this.normalizePathForReport(this.stripAnsiAndNormalize(item.file || item.failure?.file || '')),
         analysis: this.stripAnsiAndNormalize(item.analysis),
+        rootCause: this.stripAnsiAndNormalize(item.rootCause || item.root_cause || null),
+        root_cause: this.stripAnsiAndNormalize(item.rootCause || item.root_cause || null),
+        suggestedFix: this.stripAnsiAndNormalize(item.suggestedFix || item.suggested_fix || null),
+        suggested_fix: this.stripAnsiAndNormalize(item.suggestedFix || item.suggested_fix || null),
+        affectedFiles: this.stripAnsiAndNormalize(item.affectedFiles || null),
+        testingRecommendations: this.stripAnsiAndNormalize(item.testingRecommendations || null),
+        error: this.stripAnsiAndNormalize(item.error || null),
         confidence: item.confidence,
       })),
     };
@@ -390,7 +416,20 @@ class ReportGenerator {
   /**
    * Generate a test report
    */
-  async generate({ projectPath, projectName, testResults, aiAnalysis, jiraData, generationMeta, fallbackUsed, api_key, dashboard_url }) {
+  async generate({
+    projectPath,
+    projectName,
+    testResults,
+    aiAnalysis,
+    jiraData,
+    generationMeta,
+    generationQuality,
+    requirementsCoverage,
+    phaseResults,
+    fallbackUsed,
+    api_key,
+    dashboard_url,
+  }) {
     const timestamp = new Date().toISOString();
     const reportsDir = path.join(projectPath, 'testbot-reports');
     this.ensureDir(reportsDir);
@@ -440,6 +479,9 @@ class ReportGenerator {
       tests: this.buildTestsList(testResults, aiAnalysis, jiraData),
       aiSummary: aiAnalysis ? this.buildAISummary(aiAnalysis) : null,
       jiraSummary: jiraData ? this.buildJiraSummary(jiraData) : null,
+      generationQuality: this.stripAnsiAndNormalize(generationQuality || null),
+      requirementsCoverage: this.stripAnsiAndNormalize(requirementsCoverage || null),
+      phaseResults: this.stripAnsiAndNormalize(phaseResults || testResults.phaseResults || null),
     };
 
     const reportFilename = `report-${timestamp.replace(/[:.]/g, '-')}.json`;

@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useParams } from 'next/navigation';
 import Link from 'next/link';
 import { motion, AnimatePresence } from 'framer-motion';
@@ -11,6 +11,8 @@ import type { TestRun } from '@/lib/types/database';
 interface ErrorObj {
   message?: string;
   stack?: string;
+  value?: string;
+  callLog?: string[];
   snippet?: string;
   location?: { file?: string; line?: number; column?: number };
 }
@@ -57,13 +59,17 @@ interface ReportJson {
 }
 
 interface AiAnalysisItem {
+  testName?: string;
   test?: string;
   test_name?: string;
+  analysis?: string;
   root_cause?: string;
   rootCause?: string;
   suggested_fix?: string;
   suggestedFix?: string;
   fix?: string;
+  testingRecommendations?: string;
+  testing_recommendations?: string;
   confidence?: number | string;
 }
 
@@ -75,7 +81,9 @@ function errorToString(err: unknown): string | null {
   if (typeof err === 'string') return err;
   if (typeof err === 'object') {
     const e = err as ErrorObj;
-    return e.message || e.stack || JSON.stringify(err, null, 2);
+    const parts = [e.message, e.stack, e.value, e.callLog?.length ? `Call log:\n${e.callLog.join('\n')}` : null]
+      .filter(Boolean);
+    return parts.length > 0 ? parts.join('\n\n') : JSON.stringify(err, null, 2);
   }
   return String(err);
 }
@@ -92,6 +100,51 @@ function safeString(val: unknown): string | null {
   return String(val);
 }
 
+function getConfidencePercent(confidence: number | string | null | undefined): number | null {
+  if (confidence === null || confidence === undefined) return null;
+  if (typeof confidence === 'number' && Number.isFinite(confidence)) {
+    return confidence > 1 ? Math.max(0, Math.min(100, Math.round(confidence))) : Math.max(0, Math.min(100, Math.round(confidence * 100)));
+  }
+  if (typeof confidence === 'string') {
+    const trimmed = confidence.trim().toLowerCase();
+    if (!trimmed) return null;
+    if (trimmed.endsWith('%')) {
+      const pct = Number(trimmed.replace('%', ''));
+      return Number.isFinite(pct) ? Math.max(0, Math.min(100, Math.round(pct))) : null;
+    }
+    const parsed = Number(trimmed);
+    if (!Number.isFinite(parsed)) return null;
+    return parsed > 1 ? Math.max(0, Math.min(100, Math.round(parsed))) : Math.max(0, Math.min(100, Math.round(parsed * 100)));
+  }
+  return null;
+}
+
+function buildFailureInsight(errorText: string): string | null {
+  const text = errorText.toLowerCase();
+
+  if (text.includes('tohaveurl') && text.includes('/login')) {
+    return 'This flow expects an authenticated route but the app redirected to /login. Seed auth state or add a login step before asserting URL.';
+  }
+
+  if (text.includes('expect(received).tocontain(expected)') && text.includes('received array')) {
+    return 'Status assertion is too strict for this endpoint. Expand expected status set for validation/auth conflicts or update test data setup.';
+  }
+
+  if (text.includes('timeout') && (text.includes('locator') || text.includes('tobevisible'))) {
+    return 'Element was not found before timeout. Prefer role/label selectors and wait on a stable UI state tied to data load.';
+  }
+
+  if (text.includes('econnrefused') || text.includes('failed to fetch')) {
+    return 'Target server was unavailable during execution. Verify start command, base URL, and that the service is reachable before tests run.';
+  }
+
+  if (text.includes('tohaveproperty') || text.includes('unexpected token')) {
+    return 'API contract assertion failed. Response payload shape/content changed and needs updated schema expectations or endpoint fix.';
+  }
+
+  return null;
+}
+
 // ─── Count-up animation hook ─────────────────────────────────────────────────
 
 function useCountUp(target: number, duration = 1200, delay = 0) {
@@ -99,9 +152,12 @@ function useCountUp(target: number, duration = 1200, delay = 0) {
   const raf = useRef<number | null>(null);
 
   useEffect(() => {
-    if (target === 0) { setValue(0); return; }
     let start: number | null = null;
     const timeout = setTimeout(() => {
+      if (target === 0) {
+        setValue(0);
+        return;
+      }
       const step = (ts: number) => {
         if (!start) start = ts;
         const progress = Math.min((ts - start) / duration, 1);
@@ -176,10 +232,25 @@ function StatusBar({ passed, failed, skipped, total }: { passed: number; failed:
 
 function ArtifactImage({ src, alt }: { src: string; alt: string }) {
   const [expanded, setExpanded] = useState(false);
+  const [failed, setFailed] = useState(false);
+
+  if (failed) {
+    return (
+      <a
+        href={src}
+        target="_blank"
+        rel="noreferrer"
+        className="rounded-lg border border-white/10 bg-white/5 px-3 py-4 text-left text-xs text-[#8BA4C8] hover:border-blue-500/30"
+      >
+        Screenshot unavailable in preview. Open file directly.
+      </a>
+    );
+  }
+
   return (
     <>
       <button onClick={() => setExpanded(true)} className="relative group cursor-pointer rounded-lg overflow-hidden border border-white/10 hover:border-blue-500/40 transition-all">
-        <img src={src} alt={alt} className="w-full h-32 object-cover" loading="lazy" />
+        <img src={src} alt={alt} className="w-full h-32 object-cover" loading="lazy" onError={() => setFailed(true)} />
         <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
           <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2"><path d="M15 3h6v6M14 10l6.1-6.1M9 21H3v-6M10 14l-6.1 6.1" /></svg>
         </div>
@@ -213,9 +284,20 @@ function ArtifactImage({ src, alt }: { src: string; alt: string }) {
 }
 
 function ArtifactVideo({ src }: { src: string }) {
+  const [failed, setFailed] = useState(false);
+
+  if (failed) {
+    return (
+      <div className="rounded-lg overflow-hidden border border-white/10 bg-white/5 p-3">
+        <div className="text-xs text-[#8BA4C8] mb-2">Video preview unavailable for this artifact.</div>
+        <ArtifactDownload src={src} label="Download Video" />
+      </div>
+    );
+  }
+
   return (
     <div className="rounded-lg overflow-hidden border border-white/10">
-      <video controls preload="metadata" className="w-full max-h-64">
+      <video controls preload="metadata" className="w-full max-h-64" onError={() => setFailed(true)}>
         <source src={src} />
         Your browser does not support the video tag.
       </video>
@@ -280,6 +362,7 @@ function TestRow({ t, idx }: { t: NormalisedTest; idx: number }) {
   const [expanded, setExpanded] = useState(false);
   const hasDetails = !!(t.error || t.screenshots.length || t.videos.length || t.traces.length || t.errorObj);
   const isFailed = ['failed', 'fail'].includes(t.status.toLowerCase());
+  const failureInsight = t.error ? buildFailureInsight(t.error) : null;
 
   return (
     <>
@@ -354,6 +437,12 @@ function TestRow({ t, idx }: { t: NormalisedTest; idx: number }) {
                 {t.error && (
                   <div className="rounded-xl bg-red-500/5 border border-red-500/15 p-4">
                     <div className="text-red-400 text-xs font-semibold uppercase tracking-wider mb-2">Error</div>
+                    {failureInsight && (
+                      <div className="mb-3 rounded-lg border border-red-500/20 bg-red-500/5 p-2.5">
+                        <div className="text-red-300 text-[11px] font-semibold uppercase tracking-wider mb-1">Likely Cause</div>
+                        <div className="text-red-200/90 text-xs leading-relaxed">{failureInsight}</div>
+                      </div>
+                    )}
                     <pre className="text-red-300/80 text-xs font-mono whitespace-pre-wrap break-words max-h-48 overflow-y-auto leading-relaxed">
                       {t.error}
                     </pre>
@@ -361,6 +450,14 @@ function TestRow({ t, idx }: { t: NormalisedTest; idx: number }) {
                       <div className="mt-3 pt-3 border-t border-red-500/10">
                         <div className="text-red-400/60 text-xs font-semibold uppercase tracking-wider mb-1">Code Snippet</div>
                         <pre className="text-[#8BA4C8] text-xs font-mono whitespace-pre-wrap leading-relaxed">{t.errorObj.snippet}</pre>
+                      </div>
+                    )}
+                    {Array.isArray(t.errorObj?.callLog) && t.errorObj.callLog.length > 0 && (
+                      <div className="mt-3 pt-3 border-t border-red-500/10">
+                        <div className="text-red-400/60 text-xs font-semibold uppercase tracking-wider mb-1">Call Log</div>
+                        <pre className="text-[#8BA4C8] text-xs font-mono whitespace-pre-wrap leading-relaxed">
+                          {t.errorObj.callLog.join('\n')}
+                        </pre>
                       </div>
                     )}
                     {t.errorObj?.location && (
@@ -519,9 +616,16 @@ export default function TestRunDetailPage() {
 
   // AI analysis
   const aiRaw = testRun.ai_analysis;
-  const aiAnalysis: AiAnalysisItem[] = Array.isArray(aiRaw)
-    ? aiRaw
-    : aiRaw?.analyses ?? aiRaw?.items ?? [];
+  const aiAnalysis: AiAnalysisItem[] = (
+    Array.isArray(aiRaw)
+      ? aiRaw
+      : (Array.isArray(aiRaw?.analyses) ? aiRaw.analyses : Array.isArray(aiRaw?.items) ? aiRaw.items : [])
+  ).filter((item: AiAnalysisItem) => (
+    !!safeString(item?.testName ?? item?.test ?? item?.test_name)
+    || !!safeString(item?.analysis)
+    || !!safeString(item?.rootCause ?? item?.root_cause)
+    || !!safeString(item?.suggestedFix ?? item?.suggested_fix ?? item?.fix)
+  ));
 
   const formattedDate = new Date(testRun.created_at).toLocaleDateString('en-US', {
     month: 'long', day: 'numeric', year: 'numeric',
@@ -685,10 +789,12 @@ export default function TestRunDetailPage() {
             </div>
             <div className="p-5 flex flex-col gap-4">
               {aiAnalysis.map((item, i) => {
-                const testName = safeString(item.test ?? item.test_name) ?? `Issue ${i + 1}`;
+                const testName = safeString(item.testName ?? item.test ?? item.test_name) ?? `Issue ${i + 1}`;
+                const analysis = safeString(item.analysis);
                 const rootCause = safeString(item.root_cause ?? item.rootCause);
                 const fix = safeString(item.suggested_fix ?? item.suggestedFix ?? item.fix);
-                const confidence = item.confidence ?? null;
+                const testingRecommendations = safeString(item.testingRecommendations ?? item.testing_recommendations);
+                const confidence = getConfidencePercent(item.confidence);
                 return (
                   <motion.div
                     key={i}
@@ -701,10 +807,16 @@ export default function TestRunDetailPage() {
                       <div className="text-[#F0F6FF] font-semibold text-sm">{testName}</div>
                       {confidence !== null && (
                         <span className="flex-shrink-0 px-2 py-0.5 rounded-full text-xs font-semibold bg-purple-500/10 text-purple-300 border border-purple-500/20 whitespace-nowrap">
-                          {typeof confidence === 'number' ? `${Math.round(confidence * 100)}% confidence` : confidence}
+                          {`${confidence}% confidence`}
                         </span>
                       )}
                     </div>
+                    {analysis && (
+                      <div>
+                        <div className="text-[#4A6280] text-xs font-semibold uppercase tracking-wider mb-1">Analysis</div>
+                        <div className="text-[#8BA4C8] text-sm">{analysis}</div>
+                      </div>
+                    )}
                     {rootCause && (
                       <div>
                         <div className="text-[#4A6280] text-xs font-semibold uppercase tracking-wider mb-1">Root Cause</div>
@@ -716,6 +828,15 @@ export default function TestRunDetailPage() {
                         <div className="text-[#4A6280] text-xs font-semibold uppercase tracking-wider mb-1">Suggested Fix</div>
                         <div className="text-[#8BA4C8] text-sm">{fix}</div>
                       </div>
+                    )}
+                    {testingRecommendations && (
+                      <div>
+                        <div className="text-[#4A6280] text-xs font-semibold uppercase tracking-wider mb-1">Verification</div>
+                        <div className="text-[#8BA4C8] text-sm">{testingRecommendations}</div>
+                      </div>
+                    )}
+                    {!analysis && !rootCause && !fix && (
+                      <div className="text-[#8BA4C8] text-sm">No structured AI details were provided for this issue.</div>
                     )}
                   </motion.div>
                 );

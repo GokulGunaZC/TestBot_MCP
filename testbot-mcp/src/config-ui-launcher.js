@@ -110,6 +110,10 @@ class ConfigUILauncher {
       testType: projectInfo.testType || 'both',
       generateTests: String(projectInfo.generateTests !== false),
       openDashboard: String(projectInfo.openDashboard !== false),
+      strictAIGeneration: String(projectInfo.strictAIGeneration !== false),
+      minGeneratedTests: String(projectInfo.minGeneratedTests || 50),
+      coverageProfile: projectInfo.coverageProfile || 'qa-max',
+      phaseMode: projectInfo.phaseMode || 'two-phase',
       serverPort: String(this.config.port),
     });
 

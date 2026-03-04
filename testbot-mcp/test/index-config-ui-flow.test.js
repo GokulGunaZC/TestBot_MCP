@@ -80,11 +80,49 @@ test('handleTestMyApp writes awaiting_config_ui and returns configUrl immediatel
 
     assert.equal(payload.status, 'awaiting_configuration');
     assert.ok(payload.configUrl.includes('http://localhost:54321'));
+    assert.equal(payload.aiOnlyEnforced, true);
     assert.ok(fs.existsSync(payload.statusFile));
 
     const statusJson = JSON.parse(fs.readFileSync(payload.statusFile, 'utf-8'));
     assert.equal(statusJson.phase, 'awaiting_config_ui');
     assert.equal(statusJson.runId, payload.runId);
+    assert.equal(statusJson.aiOnlyEnforced, true);
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('strict AI settings default to openai-only with two-phase qa-max profile', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'testbot-config-ui-strict-defaults-'));
+  const deferred = createDeferred();
+  let capturedConfig = null;
+
+  try {
+    const subject = createSubject({
+      projectPath: tempDir,
+      waitForConfigPromise: deferred.promise,
+      onRunPipeline: (config) => {
+        capturedConfig = config;
+      },
+    });
+
+    await subject.handleTestMyApp({ showConfigUI: true });
+    deferred.resolve({
+      testType: 'both',
+      scope: 'codebase',
+      baseURL: 'http://localhost:3000',
+      startCommand: 'npm run dev',
+      generateTests: true,
+      openDashboard: true,
+    });
+
+    await waitFor(() => capturedConfig !== null);
+    assert.equal(capturedConfig.strictAIGeneration, true);
+    assert.equal(capturedConfig.aiOnlyEnforced, true);
+    assert.equal(capturedConfig.generationMode, 'openai-only');
+    assert.equal(capturedConfig.minGeneratedTests, 50);
+    assert.equal(capturedConfig.coverageProfile, 'qa-max');
+    assert.equal(capturedConfig.phaseMode, 'two-phase');
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
@@ -235,6 +273,10 @@ test('optional execution controls are forwarded into pipeline config', async () 
 
     const runPromise = subject.handleTestMyApp({
       generationMode: 'openai-first',
+      strictAIGeneration: false,
+      minGeneratedTests: 12,
+      coverageProfile: 'balanced',
+      phaseMode: 'single',
       artifactMode: 'full',
       browserMode: 'full-matrix',
       validateGeneratedTests: true,
@@ -264,6 +306,11 @@ test('optional execution controls are forwarded into pipeline config', async () 
 
     assert.equal(response.status, 'awaiting_configuration');
     assert.equal(capturedConfig.generationMode, 'openai-first');
+    assert.equal(capturedConfig.strictAIGeneration, false);
+    assert.equal(capturedConfig.aiOnlyEnforced, false);
+    assert.equal(capturedConfig.minGeneratedTests, 12);
+    assert.equal(capturedConfig.coverageProfile, 'balanced');
+    assert.equal(capturedConfig.phaseMode, 'single');
     assert.equal(capturedConfig.artifactMode, 'full');
     assert.equal(capturedConfig.browserMode, 'full-matrix');
     assert.equal(capturedConfig.validateGeneratedTests, true);

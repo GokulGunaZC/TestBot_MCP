@@ -25,6 +25,7 @@ const PlaywrightMCPIntegration = require('./playwright-mcp-integration');
 const OpenAITestGenerator = require('./test-generator-openai');
 const ResultsMerger = require('./results-merger');
 const ContextGatherer = require('./context-gatherer');
+const AgentContextRequester = require('./agent-context-requester');
 const JiraClient = require('./jira/client');
 const ReportGenerator = require('./report-generator');
 const DashboardLauncher = require('./dashboard-launcher');
@@ -45,6 +46,16 @@ const DEFAULT_STAGE_CAPS_MS = {
   reporting: 30000,
   dashboard: 30000,
 };
+
+const STRICT_AI_REQUIRED_CATEGORIES = [
+  'ui_flow',
+  'form_validation',
+  'workflow_journey',
+  'api_contract',
+  'api_auth',
+  'api_negative',
+  'api_stress',
+];
 
 function toFiniteNumber(value, fallback) {
   const parsed = Number(value);
@@ -90,6 +101,246 @@ function computePassRatePercent(results) {
 function modeAllowsTemplateFallback(generationMode) {
   const normalized = String(generationMode || 'openai-first').toLowerCase();
   return normalized !== 'openai-only' && normalized !== 'saas-only';
+}
+
+function strictAIEnabled(config = {}) {
+  return config.strictAIGeneration !== false;
+}
+
+function templatesEmergencyEnabled() {
+  return String(process.env.TESTBOT_ENABLE_TEMPLATES || '').toLowerCase() === 'true';
+}
+
+function countTestsInContent(content) {
+  if (!content) return 0;
+  const matches = String(content).match(/\b(?:test|it)\s*\(/g);
+  return matches ? matches.length : 0;
+}
+
+function listGeneratedTestFiles(projectPath) {
+  const generatedDir = path.join(projectPath, 'tests', 'generated');
+  if (!fs.existsSync(generatedDir)) {
+    return [];
+  }
+
+  return fs.readdirSync(generatedDir)
+    .filter((name) => /\.spec\.(ts|js)$/i.test(name))
+    .map((name) => path.join(generatedDir, name));
+}
+
+function toCoverageProfile(value) {
+  const normalized = String(value || 'qa-max').toLowerCase();
+  if (normalized === 'balanced' || normalized === 'exhaustive') {
+    return normalized;
+  }
+  return 'qa-max';
+}
+
+function detectCoverageCategoriesFromContent(content, filename) {
+  const text = String(content || '');
+  const fileLabel = String(filename || '').toLowerCase();
+  const categories = new Set();
+  const isApiSuite = /request\.(get|post|put|patch|delete|fetch)\(/i.test(text) || /api/.test(fileLabel);
+
+  if (!isApiSuite) {
+    if (
+      /page\.(goto|click|fill|check|selectOption|press)\(/i.test(text) ||
+      /getBy(Role|Label|Placeholder|TestId|Text|AltText)\(/.test(text) ||
+      /toHaveURL\(|toBeVisible\(/.test(text)
+    ) {
+      categories.add('ui_flow');
+    }
+
+    if (
+      /fill\(|getBy(Label|Placeholder)\(|required|validation|invalid|error message|toBeDisabled\(/i.test(text)
+    ) {
+      categories.add('form_validation');
+    }
+
+    if (
+      /workflow|journey|onboarding|checkout|multi-step|end-to-end|critical path/i.test(fileLabel) ||
+      /step\s*\d+|complete flow|end-to-end|journey/i.test(text)
+    ) {
+      categories.add('workflow_journey');
+    }
+  } else {
+    if (
+      /response\.status\(\)|toBe\(\s*\d{3}\s*\)|toContain\(\s*response\.status\(\)\s*\)|toHaveProperty\(/i.test(text)
+    ) {
+      categories.add('api_contract');
+    }
+
+    if (/authorization|bearer|unauth|401|403|auth required|test_auth_token/i.test(text)) {
+      categories.add('api_auth');
+    }
+
+    if (/malformed|invalid|negative|error|expect\(response\.status\(\)\)\.toBeGreaterThanOrEqual\(\s*400/i.test(text) ||
+      /\b(400|404|409|422|429)\b/.test(text)
+    ) {
+      categories.add('api_negative');
+    }
+
+    if (/promise\.all|burst|stress|load|p95|percentile|concurrent/i.test(text)) {
+      categories.add('api_stress');
+    }
+  }
+
+  return categories;
+}
+
+function collectGenerationQuality(projectPath) {
+  const files = listGeneratedTestFiles(projectPath);
+  const categories = Object.fromEntries(STRICT_AI_REQUIRED_CATEGORIES.map((name) => [name, 0]));
+  let totalTests = 0;
+  let filesWithPreferredSelectors = 0;
+  let uiFiles = 0;
+
+  for (const filePath of files) {
+    let content = '';
+    try {
+      content = fs.readFileSync(filePath, 'utf-8');
+    } catch {
+      continue;
+    }
+
+    totalTests += countTestsInContent(content);
+    const detected = detectCoverageCategoriesFromContent(content, path.basename(filePath));
+    for (const category of detected) {
+      categories[category] = (categories[category] || 0) + 1;
+    }
+
+    const isApiSuite = /request\.(get|post|put|patch|delete|fetch)\(/i.test(content) || /api/i.test(path.basename(filePath));
+    if (!isApiSuite) {
+      uiFiles += 1;
+      if (/getByRole|getByLabel|getByPlaceholder|getByTestId|getByText|getByAltText/.test(content)) {
+        filesWithPreferredSelectors += 1;
+      }
+    }
+  }
+
+  const selectorQuality = uiFiles > 0
+    ? Number((filesWithPreferredSelectors / uiFiles).toFixed(2))
+    : 1;
+
+  return {
+    totalFiles: files.length,
+    totalTests,
+    categories,
+    selectorQuality,
+  };
+}
+
+function buildRequirementsCoverage({ prdContent, projectPath }) {
+  const fallback = {
+    totalRequirements: 0,
+    mappedRequirements: 0,
+    uncoveredRequirements: [],
+  };
+
+  if (!prdContent || !String(prdContent).trim()) {
+    return fallback;
+  }
+
+  const requirementMatches = String(prdContent).match(/\b(?:REQ|AC|US)[-_ ]?\d+\b/gi) || [];
+  const normalizedRequirements = [...new Set(requirementMatches.map((item) => item.toUpperCase().replace(/\s+/g, '-')))];
+  if (normalizedRequirements.length === 0) {
+    return fallback;
+  }
+
+  const filePaths = listGeneratedTestFiles(projectPath);
+  const corpus = [];
+  for (const filePath of filePaths) {
+    try {
+      corpus.push(fs.readFileSync(filePath, 'utf-8').toUpperCase());
+    } catch {
+      // ignore
+    }
+  }
+  const allContent = corpus.join('\n');
+
+  const uncoveredRequirements = normalizedRequirements.filter((requirement) =>
+    !allContent.includes(requirement) &&
+    !allContent.includes(`[REQ:${requirement}]`) &&
+    !allContent.includes(`[REQ-${requirement}]`)
+  );
+
+  return {
+    totalRequirements: normalizedRequirements.length,
+    mappedRequirements: normalizedRequirements.length - uncoveredRequirements.length,
+    uncoveredRequirements,
+  };
+}
+
+function requiredCategoriesForRun({ testType, context = {} }) {
+  const normalizedType = String(testType || 'both').toLowerCase();
+  const hasApiSurface = (context.apiEndpoints || []).length > 0 || normalizedType !== 'frontend';
+  const hasUiSurface = normalizedType !== 'backend';
+
+  const required = [];
+  if (hasUiSurface) {
+    required.push('ui_flow', 'form_validation', 'workflow_journey');
+  }
+  if (hasApiSurface) {
+    required.push('api_contract', 'api_auth', 'api_negative', 'api_stress');
+  }
+  return required;
+}
+
+function minimumCategoryHitsByProfile(profile) {
+  if (profile === 'exhaustive') return 2;
+  return 1;
+}
+
+function evaluateGenerationQualityGates({ config, context, quality }) {
+  const requiredCategories = requiredCategoriesForRun({
+    testType: config.testType,
+    context,
+  });
+  const profile = toCoverageProfile(config.coverageProfile);
+  const minHits = minimumCategoryHitsByProfile(profile);
+  const missingCategories = requiredCategories.filter((category) => (quality.categories[category] || 0) < minHits);
+
+  const minGeneratedTests = toFiniteNumber(config.minGeneratedTests, 50);
+  const minSelectorQuality = profile === 'balanced' ? 0.35 : (profile === 'exhaustive' ? 0.6 : 0.5);
+
+  if (quality.totalTests < minGeneratedTests) {
+    const error = new Error(`Generated tests ${quality.totalTests} below minimum ${minGeneratedTests}`);
+    error.code = 'MIN_TEST_COUNT_NOT_MET';
+    error.generationQuality = {
+      ...quality,
+      minGeneratedTests,
+      requiredCategories,
+      missingCategories,
+      coverageProfile: profile,
+    };
+    return { ok: false, error };
+  }
+
+  if (missingCategories.length > 0 || quality.selectorQuality < minSelectorQuality) {
+    const error = new Error(`Coverage gates failed. Missing categories: ${missingCategories.join(', ') || 'none'}, selectorQuality=${quality.selectorQuality}`);
+    error.code = 'COVERAGE_GATES_FAILED';
+    error.generationQuality = {
+      ...quality,
+      minGeneratedTests,
+      requiredCategories,
+      missingCategories,
+      minSelectorQuality,
+      coverageProfile: profile,
+    };
+    return { ok: false, error };
+  }
+
+  return {
+    ok: true,
+    result: {
+      ...quality,
+      minGeneratedTests,
+      requiredCategories,
+      missingCategories: [],
+      minSelectorQuality,
+      coverageProfile: profile,
+    },
+  };
 }
 
 async function withStageBudget(budget, stage, workFn) {
@@ -151,6 +402,12 @@ function classifyErrorCode(error) {
   if (message.includes('openai')) {
     return 'OPENAI_GENERATION_FAILED';
   }
+  if (message.includes('minimum') && message.includes('generated')) {
+    return 'MIN_TEST_COUNT_NOT_MET';
+  }
+  if (message.includes('coverage gates')) {
+    return 'COVERAGE_GATES_FAILED';
+  }
   if (message.includes('pipeline')) {
     return 'PIPELINE_FAILED';
   }
@@ -159,6 +416,48 @@ function classifyErrorCode(error) {
 
 function ensureDir(dirPath) {
   fs.mkdirSync(dirPath, { recursive: true });
+}
+
+function resolveFailureAnalysisProvider(config = {}) {
+  const requestedProvider = String(config.aiProvider || process.env.AI_PROVIDER || '').trim().toLowerCase();
+  const openaiKey = process.env.OPENAI_API_KEY || null;
+  const sarvamKey = process.env.SARVAM_API_KEY || process.env.AI_API_KEY || null;
+
+  if (!requestedProvider) {
+    if (openaiKey) {
+      return { provider: 'openai', apiKey: openaiKey };
+    }
+    if (sarvamKey) {
+      return { provider: 'sarvam', apiKey: sarvamKey };
+    }
+    return { provider: 'openai', apiKey: null, reason: 'missing_openai_and_sarvam_keys' };
+  }
+
+  if (requestedProvider === 'openai') {
+    return {
+      provider: 'openai',
+      apiKey: openaiKey,
+      reason: openaiKey ? null : 'missing_openai_key',
+    };
+  }
+
+  if (requestedProvider === 'sarvam') {
+    return {
+      provider: 'sarvam',
+      apiKey: sarvamKey,
+      reason: sarvamKey ? null : 'missing_sarvam_key',
+    };
+  }
+
+  if (requestedProvider === 'cascade' || requestedProvider === 'windsurf') {
+    return { provider: requestedProvider, apiKey: null };
+  }
+
+  return {
+    provider: requestedProvider,
+    apiKey: openaiKey || sarvamKey,
+    reason: (openaiKey || sarvamKey) ? null : 'missing_provider_key',
+  };
 }
 
 function resetGeneratedTestsDir(projectPath) {
@@ -506,19 +805,26 @@ async function maybeGenerateViaSaaS({ config, context, prdContent, testsDir, pro
 }
 
 async function generateWithFallbackChain({ config, context, prdContent, runBudget, projectInfo }) {
+  const strictAI = strictAIEnabled(config);
+  const emergencyTemplates = templatesEmergencyEnabled();
   const generationMeta = {
     provider: null,
     selectedGenerator: null,
     fallbackUsed: false,
+    aiOnlyEnforced: strictAI,
+    templateFallbackEnabled: emergencyTemplates,
     attempts: [],
     startedAt: new Date().toISOString(),
     finishedAt: null,
   };
 
-  const generationMode = String(config.generationMode || 'openai-first').toLowerCase();
+  const generationMode = strictAI
+    ? 'openai-only'
+    : String(config.generationMode || 'openai-first').toLowerCase();
   const allowOpenAI = !['template-only', 'saas-only'].includes(generationMode);
-  const allowTemplate = !['openai-only', 'saas-only'].includes(generationMode);
-  const allowSaaS = !['openai-only', 'template-only'].includes(generationMode);
+  const allowTemplateByMode = !['openai-only', 'saas-only'].includes(generationMode);
+  const allowTemplate = allowTemplateByMode && emergencyTemplates;
+  const allowSaaS = !strictAI && !['openai-only', 'template-only'].includes(generationMode);
 
   const validateGeneratedTests = config.validateGeneratedTests !== false;
 
@@ -599,6 +905,13 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
 
   if (allowOpenAI) {
     if (!process.env.OPENAI_API_KEY) {
+      if (strictAI) {
+        const error = new Error('OpenAI API key is required in strict AI generation mode');
+        error.code = 'OPENAI_KEY_MISSING';
+        generationMeta.finishedAt = new Date().toISOString();
+        error.generationMeta = generationMeta;
+        throw error;
+      }
       generationMeta.attempts.push({
         generator: 'openai',
         status: 'skipped',
@@ -610,7 +923,7 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
         const openaiGenerator = new OpenAITestGenerator({
           projectPath: config.projectPath,
           outputDir: 'tests/generated',
-          fallbackOnFailure: false,
+          fallbackOnFailure: strictAI ? false : config.enableGeneratorFallback === true,
           enforceValidation: config.validateGeneratedTests !== false,
           syntaxValidationMode: config.syntaxValidationMode || 'fail-closed',
           temperature: Number.isFinite(config.openaiTemperature) ? config.openaiTemperature : undefined,
@@ -625,11 +938,28 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
             includeSmoke: true,
             includeWorkflows: true,
             includeErrorStates: true,
+            coverageProfile: config.coverageProfile || 'qa-max',
+            minGeneratedTests: toFiniteNumber(config.minGeneratedTests, 50),
+            strictAIGeneration: strictAI,
           },
         });
 
         if (!Array.isArray(files) || files.length === 0) {
-          throw new Error('OpenAI generated no files');
+          const emptyError = new Error('OpenAI generated no files');
+          emptyError.code = 'AI_GENERATION_INSUFFICIENT';
+          throw emptyError;
+        }
+
+        if (strictAI) {
+          const nonAIFile = files.find((file) => {
+            const source = String(file.source || '').toLowerCase();
+            return source.includes('template') || source.includes('fallback');
+          });
+          if (nonAIFile) {
+            const sourceError = new Error(`Strict AI mode rejected non-AI source file: ${nonAIFile.filename}`);
+            sourceError.code = 'AI_GENERATION_INSUFFICIENT';
+            throw sourceError;
+          }
         }
 
         const summary = openaiGenerator.getSummary();
@@ -637,6 +967,14 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
         return { generated: files.length, files };
       });
     }
+  }
+
+  if (!result && allowTemplateByMode && !allowTemplate) {
+    generationMeta.attempts.push({
+      generator: 'template',
+      status: 'skipped',
+      reason: 'template_fallback_disabled_without_TESTBOT_ENABLE_TEMPLATES',
+    });
   }
 
   if (!result && allowTemplate) {
@@ -680,8 +1018,12 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
   generationMeta.finishedAt = new Date().toISOString();
 
   if (!result) {
-    const error = new Error('All test generation strategies failed');
-    error.code = 'GENERATION_FAILED';
+    const error = new Error(
+      strictAI
+        ? 'Strict AI generation failed to produce valid tests'
+        : 'All test generation strategies failed'
+    );
+    error.code = strictAI ? 'AI_GENERATION_INSUFFICIENT' : 'GENERATION_FAILED';
     error.generationMeta = generationMeta;
     throw error;
   }
@@ -701,9 +1043,12 @@ async function maybeRunFailureTriage({ config, testResults, runBudget }) {
     return null;
   }
 
-  const provider = config.aiProvider || process.env.AI_PROVIDER || 'sarvam';
-  const apiKey = process.env.SARVAM_API_KEY || process.env.AI_API_KEY;
-  if (!apiKey) {
+  const providerConfig = resolveFailureAnalysisProvider(config);
+  if (providerConfig.reason) {
+    Logger.info('PipelineWorker', 'Skipping AI failure triage', {
+      reason: providerConfig.reason,
+      provider: providerConfig.provider,
+    });
     return null;
   }
 
@@ -711,7 +1056,7 @@ async function maybeRunFailureTriage({ config, testResults, runBudget }) {
   const failures = testResults.failures.slice(0, limit);
 
   return withStageBudget(runBudget, 'aiTriage', async () => {
-    const analyzer = AIAnalyzer.create(provider, apiKey);
+    const analyzer = AIAnalyzer.create(providerConfig.provider, providerConfig.apiKey);
     const analysis = await analyzer.analyzeFailures(failures);
     return Array.isArray(analysis) ? analysis : null;
   });
@@ -727,12 +1072,17 @@ async function runPipeline(config, runId) {
   const runBudget = createRunBudget(config);
   let generationMeta = null;
   let fallbackUsed = false;
+  let generationQuality = null;
+  let requirementsCoverage = null;
+  let phaseResults = null;
+  const aiOnlyEnforced = strictAIEnabled(config);
 
   updateStatus(statusDir, 'started', {
     runId,
     message: 'Pipeline started',
     project: config.projectName,
     budgetMs: runBudget.totalMs,
+    aiOnlyEnforced,
   });
   Logger.info('PipelineWorker', 'Pipeline started', {
     runId,
@@ -749,6 +1099,7 @@ async function runPipeline(config, runId) {
       updateStatus(statusDir, 'jira', {
         runId,
         message: 'Fetching Jira stories...',
+        aiOnlyEnforced,
       });
 
       jiraStories = await withStageBudget(runBudget, 'jira', async () => {
@@ -767,6 +1118,7 @@ async function runPipeline(config, runId) {
       updateStatus(statusDir, 'context', {
         runId,
         message: 'Gathering codebase context...',
+        aiOnlyEnforced,
       });
 
       codebaseContext = await withStageBudget(runBudget, 'context', async () => {
@@ -782,6 +1134,35 @@ async function runPipeline(config, runId) {
         endpoints: codebaseContext.apiEndpoints?.length || 0,
         workflows: codebaseContext.workflows?.length || 0,
       });
+
+      if (config.ideContextMode !== 'off') {
+        updateStatus(statusDir, 'context_enrichment', {
+          runId,
+          message: 'Requesting optional IDE context enrichment...',
+          aiOnlyEnforced,
+        });
+
+        try {
+          const requester = new AgentContextRequester({
+            projectPath: config.projectPath,
+            responseTimeout: toFiniteNumber(config.ideContextTimeoutMs, 2500),
+          });
+
+          const agentContext = await withStageBudget(runBudget, 'context', async () =>
+            requester.requestContext(codebaseContext, toFiniteNumber(config.ideContextTimeoutMs, 2500))
+          );
+
+          if (agentContext && typeof agentContext === 'object' && Object.keys(agentContext).length > 0) {
+            codebaseContext = requester.mergeContexts(codebaseContext, agentContext);
+            const summary = requester.summarizeContext(codebaseContext);
+            Logger.info('PipelineWorker', 'IDE context enrichment applied', summary);
+          } else {
+            Logger.info('PipelineWorker', 'IDE context enrichment not provided; continuing with auto-gathered context');
+          }
+        } catch (error) {
+          Logger.warn('PipelineWorker', 'IDE context enrichment failed (best-effort)', { reason: error.message });
+        }
+      }
     }
 
     // -------------------------------------------------------
@@ -811,6 +1192,7 @@ async function runPipeline(config, runId) {
       updateStatus(statusDir, 'generating', {
         runId,
         message: 'Generating tests...',
+        aiOnlyEnforced,
       });
 
       const generationResult = await generateWithFallbackChain({
@@ -824,10 +1206,43 @@ async function runPipeline(config, runId) {
       generationMeta = generationResult.generationMeta;
       fallbackUsed = !!generationMeta?.fallbackUsed;
 
+      if (aiOnlyEnforced && generationMeta?.selectedGenerator !== 'openai') {
+        const sourceError = new Error(`Strict AI mode requires OpenAI generator, received '${generationMeta?.selectedGenerator || 'unknown'}'`);
+        sourceError.code = 'AI_GENERATION_INSUFFICIENT';
+        sourceError.generationMeta = generationMeta;
+        throw sourceError;
+      }
+
+      const qualityScan = collectGenerationQuality(config.projectPath);
+      const qualityGate = evaluateGenerationQualityGates({
+        config,
+        context: codebaseContext || {},
+        quality: qualityScan,
+      });
+      if (!qualityGate.ok) {
+        qualityGate.error.generationMeta = generationMeta;
+        throw qualityGate.error;
+      }
+      generationQuality = qualityGate.result;
+      requirementsCoverage = buildRequirementsCoverage({
+        prdContent,
+        projectPath: config.projectPath,
+      });
+
+      if (aiOnlyEnforced && requirementsCoverage.totalRequirements > 0 && requirementsCoverage.mappedRequirements === 0) {
+        const requirementsError = new Error('BRD requirement trace coverage is zero in generated suite');
+        requirementsError.code = 'COVERAGE_GATES_FAILED';
+        requirementsError.generationMeta = generationMeta;
+        requirementsError.generationQuality = generationQuality;
+        throw requirementsError;
+      }
+
       Logger.info('PipelineWorker', 'Generated tests', {
         selectedGenerator: generationMeta?.selectedGenerator,
         generated: generationResult.generated || generationResult.files?.length || 0,
         fallbackUsed,
+        totalTests: generationQuality.totalTests,
+        categories: generationQuality.categories,
       });
 
       if (jiraStories?.length) {
@@ -850,6 +1265,9 @@ async function runPipeline(config, runId) {
       message: 'Running Playwright tests...',
       generationMeta,
       fallbackUsed,
+      aiOnlyEnforced,
+      generationQuality,
+      requirementsCoverage,
     });
 
     const executionTimeout = Math.max(1000, Math.min(getBudgetRemainingMs(runBudget), runBudget.stageCaps.execution));
@@ -913,11 +1331,14 @@ async function runPipeline(config, runId) {
       passed: testResults.passed,
       failed: testResults.failed,
     });
+    phaseResults = testResults.phaseResults || null;
 
     const initialPassRate = computePassRatePercent(testResults);
     const minOpenAIPassRate = toFiniteNumber(config.openaiMinPassRate || process.env.TESTBOT_OPENAI_MIN_PASS_RATE, 70);
     const shouldRetryWithTemplate = (
       generationMeta?.selectedGenerator === 'openai' &&
+      !strictAIEnabled(config) &&
+      templatesEmergencyEnabled() &&
       modeAllowsTemplateFallback(config.generationMode) &&
       initialPassRate < minOpenAIPassRate &&
       getBudgetRemainingMs(runBudget) > 30000
@@ -929,6 +1350,7 @@ async function runPipeline(config, runId) {
         message: `OpenAI suite pass rate ${initialPassRate.toFixed(2)}% is below threshold ${minOpenAIPassRate}%. Regenerating deterministic template suite.`,
         generationMeta,
         fallbackUsed,
+        aiOnlyEnforced,
       });
 
       Logger.warn('PipelineWorker', 'OpenAI suite below pass-rate threshold; retrying with template fallback', {
@@ -968,6 +1390,7 @@ async function runPipeline(config, runId) {
 
       if (retryPassRate >= initialPassRate) {
         testResults = retryResults;
+        phaseResults = retryResults.phaseResults || phaseResults;
         fallbackUsed = true;
         generationMeta.selectedGenerator = 'template-after-openai';
         generationMeta.fallbackUsed = true;
@@ -995,6 +1418,10 @@ async function runPipeline(config, runId) {
       },
       generationMeta,
       fallbackUsed,
+      aiOnlyEnforced,
+      generationQuality,
+      requirementsCoverage,
+      phaseResults,
     });
 
     // -------------------------------------------------------
@@ -1020,6 +1447,10 @@ async function runPipeline(config, runId) {
       message: 'Generating report...',
       generationMeta,
       fallbackUsed,
+      aiOnlyEnforced,
+      generationQuality,
+      requirementsCoverage,
+      phaseResults,
     });
 
     const report = await withStageBudget(runBudget, 'reporting', async () => {
@@ -1034,6 +1465,9 @@ async function runPipeline(config, runId) {
         aiAnalysis,
         jiraData: jiraStories,
         generationMeta,
+        generationQuality,
+        requirementsCoverage,
+        phaseResults,
         fallbackUsed,
         api_key: testbotApiKey,
         dashboard_url: testbotDashboardUrl,
@@ -1075,6 +1509,10 @@ async function runPipeline(config, runId) {
       dashboardUrl: dashboardUrl || report.url,
       generationMeta,
       fallbackUsed,
+      aiOnlyEnforced,
+      generationQuality,
+      requirementsCoverage,
+      phaseResults,
       budget: {
         totalMs: runBudget.totalMs,
         consumedMs: getBudgetElapsedMs(runBudget),
@@ -1099,6 +1537,10 @@ async function runPipeline(config, runId) {
       errorCode,
       generationMeta: error.generationMeta || generationMeta,
       fallbackUsed,
+      aiOnlyEnforced,
+      generationQuality: error.generationQuality || generationQuality,
+      requirementsCoverage,
+      phaseResults,
       budget: {
         totalMs: runBudget.totalMs,
         consumedMs: getBudgetElapsedMs(runBudget),
@@ -1111,21 +1553,32 @@ async function runPipeline(config, runId) {
 // -------------------------------------------------------
 // Entry point: receive config via IPC from parent
 // -------------------------------------------------------
-process.on('message', (msg) => {
-  const { config, runId } = msg;
+if (require.main === module) {
+  process.on('message', (msg) => {
+    const { config, runId } = msg;
 
-  // Disconnect IPC so parent is free
-  try {
-    process.disconnect();
-  } catch (e) {
-    // already disconnected
-  }
+    // Disconnect IPC so parent is free
+    try {
+      process.disconnect();
+    } catch (e) {
+      // already disconnected
+    }
 
-  // Run pipeline
-  runPipeline(config, runId)
-    .then(() => process.exit(0))
-    .catch((err) => {
-      Logger.error('PipelineWorker', 'Fatal error', err);
-      process.exit(1);
-    });
-});
+    // Run pipeline
+    runPipeline(config, runId)
+      .then(() => process.exit(0))
+      .catch((err) => {
+        Logger.error('PipelineWorker', 'Fatal error', err);
+        process.exit(1);
+      });
+  });
+}
+
+module.exports = {
+  runPipeline,
+  generateWithFallbackChain,
+  collectGenerationQuality,
+  evaluateGenerationQualityGates,
+  buildRequirementsCoverage,
+  strictAIEnabled,
+};

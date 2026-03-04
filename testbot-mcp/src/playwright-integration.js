@@ -19,6 +19,8 @@ class PlaywrightIntegration {
       timeout: config.timeout || 300000,
       browserMode: config.browserMode || 'chromium',
       artifactMode: config.artifactMode || 'hybrid',
+      phaseMode: config.phaseMode || 'two-phase',
+      allowPhase2OnGateFailure: config.allowPhase2OnGateFailure === true,
       ...config,
     };
 
@@ -112,7 +114,7 @@ class PlaywrightIntegration {
     };
   }
 
-  buildPlaywrightArgs({ configPath, project, lastFailed = false, forceJsonReporter = false } = {}) {
+  buildPlaywrightArgs({ configPath, project, lastFailed = false, forceJsonReporter = false, grep, grepInvert } = {}) {
     const args = ['playwright', 'test'];
 
     if (configPath) {
@@ -133,6 +135,14 @@ class PlaywrightIntegration {
 
     if (lastFailed) {
       args.push('--last-failed');
+    }
+
+    if (grep) {
+      args.push('--grep', grep);
+    }
+
+    if (grepInvert) {
+      args.push('--grep-invert', grepInvert);
     }
 
     if (forceJsonReporter || !configPath) {
@@ -186,7 +196,7 @@ class PlaywrightIntegration {
     });
   }
 
-  async executePlaywright({ project, lastFailed = false } = {}) {
+  async executePlaywright({ project, lastFailed = false, grep, grepInvert } = {}) {
     this.ensurePlaywrightInstalled();
 
     const configPath = this.resolvePlaywrightConfig();
@@ -197,6 +207,8 @@ class PlaywrightIntegration {
       project,
       lastFailed,
       forceJsonReporter,
+      grep,
+      grepInvert,
     });
 
     const commandStartedAt = Date.now();
@@ -283,6 +295,121 @@ class PlaywrightIntegration {
     }
 
     return reruns;
+  }
+
+  hasPhaseTwoTaggedTests() {
+    try {
+      const generatedDir = path.join(this.config.projectPath, 'tests', 'generated');
+      if (!fs.existsSync(generatedDir)) {
+        return false;
+      }
+
+      const files = fs.readdirSync(generatedDir).filter((name) => /\.spec\.(ts|js)$/i.test(name));
+      const phaseTwoTagPattern = /@phase2|@deep|@stress|@matrix|@load|@api-stress|@api-negative|@api-auth|@api-contract/i;
+
+      for (const file of files) {
+        const fullPath = path.join(generatedDir, file);
+        const content = fs.readFileSync(fullPath, 'utf-8');
+        if (phaseTwoTagPattern.test(content)) {
+          return true;
+        }
+      }
+    } catch (error) {
+      Logger.warn('PlaywrightIntegration', 'Failed to inspect phase-two tags', { reason: error.message });
+    }
+
+    return false;
+  }
+
+  combinePhaseResults(phaseOne, phaseTwo) {
+    const combined = {
+      total: Number(phaseOne.total || 0) + Number(phaseTwo.total || 0),
+      passed: Number(phaseOne.passed || 0) + Number(phaseTwo.passed || 0),
+      failed: Number(phaseOne.failed || 0) + Number(phaseTwo.failed || 0),
+      skipped: Number(phaseOne.skipped || 0) + Number(phaseTwo.skipped || 0),
+      duration: Number(phaseOne.duration || 0) + Number(phaseTwo.duration || 0),
+      tests: [...(phaseOne.tests || []), ...(phaseTwo.tests || [])],
+      failures: [...(phaseOne.failures || []), ...(phaseTwo.failures || [])],
+      phaseResults: {
+        phase1: {
+          status: phaseOne.failed > 0 ? 'failed' : 'passed',
+          total: Number(phaseOne.total || 0),
+          passed: Number(phaseOne.passed || 0),
+          failed: Number(phaseOne.failed || 0),
+          skipped: Number(phaseOne.skipped || 0),
+          duration: Number(phaseOne.duration || 0),
+        },
+        phase2: {
+          status: phaseTwo.failed > 0 ? 'failed' : 'passed',
+          total: Number(phaseTwo.total || 0),
+          passed: Number(phaseTwo.passed || 0),
+          failed: Number(phaseTwo.failed || 0),
+          skipped: Number(phaseTwo.skipped || 0),
+          duration: Number(phaseTwo.duration || 0),
+        },
+      },
+    };
+
+    return combined;
+  }
+
+  async runTwoPhaseExecution() {
+    const gatePattern = '@phase2|@deep|@stress|@matrix|@load|@api-stress|@api-negative|@api-auth|@api-contract';
+    const phaseOne = await this.executePlaywright({ grepInvert: gatePattern });
+    const allowPhaseTwoOnGateFailure = this.config.allowPhase2OnGateFailure === true;
+
+    if (phaseOne.failed > 0 && !allowPhaseTwoOnGateFailure) {
+      return {
+        ...phaseOne,
+        phaseResults: {
+          phase1: {
+            status: 'failed',
+            total: Number(phaseOne.total || 0),
+            passed: Number(phaseOne.passed || 0),
+            failed: Number(phaseOne.failed || 0),
+            skipped: Number(phaseOne.skipped || 0),
+            duration: Number(phaseOne.duration || 0),
+          },
+          phase2: {
+            status: 'skipped',
+            total: 0,
+            passed: 0,
+            failed: 0,
+            skipped: 0,
+            duration: 0,
+            reason: 'phase1_failed',
+          },
+        },
+      };
+    }
+
+    if (!this.hasPhaseTwoTaggedTests()) {
+      return {
+        ...phaseOne,
+        phaseResults: {
+          phase1: {
+            status: phaseOne.failed > 0 ? 'failed' : 'passed',
+            total: Number(phaseOne.total || 0),
+            passed: Number(phaseOne.passed || 0),
+            failed: Number(phaseOne.failed || 0),
+            skipped: Number(phaseOne.skipped || 0),
+            duration: Number(phaseOne.duration || 0),
+          },
+          phase2: {
+            status: 'skipped',
+            total: 0,
+            passed: 0,
+            failed: 0,
+            skipped: 0,
+            duration: 0,
+            reason: 'no_phase2_tagged_tests',
+          },
+        },
+      };
+    }
+
+    const phaseTwo = await this.executePlaywright({ grep: gatePattern });
+    return this.combinePhaseResults(phaseOne, phaseTwo);
   }
 
   /**
@@ -424,11 +551,36 @@ test.describe('${this.sanitizeString(scenario.name)}', () => {
     }
 
     try {
-      const primary = await this.executePlaywright();
+      const phaseMode = String(this.config.phaseMode || 'two-phase').toLowerCase();
+      const primary = phaseMode === 'two-phase'
+        ? await this.runTwoPhaseExecution()
+        : await this.executePlaywright();
       const secondary = await this.runSecondaryBrowserReruns(primary);
 
       if (secondary.length > 0) {
         primary.browserReruns = secondary;
+      }
+
+      if (!primary.phaseResults) {
+        primary.phaseResults = {
+          phase1: {
+            status: primary.failed > 0 ? 'failed' : 'passed',
+            total: Number(primary.total || 0),
+            passed: Number(primary.passed || 0),
+            failed: Number(primary.failed || 0),
+            skipped: Number(primary.skipped || 0),
+            duration: Number(primary.duration || 0),
+          },
+          phase2: {
+            status: 'skipped',
+            total: 0,
+            passed: 0,
+            failed: 0,
+            skipped: 0,
+            duration: 0,
+            reason: 'single_phase_mode',
+          },
+        };
       }
 
       return primary;
@@ -525,16 +677,40 @@ test.describe('${this.sanitizeString(scenario.name)}', () => {
     const normalizeError = (error) => {
       if (!error) return null;
       if (typeof error === 'string') {
-        return this.stripAnsi(error);
+        const cleaned = this.stripAnsi(error);
+        return cleaned ? { message: cleaned } : null;
       }
       if (typeof error === 'object') {
+        const callLog = Array.isArray(error.callLog)
+          ? error.callLog
+            .map((entry) => this.stripAnsi(String(entry || '')))
+            .filter(Boolean)
+            .slice(0, 30)
+          : null;
+
+        const location = error.location && typeof error.location === 'object'
+          ? {
+            file: this.stripAnsi(String(error.location.file || '')),
+            line: Number.isFinite(error.location.line) ? error.location.line : null,
+            column: Number.isFinite(error.location.column) ? error.location.column : null,
+          }
+          : null;
+
+        const message = this.stripAnsi(String(error.message || error.value || ''));
+        const stack = this.stripAnsi(String(error.stack || ''));
+        const snippet = this.stripAnsi(String(error.snippet || error.codeFrame || ''));
+        const value = this.stripAnsi(String(error.value || ''));
+
         return {
-          message: this.stripAnsi(String(error.message || '')),
-          stack: this.stripAnsi(String(error.stack || '')),
-          value: this.stripAnsi(String(error.value || '')),
+          message: message || stack || value || 'Unknown Playwright failure',
+          stack: stack || null,
+          value: value || null,
+          snippet: snippet || null,
+          location,
+          callLog,
         };
       }
-      return this.stripAnsi(String(error));
+      return { message: this.stripAnsi(String(error)) };
     };
 
     const processSpec = (spec, suiteName) => {
@@ -547,7 +723,12 @@ test.describe('${this.sanitizeString(scenario.name)}', () => {
         const status = lastResult?.status || test.status || 'unknown';
         const normalizedStatus = this.normalizeStatus(status);
         const artifacts = this.extractArtifacts(lastResult?.attachments || []);
-        const normalizedError = normalizeError(lastResult?.error || null);
+        const normalizedError = normalizeError(
+          lastResult?.error
+          || (Array.isArray(lastResult?.errors) ? lastResult.errors.find(Boolean) : null)
+          || (Array.isArray(test.errors) ? test.errors.find(Boolean) : null)
+          || null
+        );
 
         const testObj = {
           id: `${suiteName}-${spec.title}-${test.projectName || 'default'}`.replace(/\s+/g, '-'),

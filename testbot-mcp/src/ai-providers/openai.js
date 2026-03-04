@@ -654,10 +654,15 @@ IMPORTANT: Return ONLY valid JSON, no markdown code blocks.`;
         Logger.error('OpenAIClient', `Analysis failed`, error);
         results.push({
           failure,
+          testName: failure.testName || null,
+          file: failure.file || null,
           analysis: `Analysis failed: ${error.message}`,
+          rootCause: `AI analysis unavailable: ${error.message}`,
           suggestedFix: null,
           confidence: 0,
           error: error.message,
+          affectedFiles: failure.file ? [failure.file] : [],
+          testingRecommendations: 'Verify API key/provider configuration and retry AI analysis.',
         });
       }
     }

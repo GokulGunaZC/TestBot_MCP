@@ -320,3 +320,86 @@ test('parseTestResponse rejects API suites without burst/stress coverage', () =>
     /stress coverage|burst/i
   );
 });
+
+test('parseTestResponse enforces requirement trace tags when PRD context is provided', () => {
+  const generator = new OpenAITestGenerator({ apiKey: 'test-key' });
+  generator.generationMeta = { rejections: [] };
+  const response = JSON.stringify([
+    {
+      filename: 'frontend-no-req.spec.ts',
+      content: validPlaywrightTest('missing req tag'),
+    },
+  ]);
+
+  assert.throws(
+    () => generator.parseTestResponse(response, 'frontend', { prd: '# REQ-1\nUser can login' }),
+    /rejected|validation/i
+  );
+
+  assert.ok(
+    generator.generationMeta.rejections.some((rejection) =>
+      String(rejection.qualityErrors || '').includes('requirement trace tags')
+    )
+  );
+});
+
+test('evaluateSuiteQuality passes strict 50+ coverage gate when all required categories are present', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'openai-generator-quality-pass-'));
+
+  try {
+    const generator = new OpenAITestGenerator({
+      projectPath: tempDir,
+      outputDir: 'generated-tests',
+      apiKey: 'test-key',
+    });
+
+    const outputDir = path.join(tempDir, 'generated-tests');
+    fs.mkdirSync(outputDir, { recursive: true });
+
+    const files = [
+      {
+        filename: 'ui-flow.spec.ts',
+        content: `import { test, expect } from '@playwright/test';\n` +
+          Array.from({ length: 20 }, (_, i) => `test('[CAT:ui_flow] [REQ:REQ-${i + 1}] ui ${i}', async ({ page }) => { await page.goto('/'); await page.getByRole('button', { name: 'Continue' }).click(); await expect(page.getByRole('main')).toBeVisible(); });\n`).join(''),
+      },
+      {
+        filename: 'form-validation.spec.ts',
+        content: `import { test, expect } from '@playwright/test';\n` +
+          Array.from({ length: 15 }, (_, i) => `test('[CAT:form_validation] [REQ:REQ-${i + 21}] form ${i}', async ({ page }) => { await page.goto('/login'); await page.getByLabel('Email').fill('invalid'); await page.getByRole('button', { name: 'Submit' }).click(); await expect(page.getByText('invalid')).toBeVisible(); });\n`).join(''),
+      },
+      {
+        filename: 'workflow-journey.spec.ts',
+        content: `import { test, expect } from '@playwright/test';\n` +
+          Array.from({ length: 10 }, (_, i) => `test('[CAT:workflow_journey] [REQ:REQ-${i + 36}] journey ${i}', async ({ page }) => { await page.goto('/'); await page.getByRole('link', { name: 'Dashboard' }).click(); await expect(page).toHaveURL(/dashboard/); });\n`).join(''),
+      },
+      {
+        filename: 'api-pack.spec.ts',
+        content: `import { test, expect } from '@playwright/test';\n` +
+          Array.from({ length: 10 }, (_, i) => `test('[CAT:api_contract] [CAT:api_auth] [CAT:api_negative] [CAT:api_stress] [REQ:REQ-${i + 46}] api ${i}', async ({ request }) => { const responses = await Promise.all(Array.from({ length: 3 }, () => request.get('/api/profile', { headers: { Authorization: 'Bearer token' } }))); for (const response of responses) { expect([200, 401, 403, 422]).toContain(response.status()); expect(response.status()).toBeLessThan(500); } });\n`).join(''),
+      },
+    ];
+
+    generator.generatedFiles = files.map((file) => {
+      const filePath = path.join(outputDir, file.filename);
+      fs.writeFileSync(filePath, file.content, 'utf-8');
+      return {
+        path: filePath,
+        filename: file.filename,
+        type: 'generated',
+        source: 'openai',
+      };
+    });
+
+    const quality = generator.evaluateSuiteQuality({
+      testType: 'both',
+      minGeneratedTests: 50,
+      strictAIGeneration: true,
+    });
+
+    assert.equal(quality.valid, true);
+    assert.ok(quality.totalTests >= 50);
+    assert.equal(quality.missingCategories.length, 0);
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});

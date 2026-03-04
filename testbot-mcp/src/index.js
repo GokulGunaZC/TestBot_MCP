@@ -197,6 +197,16 @@ class TestbotMCPServer {
   }
 
   createBasePipelineConfig(context, params) {
+    const strictAIGeneration = params.strictAIGeneration !== false;
+    const resolvedGenerationMode = strictAIGeneration
+      ? 'openai-only'
+      : (params.generationMode || 'openai-first');
+
+    const parsedMinGeneratedTests = Number(params.minGeneratedTests);
+    const minGeneratedTests = Number.isFinite(parsedMinGeneratedTests) && parsedMinGeneratedTests > 0
+      ? Math.floor(parsedMinGeneratedTests)
+      : 50;
+
     return {
       projectPath: context.projectPath,
       projectName: context.projectName,
@@ -211,11 +221,16 @@ class TestbotMCPServer {
       startCommand: params.startCommand || context.startCommand,
       jira: params.jira,
       openDashboard: params.openDashboard !== false,
-      generationMode: params.generationMode || 'openai-first',
+      generationMode: resolvedGenerationMode,
       artifactMode: params.artifactMode || 'hybrid',
       browserMode: params.browserMode || 'chromium',
       validateGeneratedTests: params.validateGeneratedTests !== false,
       aiFailureAnalysis: params.aiFailureAnalysis !== false,
+      strictAIGeneration,
+      aiOnlyEnforced: strictAIGeneration,
+      minGeneratedTests,
+      coverageProfile: params.coverageProfile || 'qa-max',
+      phaseMode: params.phaseMode || 'two-phase',
       playwrightMcp: params.playwrightMcp || {},
       resultMerge: params.resultMerge || {},
       logRedaction: params.logRedaction || {},
@@ -238,6 +253,7 @@ class TestbotMCPServer {
         phase: 'config_received',
         message: 'Configuration received from UI.',
         project: baseConfig.projectName,
+        aiOnlyEnforced: baseConfig.strictAIGeneration !== false,
       });
 
       const prdFile = this.persistUploadedPrd(statusDir, validatedConfig.prd);
@@ -261,6 +277,7 @@ class TestbotMCPServer {
         phase: 'starting_pipeline',
         message: 'Validated configuration. Starting pipeline worker...',
         project: baseConfig.projectName,
+        aiOnlyEnforced: finalConfig.strictAIGeneration !== false,
       });
 
       this.runPipelineInBackground(finalConfig, runId);
@@ -270,6 +287,7 @@ class TestbotMCPServer {
         phase: 'started',
         message: 'Pipeline worker started.',
         project: baseConfig.projectName,
+        aiOnlyEnforced: finalConfig.strictAIGeneration !== false,
       });
     } catch (error) {
       const errorCode = error.code === 'CONFIG_INVALID'
@@ -283,6 +301,7 @@ class TestbotMCPServer {
         error: error.message,
         errorCode,
         project: baseConfig.projectName,
+        aiOnlyEnforced: baseConfig.strictAIGeneration !== false,
       });
       Logger.error('Index', 'Configuration UI flow failed', error, { runId, errorCode });
     }
@@ -355,7 +374,7 @@ class TestbotMCPServer {
     this.server.registerTool(
       'testbot_test_my_app',
       {
-        description: 'Test your application end-to-end with AI-powered analysis. Opens a configuration UI by default, then generates tests, runs them, analyzes failures with AI, and opens a dashboard with results. Returns immediately with a run ID and config URL while awaiting configuration.',
+        description: 'Test your application end-to-end with AI-powered analysis. Opens a configuration UI by default, then generates tests, runs them, analyzes failures with AI, and opens a dashboard with results. Strict AI-only generation is enabled by default. Returns immediately with a run ID and config URL while awaiting configuration.',
         inputSchema: z.object({
           projectPath: z.string().optional().describe('Path to the project to test (defaults to current workspace)'),
           testType: z.enum(['frontend', 'backend', 'both']).optional().describe('Type of tests to run'),
@@ -375,6 +394,10 @@ class TestbotMCPServer {
           openDashboard: z.boolean().optional().describe('Whether to automatically open the dashboard after tests (default: true)'),
           showConfigUI: z.boolean().optional().describe('Show configuration UI before starting pipeline (default: true)'),
           generationMode: z.enum(['openai-first', 'openai-only', 'template-only', 'saas-only']).optional().describe('Generation strategy'),
+          strictAIGeneration: z.boolean().optional().describe('Enforce AI-only generation with no template fallback (default: true)'),
+          minGeneratedTests: z.number().int().min(1).max(500).optional().describe('Minimum generated tests required before execution (default: 50)'),
+          coverageProfile: z.enum(['balanced', 'qa-max', 'exhaustive']).optional().describe('Generation depth and coverage profile (default: qa-max)'),
+          phaseMode: z.enum(['single', 'two-phase']).optional().describe('Execution mode: single pass or gate+deep two-phase (default: two-phase)'),
           artifactMode: z.enum(['hybrid', 'full']).optional().describe('Artifact capture mode'),
           browserMode: z.enum(['chromium', 'smoke-matrix', 'full-matrix']).optional().describe('Browser execution mode'),
           validateGeneratedTests: z.boolean().optional().describe('Validate generated tests before execution'),
@@ -840,6 +863,7 @@ Return the JSON structure above based on what you find in the codebase.
       phase: 'queued',
       message: 'Pipeline queued.',
       project: baseConfig.projectName,
+      aiOnlyEnforced: baseConfig.strictAIGeneration !== false,
     });
 
     const showConfigUI = params.showConfigUI !== false;
@@ -851,6 +875,7 @@ Return the JSON structure above based on what you find in the codebase.
         phase: 'starting_pipeline',
         message: 'Configuration UI disabled. Starting pipeline worker...',
         project: baseConfig.projectName,
+        aiOnlyEnforced: baseConfig.strictAIGeneration !== false,
       });
 
       Logger.info('Index', `Starting pipeline in background (runId: ${runId})...`);
@@ -861,6 +886,7 @@ Return the JSON structure above based on what you find in the codebase.
         phase: 'started',
         message: 'Pipeline worker started.',
         project: baseConfig.projectName,
+        aiOnlyEnforced: baseConfig.strictAIGeneration !== false,
       });
 
       return {
@@ -876,6 +902,7 @@ Return the JSON structure above based on what you find in the codebase.
               message: `TestBot pipeline started for "${baseConfig.projectName}". Configuration UI is disabled for this run.`,
               statusFile,
               dashboardUrl,
+              aiOnlyEnforced: baseConfig.strictAIGeneration !== false,
               nextSteps: [
                 `Monitor progress: check ${statusFile}`,
                 'Results will be posted to the webapp dashboard automatically when complete.',
@@ -901,6 +928,10 @@ Return the JSON structure above based on what you find in the codebase.
         testType: baseConfig.testType,
         generateTests: String(baseConfig.generateTests),
         openDashboard: String(baseConfig.openDashboard),
+        strictAIGeneration: String(baseConfig.strictAIGeneration !== false),
+        minGeneratedTests: String(baseConfig.minGeneratedTests || 50),
+        coverageProfile: baseConfig.coverageProfile || 'qa-max',
+        phaseMode: baseConfig.phaseMode || 'two-phase',
       });
       configUrl = launchResult.configUrl;
       waitForConfig = launchResult.waitForConfig;
@@ -912,6 +943,7 @@ Return the JSON structure above based on what you find in the codebase.
         error: error.message,
         errorCode: 'CONFIG_UI_LAUNCH_FAILED',
         project: baseConfig.projectName,
+        aiOnlyEnforced: baseConfig.strictAIGeneration !== false,
       });
       throw error;
     }
@@ -922,6 +954,7 @@ Return the JSON structure above based on what you find in the codebase.
       message: 'Waiting for configuration submission from UI.',
       project: baseConfig.projectName,
       configUrl,
+      aiOnlyEnforced: baseConfig.strictAIGeneration !== false,
     });
 
     this.continuePipelineAfterConfig({
@@ -948,6 +981,7 @@ Return the JSON structure above based on what you find in the codebase.
             statusFile,
             configUrl,
             dashboardUrl,
+            aiOnlyEnforced: baseConfig.strictAIGeneration !== false,
             nextSteps: [
               `Monitor progress: check ${statusFile}`,
               `Open and submit configuration UI: ${configUrl}`,
