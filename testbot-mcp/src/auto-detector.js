@@ -9,6 +9,48 @@ const path = require('path');
 const Logger = require('./logger');
 
 class AutoDetector {
+  findFileRelative(projectPath, filename, maxDepth = 3) {
+    const skipDirs = new Set([
+      '.git',
+      'node_modules',
+      '.venv',
+      'venv',
+      '__pycache__',
+      '.pytest_cache',
+      '.mypy_cache',
+      '.next',
+      'dist',
+      'build',
+    ]);
+
+    const walk = (currentDir, depth) => {
+      if (depth > maxDepth) return null;
+
+      let entries = [];
+      try {
+        entries = fs.readdirSync(currentDir, { withFileTypes: true });
+      } catch {
+        return null;
+      }
+
+      for (const entry of entries) {
+        if (entry.isFile() && entry.name === filename) {
+          return path.relative(projectPath, path.join(currentDir, entry.name));
+        }
+      }
+
+      for (const entry of entries) {
+        if (!entry.isDirectory() || skipDirs.has(entry.name)) continue;
+        const result = walk(path.join(currentDir, entry.name), depth + 1);
+        if (result) return result;
+      }
+
+      return null;
+    };
+
+    return walk(projectPath, 0);
+  }
+
   /**
    * Detect project settings from the given path
    * @param {string} projectPath - Path to the project root
@@ -351,9 +393,18 @@ class AutoDetector {
 
     // Language-specific start commands
     if (langInfo?.language === 'python') {
-      if (langInfo.ecosystem === 'django' || fs.existsSync(path.join(projectPath, 'manage.py'))) {
-        return 'python manage.py runserver';
+      const rootManagePy = fs.existsSync(path.join(projectPath, 'manage.py'));
+      const nestedManagePy = rootManagePy ? 'manage.py' : this.findFileRelative(projectPath, 'manage.py', 4);
+
+      if (langInfo.ecosystem === 'django' || nestedManagePy) {
+        const manageDir = path.dirname(nestedManagePy);
+        if (!manageDir || manageDir === '.') {
+          return 'python manage.py runserver';
+        }
+        const normalizedDir = manageDir.replace(/\\/g, '/');
+        return `cd ${normalizedDir} && python manage.py runserver`;
       }
+
       // Check for FastAPI / Uvicorn
       try {
         const req = fs.readFileSync(path.join(projectPath, 'requirements.txt'), 'utf-8');

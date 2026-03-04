@@ -438,7 +438,7 @@ class TestbotMCPServer {
         inputSchema: z.object({
           projectPath: z.string().describe('Path to the project'),
           testResultsPath: z.string().optional().describe('Path to test-results.json file'),
-          aiProvider: z.enum(['sarvam', 'cascade', 'windsurf']).optional().describe('AI provider for failure analysis'),
+          aiProvider: z.enum(['openai', 'sarvam', 'cascade', 'windsurf']).optional().describe('AI provider for failure analysis'),
         }),
       },
       async (args, extra) => {
@@ -537,6 +537,9 @@ class TestbotMCPServer {
       );
 
       // 5. Build configuration response with questions
+      const preferredAIProvider = process.env.AI_PROVIDER
+        || (process.env.OPENAI_API_KEY ? 'openai' : 'sarvam');
+
       const config = {
         projectInfo: {
           name: context.projectName,
@@ -555,7 +558,7 @@ class TestbotMCPServer {
         },
         prdFiles: prdFiles,
         jiraAvailable: hasJiraConfig,
-        aiProviderAvailable: !!(process.env.SARVAM_API_KEY || process.env.AI_API_KEY),
+        aiProviderAvailable: !!(process.env.OPENAI_API_KEY || process.env.SARVAM_API_KEY || process.env.AI_API_KEY),
 
         // Questions for the user to answer
         questions: [
@@ -591,7 +594,7 @@ class TestbotMCPServer {
           startCommand: context.startCommand,
           generateTests: existingTests.count === 0,
           prdFile: prdFiles.length > 0 ? prdFiles[0] : null,
-          aiProvider: process.env.AI_PROVIDER || 'sarvam',
+          aiProvider: preferredAIProvider,
           openDashboard: true,
         }
       };

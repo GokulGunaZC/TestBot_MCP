@@ -831,10 +831,19 @@ test.describe('${this.sanitizeString(scenario.name)}', () => {
 
     return new Promise((resolve, reject) => {
       Logger.info('PlaywrightIntegration', `Starting server: ${this.config.startCommand}`);
+      const detached = process.platform !== 'win32';
+      let settled = false;
+      let serverExited = false;
 
-      const [cmd, ...args] = this.config.startCommand.split(' ');
-      this.serverProcess = spawn(cmd, args, {
+      this.serverProcess = spawn(this.config.startCommand, {
         cwd: this.config.projectPath,
+        shell: true,
+        detached,
+        env: {
+          ...process.env,
+          BASE_URL: this.config.baseURL,
+          PORT: String(this.config.port || ''),
+        },
       });
 
       this.serverProcess.stdout.on('data', (data) => {
@@ -845,16 +854,40 @@ test.describe('${this.sanitizeString(scenario.name)}', () => {
         Logger.debug('PlaywrightIntegration', `[Server] ${data.toString()}`);
       });
 
+      const finish = (error) => {
+        if (settled) return;
+        settled = true;
+        if (error) {
+          reject(error);
+          return;
+        }
+        resolve();
+      };
+
+      this.serverProcess.on('error', (error) => {
+        finish(new Error(`Server process failed to start: ${error.message}`));
+      });
+
+      this.serverProcess.on('exit', (code, signal) => {
+        serverExited = true;
+        if (!settled) {
+          finish(new Error(`Server process exited before becoming ready (code=${code}, signal=${signal || 'none'})`));
+        }
+      });
+
       const fetchFn = global.fetch || ((url) => import('node-fetch').then((module) => module.default(url)));
 
       const checkServer = async () => {
         const maxAttempts = 30;
         for (let i = 0; i < maxAttempts; i += 1) {
+          if (serverExited) {
+            return;
+          }
           try {
             const response = await fetchFn(this.config.baseURL);
             if (response.ok || response.status < 500) {
               Logger.info('PlaywrightIntegration', 'Server is ready');
-              resolve();
+              finish();
               return;
             }
           } catch {
@@ -864,7 +897,7 @@ test.describe('${this.sanitizeString(scenario.name)}', () => {
           await new Promise((done) => setTimeout(done, 1000));
         }
 
-        reject(new Error('Server failed to start within timeout'));
+        finish(new Error('Server failed to start within timeout'));
       };
 
       checkServer();

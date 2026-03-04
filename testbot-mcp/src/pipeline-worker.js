@@ -325,16 +325,58 @@ function buildRequirementsCoverage({ prdContent, projectPath }) {
 
 function requiredCategoriesForRun({ testType, context = {} }) {
   const normalizedType = String(testType || 'both').toLowerCase();
-  const hasApiSurface = (context.apiEndpoints || []).length > 0 || normalizedType !== 'frontend';
-  const hasUiSurface = normalizedType !== 'backend';
+  const pageCount = (context.pages || []).length;
+  const formCount = (context.forms || []).length;
+  const workflowCount = (context.workflows || []).length;
+  const navEdgeCount = (context.navigationGraph || []).length;
+  const apiCount = (context.apiEndpoints || []).length;
+  const authPatternCount = (context.authPatterns || []).length;
+  const apiAuthSignals = (context.apiEndpoints || []).filter((endpoint) =>
+    endpoint?.authRequired === true ||
+    /auth|token|login|logout|session|bearer/i.test(String(endpoint?.path || ''))
+  ).length;
+
+  const explicitFrontend = normalizedType === 'frontend';
+  const explicitBackend = normalizedType === 'backend';
+
+  const hasUiSurface = !explicitBackend && (
+    pageCount > 0 ||
+    formCount > 0 ||
+    workflowCount > 0 ||
+    navEdgeCount > 0
+  );
+  const hasApiSurface = !explicitFrontend && (
+    apiCount > 0 ||
+    normalizedType === 'backend'
+  );
 
   const required = [];
   if (hasUiSurface) {
-    required.push('ui_flow', 'form_validation', 'workflow_journey');
+    required.push('ui_flow');
+    if (formCount > 0) {
+      required.push('form_validation');
+    }
+    if (navEdgeCount > 1 || workflowCount > 1 || (workflowCount > 0 && formCount > 0)) {
+      required.push('workflow_journey');
+    }
   }
   if (hasApiSurface) {
-    required.push('api_contract', 'api_auth', 'api_negative', 'api_stress');
+    required.push('api_contract', 'api_negative', 'api_stress');
+    if (apiAuthSignals > 0 || authPatternCount > 0) {
+      required.push('api_auth');
+    }
   }
+
+  if (required.length === 0) {
+    if (explicitFrontend) {
+      return ['ui_flow'];
+    }
+    if (explicitBackend) {
+      return ['api_contract', 'api_negative', 'api_stress'];
+    }
+    return ['ui_flow', 'api_contract', 'api_negative'];
+  }
+
   return required;
 }
 
@@ -1724,6 +1766,8 @@ async function runPipeline(config, runId) {
   } catch (error) {
     const errorCode = classifyErrorCode(error);
     Logger.error('PipelineWorker', 'Pipeline error', error, { errorCode, runId });
+    const errorGenerationMeta = error.generationMeta || generationMeta;
+    const errorGenerationQuality = error.generationQuality || generationQuality;
 
     updateStatus(statusDir, 'error', {
       runId,
@@ -1731,10 +1775,10 @@ async function runPipeline(config, runId) {
       error: error.message,
       stack: error.stack,
       errorCode,
-      generationMeta: error.generationMeta || generationMeta,
+      generationMeta: errorGenerationMeta,
       fallbackUsed,
       aiOnlyEnforced,
-      generationQuality: error.generationQuality || generationQuality,
+      generationQuality: errorGenerationQuality,
       requirementsCoverage,
       phaseResults,
       budget: {
@@ -1743,6 +1787,82 @@ async function runPipeline(config, runId) {
         remainingMs: getBudgetRemainingMs(runBudget),
       },
     });
+
+    try {
+      const reportGen = new ReportGenerator();
+      const syntheticFailure = {
+        testName: `[PIPELINE_ERROR:${errorCode}] TestBot pipeline failed before/while execution`,
+        file: 'pipeline-worker.js',
+        status: 'failed',
+        duration: 0,
+        error: {
+          message: error.message,
+          stack: error.stack,
+        },
+        artifacts: {
+          screenshots: [],
+          videos: [],
+          traces: [],
+          other: [],
+        },
+      };
+
+      const syntheticTestResults = {
+        total: 1,
+        passed: 0,
+        failed: 1,
+        skipped: 0,
+        duration: 0,
+        tests: [
+          {
+            id: `pipeline-error-${runId}`,
+            title: syntheticFailure.testName,
+            suite: 'pipeline',
+            file: syntheticFailure.file,
+            status: 'failed',
+            duration: 0,
+            retries: 0,
+            error: syntheticFailure.error,
+            artifacts: syntheticFailure.artifacts,
+          },
+        ],
+        failures: [syntheticFailure],
+      };
+
+      const testbotApiKey = process.env.TESTBOT_API_KEY;
+      const testbotDashboardUrl = process.env.TESTBOT_DASHBOARD_URL || 'http://localhost:3000';
+      const errorReport = await reportGen.generate({
+        projectPath: config.projectPath,
+        projectName: config.projectName,
+        testResults: syntheticTestResults,
+        aiAnalysis: null,
+        jiraData: null,
+        generationMeta: errorGenerationMeta,
+        generationQuality: errorGenerationQuality,
+        requirementsCoverage,
+        phaseResults,
+        fallbackUsed,
+        api_key: testbotApiKey,
+        dashboard_url: testbotDashboardUrl,
+      });
+
+      updateStatus(statusDir, 'error_reported', {
+        runId,
+        message: 'Pipeline failed and error report was generated.',
+        errorCode,
+        reportPath: errorReport.path,
+        dashboardUrl: errorReport.url,
+        generationMeta: errorGenerationMeta,
+        generationQuality: errorGenerationQuality,
+        requirementsCoverage,
+        phaseResults,
+      });
+    } catch (reportError) {
+      Logger.warn('PipelineWorker', 'Failed to generate/sync error report', {
+        runId,
+        reason: reportError.message,
+      });
+    }
   }
 }
 

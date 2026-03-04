@@ -113,3 +113,72 @@ test('generation quality gates fail when required API category is missing', () =
   assert.equal(gate.error.code, 'COVERAGE_GATES_FAILED');
   assert.match(gate.error.message, /api_stress/i);
 });
+
+test('generation quality gates adapt to API-only context even when testType is both', () => {
+  const gate = evaluateGenerationQualityGates({
+    config: {
+      testType: 'both',
+      minGeneratedTests: 30,
+      coverageProfile: 'qa-max',
+    },
+    context: {
+      pages: [],
+      forms: [],
+      workflows: [],
+      apiEndpoints: [
+        { method: 'GET', path: '/api/health' },
+        { method: 'POST', path: '/api/items' },
+      ],
+    },
+    quality: {
+      totalFiles: 8,
+      totalTests: 40,
+      selectorQuality: 1,
+      categories: {
+        ui_flow: 0,
+        form_validation: 0,
+        workflow_journey: 0,
+        api_contract: 2,
+        api_auth: 0,
+        api_negative: 2,
+        api_stress: 1,
+      },
+    },
+  });
+
+  assert.equal(gate.ok, true);
+});
+
+test('generation quality gates do not force workflow category for single inferred workflow without form context', () => {
+  const gate = evaluateGenerationQualityGates({
+    config: {
+      testType: 'both',
+      minGeneratedTests: 30,
+      coverageProfile: 'qa-max',
+    },
+    context: {
+      pages: [{ path: '/', components: [], interactions: ['navigation'] }],
+      forms: [],
+      workflows: [{ name: 'Dashboard Navigation', steps: ['navigate', 'assert'] }],
+      navigationGraph: [],
+      apiEndpoints: [{ method: 'GET', path: '/api/health' }],
+      authPatterns: [{ type: 'session' }],
+    },
+    quality: {
+      totalFiles: 10,
+      totalTests: 45,
+      selectorQuality: 0.8,
+      categories: {
+        ui_flow: 2,
+        form_validation: 0,
+        workflow_journey: 0,
+        api_contract: 2,
+        api_auth: 1,
+        api_negative: 2,
+        api_stress: 1,
+      },
+    },
+  });
+
+  assert.equal(gate.ok, true);
+});
