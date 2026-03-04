@@ -20,11 +20,32 @@ class PlaywrightMCPIntegration {
       saveVideo: config.saveVideo !== false,
       videoResolution: config.videoResolution || '1280x720',
       headless: config.headless !== false,
+      mcpPackageName: config.mcpPackageName || process.env.PLAYWRIGHT_MCP_PACKAGE || '@playwright/mcp',
+      mcpVersion: config.mcpVersion || process.env.PLAYWRIGHT_MCP_VERSION || '',
+      noInstall: config.noInstall !== false && process.env.PLAYWRIGHT_MCP_ALLOW_INSTALL !== 'true',
       ...config,
     };
     
     this.mcpServerAvailable = false;
     this.outputPath = path.join(this.config.projectPath, this.config.outputDir);
+  }
+
+  getMcpPackageSpecifier() {
+    const base = this.config.mcpPackageName || '@playwright/mcp';
+    const version = String(this.config.mcpVersion || '').trim();
+    if (!version || version.toLowerCase() === 'latest') {
+      return base;
+    }
+    return `${base}@${version}`;
+  }
+
+  buildNpxArgs(extraArgs = []) {
+    const args = [];
+    if (this.config.noInstall) {
+      args.push('--no-install');
+    }
+    args.push(this.getMcpPackageSpecifier(), ...extraArgs);
+    return args;
   }
 
   /**
@@ -43,7 +64,7 @@ class PlaywrightMCPIntegration {
       log('Checking Playwright MCP availability...');
       
       const result = await new Promise((resolve) => {
-        const checkProcess = spawn('npx', ['@playwright/mcp@latest', '--help'], {
+        const checkProcess = spawn('npx', this.buildNpxArgs(['--help']), {
           cwd: this.config.projectPath,
           timeout: 10000,
           stdio: ['pipe', 'pipe', 'pipe']
@@ -525,11 +546,19 @@ class PlaywrightMCPIntegration {
   /**
    * Get Playwright MCP server configuration for MCP clients
    */
-  static getServerConfig() {
+  static getServerConfig(options = {}) {
+    const mcpPackageName = options.mcpPackageName || process.env.PLAYWRIGHT_MCP_PACKAGE || '@playwright/mcp';
+    const mcpVersion = String(options.mcpVersion || process.env.PLAYWRIGHT_MCP_VERSION || '').trim();
+    const packageSpecifier = mcpVersion && mcpVersion.toLowerCase() !== 'latest'
+      ? `${mcpPackageName}@${mcpVersion}`
+      : mcpPackageName;
+    const noInstall = options.noInstall !== false;
+
     return {
       command: 'npx',
       args: [
-        '@playwright/mcp@latest',
+        ...(noInstall ? ['--no-install'] : []),
+        packageSpecifier,
         '--save-trace',
         '--save-video=1280x720',
         '--output-dir=playwright-mcp-output',

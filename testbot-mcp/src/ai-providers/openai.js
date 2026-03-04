@@ -13,7 +13,15 @@ class OpenAIClient {
     this.config = {
       ...config,
       apiKey,
-      model: config.model || process.env.OPENAI_MODEL || 'gpt-4o',
+      model: config.model || process.env.OPENAI_MODEL || process.env.OPENAI_CODEX_MODEL || 'gpt-5-codex',
+      chatFallbackModel: config.chatFallbackModel || process.env.OPENAI_CHAT_FALLBACK_MODEL || 'gpt-4o',
+      latestGPTModel: config.latestGPTModel || process.env.OPENAI_LATEST_GPT_MODEL || 'gpt-5',
+      modelFallbacks: Array.isArray(config.modelFallbacks)
+        ? config.modelFallbacks
+        : String(process.env.OPENAI_MODEL_FALLBACKS || '')
+          .split(',')
+          .map((item) => item.trim())
+          .filter(Boolean),
       maxTokens: config.maxTokens || parseInt(process.env.OPENAI_MAX_TOKENS) || 4000,
       temperature: config.temperature || 0.2,
       timeout: config.timeout || 180000, // 3 minutes for longer generations
@@ -375,13 +383,171 @@ IMPORTANT: Return ONLY valid JSON, no markdown code blocks.`;
   /**
    * Call OpenAI Chat Completions API
    */
-  async callOpenAI(messages) {
+  async callOpenAI(messages, options = {}) {
+    const requestedModel = options.model || this.config.model;
+    const modelCandidates = this.buildPreferredModelList(requestedModel);
+    let lastError = null;
+
+    for (const model of modelCandidates) {
+      const tryResponsesFirst = this.isLikelyCodexModel(model);
+      const endpointOrder = tryResponsesFirst ? ['responses', 'chat'] : ['chat', 'responses'];
+
+      for (const endpoint of endpointOrder) {
+        try {
+          const text = endpoint === 'responses'
+            ? await this.callResponsesAPI(messages, model)
+            : await this.callChatCompletionsAPI(messages, model);
+
+          if (model !== this.config.model) {
+            Logger.warn('OpenAIClient', 'Switching model for generation due compatibility fallback', {
+              previousModel: this.config.model,
+              nextModel: model,
+            });
+            this.config.model = model;
+          }
+
+          return text;
+        } catch (error) {
+          lastError = error;
+          Logger.warn('OpenAIClient', 'Model/endpoint attempt failed', {
+            model,
+            endpoint,
+            reason: error.message,
+          });
+        }
+      }
+    }
+
+    throw lastError || new Error('OpenAI API call failed for all candidate models/endpoints');
+  }
+
+  buildPreferredModelList(requestedModel) {
+    const primary = String(requestedModel || this.config.model || 'gpt-4o').trim();
+    const configuredFallbacks = (this.config.modelFallbacks || []).map((item) => String(item).trim()).filter(Boolean);
+    const codexCandidate = process.env.OPENAI_CODEX_MODEL || 'gpt-5-codex';
+
+    const list = [
+      primary,
+      codexCandidate,
+      this.config.latestGPTModel,
+      ...configuredFallbacks,
+      this.config.chatFallbackModel,
+      'gpt-4o',
+    ].filter(Boolean);
+
+    return [...new Set(list)];
+  }
+
+  isLikelyCodexModel(model) {
+    return /codex/i.test(String(model || ''));
+  }
+
+  buildResponsesInput(messages) {
+    if (!Array.isArray(messages)) {
+      return '';
+    }
+
+    return messages
+      .map((message) => {
+        const role = String(message?.role || 'user').toUpperCase();
+        const content = String(message?.content || '').trim();
+        return `${role}:\n${content}`;
+      })
+      .join('\n\n');
+  }
+
+  extractResponseText(payload) {
+    if (!payload || typeof payload !== 'object') {
+      return null;
+    }
+
+    if (typeof payload.output_text === 'string' && payload.output_text.trim()) {
+      return payload.output_text.trim();
+    }
+
+    if (Array.isArray(payload.output)) {
+      const chunks = [];
+      for (const item of payload.output) {
+        const content = Array.isArray(item?.content) ? item.content : [];
+        for (const part of content) {
+          if (typeof part?.text === 'string' && part.text.trim()) {
+            chunks.push(part.text.trim());
+          }
+        }
+      }
+
+      if (chunks.length > 0) {
+        return chunks.join('\n').trim();
+      }
+    }
+
+    const chatContent = payload.choices?.[0]?.message?.content;
+    if (typeof chatContent === 'string' && chatContent.trim()) {
+      return chatContent.trim();
+    }
+
+    if (Array.isArray(chatContent)) {
+      const flattened = chatContent
+        .map((part) => (typeof part?.text === 'string' ? part.text : ''))
+        .filter(Boolean)
+        .join('\n')
+        .trim();
+      if (flattened) {
+        return flattened;
+      }
+    }
+
+    return null;
+  }
+
+  async callResponsesAPI(messages, model) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.config.timeout);
 
     try {
-      Logger.debug('OpenAIClient', `Calling API`, { model: this.config.model });
+      Logger.debug('OpenAIClient', 'Calling Responses API', { model });
+      const response = await fetch(`${this.baseUrl}/responses`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${this.config.apiKey}`,
+        },
+        body: JSON.stringify({
+          model,
+          input: this.buildResponsesInput(messages),
+        }),
+        signal: controller.signal,
+      });
 
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}));
+        const errorMsg = errorData.error?.message || `HTTP ${response.status}`;
+        throw new Error(`OpenAI responses API error: ${errorMsg}`);
+      }
+
+      const data = await response.json();
+      const text = this.extractResponseText(data);
+      if (!text) {
+        throw new Error('Responses API returned no text content');
+      }
+
+      return text;
+    } catch (error) {
+      if (error.name === 'AbortError') {
+        throw new Error('OpenAI responses API request timeout (3 minutes)');
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  async callChatCompletionsAPI(messages, model) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), this.config.timeout);
+
+    try {
+      Logger.debug('OpenAIClient', 'Calling Chat Completions API', { model });
       const response = await fetch(`${this.baseUrl}/chat/completions`, {
         method: 'POST',
         headers: {
@@ -389,7 +555,7 @@ IMPORTANT: Return ONLY valid JSON, no markdown code blocks.`;
           'Authorization': `Bearer ${this.config.apiKey}`,
         },
         body: JSON.stringify({
-          model: this.config.model,
+          model,
           messages,
           temperature: this.config.temperature,
           max_tokens: this.config.maxTokens,
@@ -397,28 +563,26 @@ IMPORTANT: Return ONLY valid JSON, no markdown code blocks.`;
         signal: controller.signal,
       });
 
-      clearTimeout(timeout);
-
       if (!response.ok) {
         const errorData = await response.json().catch(() => ({}));
         const errorMsg = errorData.error?.message || `HTTP ${response.status}`;
-        throw new Error(`OpenAI API error: ${errorMsg}`);
+        throw new Error(`OpenAI chat API error: ${errorMsg}`);
       }
 
       const data = await response.json();
-
-      if (data.choices?.[0]?.message?.content) {
-        return data.choices[0].message.content;
+      const text = this.extractResponseText(data);
+      if (!text) {
+        throw new Error('Chat completions API returned no text content');
       }
 
-      throw new Error('Invalid response format from OpenAI API');
-
+      return text;
     } catch (error) {
-      clearTimeout(timeout);
       if (error.name === 'AbortError') {
-        throw new Error('OpenAI API request timeout (3 minutes)');
+        throw new Error('OpenAI chat API request timeout (3 minutes)');
       }
       throw error;
+    } finally {
+      clearTimeout(timeout);
     }
   }
 

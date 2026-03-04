@@ -19,6 +19,50 @@ class ContextGatherer {
       includeFileContents: config.includeFileContents !== false,
       ...config,
     };
+
+    this.fileCache = new Map();
+    this.skipDirs = new Set([
+      'node_modules',
+      '.git',
+      '.next',
+      'dist',
+      'build',
+      'coverage',
+      'out',
+      'vendor',
+      'target',
+    ]);
+  }
+
+  readFileCached(filePath, options = {}) {
+    const maxBytes = Number(options.maxBytes || this.config.maxFileSize);
+
+    try {
+      const stats = fs.statSync(filePath);
+      if (!options.allowLarge && stats.size > maxBytes) {
+        return null;
+      }
+
+      const cached = this.fileCache.get(filePath);
+      if (cached && cached.mtimeMs === stats.mtimeMs && cached.size === stats.size) {
+        return cached.content;
+      }
+
+      const content = fs.readFileSync(filePath, 'utf-8');
+      this.fileCache.set(filePath, {
+        mtimeMs: stats.mtimeMs,
+        size: stats.size,
+        content,
+      });
+
+      if (this.fileCache.size > this.config.maxFiles * 10) {
+        this.fileCache.clear();
+      }
+
+      return content;
+    } catch {
+      return null;
+    }
   }
 
   /**
@@ -112,6 +156,9 @@ class ContextGatherer {
       apiSchemas: [],
       envVariables: [],
       dependencies: {},
+      navigationGraph: { nodes: [], edges: [] },
+      selectorHints: [],
+      mockableApiContracts: [],
     };
     
     // Read package.json for dependencies
@@ -135,6 +182,14 @@ class ContextGatherer {
       richContext.fileContents = await this.readKeyFiles(projectPath);
       Logger.info('ContextGatherer', `Read key files`, { count: Object.keys(richContext.fileContents).length });
     }
+
+    richContext.navigationGraph = this.buildNavigationGraph(richContext.pages);
+    richContext.selectorHints = this.collectSelectorHints(richContext.pages, richContext.forms);
+    richContext.mockableApiContracts = this.extractMockableApiContracts(
+      projectPath,
+      richContext.apiEndpoints,
+      richContext.forms
+    );
     
     return richContext;
   }
@@ -150,7 +205,8 @@ class ContextGatherer {
     
     for (const file of files.slice(0, this.config.maxFiles)) {
       try {
-        const content = fs.readFileSync(file, 'utf-8');
+        const content = this.readFileCached(file);
+        if (!content) continue;
         const fileFormsData = this.extractFormsFromFile(content, file);
         forms.push(...fileFormsData);
       } catch (error) {
@@ -170,30 +226,99 @@ class ContextGatherer {
     // Detect form elements
     const formMatches = content.match(/<form[^>]*>[\s\S]*?<\/form>/gi) || [];
     const formHookMatches = content.match(/useForm\s*\([^)]*\)/gi) || [];
+    const labelsMap = new Map();
+
+    const labelMatches = content.matchAll(/<label[^>]*(?:for=["']([^"']+)["'])?[^>]*>([\s\S]*?)<\/label>/gi);
+    for (const match of labelMatches) {
+      const targetId = String(match[1] || '').trim();
+      const labelText = String(match[2] || '').replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim();
+      if (targetId && labelText) {
+        labelsMap.set(targetId, labelText);
+      }
+    }
     
     // Extract form fields
     const fields = [];
     
     // Input fields
-    const inputMatches = content.matchAll(/<(?:input|Input)[^>]*(?:name|id)=["']([^"']+)["'][^>]*(?:type=["']([^"']+)["'])?/gi);
+    const inputMatches = content.matchAll(/<(?:input|Input)[^>]*(?:name|id)=["']([^"']+)["'][^>]*(?:type=["']([^"']+)["'])?[^>]*>/gi);
     for (const match of inputMatches) {
+      const tag = match[0];
+      const idMatch = tag.match(/\bid=["']([^"']+)["']/i);
+      const placeholderMatch = tag.match(/\bplaceholder=["']([^"']+)["']/i);
+      const testIdMatch = tag.match(/\bdata-testid=["']([^"']+)["']/i);
+      const ariaLabelMatch = tag.match(/\baria-label=["']([^"']+)["']/i);
       fields.push({
         name: match[1],
         type: match[2] || 'text',
-        required: match[0].includes('required'),
+        required: tag.includes('required'),
+        id: idMatch?.[1] || null,
+        label: labelsMap.get(idMatch?.[1] || '') || null,
+        placeholder: placeholderMatch?.[1] || null,
+        testId: testIdMatch?.[1] || null,
+        ariaLabel: ariaLabelMatch?.[1] || null,
+        role: 'textbox',
       });
     }
     
     // Select fields
     const selectMatches = content.matchAll(/<(?:select|Select)[^>]*(?:name|id)=["']([^"']+)["']/gi);
     for (const match of selectMatches) {
-      fields.push({ name: match[1], type: 'select', required: match[0].includes('required') });
+      const tag = match[0];
+      const idMatch = tag.match(/\bid=["']([^"']+)["']/i);
+      const testIdMatch = tag.match(/\bdata-testid=["']([^"']+)["']/i);
+      const ariaLabelMatch = tag.match(/\baria-label=["']([^"']+)["']/i);
+      fields.push({
+        name: match[1],
+        type: 'select',
+        required: tag.includes('required'),
+        id: idMatch?.[1] || null,
+        label: labelsMap.get(idMatch?.[1] || '') || null,
+        placeholder: null,
+        testId: testIdMatch?.[1] || null,
+        ariaLabel: ariaLabelMatch?.[1] || null,
+        role: 'combobox',
+      });
     }
     
     // Textarea
     const textareaMatches = content.matchAll(/<(?:textarea|Textarea)[^>]*(?:name|id)=["']([^"']+)["']/gi);
     for (const match of textareaMatches) {
-      fields.push({ name: match[1], type: 'textarea', required: match[0].includes('required') });
+      const tag = match[0];
+      const idMatch = tag.match(/\bid=["']([^"']+)["']/i);
+      const placeholderMatch = tag.match(/\bplaceholder=["']([^"']+)["']/i);
+      const testIdMatch = tag.match(/\bdata-testid=["']([^"']+)["']/i);
+      const ariaLabelMatch = tag.match(/\baria-label=["']([^"']+)["']/i);
+      fields.push({
+        name: match[1],
+        type: 'textarea',
+        required: tag.includes('required'),
+        id: idMatch?.[1] || null,
+        label: labelsMap.get(idMatch?.[1] || '') || null,
+        placeholder: placeholderMatch?.[1] || null,
+        testId: testIdMatch?.[1] || null,
+        ariaLabel: ariaLabelMatch?.[1] || null,
+        role: 'textbox',
+      });
+    }
+
+    const submitButtons = [];
+    const submitMatches = content.matchAll(/<(?:button|Button)[^>]*>([\s\S]*?)<\/(?:button|Button)>/gi);
+    for (const match of submitMatches) {
+      const tag = match[0];
+      const text = String(match[1] || '').replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim();
+      const typeMatch = tag.match(/\btype=["']([^"']+)["']/i);
+      const testIdMatch = tag.match(/\bdata-testid=["']([^"']+)["']/i);
+      const ariaLabelMatch = tag.match(/\baria-label=["']([^"']+)["']/i);
+      const buttonType = (typeMatch?.[1] || '').toLowerCase();
+      if (buttonType === 'submit' || /submit|save|continue|login|sign in|register/i.test(text)) {
+        submitButtons.push({
+          text,
+          type: buttonType || 'button',
+          testId: testIdMatch?.[1] || null,
+          ariaLabel: ariaLabelMatch?.[1] || null,
+        });
+      }
     }
     
     // Validation patterns
@@ -205,12 +330,25 @@ class ContextGatherer {
     if (content.includes('email')) validationPatterns.push('email');
     
     if (fields.length > 0 || formMatches.length > 0 || formHookMatches.length > 0) {
+      const formTag = formMatches[0] || '';
+      const actionMatch = formTag.match(/\baction=["']([^"']+)["']/i);
+      const methodMatch = formTag.match(/\bmethod=["']([^"']+)["']/i);
+      const selectorHints = fields
+        .flatMap((field) => [field.testId, field.label, field.placeholder, field.name])
+        .filter(Boolean)
+        .slice(0, 20);
+
       forms.push({
         file: path.relative(this.config.projectPath, filePath),
         fields: fields.slice(0, 20), // Limit fields
         validationPatterns,
         hasFormElement: formMatches.length > 0,
         usesFormHook: formHookMatches.length > 0,
+        labels: Array.from(labelsMap.values()).slice(0, 20),
+        submitButtons: submitButtons.slice(0, 10),
+        action: actionMatch?.[1] || null,
+        method: (methodMatch?.[1] || 'POST').toUpperCase(),
+        selectorHints,
       });
     }
     
@@ -239,7 +377,8 @@ class ContextGatherer {
       
       for (const file of files.slice(0, 20)) {
         try {
-          const content = fs.readFileSync(file, 'utf-8');
+          const content = this.readFileCached(file, { allowLarge: true });
+          if (!content) continue;
           const fileModels = this.extractModelsFromFile(content, file);
           models.push(...fileModels);
         } catch (error) {
@@ -257,7 +396,8 @@ class ContextGatherer {
       
       for (const file of tsFiles.slice(0, 10)) {
         try {
-          const content = fs.readFileSync(file, 'utf-8');
+          const content = this.readFileCached(file, { allowLarge: true });
+          if (!content) continue;
           const fileModels = this.extractModelsFromFile(content, file);
           models.push(...fileModels);
         } catch (error) {
@@ -383,7 +523,8 @@ class ContextGatherer {
     
     for (const file of files.slice(0, this.config.maxFiles)) {
       try {
-        const content = fs.readFileSync(file, 'utf-8');
+        const content = this.readFileCached(file);
+        if (!content) continue;
         
         if (content.includes('jwt') || content.includes('jsonwebtoken')) hasJWT = true;
         if (content.includes('session') || content.includes('getSession')) hasSession = true;
@@ -415,7 +556,8 @@ class ContextGatherer {
     const pkgPath = path.join(projectPath, 'package.json');
     
     try {
-      const content = fs.readFileSync(pkgPath, 'utf-8');
+      const content = this.readFileCached(pkgPath, { allowLarge: true, maxBytes: 5000000 });
+      if (!content) return {};
       const pkg = JSON.parse(content);
       
       return {
@@ -443,7 +585,8 @@ class ContextGatherer {
       const envPath = path.join(projectPath, envFile);
       if (fs.existsSync(envPath)) {
         try {
-          const content = fs.readFileSync(envPath, 'utf-8');
+          const content = this.readFileCached(envPath, { allowLarge: true, maxBytes: 500000 });
+          if (!content) continue;
           const matches = content.matchAll(/^([A-Z_][A-Z0-9_]*)=/gm);
           for (const match of matches) {
             envVars.add(match[1]);
@@ -460,7 +603,8 @@ class ContextGatherer {
       const files = this.findFiles(srcDir, ['.js', '.ts', '.jsx', '.tsx']);
       for (const file of files.slice(0, 30)) {
         try {
-          const content = fs.readFileSync(file, 'utf-8');
+          const content = this.readFileCached(file);
+          if (!content) continue;
           const matches = content.matchAll(/process\.env\.([A-Z_][A-Z0-9_]*)/g);
           for (const match of matches) {
             envVars.add(match[1]);
@@ -489,7 +633,8 @@ class ContextGatherer {
       
       for (const file of files.slice(0, 30)) {
         try {
-          const content = fs.readFileSync(file, 'utf-8');
+          const content = this.readFileCached(file);
+          if (!content) continue;
           const componentData = this.extractComponentFromFile(content, file);
           if (componentData) {
             components.push(componentData);
@@ -575,7 +720,8 @@ class ContextGatherer {
       
       for (const file of files.slice(0, 20)) {
         try {
-          const content = fs.readFileSync(file, 'utf-8');
+          const content = this.readFileCached(file);
+          if (!content) continue;
           
           // Zod schemas
           const zodMatches = content.matchAll(/(?:const|export\s+const)\s+(\w+Schema)\s*=\s*z\.object\s*\(\s*\{([^}]+)\}/g);
@@ -646,7 +792,8 @@ class ContextGatherer {
         try {
           const stat = fs.statSync(fullPath);
           if (stat.size < this.config.maxFileSize) {
-            const content = fs.readFileSync(fullPath, 'utf-8');
+            const content = this.readFileCached(fullPath);
+            if (!content) continue;
             fileContents[keyFile] = content.substring(0, 5000); // Limit to 5KB
           }
         } catch (error) {
@@ -797,12 +944,19 @@ class ContextGatherer {
           const routePath = pageName === 'index' 
             ? basePath || '/'
             : `${basePath}/${pageName}`;
+          const uiHints = this.extractPageUIHints(fullPath);
           
           pages.push({
             path: routePath,
             description: this.formatPageName(routePath),
-            components: this.extractComponents(fullPath),
-            interactions: this.extractInteractions(fullPath),
+            components: uiHints.components,
+            interactions: uiHints.interactions,
+            buttons: uiHints.buttons,
+            links: uiHints.links,
+            testIds: uiHints.testIds,
+            ariaRoles: uiHints.ariaRoles,
+            navigationTargets: uiHints.navigationTargets,
+            selectorHints: uiHints.selectorHints,
           });
         }
       }
@@ -843,11 +997,18 @@ class ContextGatherer {
           const newBasePath = routePart ? `${basePath}/${routePart}` : basePath;
           
           if (pageFile) {
+            const uiHints = this.extractPageUIHints(pageFile);
             pages.push({
               path: newBasePath || '/',
               description: this.formatPageName(newBasePath || '/'),
-              components: this.extractComponents(pageFile),
-              interactions: this.extractInteractions(pageFile),
+              components: uiHints.components,
+              interactions: uiHints.interactions,
+              buttons: uiHints.buttons,
+              links: uiHints.links,
+              testIds: uiHints.testIds,
+              ariaRoles: uiHints.ariaRoles,
+              navigationTargets: uiHints.navigationTargets,
+              selectorHints: uiHints.selectorHints,
             });
           }
           
@@ -879,18 +1040,26 @@ class ContextGatherer {
     
     for (const file of files.slice(0, this.config.maxFiles)) {
       try {
-        const content = fs.readFileSync(file, 'utf-8');
+        const content = this.readFileCached(file);
+        if (!content) continue;
         
         for (const pattern of routePatterns) {
           let match;
           while ((match = pattern.exec(content)) !== null) {
             const routePath = match[1];
             if (routePath && !routePath.includes('*') && !pages.some(p => p.path === routePath)) {
+              const uiHints = this.extractPageUIHints(file);
               pages.push({
                 path: routePath,
                 description: this.formatPageName(routePath),
-                components: [],
-                interactions: [],
+                components: uiHints.components,
+                interactions: uiHints.interactions,
+                buttons: uiHints.buttons,
+                links: uiHints.links,
+                testIds: uiHints.testIds,
+                ariaRoles: uiHints.ariaRoles,
+                navigationTargets: uiHints.navigationTargets,
+                selectorHints: uiHints.selectorHints,
               });
             }
           }
@@ -915,18 +1084,26 @@ class ContextGatherer {
     if (!routerFile) return pages;
     
     try {
-      const content = fs.readFileSync(routerFile, 'utf-8');
+      const content = this.readFileCached(routerFile, { allowLarge: true });
+      if (!content) return pages;
       const pathPattern = /path:\s*["'`]([^"'`]+)["'`]/g;
       
       let match;
       while ((match = pathPattern.exec(content)) !== null) {
         const routePath = match[1];
         if (routePath && !pages.some(p => p.path === routePath)) {
+          const uiHints = this.extractPageUIHints(routerFile);
           pages.push({
             path: routePath,
             description: this.formatPageName(routePath),
-            components: [],
-            interactions: [],
+            components: uiHints.components,
+            interactions: uiHints.interactions,
+            buttons: uiHints.buttons,
+            links: uiHints.links,
+            testIds: uiHints.testIds,
+            ariaRoles: uiHints.ariaRoles,
+            navigationTargets: uiHints.navigationTargets,
+            selectorHints: uiHints.selectorHints,
           });
         }
       }
@@ -1015,6 +1192,7 @@ class ContextGatherer {
               path: routePath,
               description: `${method} ${routePath}`,
               requiresAuth: this.detectAuthRequired(fullPath),
+              source: path.relative(this.config.projectPath, fullPath),
             });
           }
         }
@@ -1043,7 +1221,8 @@ class ContextGatherer {
       if (file.includes('node_modules') || file.includes('.spec.') || file.includes('.test.')) continue;
       
       try {
-        const content = fs.readFileSync(file, 'utf-8');
+        const content = this.readFileCached(file);
+        if (!content) continue;
         
         for (const pattern of routePatterns) {
           let match;
@@ -1057,6 +1236,7 @@ class ContextGatherer {
                 path: routePath,
                 description: `${method} ${routePath}`,
                 requiresAuth: content.includes('auth') || content.includes('token'),
+                source: path.relative(this.config.projectPath, file),
               });
             }
           }
@@ -1119,7 +1299,8 @@ class ContextGatherer {
     for (const file of files.slice(0, this.config.maxFiles)) {
       if (file.includes('node_modules') || file.includes('test') || file.includes('spec')) continue;
       try {
-        const content = fs.readFileSync(file, 'utf-8');
+        const content = this.readFileCached(file);
+        if (!content) continue;
         for (const pattern of patterns) {
           let match;
           // Reset lastIndex for reuse
@@ -1188,7 +1369,8 @@ class ContextGatherer {
     for (const file of files.slice(0, this.config.maxFiles)) {
       if (file.includes('node_modules') || file.includes('test') || file.includes('spec') || file.includes('migration')) continue;
       try {
-        const content = fs.readFileSync(file, 'utf-8');
+        const content = this.readFileCached(file);
+        if (!content) continue;
         const hasAuth = content.includes('auth') || content.includes('token') || content.includes('permission');
 
         for (const patternDef of patterns) {
@@ -1417,12 +1599,13 @@ class ContextGatherer {
    */
   findFiles(dir, extensions, files = []) {
     if (!fs.existsSync(dir)) return files;
+    if (files.length >= this.config.maxFiles) return files;
     
     try {
       const entries = fs.readdirSync(dir, { withFileTypes: true });
       
       for (const entry of entries) {
-        if (entry.name.startsWith('.') || entry.name === 'node_modules') continue;
+        if (entry.name.startsWith('.') || this.skipDirs.has(entry.name)) continue;
         
         const fullPath = path.join(dir, entry.name);
         
@@ -1448,7 +1631,8 @@ class ContextGatherer {
     const components = [];
     
     try {
-      const content = fs.readFileSync(filePath, 'utf-8');
+      const content = this.readFileCached(filePath);
+      if (!content) return [];
       
       // Look for imported components
       const importPattern = /import\s+(\w+)/g;
@@ -1474,7 +1658,8 @@ class ContextGatherer {
     const interactions = [];
     
     try {
-      const content = fs.readFileSync(filePath, 'utf-8');
+      const content = this.readFileCached(filePath);
+      if (!content) return [];
       
       // Look for form elements
       if (content.includes('<form') || content.includes('<Form')) {
@@ -1506,7 +1691,8 @@ class ContextGatherer {
     const methods = [];
     
     try {
-      const content = fs.readFileSync(filePath, 'utf-8');
+      const content = this.readFileCached(filePath);
+      if (!content) return ['GET'];
       
       // Next.js API handlers
       if (content.includes('export async function GET') || content.includes('export function GET')) {
@@ -1546,7 +1732,8 @@ class ContextGatherer {
    */
   detectAuthRequired(filePath) {
     try {
-      const content = fs.readFileSync(filePath, 'utf-8');
+      const content = this.readFileCached(filePath);
+      if (!content) return false;
       return content.includes('auth') || 
              content.includes('token') || 
              content.includes('session') ||
@@ -1555,6 +1742,166 @@ class ContextGatherer {
     } catch (error) {
       return false;
     }
+  }
+
+  extractPageUIHints(filePath) {
+    const content = this.readFileCached(filePath);
+    if (!content) {
+      return {
+        components: [],
+        interactions: [],
+        buttons: [],
+        links: [],
+        testIds: [],
+        ariaRoles: [],
+        navigationTargets: [],
+        selectorHints: [],
+      };
+    }
+
+    const components = this.extractComponents(filePath);
+    const interactions = this.extractInteractions(filePath);
+    const buttons = [];
+    const links = [];
+    const testIds = [];
+    const ariaRoles = [];
+    const navigationTargets = [];
+
+    const buttonMatches = content.matchAll(/<(?:button|Button)[^>]*>([\s\S]*?)<\/(?:button|Button)>/gi);
+    for (const match of buttonMatches) {
+      const text = String(match[1] || '').replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim();
+      if (text) buttons.push(text);
+    }
+
+    const anchorMatches = content.matchAll(/<(?:a|Link)[^>]*(?:href|to)=["']([^"']+)["'][^>]*>([\s\S]*?)<\/(?:a|Link)>/gi);
+    for (const match of anchorMatches) {
+      const target = String(match[1] || '').trim();
+      const text = String(match[2] || '').replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim();
+      if (target) {
+        links.push({ text, target });
+        navigationTargets.push(target);
+      }
+    }
+
+    const navCallMatches = content.matchAll(/(?:router\.push|navigate)\(\s*["'`]([^"'`]+)["'`]\s*\)/g);
+    for (const match of navCallMatches) {
+      const target = String(match[1] || '').trim();
+      if (target) navigationTargets.push(target);
+    }
+
+    const testIdMatches = content.matchAll(/data-testid=["']([^"']+)["']/g);
+    for (const match of testIdMatches) {
+      testIds.push(match[1]);
+    }
+
+    const roleMatches = content.matchAll(/\brole=["']([^"']+)["']/g);
+    for (const match of roleMatches) {
+      ariaRoles.push(match[1]);
+    }
+
+    const selectorHints = [
+      ...testIds,
+      ...buttons,
+      ...links.map((link) => link.text),
+    ].filter(Boolean);
+
+    return {
+      components: components.slice(0, 8),
+      interactions: [...new Set(interactions)].slice(0, 10),
+      buttons: [...new Set(buttons)].slice(0, 12),
+      links: links.slice(0, 12),
+      testIds: [...new Set(testIds)].slice(0, 15),
+      ariaRoles: [...new Set(ariaRoles)].slice(0, 15),
+      navigationTargets: [...new Set(navigationTargets)].slice(0, 20),
+      selectorHints: [...new Set(selectorHints)].slice(0, 20),
+    };
+  }
+
+  buildNavigationGraph(pages = []) {
+    const nodes = [];
+    const edges = [];
+
+    for (const page of pages || []) {
+      if (!page?.path) continue;
+      nodes.push(page.path);
+      for (const target of page.navigationTargets || []) {
+        edges.push({
+          from: page.path,
+          to: target,
+          confidence: target.startsWith('/') ? 0.9 : 0.5,
+        });
+      }
+    }
+
+    return {
+      nodes: [...new Set(nodes)],
+      edges: edges.slice(0, 200),
+    };
+  }
+
+  collectSelectorHints(pages = [], forms = []) {
+    const hints = [];
+
+    for (const page of pages || []) {
+      hints.push(...(page.selectorHints || []));
+      hints.push(...(page.testIds || []));
+    }
+
+    for (const form of forms || []) {
+      hints.push(...(form.selectorHints || []));
+      for (const field of form.fields || []) {
+        hints.push(field.testId, field.label, field.placeholder, field.name);
+      }
+    }
+
+    return [...new Set(hints.filter(Boolean))].slice(0, 100);
+  }
+
+  extractMockableApiContracts(projectPath, endpoints = [], forms = []) {
+    const contracts = [];
+    const formsByAction = new Map();
+
+    for (const form of forms || []) {
+      if (form.action) {
+        formsByAction.set(form.action, form);
+      }
+    }
+
+    for (const endpoint of endpoints || []) {
+      const sourceRel = endpoint.source || '';
+      const sourcePath = sourceRel ? path.join(projectPath, sourceRel) : null;
+      const content = sourcePath ? this.readFileCached(sourcePath, { allowLarge: true }) : null;
+      const requestFields = [];
+      const responseStatuses = [];
+
+      if (content) {
+        const reqJsonMatches = content.matchAll(/const\s+\{([^}]+)\}\s*=\s*await\s+req\.json\(\)/g);
+        for (const match of reqJsonMatches) {
+          const fields = String(match[1] || '').split(',').map((field) => field.trim()).filter(Boolean);
+          requestFields.push(...fields);
+        }
+
+        const statusMatches = content.matchAll(/(?:status\s*:\s*|res\.status\()(\d{3})/g);
+        for (const match of statusMatches) {
+          responseStatuses.push(Number(match[1]));
+        }
+      }
+
+      const consumedByForm = formsByAction.get(endpoint.path);
+      contracts.push({
+        id: `${endpoint.method || 'GET'} ${endpoint.path || ''}`.trim(),
+        method: endpoint.method || 'GET',
+        path: endpoint.path || '/',
+        sourceFile: sourceRel || null,
+        request: {
+          fields: [...new Set(requestFields)].slice(0, 20),
+        },
+        responses: [...new Set(responseStatuses)].slice(0, 10),
+        consumedByForms: consumedByForm ? [consumedByForm.file] : [],
+      });
+    }
+
+    return contracts.slice(0, 100);
   }
 }
 

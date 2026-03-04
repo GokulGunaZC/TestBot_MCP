@@ -8,7 +8,7 @@
   },
   "scripts": {
     "start": "node src/index.js",
-    "test": "echo \"No tests yet\""
+    "test": "node --test test/**/*.test.js"
   },
   "keywords": [
     "testing",

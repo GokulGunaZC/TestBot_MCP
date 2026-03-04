@@ -12,6 +12,7 @@ class ResultsMerger {
     this.config = {
       projectPath: config.projectPath || process.cwd(),
       prioritizeSource: config.prioritizeSource || 'playwright-mcp', // Which source to prioritize for artifacts
+      dedupeStrategy: config.dedupeStrategy || 'strict',
       ...config
     };
   }
@@ -144,10 +145,45 @@ class ResultsMerger {
    * Get unique key for a test
    */
   getTestKey(test) {
-    // Use file + title as unique identifier
-    const file = test.file || '';
-    const title = test.title || '';
-    return `${file}::${title}`.toLowerCase().replace(/\s+/g, '-');
+    if (this.config.dedupeStrategy === 'legacy') {
+      const file = test.file || '';
+      const title = test.title || '';
+      return `${file}::${title}`.toLowerCase().replace(/\s+/g, '-');
+    }
+
+    const explicitId = this.normalizeToken(test.id);
+    if (explicitId) {
+      return `id::${explicitId}`;
+    }
+
+    const file = this.normalizePath(test.file || test.location?.file || '');
+    const suite = this.normalizeToken(test.suite || '');
+    const title = this.normalizeToken(test.title || '');
+    const project = this.normalizeToken(test.projectName || test.project || test.browser || 'default');
+    return `${file}::${suite}::${title}::${project}`;
+  }
+
+  normalizePath(input) {
+    return String(input || '')
+      .replace(/\\/g, '/')
+      .replace(/\/+/g, '/')
+      .toLowerCase()
+      .trim();
+  }
+
+  normalizeToken(input) {
+    return String(input || '')
+      .trim()
+      .toLowerCase()
+      .replace(/\s+/g, ' ');
+  }
+
+  getArtifactKey(artifact) {
+    const normalizedPath = this.normalizePath(artifact.fullPath || artifact.path || '');
+    const normalizedName = this.normalizeToken(artifact.name || '');
+    const contentType = this.normalizeToken(artifact.contentType || '');
+    const size = Number.isFinite(artifact.size) ? String(artifact.size) : '';
+    return `${normalizedPath || normalizedName}::${contentType}::${size}`;
   }
 
   /**
@@ -230,7 +266,7 @@ class ResultsMerger {
     // Add artifacts from first source
     for (const type of ['screenshots', 'videos', 'traces', 'other']) {
       for (const artifact of artifacts1?.[type] || []) {
-        const key = artifact.path || artifact.name;
+        const key = this.getArtifactKey(artifact);
         if (!seen.has(key)) {
           seen.add(key);
           merged[type].push(artifact);
@@ -241,7 +277,7 @@ class ResultsMerger {
     // Add artifacts from second source (deduped)
     for (const type of ['screenshots', 'videos', 'traces', 'other']) {
       for (const artifact of artifacts2?.[type] || []) {
-        const key = artifact.path || artifact.name;
+        const key = this.getArtifactKey(artifact);
         if (!seen.has(key)) {
           seen.add(key);
           merged[type].push(artifact);
@@ -275,7 +311,7 @@ class ResultsMerger {
       
       for (const type of ['screenshots', 'videos', 'traces', 'other']) {
         for (const artifact of collection[type] || []) {
-          const key = artifact.path || artifact.fullPath || artifact.name;
+          const key = this.getArtifactKey(artifact);
           if (!seen[type].has(key)) {
             seen[type].add(key);
             merged[type].push(artifact);

@@ -11,6 +11,17 @@ class Logger {
   static logsDir;
   static mcpLogPath;
   static errorLogPath;
+  static redactionConfig = {
+    enabled: process.env.TESTBOT_LOG_REDACTION !== 'false',
+    level: process.env.TESTBOT_LOG_REDACTION_LEVEL || 'strict',
+  };
+  static SENSITIVE_KEY_PATTERN = /(password|passwd|token|api[_-]?key|secret|authorization|cookie|session|credential)/i;
+  static SENSITIVE_VALUE_PATTERNS = [
+    /(Bearer\s+)[A-Za-z0-9._~+/=-]{8,}/gi,
+    /(Basic\s+)[A-Za-z0-9+/=]{12,}/gi,
+    /(sk-[A-Za-z0-9_-]{12,})/g,
+    /([A-Z_]*(?:TOKEN|SECRET|PASSWORD|API_KEY)\s*[=:]\s*)[^\s"']+/gi,
+  ];
 
   static initialize() {
     if (this.initialized) return;
@@ -77,16 +88,18 @@ class Logger {
     }
 
     const timestamp = new Date().toISOString();
-    const formattedMeta = this._formatMetadata(metadata);
+    const safeMessage = this._redactString(String(message));
+    const safeMetadata = this.redact(metadata);
+    const formattedMeta = this._formatMetadata(safeMetadata);
     
     // For MCP, we MUST use stderr. stdout breaks the JSON-RPC pipe.
-    const consoleOutput = `[${timestamp}] [${level}] [${moduleName}] ${message}${formattedMeta}\n`;
+    const consoleOutput = `[${timestamp}] [${level}] [${moduleName}] ${safeMessage}${formattedMeta}\n`;
     process.stderr.write(consoleOutput);
 
     // File logging
     if (this.logsDir) {
-      const fileMeta = this._formatFileMetadata(metadata);
-      const fileOutput = `[${timestamp}] [${level}] [${moduleName}] ${message}${fileMeta}\n`;
+      const fileMeta = this._formatFileMetadata(safeMetadata);
+      const fileOutput = `[${timestamp}] [${level}] [${moduleName}] ${safeMessage}${fileMeta}\n`;
       
       try {
         fs.appendFileSync(this.mcpLogPath, fileOutput);
@@ -129,6 +142,62 @@ class Logger {
   static mcp(moduleName, message, metadata = null) {
     // Specialized level for MCP protocol events
     this._log('MCP', moduleName, message, metadata);
+  }
+
+  static setRedaction(config = {}) {
+    this.redactionConfig = {
+      ...this.redactionConfig,
+      ...config,
+    };
+  }
+
+  static _redactString(input) {
+    if (!this.redactionConfig.enabled || typeof input !== 'string') {
+      return input;
+    }
+
+    let output = input;
+    for (const pattern of this.SENSITIVE_VALUE_PATTERNS) {
+      output = output.replace(pattern, '$1[REDACTED]');
+    }
+    return output;
+  }
+
+  static redact(value, seen = new WeakSet()) {
+    if (!this.redactionConfig.enabled) {
+      return value;
+    }
+
+    if (value === null || value === undefined) {
+      return value;
+    }
+
+    if (typeof value === 'string') {
+      return this._redactString(value);
+    }
+
+    if (typeof value !== 'object') {
+      return value;
+    }
+
+    if (seen.has(value)) {
+      return '[Circular]';
+    }
+    seen.add(value);
+
+    if (Array.isArray(value)) {
+      return value.map((item) => this.redact(item, seen));
+    }
+
+    const sanitized = {};
+    for (const [key, innerValue] of Object.entries(value)) {
+      if (this.SENSITIVE_KEY_PATTERN.test(key)) {
+        sanitized[key] = '[REDACTED]';
+      } else {
+        sanitized[key] = this.redact(innerValue, seen);
+      }
+    }
+    return sanitized;
   }
 }
 
