@@ -135,6 +135,23 @@ class ReportGenerator {
     const tests = testResults.tests || [];
 
     return tests.map((test) => {
+      // Normalize error to a string + preserve structured error object
+      let errorStr = null;
+      let errorDetail = null;
+      if (test.error) {
+        if (typeof test.error === 'string') {
+          errorStr = test.error;
+        } else if (typeof test.error === 'object') {
+          errorStr = test.error.message || test.error.stack || JSON.stringify(test.error);
+          errorDetail = {
+            message: test.error.message || null,
+            stack: test.error.stack || null,
+            snippet: test.error.snippet || null,
+            location: test.error.location || null,
+          };
+        }
+      }
+
       const testObj = {
         id: test.id,
         title: test.title,
@@ -142,7 +159,8 @@ class ReportGenerator {
         file: test.file,
         status: this.normalizeStatus(test.status),
         duration: test.duration,
-        error: test.error,
+        error: errorStr,
+        errorDetail,
         retries: test.retries || 0,
         attachments: {
           screenshots: test.artifacts?.screenshots || [],
