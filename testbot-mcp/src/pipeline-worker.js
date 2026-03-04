@@ -57,6 +57,58 @@ const STRICT_AI_REQUIRED_CATEGORIES = [
   'api_stress',
 ];
 
+const CURSOR_FIXTURE_BASENAME = '__testbot-fixture';
+const CURSOR_OVERLAY_INIT_SCRIPT = `
+(() => {
+  if (window.__testbotCursorOverlayInstalled) return;
+  window.__testbotCursorOverlayInstalled = true;
+
+  const ensureCursor = () => {
+    const existing = document.getElementById('__testbot-cursor-overlay');
+    if (existing) return existing;
+
+    const dot = document.createElement('div');
+    dot.id = '__testbot-cursor-overlay';
+    dot.setAttribute('aria-hidden', 'true');
+    dot.style.cssText = [
+      'position:fixed',
+      'left:0',
+      'top:0',
+      'width:16px',
+      'height:16px',
+      'margin-left:-8px',
+      'margin-top:-8px',
+      'border-radius:9999px',
+      'background:rgba(255,82,82,0.95)',
+      'border:2px solid rgba(255,255,255,0.95)',
+      'box-shadow:0 0 0 1px rgba(0,0,0,0.35)',
+      'z-index:2147483647',
+      'pointer-events:none',
+      'opacity:0',
+      'transform:translate(-100px,-100px)',
+      'transition:opacity 80ms linear, transform 16ms linear'
+    ].join(';');
+    document.documentElement.appendChild(dot);
+    return dot;
+  };
+
+  const move = (event) => {
+    const dot = ensureCursor();
+    dot.style.opacity = '1';
+    dot.style.transform = 'translate(' + event.clientX + 'px,' + event.clientY + 'px)';
+  };
+
+  const hide = () => {
+    const dot = document.getElementById('__testbot-cursor-overlay');
+    if (dot) dot.style.opacity = '0';
+  };
+
+  document.addEventListener('mousemove', move, true);
+  document.addEventListener('mouseenter', move, true);
+  document.addEventListener('mouseleave', hide, true);
+})();
+`;
+
 function toFiniteNumber(value, fallback) {
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
@@ -416,6 +468,129 @@ function classifyErrorCode(error) {
 
 function ensureDir(dirPath) {
   fs.mkdirSync(dirPath, { recursive: true });
+}
+
+function isVideoCursorEnabled(config = {}) {
+  if (config.showMouseCursorInVideo === false) {
+    return false;
+  }
+
+  const envValue = String(process.env.TESTBOT_VIDEO_CURSOR || '').trim().toLowerCase();
+  if (!envValue) {
+    return true;
+  }
+
+  return !['0', 'false', 'off', 'no'].includes(envValue);
+}
+
+function toImportPath(relativePath) {
+  const normalized = String(relativePath || '').replace(/\\/g, '/');
+  if (!normalized || normalized === '.') {
+    return './';
+  }
+  return normalized.startsWith('.') ? normalized : `./${normalized}`;
+}
+
+function getCursorFixtureContent(serializedInitScript) {
+  const ts = `import { test as base, expect } from '@playwright/test';
+
+const test = base.extend({
+  page: async ({ page }, use) => {
+    await page.addInitScript(${serializedInitScript});
+    await use(page);
+  },
+});
+
+export { test, expect };
+`;
+
+  const js = `const { test: base, expect } = require('@playwright/test');
+
+const test = base.extend({
+  page: async ({ page }, use) => {
+    await page.addInitScript(${serializedInitScript});
+    await use(page);
+  },
+});
+
+module.exports = { test, expect };
+`;
+
+  return { ts, js };
+}
+
+function ensureCursorFixtureFiles(generatedDir) {
+  const serializedInitScript = JSON.stringify(CURSOR_OVERLAY_INIT_SCRIPT);
+  const { ts, js } = getCursorFixtureContent(serializedInitScript);
+
+  const fixtureTs = path.join(generatedDir, `${CURSOR_FIXTURE_BASENAME}.ts`);
+  const fixtureJs = path.join(generatedDir, `${CURSOR_FIXTURE_BASENAME}.js`);
+
+  fs.writeFileSync(fixtureTs, ts, 'utf-8');
+  fs.writeFileSync(fixtureJs, js, 'utf-8');
+
+  return [fixtureTs, fixtureJs];
+}
+
+function rewritePlaywrightImportForCursor(content, fixtureImportPath) {
+  let rewritten = String(content || '');
+  const importPattern = /from\s+(['"])@playwright\/test\1/g;
+  const requirePattern = /require\((['"])@playwright\/test\1\)/g;
+
+  rewritten = rewritten.replace(importPattern, (_match, quote) => `from ${quote}${fixtureImportPath}${quote}`);
+  rewritten = rewritten.replace(requirePattern, (_match, quote) => `require(${quote}${fixtureImportPath}${quote})`);
+
+  return rewritten;
+}
+
+function applyMouseCursorOverlayToGeneratedTests({ projectPath, enabled }) {
+  if (!enabled) {
+    return { enabled: false, reason: 'disabled' };
+  }
+
+  const generatedDir = path.join(projectPath, 'tests', 'generated');
+  if (!fs.existsSync(generatedDir)) {
+    return { enabled: false, reason: 'generated_dir_missing' };
+  }
+
+  const testFiles = fs.readdirSync(generatedDir)
+    .filter((name) => /\.spec\.(ts|js)$/i.test(name))
+    .map((name) => path.join(generatedDir, name));
+
+  if (testFiles.length === 0) {
+    return { enabled: false, reason: 'no_generated_test_files' };
+  }
+
+  const fixtureFiles = ensureCursorFixtureFiles(generatedDir);
+  let patchedFiles = 0;
+  let skippedFiles = 0;
+
+  for (const testFile of testFiles) {
+    const raw = fs.readFileSync(testFile, 'utf-8');
+    if (!raw.includes('@playwright/test')) {
+      skippedFiles += 1;
+      continue;
+    }
+
+    const fixtureBasePath = path.join(generatedDir, CURSOR_FIXTURE_BASENAME);
+    const relativeFixturePath = path.relative(path.dirname(testFile), fixtureBasePath);
+    const fixtureImportPath = toImportPath(relativeFixturePath);
+    const rewritten = rewritePlaywrightImportForCursor(raw, fixtureImportPath);
+
+    if (rewritten !== raw) {
+      fs.writeFileSync(testFile, rewritten, 'utf-8');
+      patchedFiles += 1;
+    } else {
+      skippedFiles += 1;
+    }
+  }
+
+  return {
+    enabled: true,
+    patchedFiles,
+    skippedFiles,
+    fixtureFiles: fixtureFiles.map((filePath) => path.basename(filePath)),
+  };
 }
 
 function resolveFailureAnalysisProvider(config = {}) {
@@ -874,17 +1049,38 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
 
     try {
       const result = await withStageBudget(runBudget, 'generation', runFn);
+      let cursorOverlay = null;
+      if (config.generateTests) {
+        try {
+          cursorOverlay = applyMouseCursorOverlayToGeneratedTests({
+            projectPath: config.projectPath,
+            enabled: isVideoCursorEnabled(config),
+          });
+        } catch (cursorError) {
+          cursorOverlay = {
+            enabled: false,
+            reason: 'patch_failed',
+            error: cursorError.message,
+          };
+          Logger.warn('PipelineWorker', 'Failed to apply cursor overlay patch', {
+            generator: generatorName,
+            reason: cursorError.message,
+          });
+        }
+      }
       const validation = await runValidation(generatorName);
 
       generationMeta.provider = generatorName;
       generationMeta.selectedGenerator = generatorName;
       generationMeta.fallbackUsed = generationMeta.attempts.length > 0;
+      generationMeta.videoCursor = cursorOverlay;
       generationMeta.attempts.push({
         generator: generatorName,
         status: 'success',
         generated: result.generated || result.files?.length || 0,
         durationMs: Date.now() - startedAt,
         validation,
+        videoCursor: cursorOverlay,
       });
 
       return result;
