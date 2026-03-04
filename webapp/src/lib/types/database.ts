@@ -43,7 +43,9 @@ export interface TestRun {
   backend_pass_rate: number | null
   frontend_pass_rate: number | null
   duration_ms: number | null
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   report_json: any
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   ai_analysis: any
   framework: string | null
   source: 'mcp' | 'api' | 'dashboard'
@@ -62,3 +64,22 @@ export interface TestList {
   updated_at: string
 }
 
+export interface MCPTelemetryEvent {
+  id: string
+  user_id: string
+  api_key_id: string | null
+  source: string
+  tool_name: string
+  event_type: string
+  run_id: string | null
+  phase: string | null
+  status: string | null
+  success: boolean | null
+  error_code: string | null
+  reason: string | null
+  message: string | null
+  duration_ms: number | null
+  metadata: Record<string, unknown> | null
+  occurred_at: string | null
+  created_at: string | null
+}

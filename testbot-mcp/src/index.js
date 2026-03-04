@@ -32,6 +32,7 @@ const AIAnalyzer = require('./ai-providers/index');
 const ReportGenerator = require('./report-generator');
 const DashboardLauncher = require('./dashboard-launcher');
 const ConfigUILauncher = require('./config-ui-launcher');
+const MCPTelemetryReporter = require('./mcp-telemetry');
 
 const UI_SUBMISSION_SCHEMA = z.object({
   testType: z.enum(['frontend', 'backend', 'both']),
@@ -88,6 +89,7 @@ class TestbotMCPServer {
       name: "testbot-mcp",
       version: "1.1.0"
     });
+    this.telemetryReporter = this.createTelemetryReporter();
 
     this.registerTools();
     this.setupErrorHandling();
@@ -101,15 +103,88 @@ class TestbotMCPServer {
     return new ConfigUILauncher(config);
   }
 
+  createTelemetryReporter(config = {}) {
+    return new MCPTelemetryReporter(config);
+  }
+
+  emitTelemetry(event) {
+    if (!this.telemetryReporter || !this.telemetryReporter.isEnabled()) {
+      return;
+    }
+    this.telemetryReporter.emitBackground(event);
+  }
+
+  trackToolInvocation(toolName, args) {
+    const startedAt = Date.now();
+    this.emitTelemetry({
+      toolName,
+      eventType: 'tool_invocation',
+      status: 'info',
+      success: true,
+      metadata: {
+        hasArgs: !!args && typeof args === 'object' && Object.keys(args).length > 0,
+      },
+    });
+    return startedAt;
+  }
+
+  trackToolResult(toolName, startedAt, error = null) {
+    this.emitTelemetry({
+      toolName,
+      eventType: 'tool_result',
+      status: error ? 'error' : 'success',
+      success: !error,
+      durationMs: Date.now() - startedAt,
+      errorCode: error?.code || undefined,
+      reason: error?.message || undefined,
+      message: error ? `Tool ${toolName} failed` : `Tool ${toolName} completed`,
+    });
+  }
+
+  emitRunStatusTelemetry(statusPayload) {
+    const runId = statusPayload?.runId;
+    if (!runId) {
+      return;
+    }
+
+    const phase = String(statusPayload?.phase || '').toLowerCase();
+    const status = phase === 'completed'
+      ? 'success'
+      : (phase === 'error' || phase === 'error_reported' ? 'error' : 'info');
+
+    this.emitTelemetry({
+      toolName: 'testbot_test_my_app',
+      eventType: 'run_status',
+      runId,
+      phase: statusPayload.phase,
+      status,
+      success: status === 'success',
+      errorCode: statusPayload.errorCode,
+      reason: statusPayload.error || null,
+      message: statusPayload.message,
+      durationMs: Number(statusPayload?.results?.duration || 0) || undefined,
+      metadata: {
+        project: statusPayload.project,
+        aiOnlyEnforced: statusPayload.aiOnlyEnforced,
+        fallbackUsed: statusPayload.fallbackUsed,
+        dashboardUrl: statusPayload.dashboardUrl,
+        reportPath: statusPayload.reportPath,
+        generationProvider: statusPayload.generationMeta?.selectedGenerator || statusPayload.generationMeta?.provider || null,
+      },
+    });
+  }
+
   writeRunStatus(statusFile, data) {
     try {
+      const payload = {
+        timestamp: new Date().toISOString(),
+        ...data,
+      };
       fs.writeFileSync(
         statusFile,
-        JSON.stringify({
-          timestamp: new Date().toISOString(),
-          ...data,
-        }, null, 2)
+        JSON.stringify(payload, null, 2)
       );
+      this.emitRunStatusTelemetry(payload);
     } catch (error) {
       Logger.error('Index', 'Failed to write run status', error, { statusFile });
     }
@@ -256,6 +331,15 @@ class TestbotMCPServer {
         project: baseConfig.projectName,
         aiOnlyEnforced: baseConfig.strictAIGeneration !== false,
       });
+      this.emitTelemetry({
+        toolName: 'testbot_test_my_app',
+        eventType: 'config_ui',
+        runId,
+        phase: 'config_received',
+        status: 'success',
+        success: true,
+        message: 'Configuration submitted via UI',
+      });
 
       const prdFile = this.persistUploadedPrd(statusDir, validatedConfig.prd);
       const finalConfig = {
@@ -304,6 +388,17 @@ class TestbotMCPServer {
         project: baseConfig.projectName,
         aiOnlyEnforced: baseConfig.strictAIGeneration !== false,
       });
+      this.emitTelemetry({
+        toolName: 'testbot_test_my_app',
+        eventType: 'config_ui',
+        runId,
+        phase: 'error',
+        status: 'error',
+        success: false,
+        errorCode,
+        reason: error.message,
+        message: 'Configuration UI flow failed',
+      });
       Logger.error('Index', 'Configuration UI flow failed', error, { runId, errorCode });
     }
   }
@@ -339,6 +434,17 @@ class TestbotMCPServer {
     child.unref();
 
     Logger.info('Index', `Pipeline worker forked`, { pid: child.pid, runId });
+    this.emitTelemetry({
+      toolName: 'testbot_test_my_app',
+      eventType: 'worker_spawned',
+      runId,
+      status: 'info',
+      success: true,
+      metadata: {
+        pid: child.pid,
+        projectPath: config.projectPath,
+      },
+    });
   }
 
   registerTools() {
@@ -351,13 +457,16 @@ class TestbotMCPServer {
         }),
       },
       async (args, extra) => {
+        const telemetryStartedAt = this.trackToolInvocation('testbot_configure', args);
         console.error('[DEBUG] testbot_configure called with args:', JSON.stringify(args));
         Logger.mcp('Index', `Tool called: testbot_configure`, { args: Logger.redact(args) });
         try {
           const result = await this.handleConfigure(args);
+          this.trackToolResult('testbot_configure', telemetryStartedAt);
           console.error('[DEBUG] testbot_configure returning result');
           return result;
         } catch (error) {
+          this.trackToolResult('testbot_configure', telemetryStartedAt, error);
           console.error('[DEBUG] testbot_configure error:', error.message);
           return {
             content: [
@@ -410,13 +519,16 @@ class TestbotMCPServer {
         }),
       },
       async (args, extra) => {
+        const telemetryStartedAt = this.trackToolInvocation('testbot_test_my_app', args);
         console.error('[DEBUG] testbot_test_my_app called with args:', JSON.stringify(args));
         Logger.mcp('Index', `Tool called: testbot_test_my_app`, { args: Logger.redact(args) });
         try {
           const result = await this.handleTestMyApp(args);
+          this.trackToolResult('testbot_test_my_app', telemetryStartedAt);
           console.error('[DEBUG] testbot_test_my_app returning result');
           return result;
         } catch (error) {
+          this.trackToolResult('testbot_test_my_app', telemetryStartedAt, error);
           console.error('[DEBUG] testbot_test_my_app error:', error.message);
           return {
             content: [
@@ -442,10 +554,14 @@ class TestbotMCPServer {
         }),
       },
       async (args, extra) => {
+        const telemetryStartedAt = this.trackToolInvocation('testbot_analyze_failures', args);
         Logger.mcp('Index', `Tool called: testbot_analyze_failures`, { args: Logger.redact(args) });
         try {
-          return await this.handleAnalyzeFailures(args);
+          const result = await this.handleAnalyzeFailures(args);
+          this.trackToolResult('testbot_analyze_failures', telemetryStartedAt);
+          return result;
         } catch (error) {
+          this.trackToolResult('testbot_analyze_failures', telemetryStartedAt, error);
           return {
             content: [
               {
@@ -470,10 +586,14 @@ class TestbotMCPServer {
         }),
       },
       async (args, extra) => {
+        const telemetryStartedAt = this.trackToolInvocation('testbot_generate_report', args);
         Logger.mcp('Index', `Tool called: testbot_generate_report`, { args: Logger.redact(args) });
         try {
-          return await this.handleGenerateReport(args);
+          const result = await this.handleGenerateReport(args);
+          this.trackToolResult('testbot_generate_report', telemetryStartedAt);
+          return result;
         } catch (error) {
+          this.trackToolResult('testbot_generate_report', telemetryStartedAt, error);
           return {
             content: [
               {
@@ -870,6 +990,20 @@ Return the JSON structure above based on what you find in the codebase.
       project: baseConfig.projectName,
       aiOnlyEnforced: baseConfig.strictAIGeneration !== false,
     });
+    this.emitTelemetry({
+      toolName: 'testbot_test_my_app',
+      eventType: 'run_created',
+      runId,
+      status: 'info',
+      success: true,
+      message: 'MCP run created and queued',
+      metadata: {
+        projectPath: baseConfig.projectPath,
+        project: baseConfig.projectName,
+        testType: baseConfig.testType,
+        strictAIGeneration: baseConfig.strictAIGeneration !== false,
+      },
+    });
 
     const showConfigUI = params.showConfigUI !== false;
     const dashboardUrl = process.env.TESTBOT_DASHBOARD_URL || 'http://localhost:3000';
@@ -960,6 +1094,18 @@ Return the JSON structure above based on what you find in the codebase.
       project: baseConfig.projectName,
       configUrl,
       aiOnlyEnforced: baseConfig.strictAIGeneration !== false,
+    });
+    this.emitTelemetry({
+      toolName: 'testbot_test_my_app',
+      eventType: 'config_ui',
+      runId,
+      phase: 'awaiting_config_ui',
+      status: 'info',
+      success: true,
+      message: 'Configuration UI opened and awaiting submission',
+      metadata: {
+        configUrl,
+      },
     });
 
     this.continuePipelineAfterConfig({

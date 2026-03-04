@@ -31,6 +31,7 @@ const ReportGenerator = require('./report-generator');
 const DashboardLauncher = require('./dashboard-launcher');
 const AIAnalyzer = require('./ai-providers/index');
 const Logger = require('./logger');
+const MCPTelemetryReporter = require('./mcp-telemetry');
 
 // Initialize logger for the worker process
 Logger.initialize();
@@ -463,19 +464,63 @@ async function withStageBudget(budget, stage, workFn) {
   }
 }
 
+function phaseToTelemetryStatus(phase) {
+  const normalized = String(phase || '').toLowerCase();
+  if (normalized === 'completed') {
+    return 'success';
+  }
+  if (normalized === 'error' || normalized === 'error_reported') {
+    return 'error';
+  }
+  return 'info';
+}
+
+function emitPipelineTelemetry(reporter, payload) {
+  if (!reporter || !reporter.isEnabled() || !payload?.runId) {
+    return;
+  }
+
+  const status = phaseToTelemetryStatus(payload.phase);
+  reporter.emitBackground({
+    toolName: 'testbot_test_my_app',
+    eventType: 'pipeline_status',
+    runId: payload.runId,
+    phase: payload.phase,
+    status,
+    success: status === 'success',
+    errorCode: payload.errorCode,
+    reason: payload.error || undefined,
+    message: payload.message,
+    durationMs: Number(payload?.results?.duration || payload?.budget?.consumedMs || 0) || undefined,
+    metadata: {
+      project: payload.project,
+      aiOnlyEnforced: payload.aiOnlyEnforced,
+      fallbackUsed: payload.fallbackUsed,
+      total: payload?.results?.total,
+      passed: payload?.results?.passed,
+      failed: payload?.results?.failed,
+      skipped: payload?.results?.skipped,
+      passRate: payload?.results?.passRate,
+      generationProvider: payload?.generationMeta?.selectedGenerator || payload?.generationMeta?.provider || null,
+    },
+  });
+}
+
 /**
  * Write status update to disk so the caller can track progress.
  */
-function updateStatus(statusDir, phase, data) {
+function updateStatus(statusDir, phase, data, telemetryReporter = null) {
   try {
+    const payload = {
+      phase,
+      timestamp: new Date().toISOString(),
+      ...data,
+    };
     fs.writeFileSync(
       path.join(statusDir, 'status.json'),
-      JSON.stringify({
-        phase,
-        timestamp: new Date().toISOString(),
-        ...data,
-      }, null, 2)
+      JSON.stringify(payload, null, 2)
     );
+    emitPipelineTelemetry(telemetryReporter, payload);
   } catch (e) {
     Logger.error('PipelineWorker', 'Failed to write status', e);
   }
@@ -1306,6 +1351,7 @@ async function maybeRunFailureTriage({ config, testResults, runBudget }) {
 async function runPipeline(config, runId) {
   const statusDir = path.join(config.projectPath, 'testbot-reports', '.runs', runId);
   ensureDir(statusDir);
+  const telemetryReporter = new MCPTelemetryReporter();
 
   const runBudget = createRunBudget(config);
   let generationMeta = null;
@@ -1321,7 +1367,7 @@ async function runPipeline(config, runId) {
     project: config.projectName,
     budgetMs: runBudget.totalMs,
     aiOnlyEnforced,
-  });
+  }, telemetryReporter);
   Logger.info('PipelineWorker', 'Pipeline started', {
     runId,
     project: config.projectName,
@@ -1338,7 +1384,7 @@ async function runPipeline(config, runId) {
         runId,
         message: 'Fetching Jira stories...',
         aiOnlyEnforced,
-      });
+      }, telemetryReporter);
 
       jiraStories = await withStageBudget(runBudget, 'jira', async () => {
         const jiraClient = new JiraClient(config.jira);
@@ -1357,7 +1403,7 @@ async function runPipeline(config, runId) {
         runId,
         message: 'Gathering codebase context...',
         aiOnlyEnforced,
-      });
+      }, telemetryReporter);
 
       codebaseContext = await withStageBudget(runBudget, 'context', async () => {
         const contextGatherer = new ContextGatherer({
@@ -1378,7 +1424,7 @@ async function runPipeline(config, runId) {
           runId,
           message: 'Requesting optional IDE context enrichment...',
           aiOnlyEnforced,
-        });
+        }, telemetryReporter);
 
         try {
           const requester = new AgentContextRequester({
@@ -1431,7 +1477,7 @@ async function runPipeline(config, runId) {
         runId,
         message: 'Generating tests...',
         aiOnlyEnforced,
-      });
+      }, telemetryReporter);
 
       const generationResult = await generateWithFallbackChain({
         config,
@@ -1506,7 +1552,7 @@ async function runPipeline(config, runId) {
       aiOnlyEnforced,
       generationQuality,
       requirementsCoverage,
-    });
+    }, telemetryReporter);
 
     const executionTimeout = Math.max(1000, Math.min(getBudgetRemainingMs(runBudget), runBudget.stageCaps.execution));
     const playwright = new PlaywrightIntegration({
@@ -1589,7 +1635,7 @@ async function runPipeline(config, runId) {
         generationMeta,
         fallbackUsed,
         aiOnlyEnforced,
-      });
+      }, telemetryReporter);
 
       Logger.warn('PipelineWorker', 'OpenAI suite below pass-rate threshold; retrying with template fallback', {
         initialPassRate: Number(initialPassRate.toFixed(2)),
@@ -1660,7 +1706,7 @@ async function runPipeline(config, runId) {
       generationQuality,
       requirementsCoverage,
       phaseResults,
-    });
+    }, telemetryReporter);
 
     // -------------------------------------------------------
     // 6. Optional AI failure triage
@@ -1689,7 +1735,7 @@ async function runPipeline(config, runId) {
       generationQuality,
       requirementsCoverage,
       phaseResults,
-    });
+    }, telemetryReporter);
 
     const report = await withStageBudget(runBudget, 'reporting', async () => {
       const reportGen = new ReportGenerator();
@@ -1756,7 +1802,7 @@ async function runPipeline(config, runId) {
         consumedMs: getBudgetElapsedMs(runBudget),
         remainingMs: getBudgetRemainingMs(runBudget),
       },
-    });
+    }, telemetryReporter);
 
     Logger.info('PipelineWorker', 'Pipeline complete', {
       report: report.path,
@@ -1786,7 +1832,7 @@ async function runPipeline(config, runId) {
         consumedMs: getBudgetElapsedMs(runBudget),
         remainingMs: getBudgetRemainingMs(runBudget),
       },
-    });
+    }, telemetryReporter);
 
     try {
       const reportGen = new ReportGenerator();
@@ -1856,7 +1902,7 @@ async function runPipeline(config, runId) {
         generationQuality: errorGenerationQuality,
         requirementsCoverage,
         phaseResults,
-      });
+      }, telemetryReporter);
     } catch (reportError) {
       Logger.warn('PipelineWorker', 'Failed to generate/sync error report', {
         runId,

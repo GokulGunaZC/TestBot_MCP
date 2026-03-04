@@ -81,6 +81,39 @@ export const testRuns = pgTable(
   ]
 )
 
+export const mcpTelemetryEvents = pgTable(
+  'mcp_telemetry_events',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => profiles.id, { onDelete: 'cascade' }),
+    apiKeyId: uuid('api_key_id').references(() => apiKeys.id, { onDelete: 'set null' }),
+    source: text('source').notNull().default('testbot-mcp'),
+    toolName: text('tool_name').notNull(),
+    eventType: text('event_type').notNull(),
+    runId: text('run_id'),
+    phase: text('phase'),
+    status: text('status'),
+    success: boolean('success').default(false),
+    errorCode: text('error_code'),
+    reason: text('reason'),
+    message: text('message'),
+    durationMs: integer('duration_ms'),
+    metadata: jsonb('metadata'),
+    occurredAt: timestamp('occurred_at', { withTimezone: true }).defaultNow(),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
+  },
+  (table) => [
+    index('mcp_telemetry_user_id_idx').on(table.userId),
+    index('mcp_telemetry_api_key_id_idx').on(table.apiKeyId),
+    index('mcp_telemetry_occurred_at_idx').on(table.occurredAt),
+    index('mcp_telemetry_run_id_idx').on(table.runId),
+    index('mcp_telemetry_event_type_idx').on(table.eventType),
+    index('mcp_telemetry_status_idx').on(table.status),
+  ]
+)
+
 export const testLists = pgTable('test_lists', {
   id: uuid('id').primaryKey().defaultRandom(),
   userId: uuid('user_id')
