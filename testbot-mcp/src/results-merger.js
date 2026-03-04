@@ -5,6 +5,7 @@
  */
 
 const path = require('path');
+const Logger = require('./logger');
 
 class ResultsMerger {
   constructor(config = {}) {
@@ -19,23 +20,20 @@ class ResultsMerger {
    * Merge results from TestBot direct execution and Playwright MCP
    */
   mergeResults(directResults, mcpResults) {
-    const log = (msg) => console.error(`[ResultsMerger] ${msg}`);
-    
-    log('Merging results from parallel executions...');
+    Logger.info('ResultsMerger', 'Merging results from parallel executions...');
     
     // If one source is empty/unavailable, use the other
     if (!directResults || directResults.total === 0) {
-      log('Direct results empty, using MCP results only');
+      Logger.info('ResultsMerger', 'Direct results empty, using MCP results only');
       return this.normalizeResults(mcpResults);
     }
     
     if (!mcpResults || mcpResults.total === 0 || mcpResults.available === false) {
-      log('MCP results empty/unavailable, using direct results only');
+      Logger.info('ResultsMerger', 'MCP results empty/unavailable, using direct results only');
       return this.normalizeResults(directResults);
     }
     
-    log(`Direct results: ${directResults.total} tests`);
-    log(`MCP results: ${mcpResults.total} tests`);
+    Logger.debug('ResultsMerger', `Execution stats`, { direct: directResults.total, mcp: mcpResults.total });
     
     const merged = {
       total: 0,
@@ -127,8 +125,17 @@ class ResultsMerger {
       mcpResults.artifacts || {}
     );
     
-    log(`Merged results: ${merged.total} tests (${merged.passed} passed, ${merged.failed} failed, ${merged.skipped} skipped)`);
-    log(`Artifacts: ${merged.artifacts.screenshots.length} screenshots, ${merged.artifacts.videos.length} videos, ${merged.artifacts.traces.length} traces`);
+    Logger.info('ResultsMerger', `Merged results`, { 
+      total: merged.total, 
+      passed: merged.passed, 
+      failed: merged.failed, 
+      skipped: merged.skipped 
+    });
+    Logger.debug('ResultsMerger', `Merged artifacts`, { 
+      screenshots: merged.artifacts.screenshots.length, 
+      videos: merged.artifacts.videos.length, 
+      traces: merged.artifacts.traces.length 
+    });
     
     return merged;
   }

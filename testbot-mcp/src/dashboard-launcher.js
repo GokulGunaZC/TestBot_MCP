@@ -7,6 +7,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const Logger = require('./logger');
 
 class DashboardLauncher {
   /**
@@ -32,7 +33,7 @@ class DashboardLauncher {
     }
 
     if (!dashboardDir) {
-      console.error('[Dashboard] Dashboard not found, report saved at:', reportPath);
+      Logger.warn('DashboardLauncher', 'Dashboard not found, report saved at:', { path: reportPath });
       return reportPath;
     }
 
@@ -47,12 +48,14 @@ class DashboardLauncher {
       reportContent = fs.readFileSync(reportPath, 'utf-8');
       reportData = JSON.parse(reportContent);
       
-      console.error(`[Dashboard] Report contains: ${reportData.stats?.total || 0} tests`);
-      console.error(`[Dashboard] Project: ${reportData.metadata?.projectName || 'Unknown'}`);
+      Logger.info('DashboardLauncher', `Report contains`, { 
+        tests: reportData.stats?.total || 0, 
+        project: reportData.metadata?.projectName || 'Unknown' 
+      });
       
       // Write to dashboard directory (for HTTP server fallback)
       fs.writeFileSync(destReportPath, reportContent, 'utf-8');
-      console.error('[Dashboard] Report copied to dashboard');
+      Logger.debug('DashboardLauncher', 'Report copied to dashboard');
       
       // Also save metadata about the report source
       const metadataPath = path.join(dashboardDir, 'report-metadata.json');
@@ -65,7 +68,7 @@ class DashboardLauncher {
       }, null, 2), 'utf-8');
       
     } catch (error) {
-      console.error('[Dashboard] Failed to copy report:', error.message);
+      Logger.error('DashboardLauncher', 'Failed to copy report', error);
     }
 
     // Embed report data directly into HTML to avoid CORS issues with file:// protocol
@@ -77,16 +80,16 @@ class DashboardLauncher {
 // This file is used to bypass CORS restrictions when opening dashboard via file:// protocol
 window.__TESTBOT_EMBEDDED_REPORT__ = ${reportContent || 'null'};
 window.__TESTBOT_REPORT_TIMESTAMP__ = ${timestamp};
-console.log('📊 Embedded report data loaded:', {
+console.error('📊 Embedded report data loaded:', {
   project: window.__TESTBOT_EMBEDDED_REPORT__?.metadata?.projectName || 'Unknown',
   tests: window.__TESTBOT_EMBEDDED_REPORT__?.stats?.total || 0,
   timestamp: new Date(${timestamp}).toISOString()
 });
 `;
       fs.writeFileSync(embeddedDataPath, embeddedScript, 'utf-8');
-      console.error('[Dashboard] Embedded report data created (bypasses CORS)');
+      Logger.debug('DashboardLauncher', 'Embedded report data created (bypasses CORS)');
     } catch (error) {
-      console.error('[Dashboard] Failed to create embedded report:', error.message);
+      Logger.error('DashboardLauncher', 'Failed to create embedded report', error);
     }
 
     // Generate dashboard URL with cache-busting timestamp
@@ -99,13 +102,12 @@ console.log('📊 Embedded report data loaded:', {
         ? `start "" "${dashboardUrl}"`
         : (process.platform === 'darwin' ? `open "${dashboardUrl}"` : `xdg-open "${dashboardUrl}"`);
       exec(cmd, { windowsHide: true }, () => {});
-      console.error('[Dashboard] Opened in browser');
-      console.error('[Dashboard] If dashboard shows old data, press Cmd+Shift+R (Mac) or Ctrl+Shift+R (Windows) to hard refresh');
+      Logger.info('DashboardLauncher', 'Opened in browser');
+      Logger.info('DashboardLauncher', 'If dashboard shows old data, press Cmd+Shift+R (Mac) or Ctrl+Shift+R (Windows) to hard refresh');
     } catch (error) {
       // If exec fails, provide fallback instructions
-      console.error('[Dashboard] Could not auto-open browser');
-      console.error(`[Dashboard] Open manually: ${dashboardUrl}`);
-      console.error('[Dashboard] Use hard refresh (Cmd+Shift+R or Ctrl+Shift+R) if data looks stale');
+      Logger.warn('DashboardLauncher', 'Could not auto-open browser', { url: dashboardUrl });
+      Logger.info('DashboardLauncher', 'Use hard refresh (Cmd+Shift+R or Ctrl+Shift+R) if data looks stale');
     }
 
     return dashboardUrl;

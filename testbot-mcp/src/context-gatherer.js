@@ -7,6 +7,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const Logger = require('./logger');
 
 class ContextGatherer {
   constructor(config = {}) {
@@ -46,10 +47,9 @@ class ContextGatherer {
    * This is used when the AI agent doesn't provide structured context
    */
   async gatherAutomatically() {
-    const log = (msg) => console.error(`[ContextGatherer] ${msg}`);
     const projectPath = this.config.projectPath;
     
-    log('Gathering codebase context automatically...');
+    Logger.info('ContextGatherer', 'Gathering codebase context automatically...');
     
     const context = {
       pages: [],
@@ -64,30 +64,30 @@ class ContextGatherer {
     
     // Scan for page/route definitions
     context.pages = await this.findPages(projectPath);
-    log(`Found ${context.pages.length} pages/routes`);
+    Logger.info('ContextGatherer', `Found pages/routes`, { count: context.pages.length });
     
     // Scan for API endpoints
     context.apiEndpoints = await this.findAPIEndpoints(projectPath);
-    log(`Found ${context.apiEndpoints.length} API endpoints`);
+    Logger.info('ContextGatherer', `Found API endpoints`, { count: context.apiEndpoints.length });
     
     // Extract forms and validation
     context.forms = await this.findForms(projectPath);
-    log(`Found ${context.forms.length} forms`);
+    Logger.info('ContextGatherer', `Found forms`, { count: context.forms.length });
     
     // Extract data models/schemas
     context.dataModels = await this.findDataModels(projectPath);
-    log(`Found ${context.dataModels.length} data models`);
+    Logger.info('ContextGatherer', `Found data models`, { count: context.dataModels.length });
     
     // Detect authentication patterns
     context.authPatterns = await this.detectAuthPatterns(projectPath);
-    log(`Detected ${context.authPatterns.length} auth patterns`);
+    Logger.info('ContextGatherer', `Detected auth patterns`, { count: context.authPatterns.length });
     
     // Get project structure summary
     context.projectStructure = this.getProjectStructure(projectPath);
     
     // Identify common workflows from routes
     context.workflows = this.inferWorkflows(context.pages, context.apiEndpoints, context.forms);
-    log(`Inferred ${context.workflows.length} workflows`);
+    Logger.info('ContextGatherer', `Inferred workflows`, { count: context.workflows.length });
     
     return context;
   }
@@ -97,10 +97,9 @@ class ContextGatherer {
    * Returns more detailed context suitable for AI test generation
    */
   async gatherRichContext() {
-    const log = (msg) => console.error(`[ContextGatherer] ${msg}`);
     const projectPath = this.config.projectPath;
     
-    log('Gathering rich codebase context for AI...');
+    Logger.info('ContextGatherer', 'Gathering rich codebase context for AI...');
     
     // Get basic context first
     const basicContext = await this.gatherAutomatically();
@@ -117,24 +116,24 @@ class ContextGatherer {
     
     // Read package.json for dependencies
     richContext.dependencies = this.readPackageJson(projectPath);
-    log(`Found ${Object.keys(richContext.dependencies.dependencies || {}).length} dependencies`);
+    Logger.info('ContextGatherer', `Found dependencies`, { count: Object.keys(richContext.dependencies.dependencies || {}).length });
     
     // Get env variable names (not values)
     richContext.envVariables = this.getEnvVariableNames(projectPath);
-    log(`Found ${richContext.envVariables.length} env variables`);
+    Logger.info('ContextGatherer', `Found env variables`, { count: richContext.envVariables.length });
     
     // Extract detailed component info
     richContext.componentDetails = await this.extractComponentDetails(projectPath);
-    log(`Extracted ${richContext.componentDetails.length} component details`);
+    Logger.info('ContextGatherer', `Extracted component details`, { count: richContext.componentDetails.length });
     
     // Extract API schemas from endpoints
     richContext.apiSchemas = await this.extractAPISchemas(projectPath, basicContext.apiEndpoints);
-    log(`Extracted ${richContext.apiSchemas.length} API schemas`);
+    Logger.info('ContextGatherer', `Extracted API schemas`, { count: richContext.apiSchemas.length });
     
     // Read key file contents (limited)
     if (this.config.includeFileContents) {
       richContext.fileContents = await this.readKeyFiles(projectPath);
-      log(`Read ${Object.keys(richContext.fileContents).length} key files`);
+      Logger.info('ContextGatherer', `Read key files`, { count: Object.keys(richContext.fileContents).length });
     }
     
     return richContext;

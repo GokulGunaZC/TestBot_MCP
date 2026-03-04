@@ -5,6 +5,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const Logger = require('../logger');
 
 class WindsurfClient {
   constructor(config = {}) {
@@ -23,19 +24,19 @@ class WindsurfClient {
    * @returns {Promise<Array>} Analysis results
    */
   async analyzeFailures(failures) {
-    console.error(`[Windsurf] Analyzing ${failures.length} failures...`);
+    Logger.info('WindsurfClient', `Analyzing failures`, { count: failures.length });
 
     const results = [];
 
     for (let i = 0; i < failures.length; i++) {
       const failure = failures[i];
-      console.error(`[Windsurf] [${i + 1}/${failures.length}] ${failure.testName}`);
+      Logger.info('WindsurfClient', `Analyzing failure`, { index: i + 1, total: failures.length, testName: failure.testName });
 
       const analysis = await this.analyzeFailure(failure);
       results.push(analysis);
     }
 
-    console.error(`[Windsurf] Analysis complete: ${results.length} failures analyzed`);
+    Logger.info('WindsurfClient', `Analysis complete`, { count: results.length });
     return results;
   }
 
@@ -56,7 +57,7 @@ class WindsurfClient {
     const responseFile = path.join(tempDir, `${testName}-response.json`);
 
     fs.writeFileSync(requestFile, markdown);
-    console.error(`[Windsurf] Request saved: ${requestFile}`);
+    Logger.debug('WindsurfClient', `Request saved`, { file: requestFile });
 
     // Check if response already exists
     if (fs.existsSync(responseFile)) {
@@ -69,7 +70,7 @@ class WindsurfClient {
           ...this.parseResponse(response),
         };
       } catch (error) {
-        console.error('[Windsurf] Failed to read cached response');
+        Logger.warn('WindsurfClient', 'Failed to read cached response');
       }
     }
 

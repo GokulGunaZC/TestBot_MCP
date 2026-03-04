@@ -108,7 +108,12 @@ class PlaywrightMCPClient {
    */
   generatePageTest(page, testsDir) {
     const pagePath = page.path || '/';
-    const safeName = pagePath.replace(/\//g, '_').replace(/^_/, '') || 'home';
+    // Sanitize path to create valid filename: remove all invalid filesystem characters
+    const safeName = pagePath
+      .replace(/[<>:"|?*\[\](){}\\\/]/g, '_')  // Replace invalid chars with underscore
+      .replace(/^_+|_+$/g, '')                  // Remove leading/trailing underscores
+      .replace(/_+/g, '_')                      // Collapse multiple underscores
+      || 'home';
     const filename = `page_${safeName}.spec.js`;
     const filePath = path.join(testsDir, filename);
     
@@ -207,7 +212,12 @@ ${interactions.map(interaction => {
   generateAPITest(endpoint, testsDir) {
     const method = endpoint.method || 'GET';
     const apiPath = endpoint.path || '/api/health';
-    const safeName = apiPath.replace(/\//g, '_').replace(/^_/, '').replace(/:/g, '');
+    // Sanitize path to create valid filename: remove all invalid filesystem characters
+    const safeName = apiPath
+      .replace(/[<>:"|?*\[\](){}\\\/]/g, '_')  // Replace invalid chars with underscore
+      .replace(/^_+|_+$/g, '')                  // Remove leading/trailing underscores
+      .replace(/_+/g, '_')                      // Collapse multiple underscores
+      || 'health';
     const filename = `api_${method.toLowerCase()}_${safeName}.spec.js`;
     const filePath = path.join(testsDir, filename);
     

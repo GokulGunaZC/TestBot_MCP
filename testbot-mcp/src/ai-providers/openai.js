@@ -4,6 +4,7 @@
  */
 
 const fetch = require('node-fetch');
+const Logger = require('../logger');
 
 class OpenAIClient {
   constructor(config = {}) {
@@ -39,44 +40,43 @@ class OpenAIClient {
    * @returns {Promise<Array>} Generated test files
    */
   async generateTests(context, testType, prd, projectInfo = {}) {
-    const log = (msg) => console.error(`[OpenAI] ${msg}`);
-    log('Starting test generation with GPT...');
+    Logger.info('OpenAIClient', 'Starting test generation with GPT...');
 
     const generatedTests = [];
 
     try {
       // Generate tests in chunks based on test type
       if (testType === 'frontend' || testType === 'both') {
-        log('Generating frontend tests...');
+        Logger.info('OpenAIClient', 'Generating frontend tests...');
         const frontendTests = await this.generateFrontendTests(context, prd, projectInfo);
         generatedTests.push(...frontendTests);
       }
 
       if (testType === 'backend' || testType === 'both') {
-        log('Generating backend/API tests...');
+        Logger.info('OpenAIClient', 'Generating backend/API tests...');
         const backendTests = await this.generateBackendTests(context, prd, projectInfo);
         generatedTests.push(...backendTests);
       }
 
       // Generate workflow tests if context has workflows
       if (context?.workflows?.length > 0) {
-        log('Generating workflow tests...');
+        Logger.info('OpenAIClient', 'Generating workflow tests...');
         const workflowTests = await this.generateWorkflowTests(context, prd, projectInfo);
         generatedTests.push(...workflowTests);
       }
 
       // Generate smoke tests as fallback if nothing else generated
       if (generatedTests.length === 0) {
-        log('Generating basic smoke tests...');
+        Logger.info('OpenAIClient', 'Generating basic smoke tests...');
         const smokeTests = await this.generateSmokeTests(projectInfo);
         generatedTests.push(...smokeTests);
       }
 
-      log(`Generated ${generatedTests.length} test file(s)`);
+      Logger.info('OpenAIClient', `Generated test file(s)`, { count: generatedTests.length });
       return generatedTests;
 
     } catch (error) {
-      log(`Test generation failed: ${error.message}`);
+      Logger.error('OpenAIClient', `Test generation failed`, error);
       throw error;
     }
   }
@@ -380,7 +380,7 @@ IMPORTANT: Return ONLY valid JSON, no markdown code blocks.`;
     const timeout = setTimeout(() => controller.abort(), this.config.timeout);
 
     try {
-      console.error(`[OpenAI] Calling API with model: ${this.config.model}`);
+      Logger.debug('OpenAIClient', `Calling API`, { model: this.config.model });
 
       const response = await fetch(`${this.baseUrl}/chat/completions`, {
         method: 'POST',
@@ -462,8 +462,8 @@ IMPORTANT: Return ONLY valid JSON, no markdown code blocks.`;
       })).filter(f => f.content.length > 0);
 
     } catch (error) {
-      console.error(`[OpenAI] Failed to parse response: ${error.message}`);
-      console.error(`[OpenAI] Raw response (first 500 chars): ${response?.substring(0, 500)}`);
+      Logger.error('OpenAIClient', `Failed to parse response`, error);
+      Logger.debug('OpenAIClient', `Raw response (first 500 chars)`, { response: response?.substring(0, 500) });
       return [];
     }
   }
@@ -474,20 +474,20 @@ IMPORTANT: Return ONLY valid JSON, no markdown code blocks.`;
    * @returns {Promise<Array>} Analysis results
    */
   async analyzeFailures(failures) {
-    console.error(`[OpenAI] Analyzing ${failures.length} failures...`);
+    Logger.info('OpenAIClient', `Analyzing failures`, { count: failures.length });
 
     const results = [];
 
     for (let i = 0; i < failures.length; i++) {
       const failure = failures[i];
-      console.error(`[OpenAI] [${i + 1}/${failures.length}] Analyzing: ${failure.testName}`);
+      Logger.info('OpenAIClient', `Analyzing failure`, { index: i + 1, total: failures.length, testName: failure.testName });
 
       try {
         const analysis = await this.analyzeFailure(failure);
         results.push(analysis);
-        console.error(`[OpenAI] Complete (confidence: ${analysis.confidence})`);
+        Logger.info('OpenAIClient', `Analysis complete`, { confidence: analysis.confidence });
       } catch (error) {
-        console.error(`[OpenAI] Failed: ${error.message}`);
+        Logger.error('OpenAIClient', `Analysis failed`, error);
         results.push({
           failure,
           analysis: `Analysis failed: ${error.message}`,
@@ -498,7 +498,7 @@ IMPORTANT: Return ONLY valid JSON, no markdown code blocks.`;
       }
     }
 
-    console.error(`[OpenAI] Analysis complete: ${results.length} failures analyzed`);
+    Logger.info('OpenAIClient', `Analysis complete`, { count: results.length });
     return results;
   }
 
@@ -611,7 +611,7 @@ IMPORTANT: Return ONLY the JSON object, no markdown formatting.`;
         throw new Error('No valid JSON found');
       }
     } catch (error) {
-      console.error('[OpenAI] Failed to parse analysis response:', error.message);
+      Logger.error('OpenAIClient', 'Failed to parse analysis response', error);
       return {
         analysis: 'Failed to parse AI response',
         rootCause: 'Unable to determine root cause due to parsing error',

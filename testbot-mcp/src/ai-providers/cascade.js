@@ -5,6 +5,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const Logger = require('../logger');
 
 class CascadeClient {
   constructor(config = {}) {
@@ -22,14 +23,14 @@ class CascadeClient {
    * @returns {Promise<Array>} Analysis results
    */
   async analyzeFailures(failures) {
-    console.error(`[Cascade] Analyzing ${failures.length} failures...`);
+    Logger.info('CascadeClient', `Analyzing failures`, { count: failures.length });
 
     const results = [];
 
     // Process failures in batches
     for (let i = 0; i < failures.length; i += this.config.batchSize) {
       const batch = failures.slice(i, i + this.config.batchSize);
-      console.error(`[Cascade] Processing batch ${Math.floor(i / this.config.batchSize) + 1}`);
+      Logger.info('CascadeClient', `Processing batch`, { batchNum: Math.floor(i / this.config.batchSize) + 1 });
 
       const batchResults = await Promise.all(
         batch.map((failure) => this.analyzeFailure(failure))
@@ -37,7 +38,7 @@ class CascadeClient {
       results.push(...batchResults);
     }
 
-    console.error(`[Cascade] Analysis complete: ${results.length} failures analyzed`);
+    Logger.info('CascadeClient', `Analysis complete`, { count: results.length });
     return results;
   }
 
@@ -45,7 +46,7 @@ class CascadeClient {
    * Analyze a single failure
    */
   async analyzeFailure(failure) {
-    console.error(`[Cascade] Analyzing: ${failure.testName}`);
+    Logger.info('CascadeClient', `Analyzing failure`, { testName: failure.testName });
 
     try {
       const prompt = this.buildCascadePrompt(failure);
@@ -64,7 +65,7 @@ class CascadeClient {
         affectedFiles: analysisRequest.affectedFiles || [failure.file],
       };
     } catch (error) {
-      console.error(`[Cascade] Failed: ${error.message}`);
+      Logger.error('CascadeClient', `Analysis failed`, error);
       return {
         failure,
         testName: failure.testName,
@@ -135,7 +136,7 @@ class CascadeClient {
         const response = fs.readFileSync(responseFile, 'utf-8');
         return this.parseResponse(response);
       } catch (error) {
-        console.error('[Cascade] Failed to read cached response');
+        Logger.warn('CascadeClient', 'Failed to read cached response');
       }
     }
 

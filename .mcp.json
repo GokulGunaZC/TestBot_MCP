@@ -1,8 +1,8 @@
 {
   "mcpServers": {
-    "testbot": {
+    "testbot-mcp": {
       "command": "node",
-      "args": ["testbot-mcp/src/index.js"],
+      "args": ["c:\\Users\\ShreyesPrabhuDesai\\PersProjects\\TestBot_MCP\\testbot-mcp\\mcp-launcher.js"],
       "env": {
         "TESTBOT_DASHBOARD_URL": "http://localhost:3000"
       }

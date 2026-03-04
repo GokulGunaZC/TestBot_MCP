@@ -6,6 +6,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const Logger = require('./logger');
 
 class AutoDetector {
   /**
@@ -31,7 +32,7 @@ class AutoDetector {
     const startCommand = this.detectStartCommand(packageJson, langInfo, resolvedPath);
     const testDirs = this.scanTestDirs(resolvedPath);
 
-    return {
+    const settings = {
       projectPath: resolvedPath,
       projectName,
       language: langInfo.language,
@@ -45,6 +46,9 @@ class AutoDetector {
       packageJson,
       playwrightConfig,
     };
+
+    Logger.debug('AutoDetector', 'Finished detection', { projectName, language: langInfo.language, hasPlaywright: settings.hasPlaywright });
+    return settings;
   }
 
   /**
@@ -182,7 +186,7 @@ class AutoDetector {
         return JSON.parse(fs.readFileSync(packagePath, 'utf-8'));
       }
     } catch (error) {
-      console.error(`Failed to read package.json: ${error.message}`);
+      Logger.debug('AutoDetector', `Failed to read package.json`, error);
     }
     return null;
   }
@@ -203,7 +207,7 @@ class AutoDetector {
           return this.parsePlaywrightConfig(content);
         }
       } catch (error) {
-        console.error(`Failed to read playwright config: ${error.message}`);
+        Logger.debug('AutoDetector', `Failed to read playwright config`, error);
       }
     }
     return null;
@@ -256,7 +260,7 @@ class AutoDetector {
         return env;
       }
     } catch (error) {
-      console.error(`Failed to read .env: ${error.message}`);
+      Logger.debug('AutoDetector', `Failed to read .env`, error);
     }
     return null;
   }

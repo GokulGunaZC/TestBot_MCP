@@ -7,6 +7,7 @@
 const fs = require('fs');
 const path = require('path');
 const OpenAIClient = require('./ai-providers/openai');
+const Logger = require('./logger');
 
 class OpenAITestGenerator {
   constructor(config = {}) {
@@ -42,7 +43,7 @@ class OpenAITestGenerator {
       maxTokens: this.config.maxTokens,
     });
     
-    console.error(`[TestGenerator] Initialized with model: ${this.config.model}`);
+    Logger.info('OpenAITestGenerator', `Initialized`, { model: this.config.model });
   }
 
   /**
@@ -58,14 +59,12 @@ class OpenAITestGenerator {
       projectInfo,       // Project metadata (name, framework, baseURL)
       options = {},      // Additional options (includeSmoke, includeWorkflows, etc.)
     } = params;
-
-    const log = (msg) => console.error(`[TestGenerator] ${msg}`);
     
     if (!this.openai) {
       this.initialize();
     }
     
-    log('Starting test generation with OpenAI...');
+    Logger.info('OpenAITestGenerator', 'Starting test generation with OpenAI...');
     
     this.generatedFiles = [];
     
@@ -81,40 +80,40 @@ class OpenAITestGenerator {
     try {
       // 1. Generate smoke tests if enabled
       if (options.includeSmoke !== false) {
-        log('Generating smoke tests...');
+        Logger.info('OpenAITestGenerator', 'Generating smoke tests...');
         await this.generateSmokeTests(context, projectInfo, outputDir);
       }
       
       // 2. Generate page/frontend tests
       if (testType === 'frontend' || testType === 'both') {
-        log('Generating frontend tests...');
+        Logger.info('OpenAITestGenerator', 'Generating frontend tests...');
         await this.generateFrontendTests(context, prd, projectInfo, outputDir);
       }
       
       // 3. Generate API/backend tests
       if (testType === 'backend' || testType === 'both') {
-        log('Generating backend/API tests...');
+        Logger.info('OpenAITestGenerator', 'Generating backend/API tests...');
         await this.generateBackendTests(context, prd, projectInfo, outputDir);
       }
       
       // 4. Generate workflow tests if enabled
       if (options.includeWorkflows !== false && context.workflows?.length > 0) {
-        log('Generating workflow tests...');
+        Logger.info('OpenAITestGenerator', 'Generating workflow tests...');
         await this.generateWorkflowTests(context, prd, projectInfo, outputDir);
       }
       
       // 5. Generate error state tests if enabled
       if (options.includeErrorStates && context.errorScenarios?.length > 0) {
-        log('Generating error state tests...');
+        Logger.info('OpenAITestGenerator', 'Generating error state tests...');
         await this.generateErrorTests(context, projectInfo, outputDir);
       }
       
-      log(`Generation complete: ${this.generatedFiles.length} test file(s) created`);
+      Logger.info('OpenAITestGenerator', `Generation complete`, { filesCreated: this.generatedFiles.length });
       
       return this.generatedFiles;
       
     } catch (error) {
-      log(`Generation failed: ${error.message}`);
+      Logger.error('OpenAITestGenerator', `Generation failed`, error);
       throw error;
     }
   }
@@ -130,7 +129,7 @@ class OpenAITestGenerator {
     
     for (const configPath of configPaths) {
       if (fs.existsSync(path.join(this.config.projectPath, configPath))) {
-        console.error('[TestGenerator] Playwright config already exists');
+        Logger.debug('OpenAITestGenerator', 'Playwright config already exists');
         return;
       }
     }
@@ -172,7 +171,7 @@ export default defineConfig({
     
     const configPath = path.join(this.config.projectPath, 'playwright.config.ts');
     fs.writeFileSync(configPath, config, 'utf-8');
-    console.error('[TestGenerator] Created playwright.config.ts');
+    Logger.info('OpenAITestGenerator', 'Created playwright.config.ts');
   }
 
   /**
@@ -197,7 +196,7 @@ export default defineConfig({
     const pages = context.pages || [];
     
     if (pages.length === 0 && !prd) {
-      console.error('[TestGenerator] No pages found and no PRD provided, skipping frontend tests');
+      Logger.warn('OpenAITestGenerator', 'No pages found and no PRD provided, skipping frontend tests');
       return;
     }
     
@@ -218,7 +217,7 @@ export default defineConfig({
     const endpoints = context.apiEndpoints || [];
     
     if (endpoints.length === 0 && !prd) {
-      console.error('[TestGenerator] No API endpoints found and no PRD provided, skipping backend tests');
+      Logger.warn('OpenAITestGenerator', 'No API endpoints found and no PRD provided, skipping backend tests');
       return;
     }
     
@@ -612,7 +611,7 @@ IMPORTANT: Return ONLY valid JSON.`;
       
       return this.parseTestResponse(response, prefix);
     } catch (error) {
-      console.error(`[TestGenerator] OpenAI call failed: ${error.message}`);
+      Logger.error('OpenAITestGenerator', 'OpenAI call failed', error);
       return [];
     }
   }
@@ -653,7 +652,7 @@ IMPORTANT: Return ONLY valid JSON.`;
       })).filter(f => f.content.length > 0);
       
     } catch (error) {
-      console.error(`[TestGenerator] Failed to parse response: ${error.message}`);
+      Logger.error('OpenAITestGenerator', `Failed to parse response`, error);
       return [];
     }
   }
@@ -678,7 +677,7 @@ IMPORTANT: Return ONLY valid JSON.`;
       type: test.type,
     });
     
-    console.error(`[TestGenerator] Created: ${test.filename}`);
+    Logger.info('OpenAITestGenerator', `Created test file`, { filename: test.filename });
   }
 
   /**

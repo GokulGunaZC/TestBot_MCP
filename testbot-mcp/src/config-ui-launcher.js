@@ -7,6 +7,7 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const { URL } = require('url');
+const Logger = require('./logger');
 
 class ConfigUILauncher {
   constructor(config = {}) {
@@ -27,13 +28,6 @@ class ConfigUILauncher {
    * @returns {Promise<Object>} User configuration
    */
   async launch(projectInfo = {}) {
-    const log = (msg) => {
-      console.error(`[ConfigUI] ${msg}`);
-      if (process.stderr && process.stderr.write) {
-        process.stderr.write(`[ConfigUI] ${msg}\n`);
-      }
-    };
-    
     return new Promise(async (resolve, reject) => {
       this.resolveConfig = resolve;
       this.rejectConfig = reject;
@@ -41,7 +35,7 @@ class ConfigUILauncher {
       try {
         // Start server
         await this.startServer(projectInfo);
-        log(`Server started on port ${this.config.port}`);
+        Logger.info('ConfigUILauncher', `Server started`, { port: this.config.port });
         
         // Build URL with project info
         const params = new URLSearchParams({
@@ -55,7 +49,7 @@ class ConfigUILauncher {
         });
         
         const configURL = `http://localhost:${this.config.port}/config-form.html?${params.toString()}`;
-        log(`Opening configuration form: ${configURL}`);
+        Logger.info('ConfigUILauncher', `Opening configuration form`, { url: configURL });
         
         // Open in browser
         try {
@@ -64,9 +58,9 @@ class ConfigUILauncher {
             ? `start "" "${configURL}"`
             : (process.platform === 'darwin' ? `open "${configURL}"` : `xdg-open "${configURL}"`);
           exec(cmd, { windowsHide: true }, () => {});
-          log('Configuration form opened in browser');
+          Logger.info('ConfigUILauncher', 'Configuration form opened in browser');
         } catch (error) {
-          log(`Could not auto-open browser: ${error.message}. Please visit: ${configURL}`);
+          Logger.warn('ConfigUILauncher', `Could not auto-open browser`, { error: error.message, url: configURL });
           // Don't reject here, let the developer open the URL manually within the 5 minute window
         }
         
@@ -79,7 +73,7 @@ class ConfigUILauncher {
         }, this.config.timeout);
         
       } catch (error) {
-        log(`Launch critical error: ${error.stack || error}`);
+        Logger.error('ConfigUILauncher', `Launch critical error`, error);
         this.cleanup();
         reject(error);
       }
@@ -108,9 +102,7 @@ class ConfigUILauncher {
       }
       
       if (!dashboardDir) {
-        if (process.stderr && process.stderr.write) {
-          process.stderr.write(`[ConfigUI] CRITICAL: Configuration form not found in any of: ${dashboardPaths.join(', ')}\n`);
-        }
+        Logger.error('ConfigUILauncher', 'Configuration form not found', new Error('Missing dashboard/public/config-form.html'), { paths: dashboardPaths });
         return reject(new Error('Configuration form not found. Please ensure dashboard/public/config-form.html exists.'));
       }
       
@@ -138,7 +130,7 @@ class ConfigUILauncher {
           req.on('end', () => {
             try {
               const config = JSON.parse(body);
-              console.error('[ConfigUI] Received configuration from user');
+              Logger.info('ConfigUILauncher', 'Received configuration from user');
               
               res.writeHead(200, { 'Content-Type': 'application/json' });
               res.end(JSON.stringify({ success: true, message: 'Configuration received' }));
@@ -209,7 +201,7 @@ class ConfigUILauncher {
         if (error.code === 'EADDRINUSE') {
           // Try next port
           this.config.port++;
-          console.error(`[ConfigUI] Port in use, trying ${this.config.port}`);
+          Logger.debug('ConfigUILauncher', `Port in use, trying next port`, { port: this.config.port });
           this.startServer(projectInfo).then(resolve).catch(reject);
         } else {
           reject(error);

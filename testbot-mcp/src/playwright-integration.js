@@ -6,6 +6,7 @@
 const fs = require('fs');
 const path = require('path');
 const { spawn, execSync } = require('child_process');
+const Logger = require('./logger');
 
 class PlaywrightIntegration {
   constructor(config = {}) {
@@ -45,7 +46,7 @@ class PlaywrightIntegration {
         fs.writeFileSync(filepath, testCode, 'utf-8');
         generatedTests.push(filepath);
 
-        console.error(`[Playwright] Generated test: ${filename}`);
+        Logger.info('PlaywrightIntegration', `Generated test`, { filename });
       }
     }
 
@@ -62,7 +63,7 @@ class PlaywrightIntegration {
         fs.writeFileSync(filepath, testCode, 'utf-8');
         generatedTests.push(filepath);
 
-        console.error(`[Playwright] Generated test from PRD: ${filename}`);
+        Logger.info('PlaywrightIntegration', `Generated test from PRD`, { filename });
       }
     }
 
@@ -234,11 +235,11 @@ ${testSteps}
       // Check if Playwright is installed
       const playwrightPath = path.join(projectPath, 'node_modules', '@playwright', 'test');
       if (!fs.existsSync(playwrightPath)) {
-        console.error('[Playwright] Installing Playwright...');
+        Logger.info('PlaywrightIntegration', 'Installing Playwright...');
         try {
           execSync('npm install -D @playwright/test', { cwd: projectPath, stdio: 'pipe' });
         } catch (error) {
-          console.error('[Playwright] Failed to install Playwright:', error.message);
+          Logger.error('PlaywrightIntegration', 'Failed to install Playwright', error);
         }
       }
 
@@ -251,7 +252,7 @@ ${testSteps}
         args.push('--config', configPath);
       }
 
-      console.error(`[Playwright] Running: npx ${args.join(' ')}`);
+      Logger.info('PlaywrightIntegration', `Running: npx ${args.join(' ')}`);
 
       const proc = spawn('npx', args, {
         cwd: projectPath,
@@ -259,7 +260,6 @@ ${testSteps}
           ...process.env,
           BASE_URL: this.config.baseURL,
         },
-        shell: true,
       });
 
       let stdout = '';
@@ -267,12 +267,11 @@ ${testSteps}
 
       proc.stdout.on('data', (data) => {
         stdout += data.toString();
-        process.stderr.write(`[Playwright Output] ${data.toString()}`);
       });
 
       proc.stderr.on('data', (data) => {
         stderr += data.toString();
-        process.stderr.write(`[Playwright Error] ${data.toString()}`);
+        Logger.debug('PlaywrightIntegration', `Playwright Error: ${data.toString()}`);
       });
 
       proc.on('close', (code) => {
@@ -307,41 +306,37 @@ ${testSteps}
       failures: [],
     };
 
-    console.error('[Playwright] Parsing test results...');
-    console.error(`[Playwright] Looking for results file at: ${testResultsPath}`);
+    Logger.info('PlaywrightIntegration', 'Parsing test results...');
+    Logger.debug('PlaywrightIntegration', `Looking for results file at: ${testResultsPath}`);
 
     // Try to parse from JSON file
     if (fs.existsSync(testResultsPath)) {
       const fileStats = fs.statSync(testResultsPath);
-      console.error(`[Playwright] Found test-results.json (${fileStats.size} bytes)`);
+      Logger.debug('PlaywrightIntegration', `Found test-results.json`, { size: fileStats.size });
       
       try {
         const data = JSON.parse(fs.readFileSync(testResultsPath, 'utf-8'));
         results = this.extractResultsFromJson(data);
-        console.error(`[Playwright] Parsed ${results.total} tests from test-results.json`);
-        console.error(`[Playwright] Results: ${results.passed} passed, ${results.failed} failed, ${results.skipped} skipped`);
+        Logger.info('PlaywrightIntegration', `Parsed ${results.total} tests from test-results.json`);
+        Logger.info('PlaywrightIntegration', `Results: ${results.passed} passed, ${results.failed} failed, ${results.skipped} skipped`);
       } catch (error) {
-        console.error('[Playwright] ERROR: Failed to parse test-results.json:', error.message);
-        console.error('[Playwright] This usually means the JSON file is malformed or empty');
+        Logger.error('PlaywrightIntegration', `Failed to parse test-results.json`, error);
+        Logger.warn('PlaywrightIntegration', `This usually means the JSON file is malformed or empty`);
       }
     } else {
-      console.error('[Playwright] WARNING: test-results.json NOT FOUND at expected location');
-      console.error('[Playwright] This typically happens when:');
-      console.error('[Playwright]   1. Playwright config has reporter: "json" instead of reporter: [[\'json\', { outputFile: \'test-results.json\' }]]');
-      console.error('[Playwright]   2. Tests failed to run at all');
-      console.error('[Playwright]   3. Tests output to a different location');
+      Logger.warn('PlaywrightIntegration', `test-results.json NOT FOUND at expected location`);
     }
 
     // Fallback: try to parse from stdout
     if (results.total === 0 && stdout) {
-      console.error('[Playwright] Attempting to parse results from stdout...');
+      Logger.info('PlaywrightIntegration', 'Attempting to parse results from stdout...');
       try {
         const jsonData = JSON.parse(stdout);
         results = this.extractResultsFromJson(jsonData);
-        console.error(`[Playwright] Parsed ${results.total} tests from stdout JSON`);
+        Logger.info('PlaywrightIntegration', `Parsed ${results.total} tests from stdout JSON`);
       } catch (error) {
         // Not valid JSON, extract from text output
-        console.error('[Playwright] stdout is not JSON, extracting from text output...');
+        Logger.debug('PlaywrightIntegration', 'stdout is not JSON, extracting from text output...');
         const passedMatch = stdout.match(/(\d+)\s+passed/);
         const failedMatch = stdout.match(/(\d+)\s+failed/);
         const skippedMatch = stdout.match(/(\d+)\s+skipped/);
@@ -352,20 +347,17 @@ ${testSteps}
         results.total = results.passed + results.failed + results.skipped;
         
         if (results.total > 0) {
-          console.error(`[Playwright] Extracted from text: ${results.passed} passed, ${results.failed} failed, ${results.skipped} skipped`);
+          Logger.info('PlaywrightIntegration', `Extracted from text`, { passed: results.passed, failed: results.failed, skipped: results.skipped });
         } else {
-          console.error('[Playwright] WARNING: Could not extract any test results from stdout');
+          Logger.warn('PlaywrightIntegration', 'Could not extract any test results from stdout');
         }
       }
     }
 
     // Final warning if no tests found
     if (results.total === 0) {
-      console.error('[Playwright] ⚠️  CRITICAL: No test results found!');
-      console.error('[Playwright] The dashboard report will show 0 tests.');
-      console.error('[Playwright] To fix this, ensure your playwright.config.js has:');
-      console.error('[Playwright]   reporter: [[\'json\', { outputFile: \'test-results.json\' }]]');
-      console.error('[Playwright] Run: node scripts/debug-dashboard.js for detailed diagnostics');
+      Logger.error('PlaywrightIntegration', 'CRITICAL: No test results found!');
+      Logger.warn('PlaywrightIntegration', 'The dashboard report will show 0 tests.');
     }
 
     return results;
@@ -387,17 +379,16 @@ ${testSteps}
 
     // Log structure info for debugging
     if (!data) {
-      console.error('[Playwright] extractResultsFromJson: data is null/undefined');
+      Logger.error('PlaywrightIntegration', 'extractResultsFromJson: data is null/undefined');
       return results;
     }
     
     if (!data.suites) {
-      console.error('[Playwright] extractResultsFromJson: No suites found in data');
-      console.error('[Playwright] Data keys:', Object.keys(data));
+      Logger.error('PlaywrightIntegration', 'extractResultsFromJson: No suites found in data', { keys: Object.keys(data) });
       return results;
     }
     
-    console.error(`[Playwright] extractResultsFromJson: Processing ${data.suites.length} top-level suites`);
+    Logger.debug('PlaywrightIntegration', `Processing top-level suites`, { count: data.suites.length });
 
     const processSpec = (spec, suiteName) => {
       if (spec.tests) {
@@ -469,10 +460,7 @@ ${testSteps}
     }
 
     // Log extraction summary
-    console.error(`[Playwright] Extraction complete: ${results.total} tests found`);
-    if (results.failures.length > 0) {
-      console.error(`[Playwright] ${results.failures.length} test(s) have failures with artifacts`);
-    }
+    Logger.info('PlaywrightIntegration', `Extraction complete`, { total: results.total, failuresWithArtifacts: results.failures.length });
 
     return results;
   }
@@ -529,22 +517,20 @@ ${testSteps}
     if (!this.config.startCommand) return;
 
     return new Promise((resolve, reject) => {
-      console.error(`[Playwright] Starting server: ${this.config.startCommand}`);
+      Logger.info('PlaywrightIntegration', `Starting server: ${this.config.startCommand}`);
 
       const [cmd, ...args] = this.config.startCommand.split(' ');
 
       this.serverProcess = spawn(cmd, args, {
         cwd: this.config.projectPath,
-        shell: true,
-        detached: true,
       });
 
       this.serverProcess.stdout.on('data', (data) => {
-        process.stderr.write(`[Server] ${data.toString()}`);
+        Logger.debug('PlaywrightIntegration', `[Server] ${data.toString()}`);
       });
 
       this.serverProcess.stderr.on('data', (data) => {
-        process.stderr.write(`[Server] ${data.toString()}`);
+        Logger.debug('PlaywrightIntegration', `[Server] ${data.toString()}`);
       });
 
       // Wait for server to be ready
@@ -554,7 +540,7 @@ ${testSteps}
           try {
             const response = await fetch(this.config.baseURL);
             if (response.ok || response.status < 500) {
-              console.error('[Playwright] Server is ready');
+              Logger.info('PlaywrightIntegration', 'Server is ready');
               resolve();
               return;
             }
@@ -575,7 +561,7 @@ ${testSteps}
    */
   stopServer() {
     if (this.serverProcess) {
-      console.error('[Playwright] Stopping server');
+      Logger.info('PlaywrightIntegration', 'Stopping server');
       // Kill process group
       try {
         process.kill(-this.serverProcess.pid);

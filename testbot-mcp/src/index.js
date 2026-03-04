@@ -19,13 +19,11 @@ for (const envPath of dotenvPaths) {
 }
 
 const { fork } = require('child_process');
-const { Server } = require('@modelcontextprotocol/sdk/server/index.js');
-const { StdioServerTransport } = require('@modelcontextprotocol/sdk/server/stdio.js');
-const {
-  CallToolRequestSchema,
-  ListToolsRequestSchema,
-} = require('@modelcontextprotocol/sdk/types.js');
+const { McpServer } = require("@modelcontextprotocol/sdk/server/mcp.js");
+const { StdioServerTransport } = require("@modelcontextprotocol/sdk/server/stdio.js");
+const { z } = require('zod');
 
+const Logger = require('./logger');
 const AutoDetector = require('./auto-detector');
 const PlaywrightIntegration = require('./playwright-integration');
 const AIAnalyzer = require('./ai-providers/index');
@@ -34,19 +32,14 @@ const DashboardLauncher = require('./dashboard-launcher');
 
 class TestbotMCPServer {
   constructor() {
-    this.server = new Server(
-      {
-        name: 'testbot-mcp',
-        version: '1.1.0',
-      },
-      {
-        capabilities: {
-          tools: {},
-        },
-      }
-    );
+    Logger.initialize();
+    console.error('[DEBUG] TestBot MCP Server starting - VERSION WITH ZOD SCHEMAS');
+    this.server = new McpServer({
+      name: "testbot-mcp",
+      version: "1.1.0"
+    });
 
-    this.setupToolHandlers();
+    this.registerTools();
     this.setupErrorHandling();
   }
 
@@ -56,9 +49,9 @@ class TestbotMCPServer {
    */
   runPipelineInBackground(config, runId) {
     const workerPath = path.join(__dirname, 'pipeline-worker.js');
+    Logger.info('Index', `Forking pipeline worker in background`, { runId, projectPath: config.projectPath });
 
     const child = fork(workerPath, [], {
-      detached: true,
       stdio: ['ignore', 'ignore', 'pipe', 'ipc'],
       env: { ...process.env },
     });
@@ -80,183 +73,154 @@ class TestbotMCPServer {
     }, 1000);
     child.unref();
 
-    console.error(`[Testbot] Pipeline worker forked (PID: ${child.pid}, runId: ${runId})`);
+    Logger.info('Index', `Pipeline worker forked`, { pid: child.pid, runId });
   }
 
-  setupToolHandlers() {
-    // List available tools
-    this.server.setRequestHandler(ListToolsRequestSchema, async () => ({
-      tools: [
-        {
-          name: 'testbot_configure',
-          description: 'Analyze a project and return configuration options before testing. Use this first to understand the project structure, then use the returned configuration with testbot_test_my_app. Returns detected settings and questions for the user to answer.',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              projectPath: {
-                type: 'string',
-                description: 'Path to the project to analyze (defaults to current workspace)',
+  registerTools() {
+    this.server.registerTool(
+      'testbot_configure',
+      {
+        description: 'Analyze a project and return configuration options before testing. Use this first to understand the project structure, then use the returned configuration with testbot_test_my_app. Returns detected settings and questions for the user to answer.',
+        inputSchema: z.object({
+          projectPath: z.string().optional().describe('Path to the project to analyze (defaults to current workspace)'),
+        }),
+      },
+      async (args, extra) => {
+        console.error('[DEBUG] testbot_configure called with args:', JSON.stringify(args));
+        Logger.mcp('Index', `Tool called: testbot_configure`, { args });
+        try {
+          const result = await this.handleConfigure(args);
+          console.error('[DEBUG] testbot_configure returning result');
+          return result;
+        } catch (error) {
+          console.error('[DEBUG] testbot_configure error:', error.message);
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `Error: ${error.message}\n${error.stack}`,
               },
-            },
-          },
-        },
-        {
-          name: 'testbot_test_my_app',
-          description: 'Test your application end-to-end with AI-powered analysis. Generates tests, runs them, analyzes failures with AI, and opens a beautiful dashboard with results. Returns immediately with a run ID — the pipeline runs in the background and posts results to the dashboard when complete. For best results, run testbot_configure first to get recommended settings.',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              projectPath: {
-                type: 'string',
-                description: 'Path to the project to test (defaults to current workspace)',
-              },
-              testType: {
-                type: 'string',
-                enum: ['frontend', 'backend', 'both'],
-                description: 'Type of tests to run',
-              },
-              generateTests: {
-                type: 'boolean',
-                description: 'Whether to generate new tests (true) or use existing tests (false)',
-              },
-              prdFile: {
-                type: 'string',
-                description: 'Path to PRD/requirements document for test generation (optional)',
-              },
-              codebaseContext: {
-                type: 'object',
-                description: 'Structured codebase context from AI agent analysis (pages, apiEndpoints, workflows)',
-                properties: {
-                  pages: {
-                    type: 'array',
-                    description: 'Frontend pages/routes with their components and interactions',
-                    items: { type: 'object' }
-                  },
-                  apiEndpoints: {
-                    type: 'array',
-                    description: 'Backend API endpoints with methods and schemas',
-                    items: { type: 'object' }
-                  },
-                  workflows: {
-                    type: 'array',
-                    description: 'Main user workflows to test',
-                    items: { type: 'string' }
-                  },
-                },
-              },
-              baseURL: {
-                type: 'string',
-                description: 'Base URL for the application under test',
-              },
-              port: {
-                type: 'number',
-                description: 'Port number the app runs on',
-              },
-              startCommand: {
-                type: 'string',
-                description: 'Command to start the app server (e.g., "npm start")',
-              },
-              jira: {
-                type: 'object',
-                description: 'Jira integration configuration',
-                properties: {
-                  enabled: { type: 'boolean' },
-                  baseUrl: { type: 'string' },
-                  email: { type: 'string' },
-                  apiToken: { type: 'string' },
-                  projectKey: { type: 'string' },
-                },
-              },
-              openDashboard: {
-                type: 'boolean',
-                description: 'Whether to automatically open the dashboard after tests (default: true)',
-              },
-            },
-          },
-        },
-        {
-          name: 'testbot_analyze_failures',
-          description: 'Analyze existing test failures with AI without running new tests',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              projectPath: {
-                type: 'string',
-                description: 'Path to the project',
-              },
-              testResultsPath: {
-                type: 'string',
-                description: 'Path to test-results.json file',
-              },
-              aiProvider: {
-                type: 'string',
-                enum: ['sarvam', 'cascade', 'windsurf'],
-                description: 'AI provider for failure analysis',
-              },
-            },
-            required: ['projectPath'],
-          },
-        },
-        {
-          name: 'testbot_generate_report',
-          description: 'Generate a dashboard report from existing test results',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              projectPath: {
-                type: 'string',
-                description: 'Path to the project',
-              },
-              testResultsPath: {
-                type: 'string',
-                description: 'Path to test-results.json file',
-              },
-              openDashboard: {
-                type: 'boolean',
-                description: 'Whether to automatically open the dashboard',
-              },
-            },
-            required: ['projectPath'],
-          },
-        },
-      ],
-    }));
-
-    // Handle tool calls
-    this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
-      const { name, arguments: args } = request.params;
-
-      try {
-        switch (name) {
-          case 'testbot_configure':
-            return await this.handleConfigure(args);
-          case 'testbot_test_my_app':
-            return await this.handleTestMyApp(args);
-          case 'testbot_analyze_failures':
-            return await this.handleAnalyzeFailures(args);
-          case 'testbot_generate_report':
-            return await this.handleGenerateReport(args);
-          default:
-            throw new Error(`Unknown tool: ${name}`);
+            ],
+            isError: true,
+          };
         }
-      } catch (error) {
-        return {
-          content: [
-            {
-              type: 'text',
-              text: `Error: ${error.message}\n${error.stack}`,
-            },
-          ],
-          isError: true,
-        };
       }
-    });
+    );
+
+    this.server.registerTool(
+      'testbot_test_my_app',
+      {
+        description: 'Test your application end-to-end with AI-powered analysis. Generates tests, runs them, analyzes failures with AI, and opens a beautiful dashboard with results. Returns immediately with a run ID — the pipeline runs in the background and posts results to the dashboard when complete. For best results, run testbot_configure first to get recommended settings.',
+        inputSchema: z.object({
+          projectPath: z.string().optional().describe('Path to the project to test (defaults to current workspace)'),
+          testType: z.enum(['frontend', 'backend', 'both']).optional().describe('Type of tests to run'),
+          generateTests: z.boolean().optional().describe('Whether to generate new tests (true) or use existing tests (false)'),
+          prdFile: z.string().optional().describe('Path to PRD/requirements document for test generation (optional)'),
+          codebaseContext: z.object({
+            pages: z.array(z.any()).optional().describe('Frontend pages/routes with their components and interactions'),
+            apiEndpoints: z.array(z.any()).optional().describe('Backend API endpoints with methods and schemas'),
+            workflows: z.array(z.string()).optional().describe('Main user workflows to test'),
+          }).optional().describe('Structured codebase context from AI agent analysis (pages, apiEndpoints, workflows)'),
+          baseURL: z.string().optional().describe('Base URL for the application under test'),
+          port: z.number().optional().describe('Port number the app runs on'),
+          startCommand: z.string().optional().describe('Command to start the app server (e.g., "npm start")'),
+          jira: z.object({
+            enabled: z.boolean().optional(),
+            baseUrl: z.string().optional(),
+            email: z.string().optional(),
+            apiToken: z.string().optional(),
+            projectKey: z.string().optional(),
+          }).optional().describe('Jira integration configuration'),
+          openDashboard: z.boolean().optional().describe('Whether to automatically open the dashboard after tests (default: true)'),
+        }),
+      },
+      async (args, extra) => {
+        console.error('[DEBUG] testbot_test_my_app called with args:', JSON.stringify(args));
+        Logger.mcp('Index', `Tool called: testbot_test_my_app`, { args });
+        try {
+          const result = await this.handleTestMyApp(args);
+          console.error('[DEBUG] testbot_test_my_app returning result');
+          return result;
+        } catch (error) {
+          console.error('[DEBUG] testbot_test_my_app error:', error.message);
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `Error: ${error.message}\n${error.stack}`,
+              },
+            ],
+            isError: true,
+          };
+        }
+      }
+    );
+
+    this.server.registerTool(
+      'testbot_analyze_failures',
+      {
+        description: 'Analyze existing test failures with AI without running new tests',
+        inputSchema: z.object({
+          projectPath: z.string().describe('Path to the project'),
+          testResultsPath: z.string().optional().describe('Path to test-results.json file'),
+          aiProvider: z.enum(['sarvam', 'cascade', 'windsurf']).optional().describe('AI provider for failure analysis'),
+        }),
+      },
+      async (args, extra) => {
+        Logger.mcp('Index', `Tool called: testbot_analyze_failures`, { args });
+        try {
+          return await this.handleAnalyzeFailures(args);
+        } catch (error) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `Error: ${error.message}\n${error.stack}`,
+              },
+            ],
+            isError: true,
+          };
+        }
+      }
+    );
+
+    this.server.registerTool(
+      'testbot_generate_report',
+      {
+        description: 'Generate a dashboard report from existing test results',
+        inputSchema: z.object({
+          projectPath: z.string().describe('Path to the project'),
+          testResultsPath: z.string().optional().describe('Path to test-results.json file'),
+          openDashboard: z.boolean().optional().describe('Whether to automatically open the dashboard'),
+        }),
+      },
+      async (args, extra) => {
+        Logger.mcp('Index', `Tool called: testbot_generate_report`, { args });
+        try {
+          return await this.handleGenerateReport(args);
+        } catch (error) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `Error: ${error.message}\n${error.stack}`,
+              },
+            ],
+            isError: true,
+          };
+        }
+      }
+    );
   }
 
   setupErrorHandling() {
-    this.server.onerror = (error) => {
-      console.error('[Testbot MCP Error]', error);
-    };
+    process.on('uncaughtException', (error) => {
+      Logger.error('Index', `[Testbot MCP Uncaught Exception]`, error);
+    });
+
+    process.on('unhandledRejection', (reason, promise) => {
+      Logger.error('Index', `[Testbot MCP Unhandled Rejection]`, { reason, promise });
+    });
 
     process.on('SIGINT', async () => {
       await this.server.close();
@@ -268,29 +232,27 @@ class TestbotMCPServer {
    * Configure tool: Analyze project and return configuration options
    */
   async handleConfigure(params) {
-    const log = (msg) => console.error(`[Testbot] ${msg}`);
-    const fs = require('fs');
-    const path = require('path');
+    Logger.mcp('Index', 'handleConfigure called', { params });
 
     try {
       const projectPath = params.projectPath || process.cwd();
 
-      log('Analyzing project for configuration...');
+      Logger.info('Index', 'Analyzing project for configuration...');
 
       // 1. Auto-detect project settings
       const detector = new AutoDetector();
       const context = await detector.detect(projectPath);
 
-      log(`Detected project: ${context.projectName} (${context.language})`);
-      log(`Framework detection: ${context.hasPlaywright ? 'Playwright found' : 'No Playwright config'}`);
+      Logger.info('Index', `Detected project: ${context.projectName} (${context.language})`);
+      Logger.info('Index', `Framework detection: ${context.hasPlaywright ? 'Playwright found' : 'No Playwright config'}`);
 
       // 2. Scan for existing tests
       const existingTests = this.scanExistingTests(projectPath);
-      log(`Found ${existingTests.count} existing test files`);
+      Logger.info('Index', `Found ${existingTests.count} existing test files`);
 
       // 3. Check for PRD/requirements files
       const prdFiles = this.findPRDFiles(projectPath);
-      log(`Found ${prdFiles.length} potential PRD files`);
+      Logger.info('Index', `Found ${prdFiles.length} potential PRD files`);
 
       // 4. Check for Jira configuration
       const hasJiraConfig = context.hasJira || !!(
@@ -401,7 +363,7 @@ class TestbotMCPServer {
         ],
       };
     } catch (error) {
-      log(`Configuration error: ${error.message}`);
+      Logger.error('Index', `Configuration error`, error);
       throw error;
     }
   }
@@ -588,15 +550,14 @@ Return the JSON structure above based on what you find in the codebase.
    * Returns immediately and runs the pipeline in a background worker.
    */
   async handleTestMyApp(params) {
-    const log = (msg) => console.error(`[Testbot] ${msg}`);
+    Logger.mcp('Index', 'handleTestMyApp called', { params });
 
     // 1. Fast auto-detection (~100ms)
-    log('Detecting project settings...');
+    Logger.info('Index', 'Detecting project settings...');
     const detector = new AutoDetector();
     const context = await detector.detect(params.projectPath || process.cwd());
 
-    log(`Project: ${context.projectName} (${context.language})`);
-    log(`Path: ${context.projectPath}`);
+    Logger.info('Index', `Project: ${context.projectName} (${context.language})`, { path: context.projectPath });
 
     // 2. Merge params with detected context
     const config = {
@@ -634,7 +595,7 @@ Return the JSON structure above based on what you find in the codebase.
     );
 
     // 4. Fork the background worker
-    log(`Starting pipeline in background (runId: ${runId})...`);
+    Logger.info('Index', `Starting pipeline in background (runId: ${runId})...`);
     this.runPipelineInBackground(config, runId);
 
     // 5. Return immediately with status
@@ -670,13 +631,13 @@ Return the JSON structure above based on what you find in the codebase.
    * Analyze existing test failures
    */
   async handleAnalyzeFailures(params) {
-    const log = (msg) => console.error(`[Testbot] ${msg}`);
+    Logger.mcp('Index', 'handleAnalyzeFailures called', { params });
 
     const projectPath = params.projectPath || process.cwd();
     const testResultsPath = params.testResultsPath || `${projectPath}/test-results.json`;
     const aiProvider = params.aiProvider || process.env.AI_PROVIDER || 'sarvam';
 
-    log(`Analyzing failures in ${testResultsPath}...`);
+    Logger.info('Index', `Analyzing failures in ${testResultsPath}...`);
 
     const playwright = new PlaywrightIntegration({ projectPath });
     const testResults = await playwright.loadTestResults(testResultsPath);
@@ -713,12 +674,12 @@ Return the JSON structure above based on what you find in the codebase.
    * Generate report from existing test results
    */
   async handleGenerateReport(params) {
-    const log = (msg) => console.error(`[Testbot] ${msg}`);
+    Logger.mcp('Index', 'handleGenerateReport called', { params });
 
     const projectPath = params.projectPath || process.cwd();
     const testResultsPath = params.testResultsPath || `${projectPath}/test-results.json`;
 
-    log(`Generating report from ${testResultsPath}...`);
+    Logger.info('Index', `Generating report from ${testResultsPath}...`);
 
     const playwright = new PlaywrightIntegration({ projectPath });
     const testResults = await playwright.loadTestResults(testResultsPath);
@@ -756,7 +717,7 @@ Return the JSON structure above based on what you find in the codebase.
   async start() {
     const transport = new StdioServerTransport();
     await this.server.connect(transport);
-    console.error('Testbot MCP server started');
+    Logger.info('Index', 'Testbot MCP server started');
   }
 }
 

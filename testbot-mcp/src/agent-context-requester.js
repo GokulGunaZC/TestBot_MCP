@@ -8,6 +8,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const Logger = require('./logger');
 
 class AgentContextRequester {
   constructor(config = {}) {
@@ -152,7 +153,7 @@ Please provide as much detail as you can discover from analyzing the codebase.`;
     const promptPath = path.join(promptDir, 'context-request.md');
     
     fs.writeFileSync(promptPath, prompt, 'utf-8');
-    console.error(`[AgentRequester] Saved context request to: ${promptPath}`);
+    Logger.info('AgentContextRequester', `Saved context request`, { promptPath });
     
     // Also create an empty response file
     const responsePath = path.join(promptDir, 'context-response.json');
@@ -174,7 +175,7 @@ Please provide as much detail as you can discover from analyzing the codebase.`;
     const startTime = Date.now();
     const pollInterval = 2000; // 2 seconds
     
-    console.error(`[AgentRequester] Waiting for agent response (timeout: ${timeout}ms)...`);
+    Logger.info('AgentContextRequester', `Waiting for agent response`, { timeoutMs: timeout });
     
     while (Date.now() - startTime < timeout) {
       try {
@@ -184,7 +185,7 @@ Please provide as much detail as you can discover from analyzing the codebase.`;
         // Check if response has meaningful content
         if (parsed && Object.keys(parsed).length > 0 && 
             (parsed.mainUserWorkflows || parsed.criticalBusinessLogic || parsed.apiContractsToTest)) {
-          console.error('[AgentRequester] Received agent response');
+          Logger.info('AgentContextRequester', 'Received agent response');
           return parsed;
         }
       } catch (error) {
@@ -195,7 +196,7 @@ Please provide as much detail as you can discover from analyzing the codebase.`;
       await new Promise(resolve => setTimeout(resolve, pollInterval));
     }
     
-    console.error('[AgentRequester] Timeout waiting for agent response');
+    Logger.warn('AgentContextRequester', 'Timeout waiting for agent response');
     return null;
   }
 
@@ -206,9 +207,9 @@ Please provide as much detail as you can discover from analyzing the codebase.`;
   async requestContext(autoContext = {}) {
     const { promptPath, responsePath } = await this.savePromptFile(autoContext);
     
-    console.error('[AgentRequester] Context request saved. Waiting for AI agent to respond...');
-    console.error(`[AgentRequester] The agent should read: ${promptPath}`);
-    console.error(`[AgentRequester] And write response to: ${responsePath}`);
+    Logger.info('AgentContextRequester', 'Context request saved. Waiting for AI agent to respond...');
+    Logger.debug('AgentContextRequester', `Agent read path`, { promptPath });
+    Logger.debug('AgentContextRequester', `Agent write path`, { responsePath });
     
     // Wait for response (with shorter timeout since this may not be used)
     const response = await this.waitForResponse(responsePath, 10000); // 10 second quick check

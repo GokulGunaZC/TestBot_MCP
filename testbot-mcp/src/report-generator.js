@@ -5,6 +5,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const Logger = require('./logger');
 
 class ReportGenerator {
   /**
@@ -16,7 +17,7 @@ class ReportGenerator {
 
     // Validate and normalize test results
     if (!testResults) {
-      console.warn('[Report] No test results provided, creating empty report');
+      Logger.warn('ReportGenerator', 'No test results provided, creating empty report');
       testResults = {
         total: 0,
         passed: 0,
@@ -34,9 +35,13 @@ class ReportGenerator {
     }
 
     // Log what we're generating
-    console.error(`[Report] Generating report for: ${projectName || path.basename(projectPath)}`);
-    console.error(`[Report] Test results: ${testResults.total} total, ${testResults.passed} passed, ${testResults.failed} failed`);
-    console.error(`[Report] Tests array length: ${testResults.tests.length}`);
+    Logger.info('ReportGenerator', `Generating report`, { 
+      project: projectName || path.basename(projectPath),
+      total: testResults.total,
+      passed: testResults.passed,
+      failed: testResults.failed,
+      testsLength: testResults.tests.length
+    });
 
     // Ensure reports directory exists
     if (!fs.existsSync(reportsDir)) {
@@ -76,8 +81,7 @@ class ReportGenerator {
     const latestPath = path.join(reportsDir, 'latest.json');
     fs.writeFileSync(latestPath, JSON.stringify(report, null, 2), 'utf-8');
 
-    console.error(`[Report] Saved: ${reportPath}`);
-    console.error(`[Report] Latest: ${latestPath}`);
+    Logger.info('ReportGenerator', `Report saved`, { path: reportPath, latest: latestPath });
 
     // Copy artifacts if present
     await this.copyArtifacts(testResults, reportsDir);
@@ -89,7 +93,7 @@ class ReportGenerator {
     let dashboardLink = `file://${reportPath}`;
     if (arguments[0].api_key && arguments[0].dashboard_url) {
       try {
-        console.error(`[Report] Syncing to dashboard at ${arguments[0].dashboard_url}...`);
+        Logger.info('ReportGenerator', `Syncing to dashboard`, { url: arguments[0].dashboard_url });
         
         // Remove file.io integration
         
@@ -108,12 +112,12 @@ class ReportGenerator {
         if (syncResponse.ok) {
           const syncData = await syncResponse.json();
           dashboardLink = `${arguments[0].dashboard_url}${syncData.dashboard_url}`;
-          console.error(`[Report] Successfully synced to dashboard!`);
+          Logger.info('ReportGenerator', `Successfully synced to dashboard!`);
         } else {
-          console.error(`[Report] Failed to sync to dashboard: HTTP ${syncResponse.status}`);
+          Logger.error('ReportGenerator', `Failed to sync to dashboard`, new Error(`HTTP ${syncResponse.status}`));
         }
       } catch (syncError) {
-        console.error(`[Report] Failed to sync to dashboard: ${syncError.message}`);
+        Logger.error('ReportGenerator', `Failed to sync to dashboard`, syncError);
       }
     }
 
@@ -266,7 +270,7 @@ class ReportGenerator {
             // Update artifact path to point to new location
             artifact.path = path.relative(reportsDir, destPath);
           } catch (error) {
-            console.error(`[Report] Failed to copy ${type}: ${error.message}`);
+            Logger.error('ReportGenerator', `Failed to copy artifact`, error, { type, path: actualPath });
           }
         }
       }
@@ -303,19 +307,19 @@ class ReportGenerator {
     // Scan playwright-mcp-output directory if it exists
     const mcpOutputDir = path.join(path.dirname(reportsDir), 'playwright-mcp-output');
     if (fs.existsSync(mcpOutputDir)) {
-      console.error(`[Report] Scanning MCP output directory: ${mcpOutputDir}`);
+      Logger.debug('ReportGenerator', `Scanning MCP output directory`, { dir: mcpOutputDir });
       artifactsCopied += await this.scanAndCopyMCPArtifacts(mcpOutputDir, artifactsDir);
     }
 
     // Scan test-results directory for any remaining artifacts
     const testResultsDir = path.join(path.dirname(reportsDir), 'test-results');
     if (fs.existsSync(testResultsDir)) {
-      console.error(`[Report] Scanning test-results directory: ${testResultsDir}`);
+      Logger.debug('ReportGenerator', `Scanning test-results directory`, { dir: testResultsDir });
       artifactsCopied += await this.scanAndCopyTestResultsArtifacts(testResultsDir, artifactsDir);
     }
 
     if (artifactsCopied > 0) {
-      console.error(`[Report] Copied ${artifactsCopied} artifacts total`);
+      Logger.info('ReportGenerator', `Copied artifacts`, { count: artifactsCopied });
     }
   }
 
@@ -360,14 +364,14 @@ class ReportGenerator {
                   fs.copyFileSync(fullPath, destPath);
                   copied++;
                 } catch (error) {
-                  console.error(`[Report] Failed to copy MCP artifact: ${error.message}`);
+                  Logger.error('ReportGenerator', `Failed to copy MCP artifact`, error, { file: entry.name });
                 }
               }
             }
           }
         }
       } catch (error) {
-        console.error(`[Report] Error scanning MCP directory: ${error.message}`);
+        Logger.error('ReportGenerator', `Error scanning MCP directory`, error, { dir: mcpDir });
       }
     };
     
@@ -416,14 +420,14 @@ class ReportGenerator {
                   fs.copyFileSync(fullPath, destPath);
                   copied++;
                 } catch (error) {
-                  console.error(`[Report] Failed to copy test-results artifact: ${error.message}`);
+                  Logger.error('ReportGenerator', `Failed to copy test-results artifact`, error, { file: entry.name });
                 }
               }
             }
           }
         }
       } catch (error) {
-        console.error(`[Report] Error scanning test-results directory: ${error.message}`);
+        Logger.error('ReportGenerator', `Error scanning test-results directory`, error, { dir: testResultsDir });
       }
     };
     
@@ -452,7 +456,7 @@ class ReportGenerator {
       }
       
       if (!sourceReportDir) {
-        console.error('[Report] No Playwright HTML report found to copy');
+        Logger.debug('ReportGenerator', 'No Playwright HTML report found to copy');
         return;
       }
       
@@ -466,9 +470,9 @@ class ReportGenerator {
       // Copy the entire report directory
       this.copyDirectoryRecursive(sourceReportDir, destReportDir);
       
-      console.error(`[Report] Copied Playwright HTML report from ${sourceReportDir} to ${destReportDir}`);
+      Logger.info('ReportGenerator', `Copied Playwright HTML report`, { from: sourceReportDir, to: destReportDir });
     } catch (error) {
-      console.error(`[Report] Failed to copy Playwright HTML report: ${error.message}`);
+      Logger.error('ReportGenerator', `Failed to copy Playwright HTML report`, error);
     }
   }
   

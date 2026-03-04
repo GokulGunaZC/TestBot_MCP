@@ -21,6 +21,7 @@
   "author": "",
   "license": "MIT",
   "devDependencies": {
-    "@playwright/mcp": "^0.0.61"
+    "@playwright/mcp": "^0.0.61",
+    "@playwright/test": "^1.58.2"
   }
 }

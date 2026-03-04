@@ -4,6 +4,7 @@
  */
 
 const fetch = require('node-fetch');
+const Logger = require('../logger');
 
 class SarvamClient {
   constructor(config = {}) {
@@ -31,20 +32,20 @@ class SarvamClient {
    * @returns {Promise<Array>} Analysis results
    */
   async analyzeFailures(failures) {
-    console.error(`[Sarvam] Analyzing ${failures.length} failures...`);
+    Logger.info('SarvamClient', `Analyzing failures`, { count: failures.length });
 
     const results = [];
 
     for (let i = 0; i < failures.length; i++) {
       const failure = failures[i];
-      console.error(`[Sarvam] [${i + 1}/${failures.length}] Analyzing: ${failure.testName}`);
+      Logger.info('SarvamClient', `Analyzing failure`, { index: i + 1, total: failures.length, testName: failure.testName });
 
       try {
         const analysis = await this.analyzeFailure(failure);
         results.push(analysis);
-        console.error(`[Sarvam] Complete (confidence: ${analysis.confidence})`);
+        Logger.info('SarvamClient', `Analysis complete`, { confidence: analysis.confidence });
       } catch (error) {
-        console.error(`[Sarvam] Failed: ${error.message}`);
+        Logger.error('SarvamClient', `Analysis failed`, error);
         results.push({
           failure,
           analysis: `Analysis failed: ${error.message}`,
@@ -55,7 +56,7 @@ class SarvamClient {
       }
     }
 
-    console.error(`[Sarvam] Analysis complete: ${results.length} failures analyzed`);
+    Logger.info('SarvamClient', `Analysis complete`, { count: results.length });
     return results;
   }
 
@@ -232,7 +233,7 @@ IMPORTANT: Return ONLY the JSON object, no markdown formatting, no explanations 
         throw new Error('No valid JSON found in response');
       }
     } catch (error) {
-      console.error('[Sarvam] Failed to parse response:', error.message);
+      Logger.error('SarvamClient', 'Failed to parse response', error);
 
       // Return default low-confidence response
       return {

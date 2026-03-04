@@ -28,8 +28,10 @@ const JiraClient = require('./jira/client');
 const ReportGenerator = require('./report-generator');
 const DashboardLauncher = require('./dashboard-launcher');
 const AgentContextRequester = require('./agent-context-requester');
+const Logger = require('./logger');
 
-const log = (msg) => process.stderr.write(`[Testbot Worker] ${msg}\n`);
+// Initialize logger for the worker process
+Logger.initialize();
 
 /**
  * Write status update to disk so the caller can track progress.
@@ -45,7 +47,7 @@ function updateStatus(statusDir, phase, data) {
       }, null, 2)
     );
   } catch (e) {
-    log(`Failed to write status: ${e.message}`);
+    Logger.error('PipelineWorker', `Failed to write status`, e);
   }
 }
 
@@ -61,6 +63,7 @@ async function runPipeline(config, runId) {
     message: 'Pipeline started',
     project: config.projectName,
   });
+  Logger.info('PipelineWorker', `Pipeline started`, { runId, project: config.projectName });
 
   try {
     // -------------------------------------------------------
@@ -69,10 +72,10 @@ async function runPipeline(config, runId) {
     let jiraStories = null;
     if (config.jira?.enabled) {
       updateStatus(statusDir, 'jira', { runId, message: 'Fetching Jira stories...' });
-      log('Fetching Jira stories...');
+      Logger.info('PipelineWorker', 'Fetching Jira stories...');
       const jiraClient = new JiraClient(config.jira);
       jiraStories = await jiraClient.fetchActiveStories();
-      log(`Found ${jiraStories.length} active stories`);
+      Logger.info('PipelineWorker', `Found ${jiraStories.length} active stories`);
     }
 
     // -------------------------------------------------------
@@ -81,13 +84,16 @@ async function runPipeline(config, runId) {
     let codebaseContext = config.codebaseContext;
     if (config.generateTests && !codebaseContext) {
       updateStatus(statusDir, 'context', { runId, message: 'Gathering codebase context...' });
-      log('Gathering codebase context automatically...');
+      Logger.info('PipelineWorker', 'Gathering codebase context automatically...');
       const contextGatherer = new ContextGatherer({
         projectPath: config.projectPath,
         language: config.language,
       });
       codebaseContext = await contextGatherer.gatherRichContext();
-      log(`Found ${codebaseContext.pages?.length || 0} pages, ${codebaseContext.apiEndpoints?.length || 0} API endpoints`);
+      Logger.info('PipelineWorker', `Codebase context gathered`, {
+        pages: codebaseContext.pages?.length || 0,
+        endpoints: codebaseContext.apiEndpoints?.length || 0
+      });
     }
 
     // -------------------------------------------------------
@@ -97,9 +103,9 @@ async function runPipeline(config, runId) {
     if (config.prdFile) {
       try {
         prdContent = fs.readFileSync(config.prdFile, 'utf-8');
-        log(`Read PRD file: ${config.prdFile}`);
+        Logger.info('PipelineWorker', `Read PRD file`, { path: config.prdFile });
       } catch (error) {
-        log(`Could not read PRD file: ${error.message}`);
+        Logger.error('PipelineWorker', `Could not read PRD file`, error);
       }
     }
 
@@ -108,7 +114,7 @@ async function runPipeline(config, runId) {
     // -------------------------------------------------------
     if (config.generateTests) {
       updateStatus(statusDir, 'generating', { runId, message: 'Generating tests...' });
-      log('Generating tests...');
+      Logger.info('PipelineWorker', 'Generating tests via PlaywrightMCPClient...');
 
       // Always generate via template-based generation
       const playwrightMCP = new PlaywrightMCPClient(config);
@@ -118,13 +124,13 @@ async function runPipeline(config, runId) {
         projectPath: config.projectPath,
         prdFile: config.prdFile,
       });
-      log(`Generated ${generationResult.generated} test files via templates`);
+      Logger.info('PipelineWorker', `Generated test files via templates`, { count: generationResult.generated });
 
       // Also try SaaS backend if API key is set
       const testbotApiKey = process.env.TESTBOT_API_KEY;
       const dashboardUrl = process.env.TESTBOT_DASHBOARD_URL || 'http://localhost:3000';
       if (testbotApiKey && codebaseContext) {
-        log('Also generating tests via TestBot backend...');
+        Logger.info('PipelineWorker', 'Also generating tests via TestBot backend...');
         try {
           const fetch = require('node-fetch');
           const genResponse = await fetch(`${dashboardUrl}/api/generate-tests`, {
@@ -146,7 +152,7 @@ async function runPipeline(config, runId) {
           if (genResponse.ok) {
             const genData = await genResponse.json();
             const generatedTests = genData.tests || [];
-            log(`Received ${generatedTests.length} test file(s) from TestBot backend`);
+            Logger.info('PipelineWorker', `Received test files from TestBot backend`, { count: generatedTests.length });
 
             const testsDir = path.join(config.projectPath, 'tests', 'generated');
             if (!fs.existsSync(testsDir)) {
@@ -155,19 +161,19 @@ async function runPipeline(config, runId) {
             for (const test of generatedTests) {
               const filePath = path.join(testsDir, test.filename);
               fs.writeFileSync(filePath, test.content, 'utf-8');
-              log(`  Wrote: ${test.filename} (${test.type})`);
+              Logger.info('PipelineWorker', `Wrote backend generated test`, { filename: test.filename, type: test.type });
             }
           } else {
-            log(`TestBot backend generation failed: HTTP ${genResponse.status}`);
+            Logger.warn('PipelineWorker', `TestBot backend generation failed`, { status: genResponse.status });
           }
         } catch (e) {
-          log(`TestBot backend generation error: ${e.message}`);
+          Logger.error('PipelineWorker', `TestBot backend generation error`, e);
         }
       }
 
       // Generate from Jira stories if available
       if (jiraStories && jiraStories.length > 0) {
-        log('Generating tests from Jira stories...');
+        Logger.info('PipelineWorker', 'Generating tests from Jira stories...');
         const playwright = new PlaywrightIntegration(config);
         await playwright.generateTests({
           prdFile: config.prdFile,
@@ -181,7 +187,7 @@ async function runPipeline(config, runId) {
     // 5. Run tests
     // -------------------------------------------------------
     updateStatus(statusDir, 'running', { runId, message: 'Running Playwright tests...' });
-    log('Running tests...');
+    Logger.info('PipelineWorker', 'Running Playwright tests...');
 
     const playwright = new PlaywrightIntegration(config);
 
@@ -191,7 +197,7 @@ async function runPipeline(config, runId) {
     let testResults;
 
     if (mcpParallelEnabled) {
-      log('Parallel execution enabled - running TestBot + Playwright MCP...');
+      Logger.info('PipelineWorker', 'Parallel execution enabled - running TestBot + Playwright MCP...');
       const playwrightMCPIntegration = new PlaywrightMCPIntegration({
         projectPath: config.projectPath,
         baseURL: config.baseURL,
@@ -202,8 +208,10 @@ async function runPipeline(config, runId) {
         playwrightMCPIntegration.runTests()
       ]);
 
-      log(`Direct execution: ${directResults.total} tests`);
-      log(`MCP execution: ${mcpResults.available !== false ? mcpResults.total : 'unavailable'} tests`);
+      Logger.info('PipelineWorker', `Test execution finished`, {
+        directExecution: directResults.total,
+        mcpExecution: mcpResults.available !== false ? mcpResults.total : 'unavailable'
+      });
 
       const merger = new ResultsMerger({ projectPath: config.projectPath });
       testResults = merger.mergeResults(directResults, mcpResults);
@@ -211,7 +219,11 @@ async function runPipeline(config, runId) {
       testResults = await playwright.runTests();
     }
 
-    log(`Tests completed: ${testResults.total} total, ${testResults.passed} passed, ${testResults.failed} failed`);
+    Logger.info('PipelineWorker', `Tests completed`, { 
+      total: testResults.total, 
+      passed: testResults.passed, 
+      failed: testResults.failed 
+    });
 
     updateStatus(statusDir, 'tests_complete', {
       runId,
@@ -229,16 +241,16 @@ async function runPipeline(config, runId) {
     // 6. Generate report
     // -------------------------------------------------------
     updateStatus(statusDir, 'reporting', { runId, message: 'Generating report...' });
-    log('Generating report...');
+    Logger.info('PipelineWorker', 'Generating report...');
 
     const reportGen = new ReportGenerator();
     const testbotApiKey = process.env.TESTBOT_API_KEY;
     const testbotDashboardUrl = process.env.TESTBOT_DASHBOARD_URL || 'http://localhost:3000';
 
     if (testbotApiKey) {
-      log(`Dashboard sync enabled — will post results to ${testbotDashboardUrl}`);
+      Logger.info('PipelineWorker', `Dashboard sync enabled`, { url: testbotDashboardUrl });
     } else {
-      log('TESTBOT_API_KEY not set — skipping web dashboard sync');
+      Logger.info('PipelineWorker', 'TESTBOT_API_KEY not set — skipping web dashboard sync');
     }
 
     const report = await reportGen.generate({
@@ -256,11 +268,11 @@ async function runPipeline(config, runId) {
     // -------------------------------------------------------
     let dashboardUrl = null;
     if (config.openDashboard) {
-      log('Opening dashboard...');
+      Logger.info('PipelineWorker', 'Opening dashboard...');
       try {
         dashboardUrl = await DashboardLauncher.open(report.path);
       } catch (e) {
-        log(`Dashboard open failed: ${e.message}`);
+        Logger.error('PipelineWorker', 'Dashboard open failed', e);
         dashboardUrl = report.url || `file://${report.path}`;
       }
     }
@@ -287,12 +299,10 @@ async function runPipeline(config, runId) {
       dashboardUrl: dashboardUrl || report.url,
     });
 
-    log(`Pipeline complete. Report: ${report.path}`);
-    log(`Dashboard: ${dashboardUrl || report.url}`);
+    Logger.info('PipelineWorker', `Pipeline complete`, { report: report.path, dashboard: dashboardUrl || report.url });
 
   } catch (error) {
-    log(`Pipeline error: ${error.message}`);
-    log(error.stack);
+    Logger.error('PipelineWorker', `Pipeline error`, error);
 
     updateStatus(statusDir, 'error', {
       runId,
@@ -316,7 +326,7 @@ process.on('message', (msg) => {
   runPipeline(config, runId)
     .then(() => process.exit(0))
     .catch((err) => {
-      log(`Fatal error: ${err.message}`);
+      Logger.error('PipelineWorker', `Fatal error`, err);
       process.exit(1);
     });
 });
