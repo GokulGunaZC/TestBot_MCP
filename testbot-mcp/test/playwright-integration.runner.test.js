@@ -63,3 +63,38 @@ test('runPlaywrightCommand can list generated tests in project without local @pl
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
 });
+
+test('normalizeStartCommandForHeadlessWeb upgrades Expo start command to web + non-interactive flags', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'testbot-playwright-expo-cmd-'));
+  fs.writeFileSync(
+    path.join(tempDir, 'package.json'),
+    JSON.stringify({
+      name: 'expo-app',
+      scripts: {
+        start: 'expo start',
+        web: 'expo start --web',
+      },
+      dependencies: {
+        expo: '^54.0.0',
+      },
+    }, null, 2),
+    'utf8'
+  );
+
+  try {
+    const integration = new PlaywrightIntegration({
+      projectPath: tempDir,
+      baseURL: 'http://localhost:8081',
+      port: 8081,
+      testType: 'frontend',
+      startCommand: 'npm run start',
+    });
+
+    const command = integration.normalizeStartCommandForHeadlessWeb('npm run start');
+    assert.match(command, /^npm run web\b/i);
+    assert.match(command, /--port 8081/i);
+    assert.match(command, /--non-interactive/i);
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});

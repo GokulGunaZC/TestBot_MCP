@@ -7,6 +7,10 @@ const fs = require('fs');
 const {
   generateWithFallbackChain,
   evaluateGenerationQualityGates,
+  collectGenerationQuality,
+  auditGeneratedTestQuality,
+  classifyErrorCode,
+  buildUserFacingPipelineError,
 } = require('../src/pipeline-worker');
 
 function createRunBudget() {
@@ -149,6 +153,123 @@ test('generation quality gates adapt to API-only context even when testType is b
   assert.equal(gate.ok, true);
 });
 
+test('collectGenerationQuality detects API categories from explicit CAT tags', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'testbot-pipeline-quality-tags-'));
+
+  try {
+    const generatedDir = path.join(tempDir, 'tests', 'generated');
+    fs.mkdirSync(generatedDir, { recursive: true });
+    fs.writeFileSync(path.join(generatedDir, 'api-contract-tags.spec.ts'), `import { test, expect } from '@playwright/test';
+
+test('[CAT:api_contract] [CAT:api_negative] [CAT:api_stress] tagged api checks', async ({ request }) => {
+  const response = await request.get('/api/health');
+  const status = response.status();
+  expect([200, 400, 404]).toContain(status);
+  expect(status).toBeLessThan(500);
+});
+`, 'utf8');
+
+    const quality = collectGenerationQuality(tempDir);
+    assert.equal(quality.totalTests, 1);
+    assert.equal(quality.categories.api_contract > 0, true);
+    assert.equal(quality.categories.api_negative > 0, true);
+    assert.equal(quality.categories.api_stress > 0, true);
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('auditGeneratedTestQuality treats page.route mocks as warning (not hard failure)', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'testbot-pipeline-audit-route-'));
+
+  try {
+    const generatedDir = path.join(tempDir, 'tests', 'generated');
+    fs.mkdirSync(generatedDir, { recursive: true });
+    fs.writeFileSync(path.join(generatedDir, 'workflow.spec.ts'), `import { test, expect } from '@playwright/test';
+test('workflow route mock', async ({ page }) => {
+  await page.route('**/api/customer/**', (route) => route.fulfill({ status: 200, body: '{}' }));
+  await page.goto('/');
+  await expect(page.getByRole('main').first()).toBeVisible();
+});
+`, 'utf8');
+
+    const audit = auditGeneratedTestQuality({
+      projectPath: tempDir,
+      testType: 'frontend',
+      context: { pages: [{ path: '/' }], forms: [], workflows: [] },
+    });
+
+    assert.equal(audit.valid, true);
+    assert.equal(audit.riskyPatternHits, 0);
+    assert.equal(audit.warnings.some((warning) => warning.startsWith('uses_route_mocking:')), true);
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('auditGeneratedTestQuality treats ungrounded generic error phrases as warnings by default', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'testbot-pipeline-audit-phrase-'));
+  const priorEnv = process.env.TESTBOT_ENFORCE_PHRASE_RISK_GATES;
+  delete process.env.TESTBOT_ENFORCE_PHRASE_RISK_GATES;
+
+  try {
+    const generatedDir = path.join(tempDir, 'tests', 'generated');
+    fs.mkdirSync(generatedDir, { recursive: true });
+    fs.writeFileSync(path.join(generatedDir, 'workflow-phrase.spec.ts'), `import { test, expect } from '@playwright/test';
+test('workflow generic error phrase', async ({ page }) => {
+  await page.goto('/');
+  await expect(page.getByText(/try again/i).first()).toBeVisible();
+});
+`, 'utf8');
+
+    const audit = auditGeneratedTestQuality({
+      projectPath: tempDir,
+      testType: 'frontend',
+      context: { pages: [{ path: '/' }], forms: [], workflows: [] },
+    });
+
+    assert.equal(audit.valid, true);
+    assert.equal(audit.riskyPatternHits, 0);
+    assert.equal(audit.warnings.some((warning) => warning.startsWith('ungrounded_error_phrase:')), true);
+  } finally {
+    if (priorEnv === undefined) {
+      delete process.env.TESTBOT_ENFORCE_PHRASE_RISK_GATES;
+    } else {
+      process.env.TESTBOT_ENFORCE_PHRASE_RISK_GATES = priorEnv;
+    }
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('auditGeneratedTestQuality treats checkValidity assertions as warning (not hard failure)', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'testbot-pipeline-audit-check-validity-'));
+
+  try {
+    const generatedDir = path.join(tempDir, 'tests', 'generated');
+    fs.mkdirSync(generatedDir, { recursive: true });
+    fs.writeFileSync(path.join(generatedDir, 'form-validation.spec.ts'), `import { test, expect } from '@playwright/test';
+test('form validation', async ({ page }) => {
+  await page.goto('/');
+  const input = page.getByRole('textbox').first();
+  const isInvalid = await input.evaluate((el) => !el.checkValidity());
+  expect(typeof isInvalid).toBe('boolean');
+});
+`, 'utf8');
+
+    const audit = auditGeneratedTestQuality({
+      projectPath: tempDir,
+      testType: 'frontend',
+      context: { pages: [{ path: '/' }], forms: [{ fields: [{ label: 'Email' }] }], workflows: [] },
+    });
+
+    assert.equal(audit.valid, true);
+    assert.equal(audit.riskyPatternHits, 0);
+    assert.equal(audit.warnings.some((warning) => warning.startsWith('uses_check_validity:')), true);
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
 test('generation quality gates do not force workflow category for single inferred workflow without form context', () => {
   const gate = evaluateGenerationQualityGates({
     config: {
@@ -181,4 +302,15 @@ test('generation quality gates do not force workflow category for single inferre
   });
 
   assert.equal(gate.ok, true);
+});
+
+test('classifyErrorCode maps Expo dependency validation startup failures', () => {
+  const error = new Error('Playwright execution failed with exit code 1: [WebServer] The following packages should be updated for best compatibility with the installed expo version');
+  assert.equal(classifyErrorCode(error), 'EXPO_DEPENDENCY_VALIDATION_FAILED');
+});
+
+test('buildUserFacingPipelineError returns actionable Expo dependency guidance', () => {
+  const message = buildUserFacingPipelineError('EXPO_DEPENDENCY_VALIDATION_FAILED', new Error('expo dependency validation failed'));
+  assert.match(message, /Expo blocked server startup/i);
+  assert.match(message, /expo install --check/i);
 });

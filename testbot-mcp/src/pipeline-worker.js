@@ -179,7 +179,7 @@ function templatesEmergencyEnabled() {
 
 function countTestsInContent(content) {
   if (!content) return 0;
-  const matches = String(content).match(/\b(?:test|it)\s*\(/g);
+  const matches = String(content).match(/\b(?:test|it)(?:\.(?:only|skip|fixme|fail|slow|todo))?\s*\(\s*(['"`])/g);
   return matches ? matches.length : 0;
 }
 
@@ -202,11 +202,51 @@ function toCoverageProfile(value) {
   return 'qa-max';
 }
 
+function extractCategoryTags(content) {
+  const text = String(content || '');
+  const categories = new Set();
+  const aliases = {
+    ui: 'ui_flow',
+    uiflow: 'ui_flow',
+    ui_flow: 'ui_flow',
+    form: 'form_validation',
+    form_validation: 'form_validation',
+    workflow: 'workflow_journey',
+    workflow_journey: 'workflow_journey',
+    journey: 'workflow_journey',
+    api: 'api_contract',
+    api_contract: 'api_contract',
+    contract: 'api_contract',
+    api_auth: 'api_auth',
+    auth: 'api_auth',
+    api_negative: 'api_negative',
+    negative: 'api_negative',
+    error: 'api_negative',
+    api_stress: 'api_stress',
+    stress: 'api_stress',
+    load: 'api_stress',
+  };
+
+  const matches = text.matchAll(/\[CAT:([^\]\r\n]+)\]/gi);
+  for (const match of matches) {
+    const raw = String(match?.[1] || '')
+      .trim()
+      .toLowerCase()
+      .replace(/[\s-]+/g, '_')
+      .replace(/[^a-z0-9_]/g, '');
+    if (!raw) continue;
+    categories.add(aliases[raw] || raw);
+  }
+
+  return categories;
+}
+
 function detectCoverageCategoriesFromContent(content, filename) {
   const text = String(content || '');
   const fileLabel = String(filename || '').toLowerCase();
-  const categories = new Set();
-  const isApiSuite = /request\.(get|post|put|patch|delete|fetch)\(/i.test(text) || /api/.test(fileLabel);
+  const categories = extractCategoryTags(text);
+  const taggedApiSignals = ['api_contract', 'api_auth', 'api_negative', 'api_stress'].some((name) => categories.has(name));
+  const isApiSuite = taggedApiSignals || /request\.(get|post|put|patch|delete|fetch)\(/i.test(text) || /api/.test(fileLabel);
 
   if (!isApiSuite) {
     if (
@@ -546,6 +586,20 @@ function classifyErrorCode(error) {
 
   const message = String(error?.message || '').toLowerCase();
   if (
+    message.includes('expo dependency validation failed') ||
+    message.includes('best compatibility with the installed expo version') ||
+    (message.includes('expo version') && message.includes('expected version')) ||
+    (message.includes('dependency validation') && message.includes('expo'))
+  ) {
+    return 'EXPO_DEPENDENCY_VALIDATION_FAILED';
+  }
+  if (
+    message.includes('non-interactive mode') &&
+    (message.includes('expo') || message.includes('input is required'))
+  ) {
+    return 'EXPO_NON_INTERACTIVE_PROMPT';
+  }
+  if (
     message.includes("cannot find module '@playwright/test'") ||
     message.includes("cannot find module \"@playwright/test\"") ||
     message.includes("package subpath './cli.js' is not defined by \"exports\" in") ||
@@ -624,6 +678,14 @@ function summarizeGenerationAttemptError(error) {
 
 function buildUserFacingPipelineError(errorCode, error) {
   const normalizedMessage = normalizeErrorText(error?.message) || 'Pipeline execution failed';
+
+  if (errorCode === 'EXPO_DEPENDENCY_VALIDATION_FAILED') {
+    return 'Expo blocked server startup due to dependency version validation. Set compatible dependency versions (for example via `npx expo install --check`) or rerun with dependency validation disabled for CI automation.';
+  }
+
+  if (errorCode === 'EXPO_NON_INTERACTIVE_PROMPT') {
+    return 'Expo requested interactive input while TestBot is running headless. Update start command/env to non-interactive mode and fixed port values.';
+  }
 
   if (errorCode === 'PLAYWRIGHT_DEPENDENCY_MISSING') {
     return 'Playwright test runtime could not be resolved while validating generated tests. TestBot attempted to auto-link @playwright/test; install it in the target project if this persists.';
@@ -1142,8 +1204,11 @@ function auditGeneratedTestQuality({ projectPath, testType, context }) {
   }
 
   const preferredSelectorPattern = /getByRole|getByLabel|getByPlaceholder|getByTestId|getByText|getByAltText/;
-  const riskyUiPattern = /page\.route\(|checkValidity\(/i;
+  const routeMockPattern = /page\.route\(/i;
+  const checkValidityPattern = /\.checkValidity\(/i;
+  const riskyUiPattern = /page\.pause\(/i;
   const riskyPhrasesPattern = /(invalid credentials|email is required|password is required|network error|try again|not found|does not exist|cannot find)/gi;
+  const enforcePhraseRiskGates = String(process.env.TESTBOT_ENFORCE_PHRASE_RISK_GATES || '').toLowerCase() === 'true';
   const knownCorpus = new Set();
 
   const collectKnownText = (value) => {
@@ -1212,6 +1277,14 @@ function auditGeneratedTestQuality({ projectPath, testType, context }) {
         uiFilesWithPreferredSelectors += 1;
       }
 
+      if (routeMockPattern.test(content)) {
+        summary.warnings.push(`uses_route_mocking:${name}`);
+      }
+
+      if (checkValidityPattern.test(content)) {
+        summary.warnings.push(`uses_check_validity:${name}`);
+      }
+
       if (riskyUiPattern.test(content)) {
         summary.riskyPatternHits += 1;
         summary.riskyFiles.push(name);
@@ -1228,8 +1301,12 @@ function auditGeneratedTestQuality({ projectPath, testType, context }) {
           known.includes(normalizedPhrase) || normalizedPhrase.includes(known)
         );
         if (!grounded) {
-          summary.riskyPatternHits += 1;
-          summary.riskyFiles.push(name);
+          if (enforcePhraseRiskGates) {
+            summary.riskyPatternHits += 1;
+            summary.riskyFiles.push(name);
+          } else {
+            summary.warnings.push(`ungrounded_error_phrase:${name}`);
+          }
           break;
         }
       }
@@ -2031,7 +2108,10 @@ async function runPipeline(config, runId) {
     let dashboardUrl = null;
     if (config.openDashboard) {
       try {
-        dashboardUrl = await withStageBudget(runBudget, 'dashboard', async () => DashboardLauncher.open(report.path));
+        dashboardUrl = await withStageBudget(runBudget, 'dashboard', async () => DashboardLauncher.open(report.path, {
+          headless: config.headless,
+          openBrowser: config.autoOpenBrowser,
+        }));
       } catch (error) {
         Logger.warn('PipelineWorker', 'Dashboard open failed', { reason: error.message });
         dashboardUrl = report.url || `file://${report.path}`;
@@ -2081,7 +2161,16 @@ async function runPipeline(config, runId) {
     const userFacingError = buildUserFacingPipelineError(errorCode, error);
     const technicalError = normalizeErrorText(error?.message);
     Logger.error('PipelineWorker', 'Pipeline error', error, { errorCode, runId });
-    const errorGenerationMeta = error.generationMeta || generationMeta;
+    const errorGenerationMeta = error.generationMeta || generationMeta || {
+      provider: null,
+      selectedGenerator: null,
+      fallbackUsed: false,
+      aiOnlyEnforced,
+      attempts: [],
+      startedAt: null,
+      finishedAt: new Date().toISOString(),
+      reason: config.generateTests === false ? 'generation_skipped_use_existing_tests' : 'generation_not_started',
+    };
     const errorGenerationQuality = error.generationQuality || generationQuality;
 
     updateStatus(statusDir, 'error', {
@@ -2213,5 +2302,8 @@ module.exports = {
   collectGenerationQuality,
   evaluateGenerationQualityGates,
   buildRequirementsCoverage,
+  auditGeneratedTestQuality,
   strictAIEnabled,
+  classifyErrorCode,
+  buildUserFacingPipelineError,
 };

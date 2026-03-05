@@ -198,7 +198,7 @@ class OpenAITestGenerator {
       });
 
       if (strictAIGeneration && minGeneratedTests > 0) {
-        const maxExpansionAttempts = Math.max(0, Number(options.maxExpansionAttempts || 2));
+        const maxExpansionAttempts = Math.max(1, Math.min(6, Number(options.maxExpansionAttempts ?? 4)));
         let expansionAttempt = 0;
 
         while (expansionAttempt < maxExpansionAttempts && !generationQuality.valid) {
@@ -447,7 +447,8 @@ export default defineConfig({
 
   async generateCoverageExpansion({ context, prd, projectInfo, outputDir, quality, testsNeeded }) {
     const missingCategories = Array.isArray(quality?.missingCategories) ? quality.missingCategories : [];
-    const expansionTarget = Math.max(8, Math.min(40, Number(testsNeeded || 0)));
+    const minimumAdditionalTests = Math.max(6, Number(testsNeeded || 0) + 6);
+    const expansionTarget = Math.max(12, Math.min(60, minimumAdditionalTests + 6));
     const categoryHints = missingCategories.length > 0
       ? missingCategories.join(', ')
       : 'ui_flow, form_validation, workflow_journey, api_contract, api_auth, api_negative, api_stress';
@@ -470,9 +471,10 @@ Rules:
 - Prefer deterministic selectors and assertions only.`;
 
     const userPrompt = this.buildStructuredUserPrompt({
-      task: `Generate an expansion pack to close quality gaps. Produce approximately ${expansionTarget} additional tests.`,
+      task: `Generate an expansion pack to close quality gaps. Produce at least ${minimumAdditionalTests} additional tests (target ${expansionTarget}).`,
       requirements: [
         `Prioritize missing categories: ${categoryHints}.`,
+        `Return >= ${minimumAdditionalTests} distinct test cases across one or more files.`,
         'Cover UI flows, form validation, workflows, API contract/auth/negative/stress depending on available surfaces.',
         'Use unique filenames and avoid regenerating existing assertions verbatim.',
       ],
@@ -1998,15 +2000,56 @@ test.describe('Fallback error handling checks', () => {
   }
 
   countTestsInText(content) {
-    const matches = String(content || '').match(/\b(?:test|it)\s*\(/g);
+    const matches = String(content || '').match(/\b(?:test|it)(?:\.(?:only|skip|fixme|fail|slow|todo))?\s*\(\s*(['"`])/g);
     return matches ? matches.length : 0;
+  }
+
+  extractCategoryTags(content) {
+    const text = String(content || '');
+    const categories = new Set();
+    const aliases = {
+      ui: 'ui_flow',
+      uiflow: 'ui_flow',
+      ui_flow: 'ui_flow',
+      form: 'form_validation',
+      form_validation: 'form_validation',
+      workflow: 'workflow_journey',
+      workflow_journey: 'workflow_journey',
+      journey: 'workflow_journey',
+      api: 'api_contract',
+      api_contract: 'api_contract',
+      contract: 'api_contract',
+      api_auth: 'api_auth',
+      auth: 'api_auth',
+      api_negative: 'api_negative',
+      negative: 'api_negative',
+      error: 'api_negative',
+      api_stress: 'api_stress',
+      stress: 'api_stress',
+      load: 'api_stress',
+    };
+
+    const matches = text.matchAll(/\[CAT:([^\]\r\n]+)\]/gi);
+    for (const match of matches) {
+      const raw = String(match?.[1] || '')
+        .trim()
+        .toLowerCase()
+        .replace(/[\s-]+/g, '_')
+        .replace(/[^a-z0-9_]/g, '');
+      if (!raw) continue;
+      const normalized = aliases[raw] || raw;
+      categories.add(normalized);
+    }
+
+    return categories;
   }
 
   detectCoverageCategories(content, filename) {
     const text = String(content || '');
     const fileLabel = String(filename || '').toLowerCase();
-    const categories = new Set();
-    const isApiSuite = /request\.(get|post|put|patch|delete|fetch)\(/i.test(text) || /api/.test(fileLabel);
+    const categories = this.extractCategoryTags(text);
+    const taggedApiSignals = ['api_contract', 'api_auth', 'api_negative', 'api_stress'].some((name) => categories.has(name));
+    const isApiSuite = taggedApiSignals || /request\.(get|post|put|patch|delete|fetch)\(/i.test(text) || /api/.test(fileLabel);
 
     if (!isApiSuite) {
       if (/page\.(goto|click|fill|check|selectOption|press)\(/i.test(text) || /getBy(Role|Label|Placeholder|TestId|Text|AltText)\(/.test(text)) {

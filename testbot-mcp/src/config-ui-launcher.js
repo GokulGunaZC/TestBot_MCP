@@ -36,14 +36,29 @@ const CONFIG_UI_PAYLOAD_SCHEMA = z.object({
   }).optional().nullable(),
 });
 
+function resolveBoolean(value, fallback) {
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'number') return value !== 0;
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase();
+    if (['1', 'true', 'yes', 'on'].includes(normalized)) return true;
+    if (['0', 'false', 'no', 'off'].includes(normalized)) return false;
+  }
+  return fallback;
+}
+
 class ConfigUILauncher {
   constructor(config = {}) {
+    const envHeadless = process.env.TESTBOT_HEADLESS;
+    const envAutoOpen = process.env.TESTBOT_AUTO_OPEN_BROWSER;
     this.config = {
+      ...config,
       port: config.port || 54321,
       timeout: config.timeout || 300000, // 5 minutes
       maxRequestBytes: config.maxRequestBytes || 2 * 1024 * 1024, // 2MB
       maxPrdChars: config.maxPrdChars || 500000,
-      ...config,
+      headless: resolveBoolean(config.headless, resolveBoolean(envHeadless, true)),
+      autoOpenBrowser: resolveBoolean(config.autoOpenBrowser, resolveBoolean(envAutoOpen, false)),
     };
     
     this.server = null;
@@ -73,9 +88,15 @@ class ConfigUILauncher {
       Logger.info('ConfigUILauncher', 'Server started', { port: this.config.port });
 
       const configURL = this.buildConfigURL(projectInfo);
-      Logger.info('ConfigUILauncher', 'Opening configuration form', { url: configURL });
+      const shouldAutoOpen = this.shouldAutoOpenBrowser(projectInfo);
+      Logger.info('ConfigUILauncher', shouldAutoOpen ? 'Opening configuration form' : 'Configuration form is available (headless mode)', {
+        url: configURL,
+        autoOpenBrowser: shouldAutoOpen,
+      });
 
-      this.openInBrowser(configURL);
+      if (shouldAutoOpen) {
+        this.openInBrowser(configURL);
+      }
 
       this.timeoutHandle = setTimeout(() => {
         this.rejectSubmission(new Error('Configuration timeout - user did not complete the form within 5 minutes'));
@@ -83,6 +104,7 @@ class ConfigUILauncher {
 
       return {
         configUrl: configURL,
+        autoOpened: shouldAutoOpen,
         waitForConfig: this.submissionPromise,
       };
     } catch (error) {
@@ -118,6 +140,14 @@ class ConfigUILauncher {
     });
 
     return `http://localhost:${this.config.port}/config-form.html?${params.toString()}`;
+  }
+
+  shouldAutoOpenBrowser(projectInfo = {}) {
+    const headless = resolveBoolean(projectInfo.headless, this.config.headless);
+    if (headless) {
+      return false;
+    }
+    return resolveBoolean(projectInfo.autoOpenBrowser, this.config.autoOpenBrowser);
   }
 
   openInBrowser(configURL) {

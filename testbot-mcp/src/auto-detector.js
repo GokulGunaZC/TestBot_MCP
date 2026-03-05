@@ -71,7 +71,7 @@ class AutoDetector {
     const projectName = this.detectProjectName(resolvedPath, packageJson, langInfo);
     const port = this.detectPort(packageJson, envFile, playwrightConfig, langInfo);
     const baseURL = this.detectBaseURL(packageJson, envFile, playwrightConfig, port);
-    const startCommand = this.detectStartCommand(packageJson, langInfo, resolvedPath);
+    const startCommand = this.detectStartCommand(packageJson, langInfo, resolvedPath, port);
     const testDirs = this.scanTestDirs(resolvedPath);
 
     const settings = {
@@ -332,6 +332,10 @@ class AutoDetector {
       }
     }
 
+    if (this.isExpoProject(packageJson)) {
+      return 8081;
+    }
+
     // Node.js framework defaults
     if (packageJson?.dependencies) {
       if (packageJson.dependencies.vite) return 5173;
@@ -373,16 +377,43 @@ class AutoDetector {
       return playwrightConfig.baseURL;
     }
 
+    if (this.isExpoProject(packageJson)) {
+      return `http://localhost:${port || 8081}`;
+    }
+
     return `http://localhost:${port}`;
+  }
+
+  isExpoProject(packageJson) {
+    if (!packageJson || typeof packageJson !== 'object') return false;
+    const dependencies = {
+      ...(packageJson.dependencies || {}),
+      ...(packageJson.devDependencies || {}),
+    };
+    if (dependencies.expo || dependencies['expo-router']) {
+      return true;
+    }
+
+    const scripts = packageJson.scripts || {};
+    return Object.values(scripts).some((value) => /expo\s+start/i.test(String(value || '')));
   }
 
   /**
    * Detect start command (language-aware)
    */
-  detectStartCommand(packageJson, langInfo, projectPath) {
+  detectStartCommand(packageJson, langInfo, projectPath, port = 8000) {
     // Node.js: check package.json scripts
     if (packageJson?.scripts) {
       const scripts = packageJson.scripts;
+      if (this.isExpoProject(packageJson)) {
+        const resolvedPort = Number(port) || 8081;
+        if (scripts.web) {
+          return `npm run web -- --port ${resolvedPort}`;
+        }
+        if (scripts.start && /expo\s+start/i.test(String(scripts.start))) {
+          return `npm run start -- --web --port ${resolvedPort}`;
+        }
+      }
       const startScripts = ['dev', 'start', 'serve', 'start:dev', 'develop'];
       for (const script of startScripts) {
         if (scripts[script]) {

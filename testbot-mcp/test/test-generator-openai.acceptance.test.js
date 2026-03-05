@@ -478,3 +478,51 @@ test('[CAT:api_contract] [CAT:api_negative] [CAT:api_stress] api coverage', asyn
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
 });
+
+test('evaluateSuiteQuality recognizes API coverage from CAT tags when assertions use status variables', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'openai-generator-quality-tag-detection-'));
+
+  try {
+    const generator = new OpenAITestGenerator({
+      projectPath: tempDir,
+      outputDir: 'generated-tests',
+      apiKey: 'test-key',
+    });
+
+    const outputDir = path.join(tempDir, 'generated-tests');
+    fs.mkdirSync(outputDir, { recursive: true });
+
+    const apiFilePath = path.join(outputDir, 'api-tags.spec.ts');
+    fs.writeFileSync(apiFilePath, `import { test, expect } from '@playwright/test';
+test('[CAT:api_contract] [CAT:api_auth] [CAT:api_negative] [CAT:api_stress] tagged status variable checks', async ({ request }) => {
+  const response = await request.get('/api/profile', { headers: { Authorization: 'Bearer test-token' } });
+  const status = response.status();
+  expect([200, 401, 403, 404, 422]).toContain(status);
+  expect(status).toBeLessThan(500);
+});
+`, 'utf-8');
+
+    generator.generatedFiles = [
+      { path: apiFilePath, filename: 'api-tags.spec.ts', type: 'api', source: 'openai' },
+    ];
+
+    const quality = generator.evaluateSuiteQuality({
+      testType: 'backend',
+      minGeneratedTests: 1,
+      strictAIGeneration: true,
+      coverageProfile: 'qa-max',
+      context: {
+        pages: [],
+        forms: [],
+        workflows: [],
+        apiEndpoints: [{ method: 'GET', path: '/api/profile', requiresAuth: true }],
+        authPatterns: [{ type: 'bearer' }],
+      },
+    });
+
+    assert.equal(quality.valid, true);
+    assert.equal(quality.missingCategories.length, 0);
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});

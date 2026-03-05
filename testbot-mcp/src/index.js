@@ -81,6 +81,17 @@ const LOG_REDACTION_OPTIONS_SCHEMA = z.object({
   level: z.enum(['balanced', 'strict']).optional(),
 }).optional();
 
+function resolveBoolean(value, fallback) {
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'number') return value !== 0;
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase();
+    if (['1', 'true', 'yes', 'on'].includes(normalized)) return true;
+    if (['0', 'false', 'no', 'off'].includes(normalized)) return false;
+  }
+  return fallback;
+}
+
 class TestbotMCPServer {
   constructor() {
     Logger.initialize();
@@ -271,6 +282,19 @@ class TestbotMCPServer {
     return normalized;
   }
 
+  resolveHeadlessPreference(params = {}) {
+    const envHeadless = resolveBoolean(process.env.TESTBOT_HEADLESS, true);
+    return resolveBoolean(params.headless, envHeadless);
+  }
+
+  resolveAutoOpenBrowserPreference(params = {}, headless = this.resolveHeadlessPreference(params)) {
+    if (headless) {
+      return false;
+    }
+    const envAutoOpen = resolveBoolean(process.env.TESTBOT_AUTO_OPEN_BROWSER, false);
+    return resolveBoolean(params.autoOpenBrowser, envAutoOpen);
+  }
+
   createBasePipelineConfig(context, params) {
     const strictAIGeneration = params.strictAIGeneration !== false;
     const resolvedGenerationMode = strictAIGeneration
@@ -281,6 +305,8 @@ class TestbotMCPServer {
     const minGeneratedTests = Number.isFinite(parsedMinGeneratedTests) && parsedMinGeneratedTests > 0
       ? Math.floor(parsedMinGeneratedTests)
       : 50;
+    const headless = this.resolveHeadlessPreference(params);
+    const autoOpenBrowser = this.resolveAutoOpenBrowserPreference(params, headless);
 
     return {
       projectPath: context.projectPath,
@@ -312,6 +338,8 @@ class TestbotMCPServer {
       playwrightMcp: params.playwrightMcp || {},
       resultMerge: params.resultMerge || {},
       logRedaction: params.logRedaction || {},
+      headless,
+      autoOpenBrowser,
     };
   }
 
@@ -503,8 +531,10 @@ class TestbotMCPServer {
             apiToken: z.string().optional(),
             projectKey: z.string().optional(),
           }).optional().describe('Jira integration configuration'),
-          openDashboard: z.boolean().optional().describe('Whether to automatically open the dashboard after tests (default: true)'),
+          openDashboard: z.boolean().optional().describe('Whether to prepare/open dashboard output after tests (default: true)'),
           showConfigUI: z.boolean().optional().describe('Show configuration UI before starting pipeline (default: true)'),
+          headless: z.boolean().optional().describe('Run in headless mode (default: true). Prevents auto-opening browser windows from MCP.'),
+          autoOpenBrowser: z.boolean().optional().describe('Allow browser auto-open for config/dashboard pages (default: false, ignored when headless=true).'),
           generationMode: z.enum(['openai-first', 'openai-only', 'template-only', 'saas-only']).optional().describe('Generation strategy'),
           strictAIGeneration: z.boolean().optional().describe('Enforce AI-only generation with no template fallback (default: true)'),
           minGeneratedTests: z.number().int().min(1).max(500).optional().describe('Minimum generated tests required before execution (default: 50)'),
@@ -1011,6 +1041,8 @@ Return the JSON structure above based on what you find in the codebase.
 
     const showConfigUI = params.showConfigUI !== false;
     const dashboardUrl = process.env.TESTBOT_DASHBOARD_URL || 'http://localhost:3000';
+    const headless = this.resolveHeadlessPreference(params);
+    const autoOpenBrowser = this.resolveAutoOpenBrowserPreference(params, headless);
 
     if (!showConfigUI) {
       this.writeRunStatus(statusFile, {
@@ -1059,8 +1091,12 @@ Return the JSON structure above based on what you find in the codebase.
 
     let configUrl;
     let waitForConfig;
+    let autoOpened = false;
     try {
-      const configUILauncher = this.createConfigUILauncher();
+      const configUILauncher = this.createConfigUILauncher({
+        headless,
+        autoOpenBrowser,
+      });
       const launchResult = await configUILauncher.launchNonBlocking({
         projectPath: baseConfig.projectPath,
         projectName: baseConfig.projectName,
@@ -1069,15 +1105,18 @@ Return the JSON structure above based on what you find in the codebase.
         port: String(baseConfig.port),
         startCommand: baseConfig.startCommand,
         testType: baseConfig.testType,
-        generateTests: String(baseConfig.generateTests),
-        openDashboard: String(baseConfig.openDashboard),
-        strictAIGeneration: String(baseConfig.strictAIGeneration !== false),
-        minGeneratedTests: String(baseConfig.minGeneratedTests || 50),
+        generateTests: baseConfig.generateTests,
+        openDashboard: baseConfig.openDashboard,
+        strictAIGeneration: baseConfig.strictAIGeneration !== false,
+        minGeneratedTests: Number(baseConfig.minGeneratedTests || 50),
         coverageProfile: baseConfig.coverageProfile || 'qa-max',
         phaseMode: baseConfig.phaseMode || 'two-phase',
+        headless,
+        autoOpenBrowser,
       });
       configUrl = launchResult.configUrl;
       waitForConfig = launchResult.waitForConfig;
+      autoOpened = launchResult.autoOpened === true;
     } catch (error) {
       this.writeRunStatus(statusFile, {
         runId,
@@ -1106,9 +1145,10 @@ Return the JSON structure above based on what you find in the codebase.
       phase: 'awaiting_config_ui',
       status: 'info',
       success: true,
-      message: 'Configuration UI opened and awaiting submission',
+      message: 'Configuration UI ready and awaiting submission',
       metadata: {
         configUrl,
+        autoOpened,
       },
     });
 
@@ -1132,10 +1172,14 @@ Return the JSON structure above based on what you find in the codebase.
             runId,
             project: baseConfig.projectName,
             language: baseConfig.language,
-            message: `Configuration UI opened for "${baseConfig.projectName}". Submit the form to start the pipeline automatically.`,
+            message: autoOpened
+              ? `Configuration UI opened for "${baseConfig.projectName}". Submit the form to start the pipeline automatically.`
+              : `Configuration UI is ready for "${baseConfig.projectName}". Open the provided URL and submit the form to start the pipeline automatically.`,
             statusFile,
             configUrl,
             dashboardUrl,
+            autoOpened,
+            headless,
             aiOnlyEnforced: baseConfig.strictAIGeneration !== false,
             nextSteps: [
               `Monitor progress: check ${statusFile}`,
@@ -1220,7 +1264,10 @@ Return the JSON structure above based on what you find in the codebase.
 
     let dashboardUrl = null;
     if (params.openDashboard !== false) {
-      dashboardUrl = await DashboardLauncher.open(report.path);
+      dashboardUrl = await DashboardLauncher.open(report.path, {
+        headless: this.resolveHeadlessPreference(params),
+        openBrowser: this.resolveAutoOpenBrowserPreference(params),
+      });
     }
 
     return {

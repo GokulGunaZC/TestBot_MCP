@@ -32,6 +32,95 @@ class PlaywrightIntegration {
     };
 
     this.serverProcess = null;
+    this.packageJson = this.readPackageJsonSafe();
+    this.expoProject = this.isExpoProject();
+  }
+
+  readPackageJsonSafe() {
+    const packageJsonPath = path.join(this.config.projectPath, 'package.json');
+    if (!fs.existsSync(packageJsonPath)) {
+      return null;
+    }
+
+    try {
+      return JSON.parse(fs.readFileSync(packageJsonPath, 'utf-8'));
+    } catch {
+      return null;
+    }
+  }
+
+  isExpoProject() {
+    const packageJson = this.packageJson || {};
+    const dependencies = {
+      ...(packageJson.dependencies || {}),
+      ...(packageJson.devDependencies || {}),
+    };
+    if (dependencies.expo || dependencies['expo-router']) {
+      return true;
+    }
+
+    const scripts = packageJson.scripts || {};
+    return Object.values(scripts).some((value) => /expo\s+start/i.test(String(value || '')));
+  }
+
+  normalizeStartCommandForHeadlessWeb(startCommand) {
+    const raw = String(startCommand || '').trim();
+    if (!raw) return raw;
+    const testType = String(this.config.testType || 'both').toLowerCase();
+    const requiresWebUi = testType === 'frontend' || testType === 'both';
+    if (!requiresWebUi || !this.expoProject) {
+      return raw;
+    }
+
+    const normalized = raw.toLowerCase();
+    const configuredPort = Number(this.config.port || 8081) || 8081;
+
+    const appendExpoFlags = (baseCommand, usesNpmScriptArgs) => {
+      let command = baseCommand;
+      const invokesWebScript = /\bnpm\s+run\s+web\b|\byarn\s+web\b|\bpnpm\s+(?:run\s+)?web\b/i.test(command);
+      const hasWebFlag = invokesWebScript || /\s--web(?:\s|$)/i.test(command);
+      const hasPortFlag = /\s--port(?:=|\s)\d+/i.test(command);
+      const flags = [];
+      if (!hasWebFlag) flags.push('--web');
+      if (!hasPortFlag) flags.push(`--port ${configuredPort}`);
+
+      if (flags.length > 0) {
+        command += usesNpmScriptArgs
+          ? ` -- ${flags.join(' ')}`
+          : ` ${flags.join(' ')}`;
+      }
+      return command;
+    };
+
+    if (/^npm\s+run\s+start\b/i.test(raw) && this.packageJson?.scripts?.web) {
+      return appendExpoFlags('npm run web', true);
+    }
+
+    if (/^npm\s+run\s+web\b/i.test(raw)) {
+      return appendExpoFlags(raw, true);
+    }
+
+    if (/^yarn\s+start\b/i.test(raw) && this.packageJson?.scripts?.web) {
+      return appendExpoFlags('yarn web', false);
+    }
+
+    if (/^yarn\s+web\b/i.test(raw)) {
+      return appendExpoFlags(raw, false);
+    }
+
+    if (/^pnpm\s+start\b/i.test(raw) && this.packageJson?.scripts?.web) {
+      return appendExpoFlags('pnpm run web', false);
+    }
+
+    if (/^pnpm\s+(?:run\s+)?web\b/i.test(raw)) {
+      return appendExpoFlags(raw, false);
+    }
+
+    if (/expo\s+start/i.test(normalized)) {
+      return appendExpoFlags(raw, false);
+    }
+
+    return raw;
   }
 
   getServerProbeUrls() {
@@ -1056,25 +1145,124 @@ test.describe('${this.sanitizeString(scenario.name)}', () => {
     if (!this.config.startCommand) return;
 
     return new Promise((resolve, reject) => {
-      Logger.info('PlaywrightIntegration', `Starting server: ${this.config.startCommand}`);
+      const effectiveStartCommand = this.normalizeStartCommandForHeadlessWeb(this.config.startCommand);
+      Logger.info('PlaywrightIntegration', `Starting server: ${effectiveStartCommand}`);
       const detached = process.platform !== 'win32';
-      const startupTimeoutMs = Math.max(10000, Number(this.config.serverStartTimeoutMs || 90000));
+      const isExpoCommand = this.expoProject || /expo\s+start/i.test(effectiveStartCommand);
+      const startupTimeoutMs = Math.max(
+        isExpoCommand ? 180000 : 10000,
+        Number(this.config.serverStartTimeoutMs || 90000)
+      );
       const healthCheckIntervalMs = Math.max(250, Number(this.config.serverHealthCheckIntervalMs || 1000));
       let settled = false;
       let serverExited = false;
       let recentServerLogs = [];
       let sawReadinessLogHint = false;
+      let lastDetectedProbeUrl = null;
+      const dynamicProbeUrls = new Set(this.getServerProbeUrls());
+      let baseHost = 'localhost';
+      try {
+        baseHost = new URL(this.config.baseURL).hostname || 'localhost';
+      } catch {
+        baseHost = 'localhost';
+      }
       const readinessLogPattern = /(listening on|running on|application startup complete|started server|ready in|serving on|development server at|uvicorn running|werkzeug)/i;
+      const expoDependencyValidationPattern = /(best compatibility with the installed expo version|dependency validation|expected version:)/i;
+      const expoNonInteractivePattern = /(non-interactive mode|input is required)/i;
+      const addProbeUrlCandidate = (value) => {
+        if (!value) return false;
+        let parsed;
+        try {
+          parsed = new URL(String(value));
+        } catch {
+          return false;
+        }
 
-      this.serverProcess = spawn(this.config.startCommand, {
+        const protocol = parsed.protocol || 'http:';
+        const host = parsed.hostname || 'localhost';
+        const isKnownLocalHost = host === 'localhost'
+          || host === '127.0.0.1'
+          || host === '0.0.0.0'
+          || host === '::1'
+          || host === baseHost;
+        if (!isKnownLocalHost) {
+          return false;
+        }
+
+        const port = parsed.port;
+        if (!port) return false;
+        const normalized = `${protocol}//${host}:${port}/`;
+        const beforeSize = dynamicProbeUrls.size;
+        dynamicProbeUrls.add(normalized);
+        if (host === '0.0.0.0') {
+          dynamicProbeUrls.add(`${protocol}//localhost:${port}/`);
+          dynamicProbeUrls.add(`${protocol}//127.0.0.1:${port}/`);
+        }
+        if (dynamicProbeUrls.size > beforeSize) {
+          lastDetectedProbeUrl = normalized;
+          Logger.debug('PlaywrightIntegration', 'Added runtime probe URL candidate', { probeUrl: normalized });
+          return true;
+        }
+        return false;
+      };
+
+      const addProbePortCandidate = (port, protocol = 'http:') => {
+        const parsedPort = Number(port);
+        if (!Number.isFinite(parsedPort) || parsedPort <= 0 || parsedPort > 65535) {
+          return;
+        }
+        addProbeUrlCandidate(`${protocol}//localhost:${parsedPort}/`);
+        addProbeUrlCandidate(`${protocol}//127.0.0.1:${parsedPort}/`);
+      };
+
+      const updateRuntimeBaseURL = (probeUrl) => {
+        if (!probeUrl) return;
+        try {
+          const parsed = new URL(probeUrl);
+          if (parsed.port) {
+            const runtimeBaseURL = `${parsed.protocol}//${parsed.hostname}:${parsed.port}`;
+            if (runtimeBaseURL !== this.config.baseURL) {
+              this.config.baseURL = runtimeBaseURL;
+              this.config.port = Number(parsed.port);
+              Logger.info('PlaywrightIntegration', 'Detected runtime server URL from startup logs', {
+                baseURL: this.config.baseURL,
+                port: this.config.port,
+              });
+            }
+          }
+        } catch {
+          // ignore
+        }
+      };
+
+      const buildStartupFailure = (baseMessage, tailSize = 8) => {
+        const tail = recentServerLogs.slice(-tailSize).join(' | ');
+        const logTail = tail ? ` Last server logs: ${tail}` : '';
+        const normalizedCommand = String(effectiveStartCommand || '').toLowerCase();
+        if (expoDependencyValidationPattern.test(tail)) {
+          return new Error(`Expo dependency validation failed during server startup.${logTail}`);
+        }
+        if (expoNonInteractivePattern.test(tail) && (normalizedCommand.includes('expo') || normalizedCommand.includes('react-native'))) {
+          return new Error(`Expo startup requested interactive input in a non-interactive run.${logTail}`);
+        }
+        return new Error(`${baseMessage}${logTail}`);
+      };
+
+      const serverEnv = {
+        ...process.env,
+        BASE_URL: this.config.baseURL,
+        PORT: String(this.config.port || ''),
+        BROWSER: process.env.BROWSER || 'none',
+        CI: process.env.CI || '1',
+        EXPO_NO_DEPENDENCY_VALIDATION: process.env.EXPO_NO_DEPENDENCY_VALIDATION || '1',
+        EXPO_NO_TELEMETRY: process.env.EXPO_NO_TELEMETRY || '1',
+      };
+
+      this.serverProcess = spawn(effectiveStartCommand, {
         cwd: this.config.projectPath,
         shell: true,
         detached,
-        env: {
-          ...process.env,
-          BASE_URL: this.config.baseURL,
-          PORT: String(this.config.port || ''),
-        },
+        env: serverEnv,
       });
 
       const rememberLog = (chunk) => {
@@ -1087,6 +1275,29 @@ test.describe('${this.sanitizeString(scenario.name)}', () => {
         }
         if (readinessLogPattern.test(text)) {
           sawReadinessLogHint = true;
+        }
+
+        const urlMatches = text.match(/https?:\/\/[^\s"'<>]+/gi) || [];
+        for (const match of urlMatches) {
+          const sanitized = String(match).replace(/[),.;]+$/, '');
+          addProbeUrlCandidate(sanitized);
+        }
+
+        const localhostPortMatches = text.matchAll(/(?:localhost|127\.0\.0\.1|0\.0\.0\.0):(\d{2,5})/gi);
+        for (const match of localhostPortMatches) {
+          addProbePortCandidate(match[1]);
+        }
+
+        const fallbackPortPatterns = [
+          /using available port\s+(\d{2,5})/i,
+          /port\s+\d{2,5}\s+is in use.*?(?:port\s+)?(\d{2,5})/i,
+          /waiting on .*:(\d{2,5})/i,
+        ];
+        for (const pattern of fallbackPortPatterns) {
+          const match = text.match(pattern);
+          if (match?.[1]) {
+            addProbePortCandidate(match[1]);
+          }
         }
       };
 
@@ -1117,15 +1328,14 @@ test.describe('${this.sanitizeString(scenario.name)}', () => {
       this.serverProcess.on('exit', (code, signal) => {
         serverExited = true;
         if (!settled) {
-          const logTail = recentServerLogs.length > 0
-            ? ` Last server logs: ${recentServerLogs.slice(-6).join(' | ')}`
-            : '';
-          finish(new Error(`Server process exited before becoming ready (code=${code}, signal=${signal || 'none'}).${logTail}`));
+          finish(buildStartupFailure(
+            `Server process exited before becoming ready (code=${code}, signal=${signal || 'none'}).`,
+            6
+          ));
         }
       });
 
       const fetchFn = global.fetch || ((url) => import('node-fetch').then((module) => module.default(url)));
-      const probeUrls = this.getServerProbeUrls();
       const startedAt = Date.now();
 
       const checkServer = async () => {
@@ -1134,6 +1344,7 @@ test.describe('${this.sanitizeString(scenario.name)}', () => {
             return;
           }
 
+          const probeUrls = [...dynamicProbeUrls];
           for (const probeUrl of probeUrls) {
             try {
               const controller = new AbortController();
@@ -1144,6 +1355,7 @@ test.describe('${this.sanitizeString(scenario.name)}', () => {
               clearTimeout(timer);
               if (response.ok || response.status < 500) {
                 Logger.info('PlaywrightIntegration', 'Server is ready', { probeUrl });
+                updateRuntimeBaseURL(probeUrl);
                 finish();
                 return;
               }
@@ -1154,28 +1366,31 @@ test.describe('${this.sanitizeString(scenario.name)}', () => {
 
           // Fallback: if logs indicate readiness and TCP port is open, treat server as ready.
           if (sawReadinessLogHint) {
-            try {
-              const parsed = new URL(this.config.baseURL);
-              const tcpPort = Number(this.config.port || parsed.port || (parsed.protocol === 'https:' ? 443 : 80));
-              const tcpReady = await this.probeTcpPort(parsed.hostname || 'localhost', tcpPort);
-              if (tcpReady) {
-                Logger.info('PlaywrightIntegration', 'Server is ready (TCP readiness fallback)');
-                finish();
-                return;
+            for (const probeUrl of [...dynamicProbeUrls]) {
+              try {
+                const parsed = new URL(probeUrl);
+                const tcpPort = Number(parsed.port || this.config.port || (parsed.protocol === 'https:' ? 443 : 80));
+                const host = parsed.hostname === '0.0.0.0' ? 'localhost' : (parsed.hostname || 'localhost');
+                const tcpReady = await this.probeTcpPort(host, tcpPort);
+                if (tcpReady) {
+                  Logger.info('PlaywrightIntegration', 'Server is ready (TCP readiness fallback)', { probeUrl });
+                  updateRuntimeBaseURL(lastDetectedProbeUrl || probeUrl);
+                  finish();
+                  return;
+                }
+              } catch {
+                // ignore malformed URL
               }
-            } catch {
-              // ignore malformed URL
             }
           }
 
           await new Promise((done) => setTimeout(done, healthCheckIntervalMs));
         }
 
-        const logTail = recentServerLogs.length > 0
-          ? ` Last server logs: ${recentServerLogs.slice(-8).join(' | ')}`
-          : '';
-        finish(new Error(
-          `Server failed to start within ${startupTimeoutMs}ms. Probed URLs: ${probeUrls.join(', ')}.${logTail}`
+        const probeUrls = [...dynamicProbeUrls];
+        finish(buildStartupFailure(
+          `Server failed to start within ${startupTimeoutMs}ms. Probed URLs: ${probeUrls.join(', ')}.`,
+          8
         ));
       };
 
