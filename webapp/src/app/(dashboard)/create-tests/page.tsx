@@ -58,7 +58,7 @@ export default function CreateTestsPage() {
             <div className="flex flex-wrap gap-3 justify-center lg:justify-start">
               <Link
                 href="/mcp-tests"
-                className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-gradient-to-r from-blue-500 via-cyan-400 to-blue-500 bg-[length:200%] text-white font-medium text-sm hover:bg-right transition-all duration-500 hover:shadow-[0_0_20px_rgba(59,130,246,0.3)]"
+                className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-gradient-to-r from-blue-500 via-cyan-400 to-blue-500 bg-[length:200%] text-black font-medium text-sm hover:bg-right transition-all duration-500 hover:shadow-[0_0_20px_rgba(59,130,246,0.3)]"
               >
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
                   <rect x="2" y="3" width="20" height="14" rx="2" />

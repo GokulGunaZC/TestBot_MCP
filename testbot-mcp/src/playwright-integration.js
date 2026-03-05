@@ -123,6 +123,24 @@ class PlaywrightIntegration {
       return;
     }
 
+    const bridge = this.ensureProjectPlaywrightBridge();
+    if (bridge.ok) {
+      if (bridge.bridged) {
+        Logger.info('PlaywrightIntegration', 'Linked bundled @playwright/test into target project', {
+          target: playwrightPath,
+        });
+      }
+      return;
+    }
+
+    const packageJsonPath = path.join(projectPath, 'package.json');
+    if (!fs.existsSync(packageJsonPath)) {
+      Logger.warn('PlaywrightIntegration', 'Skipping npm install for @playwright/test because package.json is missing', {
+        projectPath,
+      });
+      return;
+    }
+
     Logger.info('PlaywrightIntegration', 'Installing Playwright...');
     try {
       execSync('npm install -D @playwright/test', { cwd: projectPath, stdio: 'pipe' });
@@ -130,6 +148,153 @@ class PlaywrightIntegration {
       Logger.error('PlaywrightIntegration', 'Failed to install Playwright', error);
       throw error;
     }
+  }
+
+  getBundledPlaywrightPackageDir() {
+    try {
+      return path.dirname(require.resolve('@playwright/test/package.json'));
+    } catch {
+      return null;
+    }
+  }
+
+  ensureProjectPlaywrightBridge() {
+    const projectPath = this.config.projectPath;
+    const localPackageDir = path.join(projectPath, 'node_modules', '@playwright', 'test');
+
+    if (fs.existsSync(localPackageDir)) {
+      return { ok: true, bridged: false, packageDir: localPackageDir };
+    }
+
+    const bundledPackageDir = this.getBundledPlaywrightPackageDir();
+    if (!bundledPackageDir) {
+      return { ok: false, bridged: false, reason: 'bundled_playwright_missing' };
+    }
+
+    try {
+      fs.mkdirSync(path.dirname(localPackageDir), { recursive: true });
+      fs.symlinkSync(bundledPackageDir, localPackageDir, 'dir');
+      return { ok: true, bridged: true, packageDir: localPackageDir };
+    } catch (error) {
+      if (fs.existsSync(localPackageDir)) {
+        return { ok: true, bridged: false, packageDir: localPackageDir };
+      }
+      return {
+        ok: false,
+        bridged: false,
+        reason: 'bridge_symlink_failed',
+        error: error.message,
+      };
+    }
+  }
+
+  resolvePlaywrightCliPath() {
+    try {
+      return require.resolve('@playwright/test/cli', { paths: [this.config.projectPath] });
+    } catch {
+      // ignore and try package fallback
+    }
+
+    try {
+      const packagePath = require.resolve('@playwright/test/package.json', { paths: [this.config.projectPath] });
+      const cliPath = path.join(path.dirname(packagePath), 'cli.js');
+      if (fs.existsSync(cliPath)) {
+        return cliPath;
+      }
+    } catch {
+      // ignore and try bridge/fallback
+    }
+
+    this.ensureProjectPlaywrightBridge();
+
+    try {
+      return require.resolve('@playwright/test/cli', { paths: [this.config.projectPath] });
+    } catch {
+      // ignore and fallback
+    }
+
+    try {
+      const packagePath = require.resolve('@playwright/test/package.json', { paths: [this.config.projectPath] });
+      const cliPath = path.join(path.dirname(packagePath), 'cli.js');
+      if (fs.existsSync(cliPath)) {
+        return cliPath;
+      }
+    } catch {
+      // ignore and fallback
+    }
+
+    try {
+      return require.resolve('@playwright/test/cli');
+    } catch {
+      // ignore and fallback
+    }
+
+    try {
+      const packagePath = require.resolve('@playwright/test/package.json');
+      const cliPath = path.join(path.dirname(packagePath), 'cli.js');
+      if (fs.existsSync(cliPath)) {
+        return cliPath;
+      }
+    } catch {
+      // ignore and fallback
+    }
+
+    const bundledBin = path.resolve(__dirname, '..', 'node_modules', '.bin', 'playwright');
+    if (fs.existsSync(bundledBin)) {
+      return bundledBin;
+    }
+
+    const projectBin = path.join(this.config.projectPath, 'node_modules', '.bin', 'playwright');
+    if (fs.existsSync(projectBin)) {
+      return projectBin;
+    }
+
+    return null;
+  }
+
+  buildRunnerInvocation(args) {
+    const normalizedArgs = Array.isArray(args) && args[0] === 'playwright'
+      ? args.slice(1)
+      : [...(args || [])];
+    const cliPath = this.resolvePlaywrightCliPath();
+    const isJsCli = cliPath ? cliPath.endsWith('.js') : false;
+
+    if (cliPath) {
+      return {
+        command: isJsCli ? process.execPath : cliPath,
+        args: isJsCli ? [cliPath, ...normalizedArgs] : normalizedArgs,
+        cliPath,
+        label: isJsCli
+          ? `${process.execPath} ${cliPath} ${normalizedArgs.join(' ')}`.trim()
+          : `${cliPath} ${normalizedArgs.join(' ')}`.trim(),
+      };
+    }
+
+    return {
+      command: 'npx',
+      args: ['--yes', '@playwright/test', ...normalizedArgs],
+      cliPath: null,
+      label: `npx --yes @playwright/test ${normalizedArgs.join(' ')}`.trim(),
+    };
+  }
+
+  buildRunnerEnv(cliPath) {
+    const currentNodePath = String(process.env.NODE_PATH || '')
+      .split(path.delimiter)
+      .map((entry) => entry.trim())
+      .filter(Boolean);
+
+    const extraNodePaths = [path.join(this.config.projectPath, 'node_modules')];
+    if (cliPath && cliPath.endsWith('.js')) {
+      const cliNodeModules = path.resolve(path.dirname(cliPath), '..', '..');
+      extraNodePaths.push(cliNodeModules);
+    }
+
+    return {
+      ...process.env,
+      BASE_URL: this.config.baseURL,
+      NODE_PATH: [...new Set([...extraNodePaths, ...currentNodePath])].join(path.delimiter),
+    };
   }
 
   extractJsonReporterOutputFiles(configPath) {
@@ -216,14 +381,12 @@ class PlaywrightIntegration {
 
   runPlaywrightCommand(args, timeoutMs) {
     return new Promise((resolve, reject) => {
-      Logger.info('PlaywrightIntegration', `Running: npx ${args.join(' ')}`);
+      const invocation = this.buildRunnerInvocation(args);
+      Logger.info('PlaywrightIntegration', `Running: ${invocation.label}`);
 
-      const proc = spawn('npx', args, {
+      const proc = spawn(invocation.command, invocation.args, {
         cwd: this.config.projectPath,
-        env: {
-          ...process.env,
-          BASE_URL: this.config.baseURL,
-        },
+        env: this.buildRunnerEnv(invocation.cliPath),
       });
 
       let stdout = '';
@@ -248,6 +411,7 @@ class PlaywrightIntegration {
           code,
           stdout,
           stderr,
+          commandLabel: invocation.label,
         });
       });
 
@@ -296,7 +460,7 @@ class PlaywrightIntegration {
       runner: {
         exitCode: commandResult.code,
         project: project || 'default',
-        command: `npx ${args.join(' ')}`,
+        command: commandResult.commandLabel || `npx ${args.join(' ')}`,
       },
     };
   }

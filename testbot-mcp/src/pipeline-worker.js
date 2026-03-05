@@ -123,6 +123,19 @@ function createRunBudget(config = {}) {
     stageCaps[stage] = toFiniteNumber(config.stageCaps?.[stage] || process.env[envKey], fallback);
   }
 
+  const strictAI = strictAIEnabled(config);
+  const hasExplicitGenerationCap = Boolean(config.stageCaps?.generation) || Boolean(process.env.TESTBOT_STAGE_GENERATION_MS);
+  if (strictAI && !hasExplicitGenerationCap) {
+    const requestedMinTests = toFiniteNumber(config.minGeneratedTests, 50);
+    const coverageProfile = String(config.coverageProfile || 'qa-max').toLowerCase();
+    const adaptiveGenerationCap = coverageProfile === 'exhaustive' || requestedMinTests >= 75
+      ? 360000
+      : requestedMinTests >= 50
+        ? 300000
+        : stageCaps.generation;
+    stageCaps.generation = Math.max(stageCaps.generation, adaptiveGenerationCap);
+  }
+
   return {
     startedAt: Date.now(),
     totalMs,
@@ -532,7 +545,12 @@ function classifyErrorCode(error) {
   }
 
   const message = String(error?.message || '').toLowerCase();
-  if (message.includes("cannot find module '@playwright/test'") || message.includes("cannot find module \"@playwright/test\"")) {
+  if (
+    message.includes("cannot find module '@playwright/test'") ||
+    message.includes("cannot find module \"@playwright/test\"") ||
+    message.includes("package subpath './cli.js' is not defined by \"exports\" in") ||
+    message.includes("package subpath './cli.js' is not defined by 'exports' in")
+  ) {
     return 'PLAYWRIGHT_DEPENDENCY_MISSING';
   }
   if (message.includes('server failed to start') || message.includes('process exited before becoming ready')) {
@@ -588,7 +606,7 @@ function summarizeGenerationAttemptError(error) {
       .map((line) => normalizeErrorText(line))
       .filter(Boolean);
     const actionable = lines.find((line) =>
-      /cannot find module ['"]@playwright\/test['"]|module_not_found|error:/i.test(line)
+      /cannot find module ['"]@playwright\/test['"]|package subpath ['"]\.?\/cli\.js['"] is not defined by ["']exports["']|module_not_found|error:/i.test(line)
     ) || lines[0];
     if (actionable) {
       details.push(actionable.slice(0, 220));
@@ -602,6 +620,35 @@ function summarizeGenerationAttemptError(error) {
   return details.length > 0
     ? `${base} (${details.join('; ')})`
     : base;
+}
+
+function buildUserFacingPipelineError(errorCode, error) {
+  const normalizedMessage = normalizeErrorText(error?.message) || 'Pipeline execution failed';
+
+  if (errorCode === 'PLAYWRIGHT_DEPENDENCY_MISSING') {
+    return 'Playwright test runtime could not be resolved while validating generated tests. TestBot attempted to auto-link @playwright/test; install it in the target project if this persists.';
+  }
+
+  if (errorCode === 'GENERATION_VALIDATION_FAILED') {
+    if (/playwright_list_failed/i.test(normalizedMessage)) {
+      return 'Generated tests failed pre-run validation (`playwright test --list`). This is usually caused by missing Playwright runtime dependencies or invalid generated imports.';
+    }
+    return `Generated tests did not pass validation gates. ${normalizedMessage}`;
+  }
+
+  if (errorCode === 'TIME_BUDGET_EXCEEDED') {
+    return 'Pipeline exceeded the configured time budget before tests could complete. Increase time budget or reduce generation/execution scope.';
+  }
+
+  if (errorCode === 'SERVER_START_TIMEOUT') {
+    return 'App server did not become reachable before timeout. Verify start command, base URL, and port settings in the config form.';
+  }
+
+  if (errorCode === 'OPENAI_KEY_MISSING') {
+    return 'OPENAI_API_KEY is missing for strict AI generation mode.';
+  }
+
+  return normalizedMessage;
 }
 
 function ensureDir(dirPath) {
@@ -855,6 +902,145 @@ function resolvePlaywrightConfig(projectPath) {
   return null;
 }
 
+function getBundledPlaywrightPackageDir() {
+  try {
+    return path.dirname(require.resolve('@playwright/test/package.json'));
+  } catch {
+    return null;
+  }
+}
+
+function ensureProjectPlaywrightBridge(projectPath) {
+  const localPackageDir = path.join(projectPath, 'node_modules', '@playwright', 'test');
+  if (fs.existsSync(localPackageDir)) {
+    return { ok: true, bridged: false, packageDir: localPackageDir };
+  }
+
+  const bundledPackageDir = getBundledPlaywrightPackageDir();
+  if (!bundledPackageDir) {
+    return { ok: false, bridged: false, reason: 'bundled_playwright_missing' };
+  }
+
+  try {
+    fs.mkdirSync(path.dirname(localPackageDir), { recursive: true });
+    fs.symlinkSync(bundledPackageDir, localPackageDir, 'dir');
+    return { ok: true, bridged: true, packageDir: localPackageDir };
+  } catch (error) {
+    if (fs.existsSync(localPackageDir)) {
+      return { ok: true, bridged: false, packageDir: localPackageDir };
+    }
+
+    return {
+      ok: false,
+      bridged: false,
+      reason: 'bridge_symlink_failed',
+      error: error.message,
+    };
+  }
+}
+
+function resolvePlaywrightCliPath(projectPath) {
+  try {
+    return require.resolve('@playwright/test/cli', { paths: [projectPath] });
+  } catch {
+    // ignore and try package fallback
+  }
+
+  try {
+    const packagePath = require.resolve('@playwright/test/package.json', { paths: [projectPath] });
+    const cliPath = path.join(path.dirname(packagePath), 'cli.js');
+    if (fs.existsSync(cliPath)) {
+      return cliPath;
+    }
+  } catch {
+    // ignore and try bridge/fallback
+  }
+
+  ensureProjectPlaywrightBridge(projectPath);
+
+  try {
+    return require.resolve('@playwright/test/cli', { paths: [projectPath] });
+  } catch {
+    // ignore and fallback to bundled resolution
+  }
+
+  try {
+    const packagePath = require.resolve('@playwright/test/package.json', { paths: [projectPath] });
+    const cliPath = path.join(path.dirname(packagePath), 'cli.js');
+    if (fs.existsSync(cliPath)) {
+      return cliPath;
+    }
+  } catch {
+    // ignore and fallback to bundled resolution
+  }
+
+  try {
+    return require.resolve('@playwright/test/cli');
+  } catch {
+    // ignore and fallback
+  }
+
+  try {
+    const packagePath = require.resolve('@playwright/test/package.json');
+    const cliPath = path.join(path.dirname(packagePath), 'cli.js');
+    if (fs.existsSync(cliPath)) {
+      return cliPath;
+    }
+  } catch {
+    // ignore and fallback
+  }
+
+  const bundledBin = path.resolve(__dirname, '..', 'node_modules', '.bin', 'playwright');
+  if (fs.existsSync(bundledBin)) {
+    return bundledBin;
+  }
+
+  const projectBin = path.join(projectPath, 'node_modules', '.bin', 'playwright');
+  if (fs.existsSync(projectBin)) {
+    return projectBin;
+  }
+
+  return null;
+}
+
+function buildPlaywrightCommand(projectPath, testArgs) {
+  const cliPath = resolvePlaywrightCliPath(projectPath);
+  if (cliPath) {
+    const isJsCli = cliPath.endsWith('.js');
+    return {
+      command: isJsCli ? process.execPath : cliPath,
+      args: isJsCli ? [cliPath, ...testArgs] : testArgs,
+      cliPath,
+    };
+  }
+
+  return {
+    command: 'npx',
+    args: ['--yes', '@playwright/test', ...testArgs],
+    cliPath: null,
+  };
+}
+
+function buildPlaywrightEnv(projectPath, cliPath = null) {
+  const currentNodePath = String(process.env.NODE_PATH || '')
+    .split(path.delimiter)
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+
+  const extraNodePaths = [path.join(projectPath, 'node_modules')];
+  if (cliPath && cliPath.endsWith('.js')) {
+    const cliNodeModules = path.resolve(path.dirname(cliPath), '..', '..');
+    extraNodePaths.push(cliNodeModules);
+  }
+
+  const mergedNodePath = [...new Set([...extraNodePaths, ...currentNodePath])];
+
+  return {
+    ...process.env,
+    NODE_PATH: mergedNodePath.join(path.delimiter),
+  };
+}
+
 async function validateGeneratedTestsWithList({ projectPath, validateGeneratedTests = true, timeoutMs = 90000 }) {
   if (!validateGeneratedTests) {
     return { valid: true, skipped: true, listedCount: 0 };
@@ -873,15 +1059,16 @@ async function validateGeneratedTestsWithList({ projectPath, validateGeneratedTe
   }
 
   return new Promise((resolve) => {
-    const args = ['playwright', 'test', 'tests/generated', '--list'];
+    const testArgs = ['test', 'tests/generated', '--list'];
     const configPath = resolvePlaywrightConfig(projectPath);
     if (configPath) {
-      args.push('--config', configPath);
+      testArgs.push('--config', configPath);
     }
+    const command = buildPlaywrightCommand(projectPath, testArgs);
 
-    const child = spawn('npx', args, {
+    const child = spawn(command.command, command.args, {
       cwd: projectPath,
-      env: { ...process.env },
+      env: buildPlaywrightEnv(projectPath, command.cliPath),
       stdio: ['ignore', 'pipe', 'pipe'],
     });
 
@@ -1257,6 +1444,23 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
     } else {
       result = await tryGenerator('openai', async () => {
         const testsDir = resetGeneratedTestsDir(config.projectPath);
+        const generationStageCapMs = toFiniteNumber(runBudget?.stageCaps?.generation, DEFAULT_STAGE_CAPS_MS.generation);
+        const explicitOpenAITimeoutMs = toFiniteNumber(
+          config.openaiTimeoutMs || process.env.OPENAI_TIMEOUT_MS,
+          0
+        );
+        const openAITimeoutMs = explicitOpenAITimeoutMs > 0
+          ? explicitOpenAITimeoutMs
+          : Math.max(30000, Math.min(90000, Math.floor(generationStageCapMs / 4)));
+        const openAIMaxRetries = Number.isFinite(Number(config.openaiMaxRetries))
+          ? Math.max(0, Math.floor(Number(config.openaiMaxRetries)))
+          : strictAI
+            ? 1
+            : 2;
+        const openAIRetryBackoffMs = Number.isFinite(Number(config.openaiRetryBackoffMs))
+          ? Math.max(100, Math.floor(Number(config.openaiRetryBackoffMs)))
+          : 750;
+
         const openaiGenerator = new OpenAITestGenerator({
           projectPath: config.projectPath,
           outputDir: 'tests/generated',
@@ -1264,6 +1468,9 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
           enforceValidation: config.validateGeneratedTests !== false,
           syntaxValidationMode: config.syntaxValidationMode || 'fail-closed',
           temperature: Number.isFinite(config.openaiTemperature) ? config.openaiTemperature : undefined,
+          timeout: openAITimeoutMs,
+          maxRetries: openAIMaxRetries,
+          retryBackoffMs: openAIRetryBackoffMs,
         });
 
         const files = await openaiGenerator.generateTests({
@@ -1871,14 +2078,17 @@ async function runPipeline(config, runId) {
     });
   } catch (error) {
     const errorCode = classifyErrorCode(error);
+    const userFacingError = buildUserFacingPipelineError(errorCode, error);
+    const technicalError = normalizeErrorText(error?.message);
     Logger.error('PipelineWorker', 'Pipeline error', error, { errorCode, runId });
     const errorGenerationMeta = error.generationMeta || generationMeta;
     const errorGenerationQuality = error.generationQuality || generationQuality;
 
     updateStatus(statusDir, 'error', {
       runId,
-      message: `Pipeline failed: ${error.message}`,
-      error: error.message,
+      message: `Pipeline failed: ${userFacingError}`,
+      error: userFacingError,
+      errorDetail: technicalError,
       stack: error.stack,
       errorCode,
       generationMeta: errorGenerationMeta,
@@ -1902,8 +2112,8 @@ async function runPipeline(config, runId) {
         status: 'failed',
         duration: 0,
         error: {
-          message: error.message,
-          stack: error.stack,
+          message: userFacingError,
+          detail: technicalError,
         },
         artifacts: {
           screenshots: [],

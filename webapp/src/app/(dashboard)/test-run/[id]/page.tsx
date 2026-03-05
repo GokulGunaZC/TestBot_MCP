@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { useParams } from 'next/navigation';
 import Link from 'next/link';
 import { motion, AnimatePresence } from 'framer-motion';
@@ -538,41 +538,133 @@ function TestRow({ t, idx }: { t: NormalisedTest; idx: number }) {
 export default function TestRunDetailPage() {
   const params = useParams();
   const id = params?.id as string;
+  const isLiveDetailId = String(id || '').startsWith('live-');
 
   const [testRun, setTestRun] = useState<TestRun | null>(null);
   const [loading, setLoading] = useState(true);
   const [notFound, setNotFound] = useState(false);
   const [filterStatus, setFilterStatus] = useState<string>('all');
+  const [activePolling, setActivePolling] = useState(true);
+  const lastRunSignatureRef = useRef<string | null>(null);
+
+  const isLiveOrRunning = useCallback((run: TestRun | null) => {
+    if (!run) return false;
+    if (isLiveDetailId) return true;
+    const status = String(run.status || '').toLowerCase();
+    const phase = String(run.current_phase || '').toLowerCase();
+    if (run.is_live) return true;
+    if (status === 'running') return true;
+    return [
+      'queued',
+      'awaiting_configuration',
+      'awaiting_config_ui',
+      'config_received',
+      'starting_pipeline',
+      'started',
+      'context',
+      'context_enrichment',
+      'generating',
+      'running',
+      'reporting',
+      'tests_complete',
+    ].includes(phase);
+  }, [isLiveDetailId]);
 
   useEffect(() => {
     if (!id) return;
     let mounted = true;
 
-    async function fetchRun(isInitial = false) {
+    const fetchRun = async (isInitial = false) => {
       if (isInitial) setLoading(true);
       try {
         const res = await fetch(`/api/test-runs/${id}`, { cache: 'no-store' });
         if (!mounted) return;
-        if (!res.ok) { setNotFound(true); }
-        else {
-          const json = await res.json();
-          setTestRun(json.data as TestRun);
-          setNotFound(false);
+
+        if (!res.ok) {
+          setNotFound(true);
+          setActivePolling(false);
+          return;
         }
+
+        const json = await res.json();
+        const nextRun = json.data as TestRun;
+        const signature = JSON.stringify({
+          id: nextRun?.id,
+          status: nextRun?.status,
+          updated_at: nextRun?.updated_at,
+          current_phase: nextRun?.current_phase,
+          error_code: nextRun?.error_code,
+          total_tests: nextRun?.total_tests,
+          passed_tests: nextRun?.passed_tests,
+          failed_tests: nextRun?.failed_tests,
+          skipped_tests: nextRun?.skipped_tests,
+        });
+
+        if (signature !== lastRunSignatureRef.current) {
+          lastRunSignatureRef.current = signature;
+          setTestRun(nextRun);
+        }
+
+        setNotFound(false);
+        setActivePolling(isLiveOrRunning(nextRun));
       } catch {
-        if (mounted) setNotFound(true);
+        if (mounted) {
+          setNotFound(true);
+          setActivePolling(false);
+        }
       } finally {
         if (mounted && isInitial) setLoading(false);
       }
-    }
+    };
 
     fetchRun(true);
-    const timer = setInterval(() => fetchRun(false), 3000);
     return () => {
       mounted = false;
-      clearInterval(timer);
     };
-  }, [id]);
+  }, [id, isLiveDetailId, isLiveOrRunning]);
+
+  useEffect(() => {
+    if (!id || !activePolling) {
+      return;
+    }
+
+    const intervalMs = 8000;
+    const timer = setInterval(() => {
+      if (typeof document !== 'undefined' && document.hidden) {
+        return;
+      }
+      fetch(`/api/test-runs/${id}`, { cache: 'no-store' })
+        .then((res) => {
+          if (!res.ok) return null;
+          return res.json();
+        })
+        .then((json) => {
+          if (!json?.data) return;
+          const nextRun = json.data as TestRun;
+          const signature = JSON.stringify({
+            id: nextRun?.id,
+            status: nextRun?.status,
+            updated_at: nextRun?.updated_at,
+            current_phase: nextRun?.current_phase,
+            error_code: nextRun?.error_code,
+            total_tests: nextRun?.total_tests,
+            passed_tests: nextRun?.passed_tests,
+            failed_tests: nextRun?.failed_tests,
+            skipped_tests: nextRun?.skipped_tests,
+          });
+          if (signature !== lastRunSignatureRef.current) {
+            lastRunSignatureRef.current = signature;
+            setTestRun(nextRun);
+          }
+          setActivePolling(isLiveOrRunning(nextRun));
+        })
+        .catch(() => {
+          // keep existing state, retry on next cycle
+        });
+    }, intervalMs);
+
+    return () => clearInterval(timer);
+  }, [id, activePolling, isLiveDetailId, isLiveOrRunning]);
 
   // ── Loading ──
   if (loading) {

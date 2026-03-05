@@ -1,12 +1,36 @@
 'use client';
 
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import Link from 'next/link';
 import type { TestRun } from '@/lib/types/database';
 
 const PAGE_SIZE_OPTIONS = [10, 25, 50];
-const REFRESH_INTERVAL_MS = 3000;
+const ACTIVE_REFRESH_INTERVAL_MS = 10000;
+const IDLE_REFRESH_INTERVAL_MS = 45000;
+
+function hasActivePipelineRuns(runs: TestRun[]): boolean {
+  return runs.some((run) => {
+    const status = String(run.status || '').toLowerCase();
+    const phase = String(run.current_phase || '').toLowerCase();
+    if (run.is_live) return true;
+    if (status === 'running') return true;
+    return [
+      'queued',
+      'awaiting_configuration',
+      'awaiting_config_ui',
+      'config_received',
+      'starting_pipeline',
+      'started',
+      'context',
+      'context_enrichment',
+      'generating',
+      'running',
+      'reporting',
+      'tests_complete',
+    ].includes(phase);
+  });
+}
 
 function formatDateTime(iso: string) {
   const d = new Date(iso);
@@ -51,6 +75,8 @@ export default function AllTestsPage() {
   const [total, setTotal] = useState(0);
   const [totalPages, setTotalPages] = useState(1);
   const [loading, setLoading] = useState(true);
+  const [activeRunsPresent, setActiveRunsPresent] = useState(false);
+  const payloadSignatureRef = useRef<string | null>(null);
 
   const [search, setSearch] = useState('');
   const [debouncedSearch, setDebouncedSearch] = useState('');
@@ -68,8 +94,9 @@ export default function AllTestsPage() {
     return () => clearTimeout(t);
   }, [search]);
 
-  const fetchTests = useCallback(async () => {
-    setLoading(true);
+  const fetchTests = useCallback(async (options: { showLoading?: boolean } = {}) => {
+    const showLoading = options.showLoading === true;
+    if (showLoading) setLoading(true);
     try {
       const params = new URLSearchParams({
         page: String(page),
@@ -101,34 +128,50 @@ export default function AllTestsPage() {
         );
       }
 
-      setTests(data);
-
       const pag = json.pagination;
-      if (pag) {
-        setTotal(pag.total ?? data.length);
-        setTotalPages(pag.totalPages ?? 1);
-      } else {
-        setTotal(data.length);
-        setTotalPages(1);
+      const nextTotal = pag ? (pag.total ?? data.length) : data.length;
+      const nextTotalPages = pag ? (pag.totalPages ?? 1) : 1;
+      const nextActive = hasActivePipelineRuns(data);
+
+      const signature = JSON.stringify({
+        ids: data.map((item) => [item.id, item.status, item.updated_at, item.current_phase, item.error_code]),
+        total: nextTotal,
+        totalPages: nextTotalPages,
+      });
+
+      if (signature !== payloadSignatureRef.current) {
+        payloadSignatureRef.current = signature;
+        setTests(data);
+        setTotal(nextTotal);
+        setTotalPages(nextTotalPages);
       }
+      setActiveRunsPresent(nextActive);
     } catch (err) {
       console.error('Failed to fetch test runs:', err);
-      setTests([]);
-      setTotal(0);
-      setTotalPages(1);
+      if (showLoading) {
+        setTests([]);
+        setTotal(0);
+        setTotalPages(1);
+      }
     } finally {
-      setLoading(false);
+      if (showLoading) setLoading(false);
     }
   }, [page, pageSize, sortBy, statusFilter, debouncedSearch]);
 
   useEffect(() => {
-    fetchTests();
+    fetchTests({ showLoading: true });
   }, [fetchTests]);
 
   useEffect(() => {
-    const timer = setInterval(() => fetchTests(), REFRESH_INTERVAL_MS);
+    const intervalMs = activeRunsPresent ? ACTIVE_REFRESH_INTERVAL_MS : IDLE_REFRESH_INTERVAL_MS;
+    const timer = setInterval(() => {
+      if (typeof document !== 'undefined' && document.hidden) {
+        return;
+      }
+      fetchTests({ showLoading: false });
+    }, intervalMs);
     return () => clearInterval(timer);
-  }, [fetchTests]);
+  }, [fetchTests, activeRunsPresent]);
 
   // Reset page when filters change
   const handleStatusChange = (v: typeof statusFilter) => {
