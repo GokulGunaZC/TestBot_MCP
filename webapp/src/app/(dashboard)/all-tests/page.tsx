@@ -6,6 +6,7 @@ import Link from 'next/link';
 import type { TestRun } from '@/lib/types/database';
 
 const PAGE_SIZE_OPTIONS = [10, 25, 50];
+const REFRESH_INTERVAL_MS = 3000;
 
 function formatDateTime(iso: string) {
   const d = new Date(iso);
@@ -122,6 +123,11 @@ export default function AllTestsPage() {
 
   useEffect(() => {
     fetchTests();
+  }, [fetchTests]);
+
+  useEffect(() => {
+    const timer = setInterval(() => fetchTests(), REFRESH_INTERVAL_MS);
+    return () => clearInterval(timer);
   }, [fetchTests]);
 
   // Reset page when filters change
@@ -270,6 +276,11 @@ export default function AllTestsPage() {
                         >
                           {test.creation_name || 'Untitled Test'}
                         </Link>
+                        {(test.current_phase || test.error_code || test.is_live) && (
+                          <div className="text-[11px] text-[#60A5FA] mt-1 font-mono">
+                            {test.is_live ? 'live' : 'run'}{test.current_phase ? ` · ${test.current_phase}` : ''}{test.error_code ? ` · ${test.error_code}` : ''}
+                          </div>
+                        )}
                       </td>
                       <td className="px-4 py-4">
                         <StatusCell pass={test.passed_tests} total={test.total_tests} />

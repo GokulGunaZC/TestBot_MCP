@@ -227,7 +227,7 @@ export default function HomePage() {
           <div className="flex flex-wrap gap-3">
             <Link
               href="/mcp-tests"
-              className="btn-gradient flex items-center gap-2 text-white font-semibold px-5 py-2.5 rounded-xl text-sm"
+              className="btn-gradient flex items-center gap-2 text-black font-semibold px-5 py-2.5 rounded-xl text-sm"
             >
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                 <rect x="2" y="2" width="20" height="8" rx="2" /><rect x="2" y="14" width="20" height="8" rx="2" />
@@ -477,7 +477,7 @@ export default function HomePage() {
 
                   <Link
                     href="/plan-billing"
-                    className="mt-4 block w-full py-2.5 rounded-xl btn-gradient text-white font-semibold text-sm text-center"
+                    className="mt-4 block w-full py-2.5 rounded-xl btn-gradient text-black font-semibold text-sm text-center"
                   >
                     Upgrade to Pro
                   </Link>

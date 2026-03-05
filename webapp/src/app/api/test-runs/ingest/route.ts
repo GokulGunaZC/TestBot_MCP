@@ -175,7 +175,12 @@ function buildAiAnalysisPayload(report: ReportPayload) {
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json()
-    const { api_key, creation_name, report } = body as { api_key?: string; creation_name?: string; report?: ReportPayload }
+    const { api_key, creation_name, run_id, report } = body as {
+      api_key?: string
+      creation_name?: string
+      run_id?: string
+      report?: ReportPayload
+    }
 
     if (!api_key || !report) {
       return NextResponse.json(
@@ -236,6 +241,16 @@ export async function POST(request: NextRequest) {
       : null
 
     const projectName = creation_name || report.metadata?.projectName || 'Untitled Test Run'
+    const normalizedRunId = typeof run_id === 'string' && run_id.trim().length > 0
+      ? run_id.trim().slice(0, 180)
+      : null
+    const reportWithRunId = {
+      ...report,
+      metadata: {
+        ...(report?.metadata || {}),
+        ...(normalizedRunId ? { runId: normalizedRunId } : {}),
+      },
+    }
     const aiAnalysisPayload = buildAiAnalysisPayload(report)
 
     // Insert test run
@@ -252,7 +267,7 @@ export async function POST(request: NextRequest) {
         durationMs: duration_ms,
         backendPassRate: backend_pass_rate,
         frontendPassRate: frontend_pass_rate,
-        reportJson: report,
+        reportJson: reportWithRunId,
         aiAnalysis: aiAnalysisPayload,
         source: 'mcp',
       })

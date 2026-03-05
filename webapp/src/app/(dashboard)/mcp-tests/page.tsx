@@ -1,8 +1,8 @@
 'use client';
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import Link from 'next/link';
-import { motion, AnimatePresence } from 'framer-motion';
+import { motion } from 'framer-motion';
 import McpSetupModal from '@/components/dashboard/McpSetupModal';
 import type { TestRun } from '@/lib/types/database';
 
@@ -29,6 +29,7 @@ function StatusBadge({ status }: { status: string }) {
 }
 
 const PAGE_SIZE = 25;
+const REFRESH_INTERVAL_MS = 3000;
 
 export default function McpTestsPage() {
   const [modalOpen, setModalOpen] = useState(false);
@@ -38,25 +39,28 @@ export default function McpTestsPage() {
   const [tests, setTests] = useState<TestRun[]>([]);
   const [loading, setLoading] = useState(true);
 
-  useEffect(() => {
-    async function fetchTests() {
-      setLoading(true);
-      try {
-        const res = await fetch('/api/test-runs?limit=100&sort_by=created_at&order=desc');
-        if (res.ok) {
-          const json = await res.json();
-          const allRuns: TestRun[] = json.data ?? [];
-          // Filter to MCP source only
-          setTests(allRuns.filter(t => t.source === 'mcp'));
-        }
-      } catch {
-        // silently fail
-      } finally {
-        setLoading(false);
+  const fetchTests = useCallback(async (isInitial = false) => {
+    if (isInitial) setLoading(true);
+    try {
+      const res = await fetch('/api/test-runs?limit=100&sort_by=created_at&order=desc&include_live=true', { cache: 'no-store' });
+      if (res.ok) {
+        const json = await res.json();
+        const allRuns: TestRun[] = json.data ?? [];
+        // Filter to MCP source only
+        setTests(allRuns.filter(t => t.source === 'mcp'));
       }
+    } catch {
+      // silently fail
+    } finally {
+      if (isInitial) setLoading(false);
     }
-    fetchTests();
   }, []);
+
+  useEffect(() => {
+    fetchTests(true);
+    const timer = setInterval(() => fetchTests(false), REFRESH_INTERVAL_MS);
+    return () => clearInterval(timer);
+  }, [fetchTests]);
 
   const filtered = tests
     .filter(t => t.creation_name.toLowerCase().includes(search.toLowerCase()))
@@ -184,6 +188,11 @@ export default function McpTestsPage() {
                       <Link href={`/test-run/${test.id}`} className="text-[#F0F6FF] text-sm font-medium hover:text-[#60A5FA] transition-colors">
                         {test.creation_name}
                       </Link>
+                      {(test.current_phase || test.error_code || test.is_live) && (
+                        <div className="text-[11px] text-[#60A5FA] mt-1 font-mono">
+                          {test.is_live ? 'live' : 'run'}{test.current_phase ? ` · ${test.current_phase}` : ''}{test.error_code ? ` · ${test.error_code}` : ''}
+                        </div>
+                      )}
                     </td>
                     <td className="px-4 py-4"><StatusBadge status={test.status} /></td>
                     <td className="px-4 py-4">

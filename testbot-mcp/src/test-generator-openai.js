@@ -193,6 +193,8 @@ class OpenAITestGenerator {
         testType,
         minGeneratedTests,
         strictAIGeneration,
+        context,
+        coverageProfile: options.coverageProfile || 'qa-max',
       });
 
       if (strictAIGeneration && minGeneratedTests > 0) {
@@ -222,6 +224,8 @@ class OpenAITestGenerator {
             testType,
             minGeneratedTests,
             strictAIGeneration,
+            context,
+            coverageProfile: options.coverageProfile || 'qa-max',
           });
         }
       }
@@ -1119,6 +1123,14 @@ Return JSON array only.`;
       }
     }
 
+    const embedded = this.extractSingleEmbeddedJSONArray(content);
+    if (embedded) {
+      return {
+        files: embedded,
+        parseMode: 'embedded-json-array',
+      };
+    }
+
     throw new Error('Model response must be strict JSON array or single fenced JSON array');
   }
 
@@ -1128,6 +1140,89 @@ Return JSON array only.`;
     } catch {
       return null;
     }
+  }
+
+  extractSingleEmbeddedJSONArray(content) {
+    if (typeof content !== 'string' || !content.includes('[')) {
+      return null;
+    }
+
+    const candidates = [];
+    let inString = false;
+    let escapeNext = false;
+    let quoteChar = '';
+    let depth = 0;
+    let start = -1;
+
+    for (let i = 0; i < content.length; i += 1) {
+      const ch = content[i];
+
+      if (escapeNext) {
+        escapeNext = false;
+        continue;
+      }
+
+      if (inString) {
+        if (ch === '\\') {
+          escapeNext = true;
+          continue;
+        }
+        if (ch === quoteChar) {
+          inString = false;
+          quoteChar = '';
+        }
+        continue;
+      }
+
+      if (ch === '"' || ch === '\'') {
+        inString = true;
+        quoteChar = ch;
+        continue;
+      }
+
+      if (ch === '[') {
+        if (depth === 0) {
+          start = i;
+        }
+        depth += 1;
+        continue;
+      }
+
+      if (ch === ']') {
+        if (depth === 0) {
+          continue;
+        }
+        depth -= 1;
+        if (depth === 0 && start >= 0) {
+          const snippet = content.slice(start, i + 1);
+          const parsed = this.tryParseJSON(snippet);
+          if (Array.isArray(parsed)) {
+            const hasFileShape = parsed.some((item) =>
+              item &&
+              typeof item === 'object' &&
+              (Object.prototype.hasOwnProperty.call(item, 'filename') || Object.prototype.hasOwnProperty.call(item, 'content'))
+            );
+            if (hasFileShape) {
+              candidates.push(parsed);
+            }
+          }
+          start = -1;
+        }
+      }
+    }
+
+    if (candidates.length === 1) {
+      return candidates[0];
+    }
+
+    if (candidates.length > 1) {
+      candidates.sort((a, b) => b.length - a.length);
+      if (candidates.length === 2 || candidates[0].length !== candidates[1].length) {
+        return candidates[0];
+      }
+    }
+
+    return null;
   }
 
   sanitizeFilename(rawFilename, prefix, index) {
@@ -1954,7 +2049,60 @@ test.describe('Fallback error handling checks', () => {
     return ['ui_flow', 'form_validation', 'workflow_journey', 'api_contract', 'api_auth', 'api_negative', 'api_stress'];
   }
 
-  evaluateSuiteQuality({ testType, minGeneratedTests = 0, strictAIGeneration = false }) {
+  requiredCategoriesForContext({ testType, context = {} }) {
+    const normalizedType = String(testType || 'both').toLowerCase();
+    const pageCount = (context.pages || []).length;
+    const formCount = (context.forms || []).length;
+    const workflowCount = (context.workflows || []).length;
+    const navEdgeCount = (context.navigationGraph || []).length;
+    const apiCount = (context.apiEndpoints || []).length;
+    const authPatternCount = (context.authPatterns || []).length;
+    const apiAuthSignals = (context.apiEndpoints || []).filter((endpoint) =>
+      endpoint?.authRequired === true ||
+      endpoint?.requiresAuth === true ||
+      /auth|token|login|logout|session|bearer/i.test(String(endpoint?.path || ''))
+    ).length;
+
+    const explicitFrontend = normalizedType === 'frontend';
+    const explicitBackend = normalizedType === 'backend';
+
+    const hasUiSurface = !explicitBackend && (
+      pageCount > 0 ||
+      formCount > 0 ||
+      workflowCount > 0 ||
+      navEdgeCount > 0
+    );
+    const hasApiSurface = !explicitFrontend && (
+      apiCount > 0 ||
+      normalizedType === 'backend'
+    );
+
+    const required = [];
+    if (hasUiSurface) {
+      required.push('ui_flow');
+      if (formCount > 0) {
+        required.push('form_validation');
+      }
+      if (navEdgeCount > 1 || workflowCount > 1 || (workflowCount > 0 && formCount > 0)) {
+        required.push('workflow_journey');
+      }
+    }
+
+    if (hasApiSurface) {
+      required.push('api_contract', 'api_negative', 'api_stress');
+      if (apiAuthSignals > 0 || authPatternCount > 0) {
+        required.push('api_auth');
+      }
+    }
+
+    if (required.length === 0) {
+      return this.requiredCategoriesForTestType(testType);
+    }
+
+    return required;
+  }
+
+  evaluateSuiteQuality({ testType, minGeneratedTests = 0, strictAIGeneration = false, context = {}, coverageProfile = 'qa-max' }) {
     const categories = {
       ui_flow: 0,
       form_validation: 0,
@@ -1982,8 +2130,12 @@ test.describe('Fallback error handling checks', () => {
       }
     }
 
-    const requiredCategories = this.requiredCategoriesForTestType(testType);
-    const missingCategories = requiredCategories.filter((category) => !categories[category]);
+    const normalizedProfile = ['balanced', 'qa-max', 'exhaustive'].includes(String(coverageProfile))
+      ? String(coverageProfile)
+      : 'qa-max';
+    const minCategoryHits = normalizedProfile === 'exhaustive' ? 2 : 1;
+    const requiredCategories = this.requiredCategoriesForContext({ testType, context });
+    const missingCategories = requiredCategories.filter((category) => (categories[category] || 0) < minCategoryHits);
     const errors = [];
     let errorCode = null;
 
@@ -2005,6 +2157,8 @@ test.describe('Fallback error handling checks', () => {
       errors,
       totalTests,
       minGeneratedTests,
+      coverageProfile: normalizedProfile,
+      minCategoryHits,
       requiredCategories,
       missingCategories,
       categories,

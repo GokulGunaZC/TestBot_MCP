@@ -419,6 +419,7 @@ class ReportGenerator {
   async generate({
     projectPath,
     projectName,
+    runId,
     testResults,
     aiAnalysis,
     jiraData,
@@ -463,6 +464,7 @@ class ReportGenerator {
         projectPath: this.normalizePathForReport(projectPath),
         version: '1.0.0',
         generator: 'testbot-mcp',
+        runId: this.stripAnsiAndNormalize(runId || null),
         generationMeta: generationMeta || null,
         fallbackUsed: Boolean(fallbackUsed),
       },
@@ -503,6 +505,7 @@ class ReportGenerator {
           body: JSON.stringify({
             api_key,
             creation_name: projectName || path.basename(projectPath),
+            run_id: runId || null,
             report,
           }),
         });

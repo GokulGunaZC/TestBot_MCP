@@ -5,6 +5,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const net = require('net');
 const { spawn, execSync } = require('child_process');
 const Logger = require('./logger');
 
@@ -15,6 +16,12 @@ class PlaywrightIntegration {
       baseURL: config.baseURL || 'http://localhost:8000',
       port: config.port || 8000,
       startCommand: config.startCommand,
+      serverStartTimeoutMs: Number.isFinite(Number(config.serverStartTimeoutMs))
+        ? Number(config.serverStartTimeoutMs)
+        : Number(process.env.TESTBOT_SERVER_START_TIMEOUT_MS || 90000),
+      serverHealthCheckIntervalMs: Number.isFinite(Number(config.serverHealthCheckIntervalMs))
+        ? Number(config.serverHealthCheckIntervalMs)
+        : Number(process.env.TESTBOT_SERVER_HEALTHCHECK_INTERVAL_MS || 1000),
       testType: config.testType || 'both',
       timeout: config.timeout || 300000,
       browserMode: config.browserMode || 'chromium',
@@ -25,6 +32,61 @@ class PlaywrightIntegration {
     };
 
     this.serverProcess = null;
+  }
+
+  getServerProbeUrls() {
+    const candidates = [];
+    const add = (value) => {
+      if (!value) return;
+      try {
+        const parsed = new URL(String(value));
+        candidates.push(parsed.toString());
+      } catch {
+        // ignore invalid URL candidate
+      }
+    };
+
+    add(this.config.baseURL);
+    try {
+      const base = new URL(this.config.baseURL);
+      add(`${base.protocol}//${base.host}/`);
+      const fallbackPort = String(this.config.port || base.port || '');
+      if (fallbackPort) {
+        add(`${base.protocol}//localhost:${fallbackPort}/`);
+        add(`${base.protocol}//127.0.0.1:${fallbackPort}/`);
+      }
+    } catch {
+      const fallbackPort = String(this.config.port || '');
+      if (fallbackPort) {
+        add(`http://localhost:${fallbackPort}/`);
+        add(`http://127.0.0.1:${fallbackPort}/`);
+      }
+    }
+
+    return [...new Set(candidates)];
+  }
+
+  probeTcpPort(hostname, port, timeoutMs = 1200) {
+    return new Promise((resolve) => {
+      if (!hostname || !port) {
+        resolve(false);
+        return;
+      }
+
+      const socket = net.createConnection({ host: hostname, port });
+      let settled = false;
+      const finish = (value) => {
+        if (settled) return;
+        settled = true;
+        socket.destroy();
+        resolve(value);
+      };
+
+      socket.setTimeout(timeoutMs);
+      socket.once('connect', () => finish(true));
+      socket.once('timeout', () => finish(false));
+      socket.once('error', () => finish(false));
+    });
   }
 
   stripAnsi(text) {
@@ -832,8 +894,13 @@ test.describe('${this.sanitizeString(scenario.name)}', () => {
     return new Promise((resolve, reject) => {
       Logger.info('PlaywrightIntegration', `Starting server: ${this.config.startCommand}`);
       const detached = process.platform !== 'win32';
+      const startupTimeoutMs = Math.max(10000, Number(this.config.serverStartTimeoutMs || 90000));
+      const healthCheckIntervalMs = Math.max(250, Number(this.config.serverHealthCheckIntervalMs || 1000));
       let settled = false;
       let serverExited = false;
+      let recentServerLogs = [];
+      let sawReadinessLogHint = false;
+      const readinessLogPattern = /(listening on|running on|application startup complete|started server|ready in|serving on|development server at|uvicorn running|werkzeug)/i;
 
       this.serverProcess = spawn(this.config.startCommand, {
         cwd: this.config.projectPath,
@@ -846,11 +913,26 @@ test.describe('${this.sanitizeString(scenario.name)}', () => {
         },
       });
 
+      const rememberLog = (chunk) => {
+        const text = this.stripAnsi(String(chunk || '')).trim();
+        if (!text) return;
+        const compact = text.length > 280 ? `${text.slice(0, 280)}...` : text;
+        recentServerLogs.push(compact);
+        if (recentServerLogs.length > 24) {
+          recentServerLogs = recentServerLogs.slice(-24);
+        }
+        if (readinessLogPattern.test(text)) {
+          sawReadinessLogHint = true;
+        }
+      };
+
       this.serverProcess.stdout.on('data', (data) => {
+        rememberLog(data.toString());
         Logger.debug('PlaywrightIntegration', `[Server] ${data.toString()}`);
       });
 
       this.serverProcess.stderr.on('data', (data) => {
+        rememberLog(data.toString());
         Logger.debug('PlaywrightIntegration', `[Server] ${data.toString()}`);
       });
 
@@ -871,33 +953,66 @@ test.describe('${this.sanitizeString(scenario.name)}', () => {
       this.serverProcess.on('exit', (code, signal) => {
         serverExited = true;
         if (!settled) {
-          finish(new Error(`Server process exited before becoming ready (code=${code}, signal=${signal || 'none'})`));
+          const logTail = recentServerLogs.length > 0
+            ? ` Last server logs: ${recentServerLogs.slice(-6).join(' | ')}`
+            : '';
+          finish(new Error(`Server process exited before becoming ready (code=${code}, signal=${signal || 'none'}).${logTail}`));
         }
       });
 
       const fetchFn = global.fetch || ((url) => import('node-fetch').then((module) => module.default(url)));
+      const probeUrls = this.getServerProbeUrls();
+      const startedAt = Date.now();
 
       const checkServer = async () => {
-        const maxAttempts = 30;
-        for (let i = 0; i < maxAttempts; i += 1) {
+        while (Date.now() - startedAt < startupTimeoutMs) {
           if (serverExited) {
             return;
           }
-          try {
-            const response = await fetchFn(this.config.baseURL);
-            if (response.ok || response.status < 500) {
-              Logger.info('PlaywrightIntegration', 'Server is ready');
-              finish();
-              return;
+
+          for (const probeUrl of probeUrls) {
+            try {
+              const controller = new AbortController();
+              const timer = setTimeout(() => controller.abort(), 1800);
+              const response = await fetchFn(probeUrl, {
+                signal: controller.signal,
+              });
+              clearTimeout(timer);
+              if (response.ok || response.status < 500) {
+                Logger.info('PlaywrightIntegration', 'Server is ready', { probeUrl });
+                finish();
+                return;
+              }
+            } catch {
+              // keep probing
             }
-          } catch {
-            // server still warming up
           }
 
-          await new Promise((done) => setTimeout(done, 1000));
+          // Fallback: if logs indicate readiness and TCP port is open, treat server as ready.
+          if (sawReadinessLogHint) {
+            try {
+              const parsed = new URL(this.config.baseURL);
+              const tcpPort = Number(this.config.port || parsed.port || (parsed.protocol === 'https:' ? 443 : 80));
+              const tcpReady = await this.probeTcpPort(parsed.hostname || 'localhost', tcpPort);
+              if (tcpReady) {
+                Logger.info('PlaywrightIntegration', 'Server is ready (TCP readiness fallback)');
+                finish();
+                return;
+              }
+            } catch {
+              // ignore malformed URL
+            }
+          }
+
+          await new Promise((done) => setTimeout(done, healthCheckIntervalMs));
         }
 
-        finish(new Error('Server failed to start within timeout'));
+        const logTail = recentServerLogs.length > 0
+          ? ` Last server logs: ${recentServerLogs.slice(-8).join(' | ')}`
+          : '';
+        finish(new Error(
+          `Server failed to start within ${startupTimeoutMs}ms. Probed URLs: ${probeUrls.join(', ')}.${logTail}`
+        ));
       };
 
       checkServer();

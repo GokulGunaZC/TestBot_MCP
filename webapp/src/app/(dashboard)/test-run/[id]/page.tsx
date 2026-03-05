@@ -51,7 +51,19 @@ interface ReportTest {
 }
 
 interface ReportJson {
-  metadata?: { projectPath?: string };
+  metadata?: {
+    projectPath?: string;
+    runId?: string;
+    run_id?: string;
+    live?: {
+      isLive?: boolean;
+      phase?: string;
+      status?: string;
+      errorCode?: string;
+      message?: string;
+      reason?: string;
+    };
+  };
   tests?: ReportTest[];
   results?: ReportTest[];
   summary?: { total?: number; passed?: number; failed?: number; skipped?: number };
@@ -534,19 +546,32 @@ export default function TestRunDetailPage() {
 
   useEffect(() => {
     if (!id) return;
-    async function fetchRun() {
-      setLoading(true);
+    let mounted = true;
+
+    async function fetchRun(isInitial = false) {
+      if (isInitial) setLoading(true);
       try {
-        const res = await fetch(`/api/test-runs/${id}`);
+        const res = await fetch(`/api/test-runs/${id}`, { cache: 'no-store' });
+        if (!mounted) return;
         if (!res.ok) { setNotFound(true); }
         else {
           const json = await res.json();
           setTestRun(json.data as TestRun);
+          setNotFound(false);
         }
-      } catch { setNotFound(true); }
-      finally { setLoading(false); }
+      } catch {
+        if (mounted) setNotFound(true);
+      } finally {
+        if (mounted && isInitial) setLoading(false);
+      }
     }
-    fetchRun();
+
+    fetchRun(true);
+    const timer = setInterval(() => fetchRun(false), 3000);
+    return () => {
+      mounted = false;
+      clearInterval(timer);
+    };
   }, [id]);
 
   // ── Loading ──
@@ -589,6 +614,8 @@ export default function TestRunDetailPage() {
 
   // ── Parse report ──
   const report: ReportJson | null = testRun.report_json ?? null;
+  const liveMeta = report?.metadata?.live || null;
+  const liveRunId = report?.metadata?.runId || report?.metadata?.run_id || testRun.run_id || null;
   const rawTests: ReportTest[] = report?.tests ?? report?.results ?? [];
   const normalisedTests = rawTests.map((t, i) => normaliseTest(t, i, id));
 
@@ -663,6 +690,28 @@ export default function TestRunDetailPage() {
           </div>
         </div>
       </motion.div>
+
+      {(testRun.is_live || !!liveMeta || !!testRun.current_phase || !!testRun.error_code) && (
+        <motion.div
+          initial={{ opacity: 0, y: 8 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="glass-card rounded-2xl p-4 border border-blue-500/20 bg-blue-500/5"
+        >
+          <div className="flex flex-col gap-1 text-sm">
+            <div className="text-[#D8E8FF] font-semibold">Live Pipeline Status</div>
+            <div className="text-[#8BA4C8] font-mono">
+              phase: {testRun.current_phase || liveMeta?.phase || testRun.status}
+              {testRun.error_code || liveMeta?.errorCode ? ` · error: ${testRun.error_code || liveMeta?.errorCode}` : ''}
+              {liveRunId ? ` · runId: ${liveRunId}` : ''}
+            </div>
+            {(liveMeta?.message || liveMeta?.reason) && (
+              <div className="text-[#BFD4F2] text-xs">
+                {liveMeta?.message || liveMeta?.reason}
+              </div>
+            )}
+          </div>
+        </motion.div>
+      )}
 
       {/* KPI cards */}
       <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-5 gap-4">

@@ -343,6 +343,18 @@ test('parseTestResponse enforces requirement trace tags when PRD context is prov
   );
 });
 
+test('parseTestResponse supports a single embedded JSON array in otherwise non-JSON output', () => {
+  const generator = new OpenAITestGenerator({ apiKey: 'test-key' });
+  const payload = [
+    { filename: 'embedded.spec.ts', content: validPlaywrightTest('[REQ:REQ-1] embedded response') },
+  ];
+  const response = `Model notes: using best practices.\n\n${JSON.stringify(payload, null, 2)}\n\nDone.`;
+  const parsed = generator.parseTestResponse(response, 'frontend', { prd: 'REQ-1' });
+  assert.equal(parsed.files.length, 1);
+  assert.equal(parsed.parseMode, 'embedded-json-array');
+  assert.equal(parsed.files[0].filename, 'embedded.spec.ts');
+});
+
 test('evaluateSuiteQuality passes strict 50+ coverage gate when all required categories are present', () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'openai-generator-quality-pass-'));
 
@@ -399,6 +411,69 @@ test('evaluateSuiteQuality passes strict 50+ coverage gate when all required cat
     assert.equal(quality.valid, true);
     assert.ok(quality.totalTests >= 50);
     assert.equal(quality.missingCategories.length, 0);
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('evaluateSuiteQuality uses context-aware required categories in strict mode', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'openai-generator-quality-context-aware-'));
+
+  try {
+    const generator = new OpenAITestGenerator({
+      projectPath: tempDir,
+      outputDir: 'generated-tests',
+      apiKey: 'test-key',
+    });
+
+    const outputDir = path.join(tempDir, 'generated-tests');
+    fs.mkdirSync(outputDir, { recursive: true });
+
+    const uiFile = path.join(outputDir, 'ui-flow.spec.ts');
+    const apiFile = path.join(outputDir, 'api-pack.spec.ts');
+
+    fs.writeFileSync(uiFile, `import { test, expect } from '@playwright/test';
+test('[CAT:ui_flow] ui flow', async ({ page }) => {
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Continue' }).click();
+  await expect(page.getByRole('main')).toBeVisible();
+});
+`, 'utf-8');
+
+    fs.writeFileSync(apiFile, `import { test, expect } from '@playwright/test';
+test('[CAT:api_contract] [CAT:api_negative] [CAT:api_stress] api coverage', async ({ request }) => {
+  const responses = await Promise.all(Array.from({ length: 3 }, () => request.get('/api/health')));
+  for (const response of responses) {
+    expect([200, 400, 404]).toContain(response.status());
+    expect(response.status()).toBeLessThan(500);
+  }
+});
+`, 'utf-8');
+
+    generator.generatedFiles = [
+      { path: uiFile, filename: 'ui-flow.spec.ts', type: 'frontend', source: 'openai' },
+      { path: apiFile, filename: 'api-pack.spec.ts', type: 'api', source: 'openai' },
+    ];
+
+    const quality = generator.evaluateSuiteQuality({
+      testType: 'both',
+      minGeneratedTests: 1,
+      strictAIGeneration: true,
+      coverageProfile: 'qa-max',
+      context: {
+        pages: [{ path: '/' }],
+        forms: [],
+        workflows: [{ name: 'single inferred workflow' }],
+        navigationGraph: [],
+        apiEndpoints: [{ method: 'GET', path: '/api/health' }],
+        authPatterns: [],
+      },
+    });
+
+    assert.equal(quality.valid, true);
+    assert.equal(quality.missingCategories.length, 0);
+    assert.equal(quality.requiredCategories.includes('form_validation'), false);
+    assert.equal(quality.requiredCategories.includes('workflow_journey'), false);
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }

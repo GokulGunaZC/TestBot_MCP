@@ -532,8 +532,17 @@ function classifyErrorCode(error) {
   }
 
   const message = String(error?.message || '').toLowerCase();
-  if (message.includes('timeout') || message.includes('budget')) {
+  if (message.includes("cannot find module '@playwright/test'") || message.includes("cannot find module \"@playwright/test\"")) {
+    return 'PLAYWRIGHT_DEPENDENCY_MISSING';
+  }
+  if (message.includes('server failed to start') || message.includes('process exited before becoming ready')) {
+    return 'SERVER_START_TIMEOUT';
+  }
+  if (message.includes('exceeded budget') || message.includes('no budget left') || message.includes('time_budget_exceeded')) {
     return 'TIME_BUDGET_EXCEEDED';
+  }
+  if (message.includes('timed out')) {
+    return 'PIPELINE_TIMEOUT';
   }
   if (message.includes('validation')) {
     return 'GENERATION_VALIDATION_FAILED';
@@ -551,6 +560,48 @@ function classifyErrorCode(error) {
     return 'PIPELINE_FAILED';
   }
   return 'PIPELINE_ERROR';
+}
+
+function normalizeErrorText(value) {
+  return String(value || '')
+    .replace(/[\u001b\u009b][[\]()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]/g, '')
+    .replace(/[\u0000-\u001F\u007F]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function summarizeGenerationAttemptError(error) {
+  const base = normalizeErrorText(error?.message) || 'generation attempt failed';
+  const validation = error?.validation;
+  if (!validation) {
+    return base;
+  }
+
+  const details = [];
+  if (validation.reason) {
+    details.push(`validation=${normalizeErrorText(validation.reason)}`);
+  }
+
+  if (typeof validation.stderr === 'string' && validation.stderr.trim()) {
+    const lines = validation.stderr
+      .split('\n')
+      .map((line) => normalizeErrorText(line))
+      .filter(Boolean);
+    const actionable = lines.find((line) =>
+      /cannot find module ['"]@playwright\/test['"]|module_not_found|error:/i.test(line)
+    ) || lines[0];
+    if (actionable) {
+      details.push(actionable.slice(0, 220));
+    }
+  }
+
+  if (validation.qualityAudit?.errors?.length) {
+    details.push(`quality=${validation.qualityAudit.errors.join(',')}`);
+  }
+
+  return details.length > 0
+    ? `${base} (${details.join('; ')})`
+    : base;
 }
 
 function ensureDir(dirPath) {
@@ -1172,11 +1223,14 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
 
       return result;
     } catch (error) {
+      const summarizedReason = summarizeGenerationAttemptError(error);
+      const errorCode = error?.code ? String(error.code) : classifyErrorCode(error);
       generationMeta.attempts.push({
         generator: generatorName,
         status: 'failed',
-        reason: error.message,
-        errorCode: classifyErrorCode(error),
+        reason: summarizedReason,
+        rawReason: normalizeErrorText(error?.message),
+        errorCode,
         validation: error.validation,
         durationMs: Date.now() - startedAt,
       });
@@ -1301,13 +1355,18 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
   generationMeta.finishedAt = new Date().toISOString();
 
   if (!result) {
-    const error = new Error(
-      strictAI
-        ? 'Strict AI generation failed to produce valid tests'
-        : 'All test generation strategies failed'
-    );
-    error.code = strictAI ? 'AI_GENERATION_INSUFFICIENT' : 'GENERATION_FAILED';
+    const failedAttempts = generationMeta.attempts.filter((attempt) => attempt.status === 'failed');
+    const primaryFailure = failedAttempts[failedAttempts.length - 1] || null;
+    const errorCode = primaryFailure?.errorCode || (strictAI ? 'AI_GENERATION_INSUFFICIENT' : 'GENERATION_FAILED');
+    const reason = primaryFailure?.reason || null;
+    const message = strictAI
+      ? (reason ? `Strict AI generation failed: ${reason}` : 'Strict AI generation failed to produce valid tests')
+      : (reason ? `All test generation strategies failed: ${reason}` : 'All test generation strategies failed');
+
+    const error = new Error(message);
+    error.code = errorCode;
     error.generationMeta = generationMeta;
+    error.primaryFailure = primaryFailure;
     throw error;
   }
 
@@ -1745,6 +1804,7 @@ async function runPipeline(config, runId) {
       return reportGen.generate({
         projectPath: config.projectPath,
         projectName: config.projectName,
+        runId,
         testResults,
         aiAnalysis,
         jiraData: jiraStories,
@@ -1880,6 +1940,7 @@ async function runPipeline(config, runId) {
       const errorReport = await reportGen.generate({
         projectPath: config.projectPath,
         projectName: config.projectName,
+        runId,
         testResults: syntheticTestResults,
         aiAnalysis: null,
         jiraData: null,

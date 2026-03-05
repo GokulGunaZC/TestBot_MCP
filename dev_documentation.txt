@@ -3,6 +3,26 @@ TESTBOT MCP dev_documentation.txt - Development log
 ================================================================================
 
 ================================================================================
+Update: 2026-03-05 - Home page CTA text colour (Test Locally, Upgrade to Pro)
+================================================================================
+
+SUMMARY:
+--------
+Changed the "Test Locally (MCP)" and "Upgrade to Pro" button/link text on the
+dashboard home page from white to black for consistent styling.
+
+ACTIONS TAKEN:
+--------------
+- webapp/src/app/(dashboard)/home/page.tsx:
+  - Get Started CTA link: text-white -> text-black for "Test Locally (MCP)".
+  - Credits card CTA link: text-white -> text-black for "Upgrade to Pro".
+  Both links retain the btn-gradient background.
+
+FILES MODIFIED:
+---------------
+- webapp/src/app/(dashboard)/home/page.tsx
+
+================================================================================
 Update: 2026-01-30 (commit and push to TestBot_MCP)
 ================================================================================
 

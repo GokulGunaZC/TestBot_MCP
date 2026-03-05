@@ -51,6 +51,10 @@ export interface TestRun {
   source: 'mcp' | 'api' | 'dashboard'
   created_at: string
   updated_at: string
+  run_id?: string | null
+  current_phase?: string | null
+  error_code?: string | null
+  is_live?: boolean
 }
 
 export interface TestList {
