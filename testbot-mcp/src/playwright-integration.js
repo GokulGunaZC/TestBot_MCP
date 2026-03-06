@@ -178,6 +178,19 @@ class PlaywrightIntegration {
     });
   }
 
+  async findFreePort(startPort, maxAttempts = 20) {
+    for (let i = 0; i < maxAttempts; i++) {
+      const candidatePort = startPort + i;
+      if (candidatePort > 65535) break;
+      const inUse = await this.probeTcpPort('127.0.0.1', candidatePort, 500)
+        || await this.probeTcpPort('localhost', candidatePort, 500);
+      if (!inUse) {
+        return candidatePort;
+      }
+    }
+    return startPort;
+  }
+
   stripAnsi(text) {
     if (typeof text !== 'string') {
       return '';
@@ -1143,6 +1156,27 @@ test.describe('${this.sanitizeString(scenario.name)}', () => {
 
   async startServer() {
     if (!this.config.startCommand) return;
+
+    const configuredPort = Number(this.config.port || 0);
+    if (configuredPort > 0) {
+      const portInUse = await this.probeTcpPort('127.0.0.1', configuredPort, 500)
+        || await this.probeTcpPort('localhost', configuredPort, 500);
+      if (portInUse) {
+        const freePort = await this.findFreePort(configuredPort + 1);
+        Logger.warn('PlaywrightIntegration', `Configured port ${configuredPort} is already in use. Switching to port ${freePort} to avoid testing the wrong server.`, {
+          originalPort: configuredPort,
+          newPort: freePort,
+        });
+        try {
+          const parsedBase = new URL(this.config.baseURL);
+          parsedBase.port = String(freePort);
+          this.config.baseURL = parsedBase.toString().replace(/\/$/, '') || `http://localhost:${freePort}`;
+        } catch {
+          this.config.baseURL = `http://localhost:${freePort}`;
+        }
+        this.config.port = freePort;
+      }
+    }
 
     return new Promise((resolve, reject) => {
       const effectiveStartCommand = this.normalizeStartCommandForHeadlessWeb(this.config.startCommand);

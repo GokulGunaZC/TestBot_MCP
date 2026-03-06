@@ -6,7 +6,8 @@ const fs = require('fs');
 const TestbotMCPServer = require('../../src/index');
 
 async function main() {
-  const webappPath = '/Users/krishsharma/Desktop/QA_Final/webapp';
+  // const webappPath = '/Users/krishsharma/Desktop/QA_Final/webapp';
+  const webappPath = 'C:/Users/ShreyesPrabhuDesai/PersProjects/TestBot_MCP/webapp';
   if (!fs.existsSync(webappPath)) {
     throw new Error(`Webapp path does not exist: ${webappPath}`);
   }

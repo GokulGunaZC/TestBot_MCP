@@ -455,7 +455,7 @@
         function initDefaults() {
             const parsedBaseURL = parseBaseURL(defaults.baseURL);
             hostInput.value = parsedBaseURL.host;
-            portInput.value = parsedBaseURL.port;
+            portInput.value = parsedBaseURL.port || urlParams.get('port') || '3000';
             pathInput.value = parsedBaseURL.path;
             startCommandInput.value = defaults.startCommand;
 

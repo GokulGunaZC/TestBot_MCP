@@ -36,14 +36,14 @@ const MCPTelemetryReporter = require('./mcp-telemetry');
 // Initialize logger for the worker process
 Logger.initialize();
 
-const DEFAULT_TOTAL_BUDGET_MS = 600000;
+const DEFAULT_TOTAL_BUDGET_MS = 1800000;
 const DEFAULT_STAGE_CAPS_MS = {
   jira: 45000,
   context: 90000,
   generation: 180000,
   validation: 90000,
-  execution: 210000,
-  aiTriage: 45000,
+  execution: 1200000,
+  aiTriage: 60000,
   reporting: 30000,
   dashboard: 30000,
 };
@@ -124,16 +124,29 @@ function createRunBudget(config = {}) {
   }
 
   const strictAI = strictAIEnabled(config);
+  const coverageProfile = String(config.coverageProfile || 'qa-max').toLowerCase();
+  const twoPhase = String(config.phaseMode || 'two-phase') === 'two-phase';
+
   const hasExplicitGenerationCap = Boolean(config.stageCaps?.generation) || Boolean(process.env.TESTBOT_STAGE_GENERATION_MS);
   if (strictAI && !hasExplicitGenerationCap) {
     const requestedMinTests = toFiniteNumber(config.minGeneratedTests, 50);
-    const coverageProfile = String(config.coverageProfile || 'qa-max').toLowerCase();
     const adaptiveGenerationCap = coverageProfile === 'exhaustive' || requestedMinTests >= 75
       ? 360000
       : requestedMinTests >= 50
         ? 300000
         : stageCaps.generation;
     stageCaps.generation = Math.max(stageCaps.generation, adaptiveGenerationCap);
+  }
+
+  // Scale execution cap for heavier profiles / two-phase mode
+  const hasExplicitExecutionCap = Boolean(config.stageCaps?.execution) || Boolean(process.env.TESTBOT_STAGE_EXECUTION_MS);
+  if (!hasExplicitExecutionCap) {
+    const adaptiveExecutionCap = coverageProfile === 'exhaustive'
+      ? 2400000
+      : twoPhase
+        ? 1200000
+        : 900000;
+    stageCaps.execution = Math.max(stageCaps.execution, adaptiveExecutionCap);
   }
 
   return {
@@ -1718,6 +1731,43 @@ async function runPipeline(config, runId) {
   });
 
   try {
+    // -------------------------------------------------------
+    // 0. Port pre-flight check (must run before test generation)
+    // -------------------------------------------------------
+    // If another process is already listening on the configured port, find a
+    // free one NOW — before AI generates tests — so that test files are written
+    // with the correct baseURL from the start.
+    if (config.startCommand) {
+      const configuredPort = Number(config.port || 0);
+      if (configuredPort > 0) {
+        const _tempPI = new PlaywrightIntegration(config);
+        const portInUse = await _tempPI.probeTcpPort('127.0.0.1', configuredPort, 500)
+          || await _tempPI.probeTcpPort('localhost', configuredPort, 500);
+        if (portInUse) {
+          const freePort = await _tempPI.findFreePort(configuredPort + 1);
+          Logger.warn('PipelineWorker', `Port ${configuredPort} is already in use — switching dev server to port ${freePort}`, {
+            originalPort: configuredPort,
+            newPort: freePort,
+          });
+          try {
+            const parsedBase = new URL(config.baseURL);
+            parsedBase.port = String(freePort);
+            config = { ...config, port: freePort, baseURL: parsedBase.toString().replace(/\/$/, '') };
+          } catch {
+            config = { ...config, port: freePort, baseURL: `http://localhost:${freePort}` };
+          }
+          updateStatus(statusDir, 'port_conflict', {
+            runId,
+            message: `Port ${configuredPort} is already in use. Dev server will start on port ${freePort} instead.`,
+            project: config.projectName,
+            originalPort: configuredPort,
+            newPort: freePort,
+            aiOnlyEnforced,
+          }, telemetryReporter);
+        }
+      }
+    }
+
     // -------------------------------------------------------
     // 1. Jira integration (optional)
     // -------------------------------------------------------

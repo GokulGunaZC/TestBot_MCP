@@ -111,7 +111,14 @@ class TestbotMCPServer {
   }
 
   createConfigUILauncher(config = {}) {
-    return new ConfigUILauncher(config);
+    // Cancel any previously active launcher so its server frees the port before the new one starts
+    if (this._activeConfigUILauncher) {
+      try { this._activeConfigUILauncher.cancel(); } catch (_) {}
+      this._activeConfigUILauncher = null;
+    }
+    const launcher = new ConfigUILauncher(config);
+    this._activeConfigUILauncher = launcher;
+    return launcher;
   }
 
   createTelemetryReporter(config = {}) {
@@ -433,6 +440,7 @@ class TestbotMCPServer {
     }
   }
 
+
   /**
    * Fork a background worker to run the full test pipeline.
    * Returns immediately so the MCP request handler can respond fast.
@@ -441,17 +449,14 @@ class TestbotMCPServer {
     const workerPath = path.join(__dirname, 'pipeline-worker.js');
     Logger.info('Index', `Forking pipeline worker in background`, { runId, projectPath: config.projectPath });
 
+    // Use 'ignore' for stdout/stderr: all important output is written to
+    // logs/mcp.log via Logger.  Piping would require draining to avoid
+    // back-pressure, and writing to process.stderr from the drain handler
+    // re-introduces the Windows synchronous pipe-blocking hang.
     const child = fork(workerPath, [], {
-      stdio: ['ignore', 'ignore', 'pipe', 'ipc'],
+      stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
       env: { ...process.env },
     });
-
-    // Pipe worker stderr to our stderr for debugging
-    if (child.stderr) {
-      child.stderr.on('data', (data) => {
-        process.stderr.write(data);
-      });
-    }
 
     // Send config to worker via IPC
     child.send({ config, runId });
@@ -461,6 +466,36 @@ class TestbotMCPServer {
     setTimeout(() => {
       try { child.disconnect(); } catch (e) { /* already disconnected */ }
     }, 1000);
+
+    // Crash detection: if worker exits with non-zero code before writing a terminal
+    // status, write an error immediately so waitForPipelineCompletion returns fast
+    // instead of hanging for 30 minutes.
+    const WORKER_TERMINAL_PHASES = new Set(['completed', 'error', 'error_reported', 'failed']);
+    const crashStatusFile = path.join(
+      config.projectPath, 'testbot-reports', '.runs', runId, 'status.json'
+    );
+    child.on('exit', (code, signal) => {
+      if (code === 0 || code === null) return; // clean exit or SIGTERM — ignore
+      process.stderr.write(`[TESTBOT] Worker exited with code ${code}\n`);
+      try {
+        let existingPhase = null;
+        if (fs.existsSync(crashStatusFile)) {
+          existingPhase = JSON.parse(fs.readFileSync(crashStatusFile, 'utf-8')).phase;
+        }
+        if (!existingPhase || !WORKER_TERMINAL_PHASES.has(existingPhase)) {
+          fs.writeFileSync(crashStatusFile, JSON.stringify({
+            runId,
+            phase: 'error',
+            message: `Pipeline worker crashed (exit code ${code}${signal ? ', signal ' + signal : ''}).`,
+            errorCode: 'WORKER_CRASH',
+            timestamp: new Date().toISOString(),
+          }));
+        }
+      } catch (e) {
+        process.stderr.write(`[TESTBOT] Could not write crash status: ${e.message}\n`);
+      }
+    });
+
     child.unref();
 
     Logger.info('Index', `Pipeline worker forked`, { pid: child.pid, runId });
@@ -477,6 +512,37 @@ class TestbotMCPServer {
     });
   }
 
+  /**
+   * Poll the run status file until the pipeline reaches a terminal phase.
+   * Keeps the MCP tool call open so the Windsurf chat stays active and
+   * the AI can show the user real results once testing completes.
+   */
+  async waitForPipelineCompletion(statusFile, maxWaitMs = 1800000) {
+    const TERMINAL_PHASES = new Set(['completed', 'error', 'error_reported', 'failed']);
+    const POLL_INTERVAL_MS = 4000;
+    const startedAt = Date.now();
+
+    let lastPhase = '';
+    while (Date.now() - startedAt < maxWaitMs) {
+      await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
+      try {
+        if (!fs.existsSync(statusFile)) continue;
+        const status = JSON.parse(fs.readFileSync(statusFile, 'utf-8'));
+        if (status.phase && status.phase !== lastPhase) {
+          lastPhase = status.phase;
+          // Keep stderr writes small to avoid Windows pipe-blocking
+          process.stderr.write(`[TESTBOT] phase=${status.phase}\n`);
+        }
+        if (TERMINAL_PHASES.has(status.phase)) {
+          return status;
+        }
+      } catch (_) {
+        // File mid-write or not yet created — try again on next poll
+      }
+    }
+    return { phase: 'timeout', message: 'Pipeline monitoring timed out after 30 minutes.' };
+  }
+
   registerTools() {
     this.server.registerTool(
       'testbot_configure',
@@ -488,8 +554,8 @@ class TestbotMCPServer {
       },
       async (args, extra) => {
         const telemetryStartedAt = this.trackToolInvocation('testbot_configure', args);
-        console.error('[DEBUG] testbot_configure called with args:', JSON.stringify(args));
-        Logger.mcp('Index', `Tool called: testbot_configure`, { args: Logger.redact(args) });
+        console.error('[DEBUG] testbot_configure called, projectPath:', args?.projectPath);
+        Logger.mcp('Index', `Tool called: testbot_configure`, { projectPath: args?.projectPath });
         try {
           const result = await this.handleConfigure(args);
           this.trackToolResult('testbot_configure', telemetryStartedAt);
@@ -554,8 +620,10 @@ class TestbotMCPServer {
       },
       async (args, extra) => {
         const telemetryStartedAt = this.trackToolInvocation('testbot_test_my_app', args);
-        console.error('[DEBUG] testbot_test_my_app called with args:', JSON.stringify(args));
-        Logger.mcp('Index', `Tool called: testbot_test_my_app`, { args: Logger.redact(args) });
+        // NOTE: Do NOT JSON.stringify full args here — on Windows stderr is a synchronous
+        // pipe write; writing 10-50KB of codebaseContext JSON blocks the event loop (4KB pipe buffer).
+        console.error('[DEBUG] testbot_test_my_app called, projectPath:', args?.projectPath, 'showConfigUI:', args?.showConfigUI);
+        Logger.mcp('Index', `Tool called: testbot_test_my_app`, { projectPath: args?.projectPath, testType: args?.testType, showConfigUI: args?.showConfigUI });
         try {
           const result = await this.handleTestMyApp(args);
           this.trackToolResult('testbot_test_my_app', telemetryStartedAt);
@@ -589,7 +657,7 @@ class TestbotMCPServer {
       },
       async (args, extra) => {
         const telemetryStartedAt = this.trackToolInvocation('testbot_analyze_failures', args);
-        Logger.mcp('Index', `Tool called: testbot_analyze_failures`, { args: Logger.redact(args) });
+        Logger.mcp('Index', `Tool called: testbot_analyze_failures`, { projectPath: args?.projectPath });
         try {
           const result = await this.handleAnalyzeFailures(args);
           this.trackToolResult('testbot_analyze_failures', telemetryStartedAt);
@@ -621,7 +689,7 @@ class TestbotMCPServer {
       },
       async (args, extra) => {
         const telemetryStartedAt = this.trackToolInvocation('testbot_generate_report', args);
-        Logger.mcp('Index', `Tool called: testbot_generate_report`, { args: Logger.redact(args) });
+        Logger.mcp('Index', `Tool called: testbot_generate_report`, { projectPath: args?.projectPath });
         try {
           const result = await this.handleGenerateReport(args);
           this.trackToolResult('testbot_generate_report', telemetryStartedAt);
@@ -661,7 +729,7 @@ class TestbotMCPServer {
    * Configure tool: Analyze project and return configuration options
    */
   async handleConfigure(params) {
-    Logger.mcp('Index', 'handleConfigure called', { params: Logger.redact(params) });
+    Logger.mcp('Index', 'handleConfigure called', { projectPath: params?.projectPath });
 
     try {
       const projectPath = params.projectPath || process.cwd();
@@ -998,7 +1066,7 @@ Return the JSON structure above based on what you find in the codebase.
       Logger.setRedaction(params.logRedaction);
     }
 
-    Logger.mcp('Index', 'handleTestMyApp called', { params: Logger.redact(params) });
+    Logger.mcp('Index', 'handleTestMyApp called', { projectPath: params?.projectPath, showConfigUI: params?.showConfigUI });
 
     // 1. Fast auto-detection (~100ms)
     Logger.info('Index', 'Detecting project settings...');
@@ -1043,8 +1111,10 @@ Return the JSON structure above based on what you find in the codebase.
     const dashboardUrl = process.env.TESTBOT_DASHBOARD_URL || 'http://localhost:3000';
     const headless = this.resolveHeadlessPreference(params);
     const autoOpenBrowser = this.resolveAutoOpenBrowserPreference(params, headless);
+    let configUrl = null;
 
     if (!showConfigUI) {
+      // ── No config UI: start pipeline immediately ───────────────────────────
       this.writeRunStatus(statusFile, {
         runId,
         phase: 'starting_pipeline',
@@ -1052,114 +1122,106 @@ Return the JSON structure above based on what you find in the codebase.
         project: baseConfig.projectName,
         aiOnlyEnforced: baseConfig.strictAIGeneration !== false,
       });
-
       Logger.info('Index', `Starting pipeline in background (runId: ${runId})...`);
       this.runPipelineInBackground(baseConfig, runId);
+      process.stderr.write(`[TESTBOT] Pipeline started (runId: ${runId}). Monitoring until completion...\n`);
+    } else {
+      // ── Config UI: launch, return immediately with URL, run pipeline in background ──
+      let waitForConfig;
+      try {
+        // Always open the browser for the config form — headless controls
+        // Playwright test execution, not the config UI itself.
+        const configUILauncher = this.createConfigUILauncher({ headless, autoOpenBrowser: true });
+        const launchResult = await configUILauncher.launchNonBlocking({
+          projectPath: baseConfig.projectPath,
+          projectName: baseConfig.projectName,
+          framework: this.detectFramework(context),
+          baseURL: baseConfig.baseURL,
+          port: String(baseConfig.port),
+          startCommand: baseConfig.startCommand,
+          testType: baseConfig.testType,
+          generateTests: baseConfig.generateTests,
+          openDashboard: baseConfig.openDashboard,
+          strictAIGeneration: baseConfig.strictAIGeneration !== false,
+          minGeneratedTests: Number(baseConfig.minGeneratedTests || 50),
+          coverageProfile: baseConfig.coverageProfile || 'qa-max',
+          phaseMode: baseConfig.phaseMode || 'two-phase',
+          headless,
+          autoOpenBrowser,
+        });
+        configUrl = launchResult.configUrl;
+        waitForConfig = launchResult.waitForConfig;
 
-      this.writeRunStatus(statusFile, {
-        runId,
-        phase: 'started',
-        message: 'Pipeline worker started.',
-        project: baseConfig.projectName,
-        aiOnlyEnforced: baseConfig.strictAIGeneration !== false,
-      });
+        this.writeRunStatus(statusFile, {
+          runId,
+          phase: 'awaiting_config_ui',
+          message: 'Waiting for configuration submission from UI.',
+          project: baseConfig.projectName,
+          configUrl,
+          aiOnlyEnforced: baseConfig.strictAIGeneration !== false,
+        });
+        this.emitTelemetry({
+          toolName: 'testbot_test_my_app',
+          eventType: 'config_ui',
+          runId,
+          phase: 'awaiting_config_ui',
+          status: 'info',
+          success: true,
+          message: 'Configuration UI ready and awaiting submission',
+        });
+        process.stderr.write(`[TESTBOT] Config form: ${configUrl} — open and submit to start testing.\n`);
+      } catch (error) {
+        this.writeRunStatus(statusFile, {
+          runId,
+          phase: 'error',
+          message: `Failed to launch configuration UI: ${error.message}`,
+          error: error.message,
+          errorCode: 'CONFIG_UI_LAUNCH_FAILED',
+          project: baseConfig.projectName,
+          aiOnlyEnforced: baseConfig.strictAIGeneration !== false,
+        });
+        throw error;
+      }
 
+      // Fire pipeline continuation in the background — do NOT await it here.
+      // This lets the MCP tool return immediately so the user sees the configUrl
+      // in chat and can open it even if the browser didn't auto-launch.
+      this.continuePipelineAfterConfig({ waitForConfig, runId, statusFile, statusDir, baseConfig })
+        .finally(() => { this._activeConfigUILauncher = null; })
+        .catch(() => {}); // errors are already written to statusFile inside continuePipelineAfterConfig
+
+      // Return immediately — the tool description says "Returns immediately with a
+      // run ID and config URL while awaiting configuration."
       return {
         content: [
           {
             type: 'text',
             text: JSON.stringify({
               success: true,
-              status: 'started',
               runId,
               project: baseConfig.projectName,
-              language: baseConfig.language,
-              message: `TestBot pipeline started for "${baseConfig.projectName}". Configuration UI is disabled for this run.`,
+              phase: 'awaiting_config_ui',
+              configUrl,
               statusFile,
-              dashboardUrl,
-              aiOnlyEnforced: baseConfig.strictAIGeneration !== false,
-              nextSteps: [
-                `Monitor progress: check ${statusFile}`,
-                'Results will be posted to the webapp dashboard automatically when complete.',
-                `Dashboard URL: ${dashboardUrl}`,
-              ],
+              message: `Configuration UI is ready!\n\nOpen this URL in your browser, review the settings, and click "Start Testing":\n\n${configUrl}\n\nOnce you submit, the test pipeline will start automatically. You can monitor progress at:\n${statusFile}`,
             }, null, 2),
           },
         ],
       };
     }
 
-    let configUrl;
-    let waitForConfig;
-    let autoOpened = false;
-    try {
-      const configUILauncher = this.createConfigUILauncher({
-        headless,
-        autoOpenBrowser,
-      });
-      const launchResult = await configUILauncher.launchNonBlocking({
-        projectPath: baseConfig.projectPath,
-        projectName: baseConfig.projectName,
-        framework: this.detectFramework(context),
-        baseURL: baseConfig.baseURL,
-        port: String(baseConfig.port),
-        startCommand: baseConfig.startCommand,
-        testType: baseConfig.testType,
-        generateTests: baseConfig.generateTests,
-        openDashboard: baseConfig.openDashboard,
-        strictAIGeneration: baseConfig.strictAIGeneration !== false,
-        minGeneratedTests: Number(baseConfig.minGeneratedTests || 50),
-        coverageProfile: baseConfig.coverageProfile || 'qa-max',
-        phaseMode: baseConfig.phaseMode || 'two-phase',
-        headless,
-        autoOpenBrowser,
-      });
-      configUrl = launchResult.configUrl;
-      waitForConfig = launchResult.waitForConfig;
-      autoOpened = launchResult.autoOpened === true;
-    } catch (error) {
-      this.writeRunStatus(statusFile, {
-        runId,
-        phase: 'error',
-        message: `Failed to launch configuration UI: ${error.message}`,
-        error: error.message,
-        errorCode: 'CONFIG_UI_LAUNCH_FAILED',
-        project: baseConfig.projectName,
-        aiOnlyEnforced: baseConfig.strictAIGeneration !== false,
-      });
-      throw error;
-    }
+    // ── !showConfigUI path: poll status file until pipeline finishes ──────────
+    // This keeps the Windsurf chat open so the AI can show the user real results.
+    const finalStatus = await this.waitForPipelineCompletion(statusFile);
 
-    this.writeRunStatus(statusFile, {
-      runId,
-      phase: 'awaiting_config_ui',
-      message: 'Waiting for configuration submission from UI.',
-      project: baseConfig.projectName,
-      configUrl,
-      aiOnlyEnforced: baseConfig.strictAIGeneration !== false,
-    });
     this.emitTelemetry({
       toolName: 'testbot_test_my_app',
-      eventType: 'config_ui',
+      eventType: 'run_complete',
       runId,
-      phase: 'awaiting_config_ui',
-      status: 'info',
-      success: true,
-      message: 'Configuration UI ready and awaiting submission',
-      metadata: {
-        configUrl,
-        autoOpened,
-      },
-    });
-
-    this.continuePipelineAfterConfig({
-      waitForConfig,
-      runId,
-      statusFile,
-      statusDir,
-      baseConfig,
-    }).catch((error) => {
-      Logger.error('Index', 'Unexpected continuation error', error, { runId });
+      phase: finalStatus.phase,
+      status: finalStatus.phase === 'completed' ? 'success' : 'error',
+      success: finalStatus.phase === 'completed',
+      message: finalStatus.message,
     });
 
     return {
@@ -1167,26 +1229,18 @@ Return the JSON structure above based on what you find in the codebase.
         {
           type: 'text',
           text: JSON.stringify({
-            success: true,
-            status: 'awaiting_configuration',
+            success: finalStatus.phase === 'completed',
             runId,
             project: baseConfig.projectName,
             language: baseConfig.language,
-            message: autoOpened
-              ? `Configuration UI opened for "${baseConfig.projectName}". Submit the form to start the pipeline automatically.`
-              : `Configuration UI is ready for "${baseConfig.projectName}". Open the provided URL and submit the form to start the pipeline automatically.`,
-            statusFile,
+            phase: finalStatus.phase,
+            message: finalStatus.message,
+            results: finalStatus.results || null,
+            reportPath: finalStatus.reportPath || null,
+            dashboardUrl: finalStatus.dashboardUrl || dashboardUrl,
             configUrl,
-            dashboardUrl,
-            autoOpened,
-            headless,
+            statusFile,
             aiOnlyEnforced: baseConfig.strictAIGeneration !== false,
-            nextSteps: [
-              `Monitor progress: check ${statusFile}`,
-              `Open and submit configuration UI: ${configUrl}`,
-              'Pipeline starts automatically right after configuration submission.',
-              `Dashboard URL: ${dashboardUrl}`,
-            ],
           }, null, 2),
         },
       ],
@@ -1197,7 +1251,7 @@ Return the JSON structure above based on what you find in the codebase.
    * Analyze existing test failures
    */
   async handleAnalyzeFailures(params) {
-    Logger.mcp('Index', 'handleAnalyzeFailures called', { params });
+    Logger.mcp('Index', 'handleAnalyzeFailures called', { projectPath: params?.projectPath });
 
     const projectPath = params.projectPath || process.cwd();
     const testResultsPath = params.testResultsPath || `${projectPath}/test-results.json`;

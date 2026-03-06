@@ -74,8 +74,10 @@ class ConfigUILauncher {
    * @returns {Promise<{configUrl: string, waitForConfig: Promise<Object>}>}
    */
   async launchNonBlocking(projectInfo = {}) {
+    // Clean up any existing server/promise before launching new one
     if (this.server || this.submissionPromise) {
-      throw new Error('Configuration UI launch already in progress');
+      Logger.warn('ConfigUILauncher', 'Cleaning up existing configuration UI session before launching new one');
+      this.cleanup();
     }
 
     this.submissionPromise = new Promise((resolve, reject) => {
@@ -88,15 +90,11 @@ class ConfigUILauncher {
       Logger.info('ConfigUILauncher', 'Server started', { port: this.config.port });
 
       const configURL = this.buildConfigURL(projectInfo);
-      const shouldAutoOpen = this.shouldAutoOpenBrowser(projectInfo);
-      Logger.info('ConfigUILauncher', shouldAutoOpen ? 'Opening configuration form' : 'Configuration form is available (headless mode)', {
+      Logger.info('ConfigUILauncher', 'Opening configuration form in browser', {
         url: configURL,
-        autoOpenBrowser: shouldAutoOpen,
       });
 
-      if (shouldAutoOpen) {
-        this.openInBrowser(configURL);
-      }
+      this.openInBrowser(configURL);
 
       this.timeoutHandle = setTimeout(() => {
         this.rejectSubmission(new Error('Configuration timeout - user did not complete the form within 5 minutes'));
@@ -104,7 +102,7 @@ class ConfigUILauncher {
 
       return {
         configUrl: configURL,
-        autoOpened: shouldAutoOpen,
+        autoOpened: true,
         waitForConfig: this.submissionPromise,
       };
     } catch (error) {
@@ -143,6 +141,12 @@ class ConfigUILauncher {
   }
 
   shouldAutoOpenBrowser(projectInfo = {}) {
+    // If autoOpenBrowser was explicitly set in constructor config, respect it
+    // The headless param in projectInfo is for Playwright execution, not config UI
+    if (this.config.autoOpenBrowser === true) {
+      return true;
+    }
+    
     const headless = resolveBoolean(projectInfo.headless, this.config.headless);
     if (headless) {
       return false;
@@ -152,14 +156,29 @@ class ConfigUILauncher {
 
   openInBrowser(configURL) {
     try {
-      const { exec } = require('child_process');
-      const cmd = process.platform === 'win32'
-        ? `start "" "${configURL}"`
-        : (process.platform === 'darwin' ? `open "${configURL}"` : `xdg-open "${configURL}"`);
-      exec(cmd, { windowsHide: true }, () => {});
-      Logger.info('ConfigUILauncher', 'Configuration form opened in browser');
+      const { spawn } = require('child_process');
+      let child;
+      if (process.platform === 'win32') {
+        // Use PowerShell Start-Process — handles URLs with & query params reliably
+        const escapedUrl = configURL.replace(/'/g, "''");
+        const command = `Start-Process '${escapedUrl}'`;
+        Logger.info('ConfigUILauncher', 'Opening browser on Windows', { command });
+        child = spawn('powershell.exe', [
+          '-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden',
+          '-Command', command
+        ], { detached: true, stdio: 'ignore' });
+        child.on('error', (err) => {
+          Logger.error('ConfigUILauncher', 'PowerShell spawn error', err);
+        });
+      } else if (process.platform === 'darwin') {
+        child = spawn('open', [configURL], { detached: true, stdio: 'ignore' });
+      } else {
+        child = spawn('xdg-open', [configURL], { detached: true, stdio: 'ignore' });
+      }
+      child.unref();
+      Logger.info('ConfigUILauncher', 'Configuration form opened in browser', { url: configURL, platform: process.platform });
     } catch (error) {
-      Logger.warn('ConfigUILauncher', 'Could not auto-open browser', { error: error.message, url: configURL });
+      Logger.warn('ConfigUILauncher', 'Could not auto-open browser', { error: error.message, url: configURL, platform: process.platform });
     }
   }
 
@@ -284,10 +303,10 @@ class ConfigUILauncher {
               Logger.info('ConfigUILauncher', 'Received valid configuration from user');
               
               res.writeHead(200, { 'Content-Type': 'application/json' });
-              res.end(JSON.stringify({ success: true, message: 'Configuration received' }));
-              
-              // Resolve the promise with the config
-              this.resolveSubmission(validation.value);
+              // Resolve only after response is fully flushed — prevents server.close() racing the response
+              res.end(JSON.stringify({ success: true, message: 'Configuration received' }), () => {
+                this.resolveSubmission(validation.value);
+              });
             } catch (error) {
               res.writeHead(400, { 'Content-Type': 'application/json' });
               res.end(JSON.stringify({ success: false, message: 'Invalid JSON payload' }));
@@ -372,7 +391,15 @@ class ConfigUILauncher {
     }
 
     if (this.server) {
-      this.server.close();
+      try {
+        this.server.close((err) => {
+          if (err) {
+            Logger.warn('ConfigUILauncher', 'Error closing server', err);
+          }
+        });
+      } catch (error) {
+        Logger.warn('ConfigUILauncher', 'Exception during server close', error);
+      }
       this.server = null;
     }
 
