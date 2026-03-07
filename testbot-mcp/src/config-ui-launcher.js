@@ -156,27 +156,11 @@ class ConfigUILauncher {
 
   openInBrowser(configURL) {
     try {
-      const { spawn } = require('child_process');
-      let child;
-      if (process.platform === 'win32') {
-        // Use PowerShell Start-Process — handles URLs with & query params reliably
-        const escapedUrl = configURL.replace(/'/g, "''");
-        const command = `Start-Process '${escapedUrl}'`;
-        Logger.info('ConfigUILauncher', 'Opening browser on Windows', { command });
-        child = spawn('powershell.exe', [
-          '-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden',
-          '-Command', command
-        ], { detached: true, stdio: 'ignore' });
-        child.on('error', (err) => {
-          Logger.error('ConfigUILauncher', 'PowerShell spawn error', err);
-        });
-      } else if (process.platform === 'darwin') {
-        child = spawn('open', [configURL], { detached: true, stdio: 'ignore' });
-      } else {
-        child = spawn('xdg-open', [configURL], { detached: true, stdio: 'ignore' });
-      }
-      child.unref();
-      Logger.info('ConfigUILauncher', 'Configuration form opened in browser', { url: configURL, platform: process.platform });
+      const open = require('open');
+      Logger.info('ConfigUILauncher', 'Opening configuration form in system browser', { url: configURL });
+      open(configURL).catch((err) => {
+        Logger.warn('ConfigUILauncher', 'Could not auto-open browser', { error: err.message, url: configURL });
+      });
     } catch (error) {
       Logger.warn('ConfigUILauncher', 'Could not auto-open browser', { error: error.message, url: configURL, platform: process.platform });
     }
