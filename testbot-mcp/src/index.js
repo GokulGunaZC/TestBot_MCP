@@ -402,15 +402,17 @@ class TestbotMCPServer {
         aiOnlyEnforced: finalConfig.strictAIGeneration !== false,
       });
 
-      this.runPipelineInBackground(finalConfig, runId);
-
+      // Write 'started' BEFORE forking so the status is never permanently stuck at
+      // 'starting_pipeline' even if the fork takes a moment on Windows.
       this.writeRunStatus(statusFile, {
         runId,
         phase: 'started',
-        message: 'Pipeline worker started.',
+        message: 'Pipeline worker starting...',
         project: baseConfig.projectName,
         aiOnlyEnforced: finalConfig.strictAIGeneration !== false,
       });
+
+      this.runPipelineInBackground(finalConfig, runId, statusDir);
     } catch (error) {
       const errorCode = error.code === 'CONFIG_INVALID'
         ? 'CONFIG_INVALID'
@@ -445,9 +447,27 @@ class TestbotMCPServer {
    * Fork a background worker to run the full test pipeline.
    * Returns immediately so the MCP request handler can respond fast.
    */
-  runPipelineInBackground(config, runId) {
+  runPipelineInBackground(config, runId, statusDir) {
     const workerPath = path.join(__dirname, 'pipeline-worker.js');
     Logger.info('Index', `Forking pipeline worker in background`, { runId, projectPath: config.projectPath });
+
+    // Write config to a temp file so we send only a tiny file-path string via IPC.
+    // On Windows, named-pipe IPC buffers are ~4 KB; a large codebaseContext will
+    // overflow the buffer and block child.send() until the child drains it —
+    // but the child hasn't started reading yet — causing a permanent deadlock.
+    const resolvedStatusDir = statusDir || path.join(
+      config.projectPath, 'testbot-reports', '.runs', runId
+    );
+    const configTempFile = path.join(resolvedStatusDir, 'pipeline-config.json');
+    let useTempFile = false;
+    let sendError = null;
+    try {
+      fs.mkdirSync(resolvedStatusDir, { recursive: true });
+      fs.writeFileSync(configTempFile, JSON.stringify({ config, runId }));
+      useTempFile = true;
+    } catch (writeErr) {
+      Logger.warn('Index', 'Could not write config temp file; falling back to IPC send', { error: writeErr.message });
+    }
 
     // Use 'ignore' for stdout/stderr: all important output is written to
     // logs/mcp.log via Logger.  Piping would require draining to avoid
@@ -458,8 +478,17 @@ class TestbotMCPServer {
       env: { ...process.env },
     });
 
-    // Send config to worker via IPC
-    child.send({ config, runId });
+    // Send config to worker via IPC — tiny message (file path) or full payload fallback
+    try {
+      if (useTempFile) {
+        child.send({ configFile: configTempFile, runId });
+      } else {
+        child.send({ config, runId });
+      }
+    } catch (sendErr) {
+      sendError = sendErr;
+      process.stderr.write(`[TESTBOT] Failed to send config to worker: ${sendErr.message}\n`);
+    }
 
     // Disconnect IPC and unref so MCP server is not blocked
     child.on('message', () => {}); // drain any messages
@@ -467,27 +496,35 @@ class TestbotMCPServer {
       try { child.disconnect(); } catch (e) { /* already disconnected */ }
     }, 1000);
 
-    // Crash detection: if worker exits with non-zero code before writing a terminal
-    // status, write an error immediately so waitForPipelineCompletion returns fast
+    // Crash detection: if worker exits before writing a terminal status (regardless of
+    // exit code), write an error immediately so waitForPipelineCompletion returns fast
     // instead of hanging for 30 minutes.
     const WORKER_TERMINAL_PHASES = new Set(['completed', 'error', 'error_reported', 'failed']);
     const crashStatusFile = path.join(
       config.projectPath, 'testbot-reports', '.runs', runId, 'status.json'
     );
     child.on('exit', (code, signal) => {
-      if (code === 0 || code === null) return; // clean exit or SIGTERM — ignore
-      process.stderr.write(`[TESTBOT] Worker exited with code ${code}\n`);
+      // Intentional stops: SIGKILL/SIGTERM are user/system actions — skip.
+      if (code === null && (signal === 'SIGKILL' || signal === 'SIGTERM')) return;
       try {
         let existingPhase = null;
         if (fs.existsSync(crashStatusFile)) {
-          existingPhase = JSON.parse(fs.readFileSync(crashStatusFile, 'utf-8')).phase;
+          try {
+            existingPhase = JSON.parse(fs.readFileSync(crashStatusFile, 'utf-8')).phase;
+          } catch { /* ignore parse errors */ }
         }
         if (!existingPhase || !WORKER_TERMINAL_PHASES.has(existingPhase)) {
+          const isCleanButUnfinished = code === 0;
+          const message = isCleanButUnfinished
+            ? `Pipeline worker exited before completing (no error code). Last phase: ${existingPhase || 'unknown'}.`
+            : `Pipeline worker crashed (exit code ${code}${signal ? ', signal ' + signal : ''}). Last phase: ${existingPhase || 'unknown'}.`;
+          const errorCode = isCleanButUnfinished ? 'WORKER_SILENT_EXIT' : 'WORKER_CRASH';
+          process.stderr.write(`[TESTBOT] ${message}\n`);
           fs.writeFileSync(crashStatusFile, JSON.stringify({
             runId,
             phase: 'error',
-            message: `Pipeline worker crashed (exit code ${code}${signal ? ', signal ' + signal : ''}).`,
-            errorCode: 'WORKER_CRASH',
+            message,
+            errorCode,
             timestamp: new Date().toISOString(),
           }));
         }
@@ -495,6 +532,21 @@ class TestbotMCPServer {
         process.stderr.write(`[TESTBOT] Could not write crash status: ${e.message}\n`);
       }
     });
+
+    if (sendError) {
+      // IPC send failed — write error status directly so the pipeline doesn't hang.
+      try {
+        fs.writeFileSync(crashStatusFile, JSON.stringify({
+          runId,
+          phase: 'error',
+          message: `Failed to start pipeline worker: ${sendError.message}`,
+          errorCode: 'WORKER_IPC_SEND_FAILED',
+          timestamp: new Date().toISOString(),
+        }));
+      } catch (e) {
+        process.stderr.write(`[TESTBOT] Could not write IPC-send error status: ${e.message}\n`);
+      }
+    }
 
     child.unref();
 

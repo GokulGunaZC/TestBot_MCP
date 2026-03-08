@@ -131,9 +131,9 @@ function createRunBudget(config = {}) {
   if (strictAI && !hasExplicitGenerationCap) {
     const requestedMinTests = toFiniteNumber(config.minGeneratedTests, 50);
     const adaptiveGenerationCap = coverageProfile === 'exhaustive' || requestedMinTests >= 75
-      ? 360000
+      ? 600000
       : requestedMinTests >= 50
-        ? 300000
+        ? 480000
         : stageCaps.generation;
     stageCaps.generation = Math.max(stageCaps.generation, adaptiveGenerationCap);
   }
@@ -607,8 +607,9 @@ function classifyErrorCode(error) {
     return 'EXPO_DEPENDENCY_VALIDATION_FAILED';
   }
   if (
-    message.includes('non-interactive mode') &&
-    (message.includes('expo') || message.includes('input is required'))
+    message.includes('requested interactive input') ||
+    (message.includes('input is required') && (message.includes('non-interactive') || message.includes('expo'))) ||
+    (message.includes('cannot prompt') && message.includes('non-interactive'))
   ) {
     return 'EXPO_NON_INTERACTIVE_PROMPT';
   }
@@ -716,7 +717,8 @@ function buildUserFacingPipelineError(errorCode, error) {
   }
 
   if (errorCode === 'SERVER_START_TIMEOUT') {
-    return 'App server did not become reachable before timeout. Verify start command, base URL, and port settings in the config form.';
+    const detail = normalizedMessage ? ` Detail: ${normalizedMessage}` : '';
+    return `App server did not become reachable before timeout. Verify start command, base URL, and port settings in the config form.${detail}`;
   }
 
   if (errorCode === 'OPENAI_KEY_MISSING') {
@@ -752,7 +754,7 @@ function toImportPath(relativePath) {
 }
 
 function getCursorFixtureContent(serializedInitScript) {
-  const ts = `import { test as base, expect } from '@playwright/test';
+  const ts = `import { test as base, expect, request } from '@playwright/test';
 
 const test = base.extend({
   page: async ({ page }, use) => {
@@ -761,10 +763,10 @@ const test = base.extend({
   },
 });
 
-export { test, expect };
+export { test, expect, request };
 `;
 
-  const js = `const { test: base, expect } = require('@playwright/test');
+  const js = `const { test: base, expect, request } = require('@playwright/test');
 
 const test = base.extend({
   page: async ({ page }, use) => {
@@ -773,7 +775,7 @@ const test = base.extend({
   },
 });
 
-module.exports = { test, expect };
+module.exports = { test, expect, request };
 `;
 
   return { ts, js };
@@ -2327,13 +2329,31 @@ async function runPipeline(config, runId) {
 // -------------------------------------------------------
 if (require.main === module) {
   process.on('message', (msg) => {
-    const { config, runId } = msg;
-
     // Disconnect IPC so parent is free
     try {
       process.disconnect();
     } catch (e) {
       // already disconnected
+    }
+
+    let config;
+    let runId;
+
+    // Config may be passed via a temp file (to avoid large IPC pipe-buffer deadlock on Windows)
+    if (msg.configFile) {
+      try {
+        const raw = fs.readFileSync(msg.configFile, 'utf-8');
+        const parsed = JSON.parse(raw);
+        config = parsed.config;
+        runId = parsed.runId || msg.runId;
+      } catch (readErr) {
+        Logger.error('PipelineWorker', 'Failed to read config temp file', readErr, { configFile: msg.configFile });
+        process.exit(1);
+        return;
+      }
+    } else {
+      config = msg.config;
+      runId = msg.runId;
     }
 
     // Run pipeline
