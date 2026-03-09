@@ -1159,7 +1159,8 @@ Return the JSON structure above based on what you find in the codebase.
       },
     });
 
-    const showConfigUI = params.showConfigUI !== false;
+    // const showConfigUI = params.showConfigUI !== false;
+    const showConfigUI = true;
     const dashboardUrl = process.env.TESTBOT_DASHBOARD_URL || 'http://localhost:3000';
     const headless = this.resolveHeadlessPreference(params);
     const autoOpenBrowser = this.resolveAutoOpenBrowserPreference(params, headless);
