@@ -451,6 +451,32 @@ class TestbotMCPServer {
     const workerPath = path.join(__dirname, 'pipeline-worker.js');
     Logger.info('Index', `Forking pipeline worker in background`, { runId, projectPath: config.projectPath });
 
+    // ── Kill any previous TestBot pipeline worker ────────────────────────────
+    // The worker is unref()'d so it survives Windsurf closure. If a previous run
+    // is still in-flight (e.g. stuck in AI generation), kill it before starting
+    // a new one. We ONLY kill what we wrote into this PID file — nothing else.
+    const testbotReportsDir = path.join(config.projectPath, 'testbot-reports');
+    const workerPidFile = path.join(testbotReportsDir, '.testbot-worker.pid');
+    const _killWorkerPid = (pidFile) => {
+      if (!fs.existsSync(pidFile)) return;
+      let pid;
+      try { pid = parseInt(fs.readFileSync(pidFile, 'utf-8').trim(), 10); } catch { /* ignore */ }
+      if (pid > 0) {
+        try {
+          if (process.platform === 'win32') {
+            require('child_process').spawnSync('taskkill', ['/F', '/T', '/PID', String(pid)], { stdio: 'ignore' });
+          } else {
+            try { process.kill(-pid, 'SIGKILL'); } catch { try { process.kill(pid, 'SIGKILL'); } catch { /* gone */ } }
+          }
+          Logger.info('Index', 'Killed leftover TestBot pipeline worker', { pid });
+        } catch { /* already gone */ }
+      }
+      try { fs.unlinkSync(pidFile); } catch { /* ignore */ }
+    };
+    try { fs.mkdirSync(testbotReportsDir, { recursive: true }); } catch { /* ignore */ }
+    _killWorkerPid(workerPidFile);
+    // ────────────────────────────────────────────────────────────────────────
+
     // Write config to a temp file so we send only a tiny file-path string via IPC.
     // On Windows, named-pipe IPC buffers are ~4 KB; a large codebaseContext will
     // overflow the buffer and block child.send() until the child drains it —
@@ -504,7 +530,10 @@ class TestbotMCPServer {
       config.projectPath, 'testbot-reports', '.runs', runId, 'status.json'
     );
     child.on('exit', (code, signal) => {
-      // Intentional stops: SIGKILL/SIGTERM are user/system actions — skip.
+      // Always clean up the PID file so it never lingers as a stale kill-target.
+      try { fs.unlinkSync(workerPidFile); } catch { /* already deleted or never written */ }
+
+      // Intentional stops (SIGKILL/SIGTERM): skip crash-status write.
       if (code === null && (signal === 'SIGKILL' || signal === 'SIGTERM')) return;
       try {
         let existingPhase = null;
@@ -546,6 +575,11 @@ class TestbotMCPServer {
       } catch (e) {
         process.stderr.write(`[TESTBOT] Could not write IPC-send error status: ${e.message}\n`);
       }
+    }
+
+    // Track this worker's PID so the next run can kill it if still running.
+    if (child.pid) {
+      try { fs.writeFileSync(workerPidFile, String(child.pid)); } catch { /* non-fatal */ }
     }
 
     child.unref();
@@ -650,7 +684,6 @@ class TestbotMCPServer {
             projectKey: z.string().optional(),
           }).optional().describe('Jira integration configuration'),
           openDashboard: z.boolean().optional().describe('Whether to prepare/open dashboard output after tests (default: true)'),
-          showConfigUI: z.boolean().optional().describe('Show configuration UI before starting pipeline (default: true)'),
           headless: z.boolean().optional().describe('Run in headless mode (default: true). Prevents auto-opening browser windows from MCP.'),
           autoOpenBrowser: z.boolean().optional().describe('Allow browser auto-open for config/dashboard pages (default: false, ignored when headless=true).'),
           generationMode: z.enum(['openai-first', 'openai-only', 'template-only', 'saas-only']).optional().describe('Generation strategy'),
@@ -674,8 +707,8 @@ class TestbotMCPServer {
         const telemetryStartedAt = this.trackToolInvocation('testbot_test_my_app', args);
         // NOTE: Do NOT JSON.stringify full args here — on Windows stderr is a synchronous
         // pipe write; writing 10-50KB of codebaseContext JSON blocks the event loop (4KB pipe buffer).
-        console.error('[DEBUG] testbot_test_my_app called, projectPath:', args?.projectPath, 'showConfigUI:', args?.showConfigUI);
-        Logger.mcp('Index', `Tool called: testbot_test_my_app`, { projectPath: args?.projectPath, testType: args?.testType, showConfigUI: args?.showConfigUI });
+        console.error('[DEBUG] testbot_test_my_app called, projectPath:', args?.projectPath);
+        Logger.mcp('Index', `Tool called: testbot_test_my_app`, { projectPath: args?.projectPath, testType: args?.testType });
         try {
           const result = await this.handleTestMyApp(args);
           this.trackToolResult('testbot_test_my_app', telemetryStartedAt);
@@ -1118,7 +1151,7 @@ Return the JSON structure above based on what you find in the codebase.
       Logger.setRedaction(params.logRedaction);
     }
 
-    Logger.mcp('Index', 'handleTestMyApp called', { projectPath: params?.projectPath, showConfigUI: params?.showConfigUI });
+    Logger.mcp('Index', 'handleTestMyApp called', { projectPath: params?.projectPath });
 
     // 1. Fast auto-detection (~100ms)
     Logger.info('Index', 'Detecting project settings...');
@@ -1159,27 +1192,13 @@ Return the JSON structure above based on what you find in the codebase.
       },
     });
 
-    // const showConfigUI = params.showConfigUI !== false;
-    const showConfigUI = true;
     const dashboardUrl = process.env.TESTBOT_DASHBOARD_URL || 'http://localhost:3000';
     const headless = this.resolveHeadlessPreference(params);
     const autoOpenBrowser = this.resolveAutoOpenBrowserPreference(params, headless);
     let configUrl = null;
 
-    if (!showConfigUI) {
-      // ── No config UI: start pipeline immediately ───────────────────────────
-      this.writeRunStatus(statusFile, {
-        runId,
-        phase: 'starting_pipeline',
-        message: 'Configuration UI disabled. Starting pipeline worker...',
-        project: baseConfig.projectName,
-        aiOnlyEnforced: baseConfig.strictAIGeneration !== false,
-      });
-      Logger.info('Index', `Starting pipeline in background (runId: ${runId})...`);
-      this.runPipelineInBackground(baseConfig, runId);
-      process.stderr.write(`[TESTBOT] Pipeline started (runId: ${runId}). Monitoring until completion...\n`);
-    } else {
-      // ── Config UI: launch, return immediately with URL, run pipeline in background ──
+    {
+      // ── Config UI: always launched — return immediately with URL, run pipeline in background ──
       let waitForConfig;
       try {
         // Always open the browser for the config form — headless controls
@@ -1262,42 +1281,6 @@ Return the JSON structure above based on what you find in the codebase.
         ],
       };
     }
-
-    // ── !showConfigUI path: poll status file until pipeline finishes ──────────
-    // This keeps the Windsurf chat open so the AI can show the user real results.
-    const finalStatus = await this.waitForPipelineCompletion(statusFile);
-
-    this.emitTelemetry({
-      toolName: 'testbot_test_my_app',
-      eventType: 'run_complete',
-      runId,
-      phase: finalStatus.phase,
-      status: finalStatus.phase === 'completed' ? 'success' : 'error',
-      success: finalStatus.phase === 'completed',
-      message: finalStatus.message,
-    });
-
-    return {
-      content: [
-        {
-          type: 'text',
-          text: JSON.stringify({
-            success: finalStatus.phase === 'completed',
-            runId,
-            project: baseConfig.projectName,
-            language: baseConfig.language,
-            phase: finalStatus.phase,
-            message: finalStatus.message,
-            results: finalStatus.results || null,
-            reportPath: finalStatus.reportPath || null,
-            dashboardUrl: finalStatus.dashboardUrl || dashboardUrl,
-            configUrl,
-            statusFile,
-            aiOnlyEnforced: baseConfig.strictAIGeneration !== false,
-          }, null, 2),
-        },
-      ],
-    };
   }
 
   /**

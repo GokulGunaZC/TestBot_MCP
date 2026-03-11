@@ -36,13 +36,13 @@ const MCPTelemetryReporter = require('./mcp-telemetry');
 // Initialize logger for the worker process
 Logger.initialize();
 
-const DEFAULT_TOTAL_BUDGET_MS = 1800000;
+const DEFAULT_TOTAL_BUDGET_MS = 3600000; // 60 minutes
 const DEFAULT_STAGE_CAPS_MS = {
   jira: 45000,
   context: 90000,
-  generation: 180000,
+  generation: 360000,  // 6 minutes
   validation: 90000,
-  execution: 1200000,
+  execution: 2400000,  // 40 minutes
   aiTriage: 60000,
   reporting: 30000,
   dashboard: 30000,
@@ -109,6 +109,50 @@ const CURSOR_OVERLAY_INIT_SCRIPT = `
   document.addEventListener('mouseleave', hide, true);
 })();
 `;
+
+// ── TestBot PID-file helpers ────────────────────────────────────────────────
+// We write a PID file for every process TestBot starts (dev server, worker).
+// On the next run startup we read these files and kill only those PIDs —
+// never any unrelated user process.
+
+const TESTBOT_SERVER_PID_FILENAME  = '.testbot-server.pid';
+const TESTBOT_WORKER_PID_FILENAME  = '.testbot-worker.pid';
+
+/**
+ * Kill a process tree identified by a PID file TestBot previously wrote.
+ * Silently no-ops if the file is missing or the process is already gone.
+ * Removes the file regardless.
+ */
+function killOrphanedTestbotProcess(pidFile, label) {
+  if (!fs.existsSync(pidFile)) return;
+  let pid;
+  try {
+    pid = parseInt(fs.readFileSync(pidFile, 'utf-8').trim(), 10);
+  } catch { /* unreadable — just delete */ }
+
+  if (pid > 0) {
+    try {
+      if (process.platform === 'win32') {
+        const { spawnSync } = require('child_process');
+        spawnSync('taskkill', ['/F', '/T', '/PID', String(pid)], { stdio: 'ignore' });
+      } else {
+        try { process.kill(-pid, 'SIGKILL'); } catch { try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ } }
+      }
+      Logger.info('PipelineWorker', `Killed leftover TestBot ${label} process`, { pid });
+    } catch { /* process already gone — ignore */ }
+  }
+
+  try { fs.unlinkSync(pidFile); } catch { /* ignore */ }
+}
+
+/**
+ * Write a PID to a TestBot-owned PID file so it can be cleaned up later.
+ */
+function writeTestbotPidFile(pidFile, pid) {
+  try { fs.writeFileSync(pidFile, String(pid)); } catch { /* non-fatal */ }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 
 function toFiniteNumber(value, fallback) {
   const parsed = Number(value);
@@ -1711,10 +1755,17 @@ async function runPipeline(config, runId) {
   ensureDir(statusDir);
   const telemetryReporter = new MCPTelemetryReporter();
 
+  // Kill any leftover TestBot-started dev server from a previous run.
+  // We only kill what TestBot wrote into this PID file — nothing else.
+  const testbotReportsDir = path.join(config.projectPath, 'testbot-reports');
+  const serverPidFile = path.join(testbotReportsDir, TESTBOT_SERVER_PID_FILENAME);
+  killOrphanedTestbotProcess(serverPidFile, 'dev-server');
+
   const runBudget = createRunBudget(config);
   let generationMeta = null;
   let fallbackUsed = false;
   let generationQuality = null;
+  let playwright = null; // declared here so catch can call stopServer() on budget timeout
   let requirementsCoverage = null;
   let phaseResults = null;
   const aiOnlyEnforced = strictAIEnabled(config);
@@ -1924,6 +1975,44 @@ async function runPipeline(config, runId) {
         categories: generationQuality.categories,
       });
 
+      if (telemetryReporter && telemetryReporter.isEnabled()) {
+        const generatedTestFiles = listGeneratedTestFiles(config.projectPath);
+
+        for (const filePath of generatedTestFiles) {
+          telemetryReporter.emitBackground({
+            toolName: 'testbot_test_my_app',
+            eventType: 'test_file_generated',
+            runId,
+            phase: 'generating',
+            status: 'info',
+            success: true,
+            message: path.basename(filePath),
+            metadata: {
+              project: config.projectName,
+              file: path.basename(filePath),
+              fileCount: generatedTestFiles.length,
+            },
+          });
+        }
+
+        telemetryReporter.emitBackground({
+          toolName: 'testbot_test_my_app',
+          eventType: 'tests_generated',
+          runId,
+          phase: 'generating',
+          status: 'info',
+          success: true,
+          message: `Generated ${generationQuality.totalTests} tests across ${generatedTestFiles.length} file(s)`,
+          metadata: {
+            project: config.projectName,
+            files: generatedTestFiles.map(f => path.basename(f)),
+            fileCount: generatedTestFiles.length,
+            totalTests: generationQuality.totalTests,
+            categories: generationQuality.categories,
+          },
+        });
+      }
+
       if (jiraStories?.length) {
         await withStageBudget(runBudget, 'generation', async () => {
           const playwright = new PlaywrightIntegration(config);
@@ -1950,9 +2039,10 @@ async function runPipeline(config, runId) {
     }, telemetryReporter);
 
     const executionTimeout = Math.max(1000, Math.min(getBudgetRemainingMs(runBudget), runBudget.stageCaps.execution));
-    const playwright = new PlaywrightIntegration({
+    playwright = new PlaywrightIntegration({
       ...config,
       timeout: executionTimeout,
+      serverPidFile,
     });
 
     const mcpParallelEnabled =
@@ -2103,6 +2193,54 @@ async function runPipeline(config, runId) {
       phaseResults,
     }, telemetryReporter);
 
+    if (telemetryReporter && telemetryReporter.isEnabled() && Array.isArray(testResults.tests) && testResults.tests.length > 0) {
+      const simplifiedTests = testResults.tests.slice(0, 300).map(t => ({
+        n: String(t.title || t.name || ''),
+        su: String(t.suite || ''),
+        f: String(t.file || ''),
+        s: String(t.status || 'unknown'),
+        d: Number(t.duration || 0),
+      }));
+
+      for (const t of simplifiedTests) {
+        telemetryReporter.emitBackground({
+          toolName: 'testbot_test_my_app',
+          eventType: 'test_result',
+          runId,
+          phase: 'tests_complete',
+          status: t.s === 'failed' ? 'error' : 'info',
+          success: t.s !== 'failed',
+          message: t.n,
+          metadata: {
+            project: config.projectName,
+            test: t,
+            total: testResults.total,
+            passed: testResults.passed,
+            failed: testResults.failed,
+            skipped: testResults.skipped,
+          },
+        });
+      }
+
+      telemetryReporter.emitBackground({
+        toolName: 'testbot_test_my_app',
+        eventType: 'test_results',
+        runId,
+        phase: 'tests_complete',
+        status: 'info',
+        success: true,
+        message: `Test results: ${testResults.passed}/${testResults.total} passed`,
+        metadata: {
+          project: config.projectName,
+          tests: simplifiedTests,
+          total: testResults.total,
+          passed: testResults.passed,
+          failed: testResults.failed,
+          skipped: testResults.skipped,
+        },
+      });
+    }
+
     // -------------------------------------------------------
     // 6. Optional AI failure triage
     // -------------------------------------------------------
@@ -2209,6 +2347,12 @@ async function runPipeline(config, runId) {
       runId,
     });
   } catch (error) {
+    // Ensure the dev server is killed immediately even when the budget timeout
+    // races ahead of playwright.runTests()'s own finally{stopServer()} block.
+    if (playwright) {
+      try { playwright.stopServer(); } catch { /* ignore */ }
+    }
+
     const errorCode = classifyErrorCode(error);
     const userFacingError = buildUserFacingPipelineError(errorCode, error);
     const technicalError = normalizeErrorText(error?.message);

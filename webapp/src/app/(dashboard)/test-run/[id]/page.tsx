@@ -62,6 +62,8 @@ interface ReportJson {
       errorCode?: string;
       message?: string;
       reason?: string;
+      generatedFiles?: string[];
+      hasLiveTests?: boolean;
     };
   };
   tests?: ReportTest[];
@@ -83,6 +85,28 @@ interface AiAnalysisItem {
   testingRecommendations?: string;
   testing_recommendations?: string;
   confidence?: number | string;
+}
+
+interface LiveEvent {
+  id: string;
+  type: string;
+  phase: string | null;
+  status: string | null;
+  message: string | null;
+  errorCode: string | null;
+  reason: string | null;
+  eventType: string | null;
+  durationMs: number | null;
+  occurredAt: string | null;
+  metadata: Record<string, unknown> | null;
+}
+
+interface LiveTestResult {
+  n: string;
+  su: string;
+  f: string;
+  s: string;
+  d: number;
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -162,19 +186,21 @@ function buildFailureInsight(errorText: string): string | null {
 function useCountUp(target: number, duration = 1200, delay = 0) {
   const [value, setValue] = useState(0);
   const raf = useRef<number | null>(null);
+  const fromRef = useRef(0);
 
   useEffect(() => {
+    const from = fromRef.current;
     let start: number | null = null;
     const timeout = setTimeout(() => {
-      if (target === 0) {
-        setValue(0);
-        return;
-      }
+      if (target === from) return;
+      if (target === 0) { fromRef.current = 0; setValue(0); return; }
       const step = (ts: number) => {
         if (!start) start = ts;
         const progress = Math.min((ts - start) / duration, 1);
         const eased = 1 - Math.pow(1 - progress, 3);
-        setValue(Math.round(eased * target));
+        const next = Math.round(from + eased * (target - from));
+        fromRef.current = next;
+        setValue(next);
         if (progress < 1) raf.current = requestAnimationFrame(step);
       };
       raf.current = requestAnimationFrame(step);
@@ -533,6 +559,164 @@ function TestRow({ t, idx }: { t: NormalisedTest; idx: number }) {
   );
 }
 
+// ─── Phase display helpers ───────────────────────────────────────────────────
+
+const PHASE_LABELS: Record<string, string> = {
+  started: 'Pipeline Started',
+  port_conflict: 'Port Conflict',
+  jira: 'Fetching Jira',
+  context: 'Gathering Context',
+  context_enrichment: 'IDE Context',
+  generating: 'Generating Tests',
+  tests_generated: 'Tests Generated',
+  running: 'Running Tests',
+  rerun_template: 'Template Fallback',
+  tests_complete: 'Tests Complete',
+  test_results: 'Test Results',
+  reporting: 'Generating Report',
+  completed: 'Completed',
+  error: 'Error',
+  error_reported: 'Error Reported',
+};
+
+const TERMINAL_PHASES = new Set(['completed', 'error', 'error_reported']);
+
+function phaseLabel(phase: string | null): string {
+  if (!phase) return 'Unknown';
+  return PHASE_LABELS[phase.toLowerCase()] || phase;
+}
+
+function PhaseIcon({ phase, isLast }: { phase: string | null; isLast: boolean }) {
+  const p = (phase || '').toLowerCase();
+  if (p === 'completed') {
+    return (
+      <span className="flex-shrink-0 w-5 h-5 rounded-full bg-emerald-500/20 border border-emerald-500/40 flex items-center justify-center">
+        <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="#34D399" strokeWidth="3"><polyline points="20 6 9 17 4 12" /></svg>
+      </span>
+    );
+  }
+  if (p === 'error' || p === 'error_reported') {
+    return (
+      <span className="flex-shrink-0 w-5 h-5 rounded-full bg-red-500/20 border border-red-500/40 flex items-center justify-center">
+        <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="#F87171" strokeWidth="3"><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></svg>
+      </span>
+    );
+  }
+  if (isLast) {
+    return (
+      <span className="flex-shrink-0 w-5 h-5 rounded-full bg-blue-500/20 border border-blue-500/40 flex items-center justify-center">
+        <span className="w-2 h-2 rounded-full bg-blue-400 animate-pulse" />
+      </span>
+    );
+  }
+  return (
+    <span className="flex-shrink-0 w-5 h-5 rounded-full bg-emerald-500/20 border border-emerald-500/40 flex items-center justify-center">
+      <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="#34D399" strokeWidth="3"><polyline points="20 6 9 17 4 12" /></svg>
+    </span>
+  );
+}
+
+function LiveTimeline({ events, liveFiles, liveTestResults, pipelineEnded }: {
+  events: LiveEvent[];
+  liveFiles: string[];
+  liveTestResults: LiveTestResult[];
+  pipelineEnded: boolean;
+}) {
+  const displayEvents = events.filter(e =>
+    e.eventType !== 'test_results' &&
+    e.eventType !== 'test_file_generated' &&
+    e.eventType !== 'test_result'
+  );
+  if (displayEvents.length === 0) return null;
+  // Decide which single event owns files/results to avoid duplicates
+  const hasTestsGenEvent = displayEvents.some(e => e.eventType === 'tests_generated');
+  const hasTestsCompleteEvent = displayEvents.some(e => (e.phase || '').toLowerCase() === 'tests_complete' && e.eventType !== 'test_results');
+  return (
+    <div className="flex flex-col gap-0">
+      {displayEvents.map((ev, i) => {
+        const isLast = i === displayEvents.length - 1;
+        const isTerminal = TERMINAL_PHASES.has((ev.phase || '').toLowerCase());
+        const isTestsGen = ev.eventType === 'tests_generated';
+        const isGeneratingPhase = (ev.phase || '').toLowerCase() === 'generating';
+        const isRunningPhase = (ev.phase || '').toLowerCase() === 'running';
+        const isTestsComplete = (ev.phase || '').toLowerCase() === 'tests_complete' && ev.eventType !== 'test_results';
+        // Show files: prefer tests_generated event if present, else generating phase
+        const showFiles = liveFiles.length > 0 && (hasTestsGenEvent ? isTestsGen : isGeneratingPhase);
+        // Show results: prefer tests_complete event if present, else running phase
+        const showResults = liveTestResults.length > 0 && (hasTestsCompleteEvent ? isTestsComplete : isRunningPhase);
+        const effectiveIsLast = isLast && !isTerminal && !pipelineEnded;
+        const time = ev.occurredAt ? new Date(ev.occurredAt).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true }) : '';
+        return (
+          <div key={ev.id} className="flex gap-3 group">
+            <div className="flex flex-col items-center">
+              <PhaseIcon phase={isTerminal ? ev.phase : (effectiveIsLast ? ev.phase : 'done')} isLast={effectiveIsLast} />
+              {i < displayEvents.length - 1 && (
+                <div className="w-px h-full min-h-[16px] bg-white/10 mt-0.5" />
+              )}
+            </div>
+            <div className="pb-3 flex-1 min-w-0">
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className="text-[#F0F6FF] text-xs font-semibold">{phaseLabel(ev.phase)}</span>
+                {time && <span className="text-[#4A6280] text-[10px] font-mono">{time}</span>}
+                {ev.durationMs != null && ev.durationMs > 0 && (
+                  <span className="text-[#4A6280] text-[10px] font-mono">{(ev.durationMs / 1000).toFixed(1)}s</span>
+                )}
+              </div>
+              {ev.message && (
+                <div className="text-[#8BA4C8] text-xs mt-0.5">{ev.message}</div>
+              )}
+              {ev.reason && (
+                <div className="text-red-300/80 text-xs mt-0.5 font-mono">{ev.reason}</div>
+              )}
+
+              {/* Live file badges — drip in under generating phase AND tests_generated */}
+              {showFiles && (
+                <div className="mt-2 flex flex-wrap gap-1">
+                  {liveFiles.map((f, fi) => (
+                    <motion.span
+                      key={f}
+                      initial={{ opacity: 0, scale: 0.8, y: 4 }}
+                      animate={{ opacity: 1, scale: 1, y: 0 }}
+                      transition={{ duration: 0.2, delay: fi * 0.055 }}
+                      className="px-1.5 py-0.5 rounded bg-blue-500/10 border border-blue-500/20 text-blue-300/80 text-[10px] font-mono"
+                    >
+                      {f}
+                    </motion.span>
+                  ))}
+                </div>
+              )}
+
+              {/* Live test results — drip in under running phase AND tests_complete */}
+              {showResults && (
+                <div className="mt-2 flex flex-col gap-0.5 max-h-48 overflow-y-auto pr-1">
+                  {liveTestResults.map((t, ti) => (
+                    <motion.div
+                      key={ti}
+                      initial={{ opacity: 0, x: -6 }}
+                      animate={{ opacity: 1, x: 0 }}
+                      transition={{ duration: 0.15, delay: 0 }}
+                      className="flex items-center gap-2"
+                    >
+                      <span className={`text-[11px] flex-shrink-0 ${
+                        t.s === 'passed' ? 'text-emerald-400' :
+                        t.s === 'failed' ? 'text-red-400' : 'text-amber-400'
+                      }`}>
+                        {t.s === 'passed' ? '✓' : t.s === 'failed' ? '✗' : '○'}
+                      </span>
+                      <span className="text-[#8BA4C8] text-[10px] truncate flex-1">{t.n || 'Unnamed test'}</span>
+                      {t.d > 0 && <span className="text-[#4A6280] text-[10px] font-mono flex-shrink-0">{(t.d / 1000).toFixed(1)}s</span>}
+                    </motion.div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 // ─── Main page ────────────────────────────────────────────────────────────────
 
 export default function TestRunDetailPage() {
@@ -546,6 +730,12 @@ export default function TestRunDetailPage() {
   const [filterStatus, setFilterStatus] = useState<string>('all');
   const [activePolling, setActivePolling] = useState(true);
   const lastRunSignatureRef = useRef<string | null>(null);
+
+  const [liveEvents, setLiveEvents] = useState<LiveEvent[]>([]);
+  const [liveFiles, setLiveFiles] = useState<string[]>([]);
+  const [liveTestResults, setLiveTestResults] = useState<LiveTestResult[]>([]);
+  const [pipelineOpen, setPipelineOpen] = useState(true);
+  const [pipelineEnded, setPipelineEnded] = useState(false);
 
   const isLiveOrRunning = useCallback((run: TestRun | null) => {
     if (!run) return false;
@@ -569,6 +759,45 @@ export default function TestRunDetailPage() {
       'tests_complete',
     ].includes(phase);
   }, [isLiveDetailId]);
+
+  useEffect(() => {
+    if (!id || !isLiveDetailId) return;
+    const evtSource = new EventSource(`/api/test-runs/${id}/stream`);
+    evtSource.onmessage = (e: MessageEvent) => {
+      try {
+        const data = JSON.parse(e.data) as LiveEvent & { type: string };
+        if (data.type === 'event') {
+          setLiveEvents(prev => {
+            if (prev.some(ev => ev.id === data.id)) return prev;
+            return [...prev, data];
+          });
+          if (data.eventType === 'test_file_generated' && typeof (data.metadata as Record<string, unknown>)?.file === 'string') {
+            const file = (data.metadata as Record<string, unknown>).file as string;
+            setLiveFiles(prev => prev.includes(file) ? prev : [...prev, file]);
+          }
+          if (data.eventType === 'test_result' && (data.metadata as Record<string, unknown>)?.test) {
+            const t = (data.metadata as Record<string, unknown>).test as LiveTestResult;
+            setLiveTestResults(prev => [...prev, t]);
+          }
+          if (data.eventType === 'test_results' && Array.isArray((data.metadata as Record<string, unknown>)?.tests)) {
+            const batch = (data.metadata as Record<string, unknown>).tests as LiveTestResult[];
+            setLiveTestResults(prev => prev.length === 0 ? batch : prev);
+          }
+        } else if (data.type === 'done') {
+          evtSource.close();
+          setActivePolling(false);
+          setPipelineEnded(true);
+          // Final fetch to pick up completed state & report
+          fetch(`/api/test-runs/${id}`, { cache: 'no-store' })
+            .then(res => res.ok ? res.json() : null)
+            .then(json => { if (json?.data) setTestRun(json.data); })
+            .catch(() => {});
+        }
+      } catch { /* ignore malformed events */ }
+    };
+    evtSource.onerror = () => { evtSource.close(); };
+    return () => { evtSource.close(); };
+  }, [id, isLiveDetailId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (!id) return;
@@ -711,16 +940,27 @@ export default function TestRunDetailPage() {
   const rawTests: ReportTest[] = report?.tests ?? report?.results ?? [];
   const normalisedTests = rawTests.map((t, i) => normaliseTest(t, i, id));
 
-  const totalTests = testRun.total_tests || report?.summary?.total || report?.stats?.total || normalisedTests.length;
-  const passedTests = testRun.passed_tests || report?.summary?.passed || report?.stats?.passed || normalisedTests.filter(t => ['passed', 'pass'].includes(t.status.toLowerCase())).length;
-  const failedTests = testRun.failed_tests || report?.summary?.failed || report?.stats?.failed || normalisedTests.filter(t => ['failed', 'fail'].includes(t.status.toLowerCase())).length;
-  const skippedTests = testRun.skipped_tests || report?.summary?.skipped || report?.stats?.skipped || normalisedTests.filter(t => ['skipped', 'skip', 'pending'].includes(t.status.toLowerCase())).length;
-  const passRate = totalTests > 0 ? Math.round((passedTests / totalTests) * 100) : 0;
+  // Filter tests — strip synthetic pipeline rows when we have real test data
+  const isPipelineSynthetic = (t: NormalisedTest) =>
+    t.suite === 'pipeline' && (t.name.startsWith('[PIPELINE') || t.name.startsWith('[PIPELINE_ERROR'));
+  const hasRealTests = liveTestResults.length > 0 || normalisedTests.some(t => !isPipelineSynthetic(t));
+  const displayTests = hasRealTests ? normalisedTests.filter(t => !isPipelineSynthetic(t)) : normalisedTests;
 
-  // Filter tests
+  // Use live test results for stats when available (real-time updates)
+  const livePassed = liveTestResults.filter(t => t.s === 'passed').length;
+  const liveFailed = liveTestResults.filter(t => t.s === 'failed').length;
+  const liveSkipped = liveTestResults.filter(t => t.s === 'skipped').length;
+  const liveTotal = liveTestResults.length;
+  const hasLiveStats = liveTotal > 0;
+
+  const totalTests = hasLiveStats ? liveTotal : (testRun.total_tests || report?.summary?.total || report?.stats?.total || displayTests.length);
+  const passedTests = hasLiveStats ? livePassed : (testRun.passed_tests || report?.summary?.passed || report?.stats?.passed || displayTests.filter(t => ['passed', 'pass'].includes(t.status.toLowerCase())).length);
+  const failedTests = hasLiveStats ? liveFailed : (testRun.failed_tests || report?.summary?.failed || report?.stats?.failed || displayTests.filter(t => ['failed', 'fail'].includes(t.status.toLowerCase())).length);
+  const skippedTests = hasLiveStats ? liveSkipped : (testRun.skipped_tests || report?.summary?.skipped || report?.stats?.skipped || displayTests.filter(t => ['skipped', 'skip', 'pending'].includes(t.status.toLowerCase())).length);
+  const passRate = totalTests > 0 ? Math.round((passedTests / totalTests) * 100) : 0;
   const filteredTests = filterStatus === 'all'
-    ? normalisedTests
-    : normalisedTests.filter(t => {
+    ? displayTests
+    : displayTests.filter(t => {
         const s = t.status.toLowerCase();
         if (filterStatus === 'passed') return s === 'passed' || s === 'pass';
         if (filterStatus === 'failed') return s === 'failed' || s === 'fail';
@@ -783,25 +1023,175 @@ export default function TestRunDetailPage() {
         </div>
       </motion.div>
 
-      {(testRun.is_live || !!liveMeta || !!testRun.current_phase || !!testRun.error_code) && (
+      {(testRun.is_live || !!liveMeta || !!testRun.current_phase || !!testRun.error_code || liveEvents.length > 0) && (
         <motion.div
           initial={{ opacity: 0, y: 8 }}
           animate={{ opacity: 1, y: 0 }}
-          className="glass-card rounded-2xl p-4 border border-blue-500/20 bg-blue-500/5"
+          className="glass-card rounded-2xl overflow-hidden border border-blue-500/20 bg-blue-500/[0.03]"
         >
-          <div className="flex flex-col gap-1 text-sm">
-            <div className="text-[#D8E8FF] font-semibold">Live Pipeline Status</div>
-            <div className="text-[#8BA4C8] font-mono">
-              phase: {testRun.current_phase || liveMeta?.phase || testRun.status}
-              {testRun.error_code || liveMeta?.errorCode ? ` · error: ${testRun.error_code || liveMeta?.errorCode}` : ''}
-              {liveRunId ? ` · runId: ${liveRunId}` : ''}
-            </div>
-            {(liveMeta?.message || liveMeta?.reason) && (
-              <div className="text-[#BFD4F2] text-xs">
-                {liveMeta?.message || liveMeta?.reason}
+          {/* Header — clickable to collapse/expand */}
+          <button
+            onClick={() => setPipelineOpen(o => !o)}
+            className="w-full px-5 py-3.5 border-b border-white/8 flex items-center justify-between gap-3 text-left hover:bg-white/[0.02] transition-colors"
+          >
+            <div className="flex items-center gap-2.5">
+              <div className={`w-7 h-7 rounded-lg flex items-center justify-center flex-shrink-0 ${
+                pipelineEnded
+                  ? 'bg-emerald-500/10 border border-emerald-500/30'
+                  : 'bg-blue-500/10 border border-blue-500/20'
+              }`}>
+                {pipelineEnded ? (
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#34D399" strokeWidth="3"><polyline points="20 6 9 17 4 12" /></svg>
+                ) : (
+                  <span className="w-2.5 h-2.5 rounded-full bg-blue-400 animate-pulse" />
+                )}
               </div>
+              <div>
+                <div className="text-[#D8E8FF] font-semibold text-sm">Pipeline Activity</div>
+                <div className="text-[#4A6280] text-[11px] font-mono">
+                  {pipelineEnded ? 'completed' : (testRun.current_phase || liveMeta?.phase || testRun.status)}
+                  {testRun.error_code || liveMeta?.errorCode ? ` · error: ${testRun.error_code || liveMeta?.errorCode}` : ''}
+                  {liveRunId ? ` · run: ${liveRunId}` : ''}
+                </div>
+              </div>
+            </div>
+            <div className="flex items-center gap-2">
+              {liveEvents.length > 0 && (() => {
+                const pipelineCount = liveEvents.filter(e =>
+                  e.eventType !== 'test_results' &&
+                  e.eventType !== 'test_file_generated' &&
+                  e.eventType !== 'test_result'
+                ).length;
+                return (
+                  <div className="flex items-center gap-1.5">
+                    <span className="px-2 py-0.5 rounded-full bg-blue-500/10 border border-blue-500/20 text-blue-300 text-[10px] font-semibold">
+                      {pipelineCount} step{pipelineCount !== 1 ? 's' : ''}
+                    </span>
+                    {liveFiles.length > 0 && (
+                      <span className="px-2 py-0.5 rounded-full bg-indigo-500/10 border border-indigo-500/20 text-indigo-300 text-[10px] font-semibold">
+                        {liveFiles.length} file{liveFiles.length !== 1 ? 's' : ''}
+                      </span>
+                    )}
+                    {liveTestResults.length > 0 && (
+                      <span className="px-2 py-0.5 rounded-full bg-emerald-500/10 border border-emerald-500/20 text-emerald-300 text-[10px] font-semibold">
+                        {liveTestResults.length} test{liveTestResults.length !== 1 ? 's' : ''}
+                      </span>
+                    )}
+                  </div>
+                );
+              })()}
+              <svg
+                width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"
+                className={`text-[#4A6280] transition-transform duration-200 flex-shrink-0 ${pipelineOpen ? 'rotate-180' : ''}`}
+              >
+                <polyline points="6 9 12 15 18 9" />
+              </svg>
+            </div>
+          </button>
+
+          <AnimatePresence initial={false}>
+            {pipelineOpen && (
+              <motion.div
+                key="pipeline-body"
+                initial={{ height: 0, opacity: 0 }}
+                animate={{ height: 'auto', opacity: 1 }}
+                exit={{ height: 0, opacity: 0 }}
+                transition={{ duration: 0.25 }}
+                style={{ overflow: 'hidden' }}
+              >
+                {/* SSE timeline */}
+                {liveEvents.length > 0 ? (
+                  <div className="px-5 py-4">
+                    <LiveTimeline events={liveEvents} liveFiles={liveFiles} liveTestResults={liveTestResults} pipelineEnded={pipelineEnded} />
+                  </div>
+                ) : (
+                  (liveMeta?.message || liveMeta?.reason) && (
+                    <div className="px-5 py-3 text-[#BFD4F2] text-xs">
+                      {liveMeta?.message || liveMeta?.reason}
+                    </div>
+                  )
+                )}
+
+                {/* Generated Files — standalone section, shown when no tests_generated event */}
+                {liveFiles.length > 0 && !liveEvents.some(e => e.eventType === 'tests_generated') && !liveEvents.some(e => (e.phase || '').toLowerCase() === 'generating') && (
+                  <div className="border-t border-white/8 px-5 py-3">
+                    <div className="text-[#4A6280] text-[10px] font-semibold uppercase tracking-wider mb-2">
+                      Generated Files ({liveFiles.length})
+                    </div>
+                    <div className="flex flex-wrap gap-1">
+                      {liveFiles.map((f, fi) => (
+                        <motion.span
+                          key={f}
+                          initial={{ opacity: 0, scale: 0.8, y: 4 }}
+                          animate={{ opacity: 1, scale: 1, y: 0 }}
+                          transition={{ duration: 0.2, delay: fi * 0.055 }}
+                          className="px-1.5 py-0.5 rounded bg-blue-500/10 border border-blue-500/20 text-blue-300/80 text-[10px] font-mono"
+                        >
+                          {f}
+                        </motion.span>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* Live test execution results from SSE */}
+                {liveTestResults.length > 0 && (
+                  <div className="border-t border-white/8">
+                    <div className="px-5 py-3 border-b border-white/5 flex items-center justify-between">
+                      <div className="text-[#F0F6FF] text-sm font-semibold">Live Test Execution</div>
+                      <div className="flex items-center gap-3 text-xs">
+                        <span className="text-emerald-400">{livePassed} passed</span>
+                        <span className="text-red-400">{liveFailed} failed</span>
+                        {liveSkipped > 0 && (
+                          <span className="text-amber-400">{liveSkipped} skipped</span>
+                        )}
+                        <span className="text-[#4A6280]">/ {liveTotal} total</span>
+                      </div>
+                    </div>
+                    <div className="overflow-x-auto max-h-80 overflow-y-auto">
+                      <table className="w-full">
+                        <thead className="sticky top-0 bg-[#0D1B2A]">
+                          <tr className="border-b border-white/5">
+                            <th className="text-left px-5 py-2 text-[#4A6280] text-[10px] font-semibold uppercase tracking-wider">Test Name</th>
+                            <th className="text-left px-4 py-2 text-[#4A6280] text-[10px] font-semibold uppercase tracking-wider">Suite</th>
+                            <th className="text-left px-4 py-2 text-[#4A6280] text-[10px] font-semibold uppercase tracking-wider">Status</th>
+                            <th className="text-left px-4 py-2 text-[#4A6280] text-[10px] font-semibold uppercase tracking-wider">Duration</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {liveTestResults.map((t, i) => (
+                            <motion.tr
+                              key={i}
+                              initial={{ opacity: 0, x: -8 }}
+                              animate={{ opacity: 1, x: 0 }}
+                              transition={{ duration: 0.18, delay: 0 }}
+                              className="border-b border-white/5 last:border-0 hover:bg-white/[0.02]"
+                            >
+                              <td className="px-5 py-2.5 text-[#F0F6FF] text-xs font-medium">{t.n || `Test ${i + 1}`}</td>
+                              <td className="px-4 py-2.5 text-[#4A6280] text-xs font-mono truncate max-w-[140px]">{t.su || t.f || '—'}</td>
+                              <td className="px-4 py-2.5"><StatusBadge status={t.s || 'unknown'} /></td>
+                              <td className="px-4 py-2.5 text-[#4A6280] text-xs font-mono">{t.d > 0 ? `${(t.d / 1000).toFixed(2)}s` : '—'}</td>
+                            </motion.tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                )}
+
+                {/* End-of-testing banner */}
+                {pipelineEnded && (
+                  <div className="border-t border-white/8 px-5 py-3 flex items-center gap-2">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#34D399" strokeWidth="3"><polyline points="20 6 9 17 4 12" /></svg>
+                    <span className="text-emerald-400 text-xs font-semibold">Pipeline complete</span>
+                    {liveTotal > 0 && (
+                      <span className="text-[#4A6280] text-xs">— {livePassed}/{liveTotal} tests passed ({Math.round((livePassed / liveTotal) * 100)}%)</span>
+                    )}
+                  </div>
+                )}
+              </motion.div>
             )}
-          </div>
+          </AnimatePresence>
         </motion.div>
       )}
 
@@ -862,12 +1252,12 @@ export default function TestRunDetailPage() {
             <div className="text-[#4A6280] text-sm">No detailed report was saved for this test run.</div>
           </div>
         </motion.div>
-      ) : normalisedTests.length > 0 ? (
+      ) : displayTests.length > 0 ? (
         <motion.div initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.35 }} className="glass-card rounded-2xl overflow-hidden">
           <div className="px-6 py-4 border-b border-white/8 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
             <div>
               <h2 className="text-[#F0F6FF] font-semibold text-base">Test Results</h2>
-              <p className="text-[#4A6280] text-xs mt-0.5">{normalisedTests.length} individual tests — click a row to expand details</p>
+              <p className="text-[#4A6280] text-xs mt-0.5">{displayTests.length} individual tests — click a row to expand details</p>
             </div>
             {/* Filter buttons */}
             <div className="flex items-center gap-1.5">
@@ -884,7 +1274,7 @@ export default function TestRunDetailPage() {
                       : 'bg-white/5 text-[#4A6280] border border-transparent hover:border-white/10'
                   }`}
                 >
-                  {f === 'all' ? `All (${normalisedTests.length})` : f === 'passed' ? `Passed (${passedTests})` : f === 'failed' ? `Failed (${failedTests})` : `Skipped (${skippedTests})`}
+                  {f === 'all' ? `All (${displayTests.length})` : f === 'passed' ? `Passed (${passedTests})` : f === 'failed' ? `Failed (${failedTests})` : `Skipped (${skippedTests})`}
                 </button>
               ))}
             </div>

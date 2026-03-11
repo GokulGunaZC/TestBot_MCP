@@ -214,6 +214,14 @@ class ConfigUILauncher {
    */
   startServer(projectInfo) {
     return new Promise((resolve, reject) => {
+      // Hard timeout: if we never bind after 30 s (e.g. close() callback never
+      // fires on Windows for a never-bound server) fail fast instead of hanging.
+      const globalTimeout = setTimeout(() => {
+        reject(new Error('Config UI server failed to start within 30 seconds'));
+      }, 30000);
+      const safeResolve = () => { clearTimeout(globalTimeout); resolve(); };
+      const safeReject  = (e) => { clearTimeout(globalTimeout); reject(e);  };
+
       // Find dashboard directory
       const dashboardPaths = [
         path.join(__dirname, '../dashboard/public'),
@@ -232,7 +240,7 @@ class ConfigUILauncher {
       
       if (!dashboardDir) {
         Logger.error('ConfigUILauncher', 'Configuration form not found', new Error('Missing dashboard/public/config-form.html'), { paths: dashboardPaths });
-        return reject(new Error('Configuration form not found. Please ensure dashboard/public/config-form.html exists.'));
+        return safeReject(new Error('Configuration form not found. Please ensure dashboard/public/config-form.html exists.'));
       }
       
       const stylesDir = path.join(dashboardDir, '../src/styles');
@@ -348,19 +356,26 @@ class ConfigUILauncher {
         });
       });
       
-      this.server.on('error', (error) => {
+      this.server.once('error', (error) => {
         if (error.code === 'EADDRINUSE') {
-          // Try next port
+          // The server never bound to the port so there's nothing to close.
+          // Calling server.close() here can hang forever on Windows because the
+          // close-callback is only fired after all connections drain — but a
+          // never-bound server may never fire it in some Node.js versions.
+          // Skip close() and go straight to the next port.
+          this.server = null;
           this.config.port++;
           Logger.debug('ConfigUILauncher', `Port in use, trying next port`, { port: this.config.port });
-          this.startServer(projectInfo).then(resolve).catch(reject);
+          setImmediate(() => {
+            this.startServer(projectInfo).then(safeResolve).catch(safeReject);
+          });
         } else {
-          reject(error);
+          safeReject(error);
         }
       });
       
       this.server.listen(this.config.port, () => {
-        resolve();
+        safeResolve();
       });
     });
   }

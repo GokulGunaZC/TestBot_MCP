@@ -1328,6 +1328,12 @@ test.describe('${this.sanitizeString(scenario.name)}', () => {
         stdio: ['ignore', 'pipe', 'pipe'],
       });
 
+      // Write PID so the next TestBot run can kill this server if it is left
+      // running (e.g. after a crash, budget timeout, or Windsurf closure).
+      if (this.config.serverPidFile && this.serverProcess.pid) {
+        try { fs.writeFileSync(this.config.serverPidFile, String(this.serverProcess.pid)); } catch { /* non-fatal */ }
+      }
+
       const rememberLog = (chunk) => {
         const text = this.stripAnsi(String(chunk || '')).trim();
         if (serverLogStream) {
@@ -1471,14 +1477,32 @@ test.describe('${this.sanitizeString(scenario.name)}', () => {
       return;
     }
 
-    Logger.info('PlaywrightIntegration', 'Stopping server');
-    try {
-      process.kill(-this.serverProcess.pid);
-    } catch {
-      this.serverProcess.kill();
+    const proc = this.serverProcess;
+    this.serverProcess = null;
+    Logger.info('PlaywrightIntegration', 'Stopping server', { pid: proc.pid });
+
+    if (process.platform === 'win32') {
+      // On Windows, process.kill(-pid) is unsupported and only kills the shell
+      // wrapper — leaving npm/Next.js children alive and holding the port.
+      // taskkill /F /T /PID kills the entire process tree recursively.
+      try {
+        const { spawnSync } = require('child_process');
+        spawnSync('taskkill', ['/F', '/T', '/PID', String(proc.pid)], { stdio: 'ignore' });
+      } catch {
+        try { proc.kill('SIGKILL'); } catch { /* ignore */ }
+      }
+    } else {
+      try {
+        process.kill(-proc.pid);
+      } catch {
+        try { proc.kill(); } catch { /* ignore */ }
+      }
     }
 
-    this.serverProcess = null;
+    // Remove PID file now that the process is gone.
+    if (this.config.serverPidFile) {
+      try { fs.unlinkSync(this.config.serverPidFile); } catch { /* already deleted or never written */ }
+    }
   }
 
   sanitizeString(str) {
