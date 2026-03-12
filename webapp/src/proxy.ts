@@ -1,5 +1,5 @@
-import { NextResponse, type NextRequest } from 'next/server'
-import { jwtVerify } from 'jose'
+import { createServerClient } from '@supabase/ssr'
+import { NextRequest, NextResponse } from 'next/server'
 
 const PROTECTED_ROUTES = [
   '/home',
@@ -15,23 +15,32 @@ const PROTECTED_ROUTES = [
 
 const AUTH_ROUTES = ['/login', '/signup', '/forgot-password']
 
-async function getSessionUser(request: NextRequest): Promise<{ userId: string } | null> {
-  const token = request.cookies.get('testbot-session')?.value
-  if (!token) return null
-
-  try {
-    const secret = new TextEncoder().encode(process.env.JWT_SECRET)
-    const { payload } = await jwtVerify(token, secret)
-    if (!payload.sub) return null
-    return { userId: payload.sub }
-  } catch {
-    return null
-  }
-}
-
 export async function proxy(request: NextRequest) {
+  let supabaseResponse = NextResponse.next({ request })
+
+  const supabase = createServerClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
+    {
+      cookies: {
+        getAll() {
+          return request.cookies.getAll()
+        },
+        setAll(cookiesToSet) {
+          cookiesToSet.forEach(({ name, value }) => request.cookies.set(name, value))
+          supabaseResponse = NextResponse.next({ request })
+          cookiesToSet.forEach(({ name, value, options }) =>
+            supabaseResponse.cookies.set(name, value, options)
+          )
+        },
+      },
+    }
+  )
+
+  // Refresh session — must be called before any redirect checks.
+  const { data: { user } } = await supabase.auth.getUser()
+
   const { pathname } = request.nextUrl
-  const session = await getSessionUser(request)
 
   const isProtected = PROTECTED_ROUTES.some(
     (route) => pathname === route || pathname.startsWith(route + '/')
@@ -40,21 +49,21 @@ export async function proxy(request: NextRequest) {
     (route) => pathname === route || pathname.startsWith(route + '/')
   )
 
-  if (isProtected && !session) {
+  if (isProtected && !user) {
     const loginUrl = request.nextUrl.clone()
     loginUrl.pathname = '/login'
     loginUrl.searchParams.set('redirectedFrom', pathname)
     return NextResponse.redirect(loginUrl)
   }
 
-  if (isAuthRoute && session) {
+  if (isAuthRoute && user) {
     const homeUrl = request.nextUrl.clone()
     homeUrl.pathname = '/home'
     homeUrl.search = ''
     return NextResponse.redirect(homeUrl)
   }
 
-  return NextResponse.next()
+  return supabaseResponse
 }
 
 export const config = {
@@ -62,3 +71,4 @@ export const config = {
     '/((?!_next/static|_next/image|favicon.ico|.*\\.(?:svg|png|jpg|jpeg|gif|webp)$).*)',
   ],
 }
+
