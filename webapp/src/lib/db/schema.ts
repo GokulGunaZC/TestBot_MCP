@@ -10,17 +10,8 @@ import {
   index,
 } from 'drizzle-orm/pg-core'
 
-export const users = pgTable('users', {
-  id: uuid('id').primaryKey().defaultRandom(),
-  email: text('email').unique().notNull(),
-  passwordHash: text('password_hash').notNull(),
-  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
-})
-
 export const profiles = pgTable('profiles', {
-  id: uuid('id')
-    .primaryKey()
-    .references(() => users.id, { onDelete: 'cascade' }),
+  id: uuid('id').primaryKey(),
   email: text('email').notNull(),
   fullName: text('full_name'),
   avatarUrl: text('avatar_url'),

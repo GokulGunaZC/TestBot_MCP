@@ -40,16 +40,14 @@ export async function GET(request: NextRequest) {
   const status = searchParams.get('status')
   const includeLive = searchParams.get('include_live') !== 'false'
 
-  let sortField = testRuns.createdAt
-  if (sort_by === 'updated_at') {
-    sortField = testRuns.updatedAt
-  } else if (sort_by === 'status') {
-    sortField = testRuns.status
-  } else if (sort_by === 'total_tests') {
-    sortField = testRuns.totalTests
-  } else if (sort_by === 'duration_ms') {
-    sortField = testRuns.durationMs
-  }
+  const sortColumns = {
+    created_at: testRuns.createdAt,
+    updated_at: testRuns.updatedAt,
+    status: testRuns.status,
+    total_tests: testRuns.totalTests,
+    duration_ms: testRuns.durationMs,
+  } as const
+  const sortField = (sortColumns[sort_by as keyof typeof sortColumns] ?? testRuns.createdAt) as typeof testRuns.createdAt
   const orderFn = order === 'asc' ? asc : desc
 
   try {
@@ -98,7 +96,7 @@ export async function GET(request: NextRequest) {
       is_live: false,
     }))
 
-    let mergedData = mappedData
+    let mergedData: typeof mappedData = mappedData
     let mergedTotal = total ?? 0
 
     if (includeLive && page === 1) {
@@ -115,7 +113,7 @@ export async function GET(request: NextRequest) {
 
       if (filteredLiveRuns.length > 0) {
         mergedTotal += filteredLiveRuns.length
-        mergedData = [...filteredLiveRuns, ...mappedData]
+        mergedData = ([...filteredLiveRuns, ...mappedData] as typeof mappedData)
           .sort((a, b) => compareRows(a as Record<string, unknown>, b as Record<string, unknown>, sort_by, order))
           .slice(0, limit)
       }

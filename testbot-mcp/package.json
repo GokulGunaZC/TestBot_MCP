@@ -23,6 +23,12 @@
   ],
   "author": "",
   "license": "MIT",
+  "files": [
+    "bin/",
+    "src/",
+    "dashboard/",
+    "mcp-launcher.js"
+  ],
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
     "@playwright/test": "^1.49.0",

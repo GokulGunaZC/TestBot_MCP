@@ -36,14 +36,14 @@ const MCPTelemetryReporter = require('./mcp-telemetry');
 // Initialize logger for the worker process
 Logger.initialize();
 
-const DEFAULT_TOTAL_BUDGET_MS = 600000;
+const DEFAULT_TOTAL_BUDGET_MS = 3600000; // 60 minutes
 const DEFAULT_STAGE_CAPS_MS = {
   jira: 45000,
   context: 90000,
-  generation: 180000,
+  generation: 360000,  // 6 minutes
   validation: 90000,
-  execution: 210000,
-  aiTriage: 45000,
+  execution: 2400000,  // 40 minutes
+  aiTriage: 60000,
   reporting: 30000,
   dashboard: 30000,
 };
@@ -110,6 +110,50 @@ const CURSOR_OVERLAY_INIT_SCRIPT = `
 })();
 `;
 
+// ── TestBot PID-file helpers ────────────────────────────────────────────────
+// We write a PID file for every process TestBot starts (dev server, worker).
+// On the next run startup we read these files and kill only those PIDs —
+// never any unrelated user process.
+
+const TESTBOT_SERVER_PID_FILENAME  = '.testbot-server.pid';
+const TESTBOT_WORKER_PID_FILENAME  = '.testbot-worker.pid';
+
+/**
+ * Kill a process tree identified by a PID file TestBot previously wrote.
+ * Silently no-ops if the file is missing or the process is already gone.
+ * Removes the file regardless.
+ */
+function killOrphanedTestbotProcess(pidFile, label) {
+  if (!fs.existsSync(pidFile)) return;
+  let pid;
+  try {
+    pid = parseInt(fs.readFileSync(pidFile, 'utf-8').trim(), 10);
+  } catch { /* unreadable — just delete */ }
+
+  if (pid > 0) {
+    try {
+      if (process.platform === 'win32') {
+        const { spawnSync } = require('child_process');
+        spawnSync('taskkill', ['/F', '/T', '/PID', String(pid)], { stdio: 'ignore' });
+      } else {
+        try { process.kill(-pid, 'SIGKILL'); } catch { try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ } }
+      }
+      Logger.info('PipelineWorker', `Killed leftover TestBot ${label} process`, { pid });
+    } catch { /* process already gone — ignore */ }
+  }
+
+  try { fs.unlinkSync(pidFile); } catch { /* ignore */ }
+}
+
+/**
+ * Write a PID to a TestBot-owned PID file so it can be cleaned up later.
+ */
+function writeTestbotPidFile(pidFile, pid) {
+  try { fs.writeFileSync(pidFile, String(pid)); } catch { /* non-fatal */ }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+
 function toFiniteNumber(value, fallback) {
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
@@ -124,16 +168,29 @@ function createRunBudget(config = {}) {
   }
 
   const strictAI = strictAIEnabled(config);
+  const coverageProfile = String(config.coverageProfile || 'qa-max').toLowerCase();
+  const twoPhase = String(config.phaseMode || 'two-phase') === 'two-phase';
+
   const hasExplicitGenerationCap = Boolean(config.stageCaps?.generation) || Boolean(process.env.TESTBOT_STAGE_GENERATION_MS);
   if (strictAI && !hasExplicitGenerationCap) {
     const requestedMinTests = toFiniteNumber(config.minGeneratedTests, 50);
-    const coverageProfile = String(config.coverageProfile || 'qa-max').toLowerCase();
     const adaptiveGenerationCap = coverageProfile === 'exhaustive' || requestedMinTests >= 75
-      ? 360000
+      ? 600000
       : requestedMinTests >= 50
-        ? 300000
+        ? 480000
         : stageCaps.generation;
     stageCaps.generation = Math.max(stageCaps.generation, adaptiveGenerationCap);
+  }
+
+  // Scale execution cap for heavier profiles / two-phase mode
+  const hasExplicitExecutionCap = Boolean(config.stageCaps?.execution) || Boolean(process.env.TESTBOT_STAGE_EXECUTION_MS);
+  if (!hasExplicitExecutionCap) {
+    const adaptiveExecutionCap = coverageProfile === 'exhaustive'
+      ? 2400000
+      : twoPhase
+        ? 1200000
+        : 900000;
+    stageCaps.execution = Math.max(stageCaps.execution, adaptiveExecutionCap);
   }
 
   return {
@@ -594,8 +651,9 @@ function classifyErrorCode(error) {
     return 'EXPO_DEPENDENCY_VALIDATION_FAILED';
   }
   if (
-    message.includes('non-interactive mode') &&
-    (message.includes('expo') || message.includes('input is required'))
+    message.includes('requested interactive input') ||
+    (message.includes('input is required') && (message.includes('non-interactive') || message.includes('expo'))) ||
+    (message.includes('cannot prompt') && message.includes('non-interactive'))
   ) {
     return 'EXPO_NON_INTERACTIVE_PROMPT';
   }
@@ -703,7 +761,8 @@ function buildUserFacingPipelineError(errorCode, error) {
   }
 
   if (errorCode === 'SERVER_START_TIMEOUT') {
-    return 'App server did not become reachable before timeout. Verify start command, base URL, and port settings in the config form.';
+    const detail = normalizedMessage ? ` Detail: ${normalizedMessage}` : '';
+    return `App server did not become reachable before timeout. Verify start command, base URL, and port settings in the config form.${detail}`;
   }
 
   if (errorCode === 'OPENAI_KEY_MISSING') {
@@ -739,7 +798,7 @@ function toImportPath(relativePath) {
 }
 
 function getCursorFixtureContent(serializedInitScript) {
-  const ts = `import { test as base, expect } from '@playwright/test';
+  const ts = `import { test as base, expect, request } from '@playwright/test';
 
 const test = base.extend({
   page: async ({ page }, use) => {
@@ -748,10 +807,10 @@ const test = base.extend({
   },
 });
 
-export { test, expect };
+export { test, expect, request };
 `;
 
-  const js = `const { test: base, expect } = require('@playwright/test');
+  const js = `const { test: base, expect, request } = require('@playwright/test');
 
 const test = base.extend({
   page: async ({ page }, use) => {
@@ -760,7 +819,7 @@ const test = base.extend({
   },
 });
 
-module.exports = { test, expect };
+module.exports = { test, expect, request };
 `;
 
   return { ts, js };
@@ -1696,10 +1755,17 @@ async function runPipeline(config, runId) {
   ensureDir(statusDir);
   const telemetryReporter = new MCPTelemetryReporter();
 
+  // Kill any leftover TestBot-started dev server from a previous run.
+  // We only kill what TestBot wrote into this PID file — nothing else.
+  const testbotReportsDir = path.join(config.projectPath, 'testbot-reports');
+  const serverPidFile = path.join(testbotReportsDir, TESTBOT_SERVER_PID_FILENAME);
+  killOrphanedTestbotProcess(serverPidFile, 'dev-server');
+
   const runBudget = createRunBudget(config);
   let generationMeta = null;
   let fallbackUsed = false;
   let generationQuality = null;
+  let playwright = null; // declared here so catch can call stopServer() on budget timeout
   let requirementsCoverage = null;
   let phaseResults = null;
   const aiOnlyEnforced = strictAIEnabled(config);
@@ -1718,6 +1784,43 @@ async function runPipeline(config, runId) {
   });
 
   try {
+    // -------------------------------------------------------
+    // 0. Port pre-flight check (must run before test generation)
+    // -------------------------------------------------------
+    // If another process is already listening on the configured port, find a
+    // free one NOW — before AI generates tests — so that test files are written
+    // with the correct baseURL from the start.
+    if (config.startCommand) {
+      const configuredPort = Number(config.port || 0);
+      if (configuredPort > 0) {
+        const _tempPI = new PlaywrightIntegration(config);
+        const portInUse = await _tempPI.probeTcpPort('127.0.0.1', configuredPort, 500)
+          || await _tempPI.probeTcpPort('localhost', configuredPort, 500);
+        if (portInUse) {
+          const freePort = await _tempPI.findFreePort(configuredPort + 1);
+          Logger.warn('PipelineWorker', `Port ${configuredPort} is already in use — switching dev server to port ${freePort}`, {
+            originalPort: configuredPort,
+            newPort: freePort,
+          });
+          try {
+            const parsedBase = new URL(config.baseURL);
+            parsedBase.port = String(freePort);
+            config = { ...config, port: freePort, baseURL: parsedBase.toString().replace(/\/$/, '') };
+          } catch {
+            config = { ...config, port: freePort, baseURL: `http://localhost:${freePort}` };
+          }
+          updateStatus(statusDir, 'port_conflict', {
+            runId,
+            message: `Port ${configuredPort} is already in use. Dev server will start on port ${freePort} instead.`,
+            project: config.projectName,
+            originalPort: configuredPort,
+            newPort: freePort,
+            aiOnlyEnforced,
+          }, telemetryReporter);
+        }
+      }
+    }
+
     // -------------------------------------------------------
     // 1. Jira integration (optional)
     // -------------------------------------------------------
@@ -1872,6 +1975,44 @@ async function runPipeline(config, runId) {
         categories: generationQuality.categories,
       });
 
+      if (telemetryReporter && telemetryReporter.isEnabled()) {
+        const generatedTestFiles = listGeneratedTestFiles(config.projectPath);
+
+        for (const filePath of generatedTestFiles) {
+          telemetryReporter.emitBackground({
+            toolName: 'testbot_test_my_app',
+            eventType: 'test_file_generated',
+            runId,
+            phase: 'generating',
+            status: 'info',
+            success: true,
+            message: path.basename(filePath),
+            metadata: {
+              project: config.projectName,
+              file: path.basename(filePath),
+              fileCount: generatedTestFiles.length,
+            },
+          });
+        }
+
+        telemetryReporter.emitBackground({
+          toolName: 'testbot_test_my_app',
+          eventType: 'tests_generated',
+          runId,
+          phase: 'generating',
+          status: 'info',
+          success: true,
+          message: `Generated ${generationQuality.totalTests} tests across ${generatedTestFiles.length} file(s)`,
+          metadata: {
+            project: config.projectName,
+            files: generatedTestFiles.map(f => path.basename(f)),
+            fileCount: generatedTestFiles.length,
+            totalTests: generationQuality.totalTests,
+            categories: generationQuality.categories,
+          },
+        });
+      }
+
       if (jiraStories?.length) {
         await withStageBudget(runBudget, 'generation', async () => {
           const playwright = new PlaywrightIntegration(config);
@@ -1898,9 +2039,10 @@ async function runPipeline(config, runId) {
     }, telemetryReporter);
 
     const executionTimeout = Math.max(1000, Math.min(getBudgetRemainingMs(runBudget), runBudget.stageCaps.execution));
-    const playwright = new PlaywrightIntegration({
+    playwright = new PlaywrightIntegration({
       ...config,
       timeout: executionTimeout,
+      serverPidFile,
     });
 
     const mcpParallelEnabled =
@@ -2051,6 +2193,54 @@ async function runPipeline(config, runId) {
       phaseResults,
     }, telemetryReporter);
 
+    if (telemetryReporter && telemetryReporter.isEnabled() && Array.isArray(testResults.tests) && testResults.tests.length > 0) {
+      const simplifiedTests = testResults.tests.slice(0, 300).map(t => ({
+        n: String(t.title || t.name || ''),
+        su: String(t.suite || ''),
+        f: String(t.file || ''),
+        s: String(t.status || 'unknown'),
+        d: Number(t.duration || 0),
+      }));
+
+      for (const t of simplifiedTests) {
+        telemetryReporter.emitBackground({
+          toolName: 'testbot_test_my_app',
+          eventType: 'test_result',
+          runId,
+          phase: 'tests_complete',
+          status: t.s === 'failed' ? 'error' : 'info',
+          success: t.s !== 'failed',
+          message: t.n,
+          metadata: {
+            project: config.projectName,
+            test: t,
+            total: testResults.total,
+            passed: testResults.passed,
+            failed: testResults.failed,
+            skipped: testResults.skipped,
+          },
+        });
+      }
+
+      telemetryReporter.emitBackground({
+        toolName: 'testbot_test_my_app',
+        eventType: 'test_results',
+        runId,
+        phase: 'tests_complete',
+        status: 'info',
+        success: true,
+        message: `Test results: ${testResults.passed}/${testResults.total} passed`,
+        metadata: {
+          project: config.projectName,
+          tests: simplifiedTests,
+          total: testResults.total,
+          passed: testResults.passed,
+          failed: testResults.failed,
+          skipped: testResults.skipped,
+        },
+      });
+    }
+
     // -------------------------------------------------------
     // 6. Optional AI failure triage
     // -------------------------------------------------------
@@ -2157,6 +2347,12 @@ async function runPipeline(config, runId) {
       runId,
     });
   } catch (error) {
+    // Ensure the dev server is killed immediately even when the budget timeout
+    // races ahead of playwright.runTests()'s own finally{stopServer()} block.
+    if (playwright) {
+      try { playwright.stopServer(); } catch { /* ignore */ }
+    }
+
     const errorCode = classifyErrorCode(error);
     const userFacingError = buildUserFacingPipelineError(errorCode, error);
     const technicalError = normalizeErrorText(error?.message);
@@ -2277,13 +2473,31 @@ async function runPipeline(config, runId) {
 // -------------------------------------------------------
 if (require.main === module) {
   process.on('message', (msg) => {
-    const { config, runId } = msg;
-
     // Disconnect IPC so parent is free
     try {
       process.disconnect();
     } catch (e) {
       // already disconnected
+    }
+
+    let config;
+    let runId;
+
+    // Config may be passed via a temp file (to avoid large IPC pipe-buffer deadlock on Windows)
+    if (msg.configFile) {
+      try {
+        const raw = fs.readFileSync(msg.configFile, 'utf-8');
+        const parsed = JSON.parse(raw);
+        config = parsed.config;
+        runId = parsed.runId || msg.runId;
+      } catch (readErr) {
+        Logger.error('PipelineWorker', 'Failed to read config temp file', readErr, { configFile: msg.configFile });
+        process.exit(1);
+        return;
+      }
+    } else {
+      config = msg.config;
+      runId = msg.runId;
     }
 
     // Run pipeline

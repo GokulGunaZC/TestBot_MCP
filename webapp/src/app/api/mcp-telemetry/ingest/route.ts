@@ -116,13 +116,17 @@ export async function POST(request: NextRequest) {
 
     const keyHash = hashApiKey(apiKey)
     const [apiKeyRecord] = await db
-      .select({ id: apiKeys.id, userId: apiKeys.userId, isActive: apiKeys.isActive })
+      .select({ id: apiKeys.id, userId: apiKeys.userId, isActive: apiKeys.isActive, expiresAt: apiKeys.expiresAt })
       .from(apiKeys)
       .where(and(eq(apiKeys.keyHash, keyHash), eq(apiKeys.isActive, true)))
       .limit(1)
 
     if (!apiKeyRecord) {
       return NextResponse.json({ error: 'Invalid or inactive API key' }, { status: 401 })
+    }
+
+    if (apiKeyRecord.expiresAt && apiKeyRecord.expiresAt < new Date()) {
+      return NextResponse.json({ error: 'API key has expired' }, { status: 401 })
     }
 
     const event = normalizeEvent(rawEvent)

@@ -25,6 +25,7 @@ const { McpServer } = require("@modelcontextprotocol/sdk/server/mcp.js");
 const { StdioServerTransport } = require("@modelcontextprotocol/sdk/server/stdio.js");
 const { z } = require('zod');
 
+const fetch = global.fetch || require('node-fetch');
 const Logger = require('./logger');
 const AutoDetector = require('./auto-detector');
 const PlaywrightIntegration = require('./playwright-integration');
@@ -111,7 +112,14 @@ class TestbotMCPServer {
   }
 
   createConfigUILauncher(config = {}) {
-    return new ConfigUILauncher(config);
+    // Cancel any previously active launcher so its server frees the port before the new one starts
+    if (this._activeConfigUILauncher) {
+      try { this._activeConfigUILauncher.cancel(); } catch (_) {}
+      this._activeConfigUILauncher = null;
+    }
+    const launcher = new ConfigUILauncher(config);
+    this._activeConfigUILauncher = launcher;
+    return launcher;
   }
 
   createTelemetryReporter(config = {}) {
@@ -395,15 +403,17 @@ class TestbotMCPServer {
         aiOnlyEnforced: finalConfig.strictAIGeneration !== false,
       });
 
-      this.runPipelineInBackground(finalConfig, runId);
-
+      // Write 'started' BEFORE forking so the status is never permanently stuck at
+      // 'starting_pipeline' even if the fork takes a moment on Windows.
       this.writeRunStatus(statusFile, {
         runId,
         phase: 'started',
-        message: 'Pipeline worker started.',
+        message: 'Pipeline worker starting...',
         project: baseConfig.projectName,
         aiOnlyEnforced: finalConfig.strictAIGeneration !== false,
       });
+
+      this.runPipelineInBackground(finalConfig, runId, statusDir);
     } catch (error) {
       const errorCode = error.code === 'CONFIG_INVALID'
         ? 'CONFIG_INVALID'
@@ -433,34 +443,146 @@ class TestbotMCPServer {
     }
   }
 
+
   /**
    * Fork a background worker to run the full test pipeline.
    * Returns immediately so the MCP request handler can respond fast.
    */
-  runPipelineInBackground(config, runId) {
+  runPipelineInBackground(config, runId, statusDir) {
     const workerPath = path.join(__dirname, 'pipeline-worker.js');
     Logger.info('Index', `Forking pipeline worker in background`, { runId, projectPath: config.projectPath });
 
+    // ── Kill any previous TestBot pipeline worker ────────────────────────────
+    // The worker is unref()'d so it survives Windsurf closure. If a previous run
+    // is still in-flight (e.g. stuck in AI generation), kill it before starting
+    // a new one. We ONLY kill what we wrote into this PID file — nothing else.
+    const testbotReportsDir = path.join(config.projectPath, 'testbot-reports');
+    const workerPidFile = path.join(testbotReportsDir, '.testbot-worker.pid');
+    const _killWorkerPid = (pidFile) => {
+      if (!fs.existsSync(pidFile)) return;
+      let pid;
+      try { pid = parseInt(fs.readFileSync(pidFile, 'utf-8').trim(), 10); } catch { /* ignore */ }
+      if (pid > 0) {
+        try {
+          if (process.platform === 'win32') {
+            require('child_process').spawnSync('taskkill', ['/F', '/T', '/PID', String(pid)], { stdio: 'ignore' });
+          } else {
+            try { process.kill(-pid, 'SIGKILL'); } catch { try { process.kill(pid, 'SIGKILL'); } catch { /* gone */ } }
+          }
+          Logger.info('Index', 'Killed leftover TestBot pipeline worker', { pid });
+        } catch { /* already gone */ }
+      }
+      try { fs.unlinkSync(pidFile); } catch { /* ignore */ }
+    };
+    try { fs.mkdirSync(testbotReportsDir, { recursive: true }); } catch { /* ignore */ }
+    _killWorkerPid(workerPidFile);
+    // ────────────────────────────────────────────────────────────────────────
+
+    // Write config to a temp file so we send only a tiny file-path string via IPC.
+    // On Windows, named-pipe IPC buffers are ~4 KB; a large codebaseContext will
+    // overflow the buffer and block child.send() until the child drains it —
+    // but the child hasn't started reading yet — causing a permanent deadlock.
+    const resolvedStatusDir = statusDir || path.join(
+      config.projectPath, 'testbot-reports', '.runs', runId
+    );
+    const configTempFile = path.join(resolvedStatusDir, 'pipeline-config.json');
+    let useTempFile = false;
+    let sendError = null;
+    try {
+      fs.mkdirSync(resolvedStatusDir, { recursive: true });
+      fs.writeFileSync(configTempFile, JSON.stringify({ config, runId }));
+      useTempFile = true;
+    } catch (writeErr) {
+      Logger.warn('Index', 'Could not write config temp file; falling back to IPC send', { error: writeErr.message });
+    }
+
+    // Use 'ignore' for stdout/stderr: all important output is written to
+    // logs/mcp.log via Logger.  Piping would require draining to avoid
+    // back-pressure, and writing to process.stderr from the drain handler
+    // re-introduces the Windows synchronous pipe-blocking hang.
     const child = fork(workerPath, [], {
-      stdio: ['ignore', 'ignore', 'pipe', 'ipc'],
+      stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
       env: { ...process.env },
     });
 
-    // Pipe worker stderr to our stderr for debugging
-    if (child.stderr) {
-      child.stderr.on('data', (data) => {
-        process.stderr.write(data);
-      });
+    // Send config to worker via IPC — tiny message (file path) or full payload fallback
+    try {
+      if (useTempFile) {
+        child.send({ configFile: configTempFile, runId });
+      } else {
+        child.send({ config, runId });
+      }
+    } catch (sendErr) {
+      sendError = sendErr;
+      process.stderr.write(`[TESTBOT] Failed to send config to worker: ${sendErr.message}\n`);
     }
-
-    // Send config to worker via IPC
-    child.send({ config, runId });
 
     // Disconnect IPC and unref so MCP server is not blocked
     child.on('message', () => {}); // drain any messages
     setTimeout(() => {
       try { child.disconnect(); } catch (e) { /* already disconnected */ }
     }, 1000);
+
+    // Crash detection: if worker exits before writing a terminal status (regardless of
+    // exit code), write an error immediately so waitForPipelineCompletion returns fast
+    // instead of hanging for 30 minutes.
+    const WORKER_TERMINAL_PHASES = new Set(['completed', 'error', 'error_reported', 'failed']);
+    const crashStatusFile = path.join(
+      config.projectPath, 'testbot-reports', '.runs', runId, 'status.json'
+    );
+    child.on('exit', (code, signal) => {
+      // Always clean up the PID file so it never lingers as a stale kill-target.
+      try { fs.unlinkSync(workerPidFile); } catch { /* already deleted or never written */ }
+
+      // Intentional stops (SIGKILL/SIGTERM): skip crash-status write.
+      if (code === null && (signal === 'SIGKILL' || signal === 'SIGTERM')) return;
+      try {
+        let existingPhase = null;
+        if (fs.existsSync(crashStatusFile)) {
+          try {
+            existingPhase = JSON.parse(fs.readFileSync(crashStatusFile, 'utf-8')).phase;
+          } catch { /* ignore parse errors */ }
+        }
+        if (!existingPhase || !WORKER_TERMINAL_PHASES.has(existingPhase)) {
+          const isCleanButUnfinished = code === 0;
+          const message = isCleanButUnfinished
+            ? `Pipeline worker exited before completing (no error code). Last phase: ${existingPhase || 'unknown'}.`
+            : `Pipeline worker crashed (exit code ${code}${signal ? ', signal ' + signal : ''}). Last phase: ${existingPhase || 'unknown'}.`;
+          const errorCode = isCleanButUnfinished ? 'WORKER_SILENT_EXIT' : 'WORKER_CRASH';
+          process.stderr.write(`[TESTBOT] ${message}\n`);
+          fs.writeFileSync(crashStatusFile, JSON.stringify({
+            runId,
+            phase: 'error',
+            message,
+            errorCode,
+            timestamp: new Date().toISOString(),
+          }));
+        }
+      } catch (e) {
+        process.stderr.write(`[TESTBOT] Could not write crash status: ${e.message}\n`);
+      }
+    });
+
+    if (sendError) {
+      // IPC send failed — write error status directly so the pipeline doesn't hang.
+      try {
+        fs.writeFileSync(crashStatusFile, JSON.stringify({
+          runId,
+          phase: 'error',
+          message: `Failed to start pipeline worker: ${sendError.message}`,
+          errorCode: 'WORKER_IPC_SEND_FAILED',
+          timestamp: new Date().toISOString(),
+        }));
+      } catch (e) {
+        process.stderr.write(`[TESTBOT] Could not write IPC-send error status: ${e.message}\n`);
+      }
+    }
+
+    // Track this worker's PID so the next run can kill it if still running.
+    if (child.pid) {
+      try { fs.writeFileSync(workerPidFile, String(child.pid)); } catch { /* non-fatal */ }
+    }
+
     child.unref();
 
     Logger.info('Index', `Pipeline worker forked`, { pid: child.pid, runId });
@@ -477,6 +599,37 @@ class TestbotMCPServer {
     });
   }
 
+  /**
+   * Poll the run status file until the pipeline reaches a terminal phase.
+   * Keeps the MCP tool call open so the Windsurf chat stays active and
+   * the AI can show the user real results once testing completes.
+   */
+  async waitForPipelineCompletion(statusFile, maxWaitMs = 1800000) {
+    const TERMINAL_PHASES = new Set(['completed', 'error', 'error_reported', 'failed']);
+    const POLL_INTERVAL_MS = 4000;
+    const startedAt = Date.now();
+
+    let lastPhase = '';
+    while (Date.now() - startedAt < maxWaitMs) {
+      await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
+      try {
+        if (!fs.existsSync(statusFile)) continue;
+        const status = JSON.parse(fs.readFileSync(statusFile, 'utf-8'));
+        if (status.phase && status.phase !== lastPhase) {
+          lastPhase = status.phase;
+          // Keep stderr writes small to avoid Windows pipe-blocking
+          process.stderr.write(`[TESTBOT] phase=${status.phase}\n`);
+        }
+        if (TERMINAL_PHASES.has(status.phase)) {
+          return status;
+        }
+      } catch (_) {
+        // File mid-write or not yet created — try again on next poll
+      }
+    }
+    return { phase: 'timeout', message: 'Pipeline monitoring timed out after 30 minutes.' };
+  }
+
   registerTools() {
     this.server.registerTool(
       'testbot_configure',
@@ -488,9 +641,10 @@ class TestbotMCPServer {
       },
       async (args, extra) => {
         const telemetryStartedAt = this.trackToolInvocation('testbot_configure', args);
-        console.error('[DEBUG] testbot_configure called with args:', JSON.stringify(args));
-        Logger.mcp('Index', `Tool called: testbot_configure`, { args: Logger.redact(args) });
+        console.error('[DEBUG] testbot_configure called, projectPath:', args?.projectPath);
+        Logger.mcp('Index', `Tool called: testbot_configure`, { projectPath: args?.projectPath });
         try {
+          await this.validateApiKey();
           const result = await this.handleConfigure(args);
           this.trackToolResult('testbot_configure', telemetryStartedAt);
           console.error('[DEBUG] testbot_configure returning result');
@@ -532,7 +686,6 @@ class TestbotMCPServer {
             projectKey: z.string().optional(),
           }).optional().describe('Jira integration configuration'),
           openDashboard: z.boolean().optional().describe('Whether to prepare/open dashboard output after tests (default: true)'),
-          showConfigUI: z.boolean().optional().describe('Show configuration UI before starting pipeline (default: true)'),
           headless: z.boolean().optional().describe('Run in headless mode (default: true). Prevents auto-opening browser windows from MCP.'),
           autoOpenBrowser: z.boolean().optional().describe('Allow browser auto-open for config/dashboard pages (default: false, ignored when headless=true).'),
           generationMode: z.enum(['openai-first', 'openai-only', 'template-only', 'saas-only']).optional().describe('Generation strategy'),
@@ -554,9 +707,12 @@ class TestbotMCPServer {
       },
       async (args, extra) => {
         const telemetryStartedAt = this.trackToolInvocation('testbot_test_my_app', args);
-        console.error('[DEBUG] testbot_test_my_app called with args:', JSON.stringify(args));
-        Logger.mcp('Index', `Tool called: testbot_test_my_app`, { args: Logger.redact(args) });
+        // NOTE: Do NOT JSON.stringify full args here — on Windows stderr is a synchronous
+        // pipe write; writing 10-50KB of codebaseContext JSON blocks the event loop (4KB pipe buffer).
+        console.error('[DEBUG] testbot_test_my_app called, projectPath:', args?.projectPath);
+        Logger.mcp('Index', `Tool called: testbot_test_my_app`, { projectPath: args?.projectPath, testType: args?.testType });
         try {
+          await this.validateApiKey();
           const result = await this.handleTestMyApp(args);
           this.trackToolResult('testbot_test_my_app', telemetryStartedAt);
           console.error('[DEBUG] testbot_test_my_app returning result');
@@ -589,8 +745,9 @@ class TestbotMCPServer {
       },
       async (args, extra) => {
         const telemetryStartedAt = this.trackToolInvocation('testbot_analyze_failures', args);
-        Logger.mcp('Index', `Tool called: testbot_analyze_failures`, { args: Logger.redact(args) });
+        Logger.mcp('Index', `Tool called: testbot_analyze_failures`, { projectPath: args?.projectPath });
         try {
+          await this.validateApiKey();
           const result = await this.handleAnalyzeFailures(args);
           this.trackToolResult('testbot_analyze_failures', telemetryStartedAt);
           return result;
@@ -621,8 +778,9 @@ class TestbotMCPServer {
       },
       async (args, extra) => {
         const telemetryStartedAt = this.trackToolInvocation('testbot_generate_report', args);
-        Logger.mcp('Index', `Tool called: testbot_generate_report`, { args: Logger.redact(args) });
+        Logger.mcp('Index', `Tool called: testbot_generate_report`, { projectPath: args?.projectPath });
         try {
+          await this.validateApiKey();
           const result = await this.handleGenerateReport(args);
           this.trackToolResult('testbot_generate_report', telemetryStartedAt);
           return result;
@@ -640,6 +798,83 @@ class TestbotMCPServer {
         }
       }
     );
+  }
+
+  /**
+   * Validate the TESTBOT_API_KEY before executing any tool.
+   * Throws a descriptive error if the key is missing, invalid, expired, or credits are exhausted.
+   */
+  async validateApiKey() {
+    const apiKey = process.env.TESTBOT_API_KEY;
+    const dashboardUrl = process.env.TESTBOT_DASHBOARD_URL;
+
+    if (!apiKey) {
+      const err = new Error(
+        '❌ TestBot API key not configured.\n\n' +
+        'Add TESTBOT_API_KEY to your IDE\'s MCP server configuration:\n\n' +
+        '  Cursor  → Edit ~/.cursor/mcp.json\n' +
+        '  Windsurf → Edit ~/.codeium/windsurf/mcp_config.json\n\n' +
+        'In that file, under your testbot-mcp server entry, add an "env" block:\n\n' +
+        '  {\n' +
+        '    "mcpServers": {\n' +
+        '      "testbot-mcp": {\n' +
+        '        "command": "npx",\n' +
+        '        "args": ["-y", "@testbot/mcp"],\n' +
+        '        "env": {\n' +
+        '          "TESTBOT_API_KEY": "tb_your_key_here",\n' +
+        '          "TESTBOT_DASHBOARD_URL": "https://your-dashboard-url"\n' +
+        '        }\n' +
+        '      }\n' +
+        '    }\n' +
+        '  }\n\n' +
+        'Get your API key from the TestBot dashboard → API Keys.\n' +
+        'Then restart your IDE for the changes to take effect.'
+      );
+      err.code = 'KEY_MISSING';
+      throw err;
+    }
+
+    if (!dashboardUrl) {
+      return;
+    }
+
+    let response;
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 6000);
+      response = await fetch(`${dashboardUrl}/api/mcp-auth/validate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ api_key: apiKey }),
+        signal: controller.signal,
+      });
+      clearTimeout(timeout);
+    } catch (networkErr) {
+      Logger.warn('Index', 'API key validation request failed (network/timeout) — proceeding anyway', { error: networkErr.message });
+      return;
+    }
+
+    if (response.ok) {
+      return;
+    }
+
+    let data = {};
+    try { data = await response.json(); } catch (_) {}
+
+    const errorCode = data.error || 'KEY_INVALID';
+    const serverMessage = data.message || 'API key validation failed';
+
+    const USER_MESSAGES = {
+      KEY_INVALID: '❌ Invalid TestBot API key.\n\nVerify that TESTBOT_API_KEY in your IDE MCP config matches the key shown in the TestBot dashboard.\n\n  Cursor   → ~/.cursor/mcp.json\n  Windsurf → ~/.codeium/windsurf/mcp_config.json\n',
+      KEY_INACTIVE: '❌ Your TestBot API key has been deactivated.\n\nGenerate a new key in the TestBot dashboard → API Keys, then update the "env" section of your IDE MCP config file.',
+      KEY_EXPIRED: '❌ Your TestBot API key has expired.\n\nGenerate a new key in the TestBot dashboard → API Keys, then update the "env" section of your IDE MCP config file.',
+      NO_CREDITS: '❌ No TestBot credits remaining.\n\nPlease upgrade your plan or purchase more credits in the TestBot dashboard.',
+    };
+
+    const message = USER_MESSAGES[errorCode] || `❌ TestBot API key rejected: ${serverMessage}`;
+    const err = new Error(message);
+    err.code = errorCode;
+    throw err;
   }
 
   setupErrorHandling() {
@@ -661,7 +896,7 @@ class TestbotMCPServer {
    * Configure tool: Analyze project and return configuration options
    */
   async handleConfigure(params) {
-    Logger.mcp('Index', 'handleConfigure called', { params: Logger.redact(params) });
+    Logger.mcp('Index', 'handleConfigure called', { projectPath: params?.projectPath });
 
     try {
       const projectPath = params.projectPath || process.cwd();
@@ -998,7 +1233,7 @@ Return the JSON structure above based on what you find in the codebase.
       Logger.setRedaction(params.logRedaction);
     }
 
-    Logger.mcp('Index', 'handleTestMyApp called', { params: Logger.redact(params) });
+    Logger.mcp('Index', 'handleTestMyApp called', { projectPath: params?.projectPath });
 
     // 1. Fast auto-detection (~100ms)
     Logger.info('Index', 'Detecting project settings...');
@@ -1039,165 +1274,102 @@ Return the JSON structure above based on what you find in the codebase.
       },
     });
 
-    const showConfigUI = params.showConfigUI !== false;
     const dashboardUrl = process.env.TESTBOT_DASHBOARD_URL || 'http://localhost:3000';
     const headless = this.resolveHeadlessPreference(params);
     const autoOpenBrowser = this.resolveAutoOpenBrowserPreference(params, headless);
+    let configUrl = null;
 
-    if (!showConfigUI) {
-      this.writeRunStatus(statusFile, {
-        runId,
-        phase: 'starting_pipeline',
-        message: 'Configuration UI disabled. Starting pipeline worker...',
-        project: baseConfig.projectName,
-        aiOnlyEnforced: baseConfig.strictAIGeneration !== false,
-      });
+    {
+      // ── Config UI: always launched — return immediately with URL, run pipeline in background ──
+      let waitForConfig;
+      try {
+        // Always open the browser for the config form — headless controls
+        // Playwright test execution, not the config UI itself.
+        const configUILauncher = this.createConfigUILauncher({ headless, autoOpenBrowser: true });
+        const launchResult = await configUILauncher.launchNonBlocking({
+          projectPath: baseConfig.projectPath,
+          projectName: baseConfig.projectName,
+          framework: this.detectFramework(context),
+          baseURL: baseConfig.baseURL,
+          port: String(baseConfig.port),
+          startCommand: baseConfig.startCommand,
+          testType: baseConfig.testType,
+          generateTests: baseConfig.generateTests,
+          openDashboard: baseConfig.openDashboard,
+          strictAIGeneration: baseConfig.strictAIGeneration !== false,
+          minGeneratedTests: Number(baseConfig.minGeneratedTests || 50),
+          coverageProfile: baseConfig.coverageProfile || 'qa-max',
+          phaseMode: baseConfig.phaseMode || 'two-phase',
+          headless,
+          autoOpenBrowser,
+        });
+        configUrl = launchResult.configUrl;
+        waitForConfig = launchResult.waitForConfig;
 
-      Logger.info('Index', `Starting pipeline in background (runId: ${runId})...`);
-      this.runPipelineInBackground(baseConfig, runId);
+        this.writeRunStatus(statusFile, {
+          runId,
+          phase: 'awaiting_config_ui',
+          message: 'Waiting for configuration submission from UI.',
+          project: baseConfig.projectName,
+          configUrl,
+          aiOnlyEnforced: baseConfig.strictAIGeneration !== false,
+        });
+        this.emitTelemetry({
+          toolName: 'testbot_test_my_app',
+          eventType: 'config_ui',
+          runId,
+          phase: 'awaiting_config_ui',
+          status: 'info',
+          success: true,
+          message: 'Configuration UI ready and awaiting submission',
+        });
+        process.stderr.write(`[TESTBOT] Config form: ${configUrl} — open and submit to start testing.\n`);
+      } catch (error) {
+        this.writeRunStatus(statusFile, {
+          runId,
+          phase: 'error',
+          message: `Failed to launch configuration UI: ${error.message}`,
+          error: error.message,
+          errorCode: 'CONFIG_UI_LAUNCH_FAILED',
+          project: baseConfig.projectName,
+          aiOnlyEnforced: baseConfig.strictAIGeneration !== false,
+        });
+        throw error;
+      }
 
-      this.writeRunStatus(statusFile, {
-        runId,
-        phase: 'started',
-        message: 'Pipeline worker started.',
-        project: baseConfig.projectName,
-        aiOnlyEnforced: baseConfig.strictAIGeneration !== false,
-      });
+      // Fire pipeline continuation in the background — do NOT await it here.
+      // This lets the MCP tool return immediately so the user sees the configUrl
+      // in chat and can open it even if the browser didn't auto-launch.
+      this.continuePipelineAfterConfig({ waitForConfig, runId, statusFile, statusDir, baseConfig })
+        .finally(() => { this._activeConfigUILauncher = null; })
+        .catch(() => {}); // errors are already written to statusFile inside continuePipelineAfterConfig
 
+      // Return immediately — the tool description says "Returns immediately with a
+      // run ID and config URL while awaiting configuration."
       return {
         content: [
           {
             type: 'text',
             text: JSON.stringify({
               success: true,
-              status: 'started',
               runId,
               project: baseConfig.projectName,
-              language: baseConfig.language,
-              message: `TestBot pipeline started for "${baseConfig.projectName}". Configuration UI is disabled for this run.`,
+              phase: 'awaiting_config_ui',
+              configUrl,
               statusFile,
-              dashboardUrl,
-              aiOnlyEnforced: baseConfig.strictAIGeneration !== false,
-              nextSteps: [
-                `Monitor progress: check ${statusFile}`,
-                'Results will be posted to the webapp dashboard automatically when complete.',
-                `Dashboard URL: ${dashboardUrl}`,
-              ],
+              message: `Configuration UI is ready!\n\nOpen this URL in your browser, review the settings, and click "Start Testing":\n\n${configUrl}\n\nOnce you submit, the test pipeline will start automatically. You can monitor progress at:\n${statusFile}`,
             }, null, 2),
           },
         ],
       };
     }
-
-    let configUrl;
-    let waitForConfig;
-    let autoOpened = false;
-    try {
-      const configUILauncher = this.createConfigUILauncher({
-        headless,
-        autoOpenBrowser,
-      });
-      const launchResult = await configUILauncher.launchNonBlocking({
-        projectPath: baseConfig.projectPath,
-        projectName: baseConfig.projectName,
-        framework: this.detectFramework(context),
-        baseURL: baseConfig.baseURL,
-        port: String(baseConfig.port),
-        startCommand: baseConfig.startCommand,
-        testType: baseConfig.testType,
-        generateTests: baseConfig.generateTests,
-        openDashboard: baseConfig.openDashboard,
-        strictAIGeneration: baseConfig.strictAIGeneration !== false,
-        minGeneratedTests: Number(baseConfig.minGeneratedTests || 50),
-        coverageProfile: baseConfig.coverageProfile || 'qa-max',
-        phaseMode: baseConfig.phaseMode || 'two-phase',
-        headless,
-        autoOpenBrowser,
-      });
-      configUrl = launchResult.configUrl;
-      waitForConfig = launchResult.waitForConfig;
-      autoOpened = launchResult.autoOpened === true;
-    } catch (error) {
-      this.writeRunStatus(statusFile, {
-        runId,
-        phase: 'error',
-        message: `Failed to launch configuration UI: ${error.message}`,
-        error: error.message,
-        errorCode: 'CONFIG_UI_LAUNCH_FAILED',
-        project: baseConfig.projectName,
-        aiOnlyEnforced: baseConfig.strictAIGeneration !== false,
-      });
-      throw error;
-    }
-
-    this.writeRunStatus(statusFile, {
-      runId,
-      phase: 'awaiting_config_ui',
-      message: 'Waiting for configuration submission from UI.',
-      project: baseConfig.projectName,
-      configUrl,
-      aiOnlyEnforced: baseConfig.strictAIGeneration !== false,
-    });
-    this.emitTelemetry({
-      toolName: 'testbot_test_my_app',
-      eventType: 'config_ui',
-      runId,
-      phase: 'awaiting_config_ui',
-      status: 'info',
-      success: true,
-      message: 'Configuration UI ready and awaiting submission',
-      metadata: {
-        configUrl,
-        autoOpened,
-      },
-    });
-
-    this.continuePipelineAfterConfig({
-      waitForConfig,
-      runId,
-      statusFile,
-      statusDir,
-      baseConfig,
-    }).catch((error) => {
-      Logger.error('Index', 'Unexpected continuation error', error, { runId });
-    });
-
-    return {
-      content: [
-        {
-          type: 'text',
-          text: JSON.stringify({
-            success: true,
-            status: 'awaiting_configuration',
-            runId,
-            project: baseConfig.projectName,
-            language: baseConfig.language,
-            message: autoOpened
-              ? `Configuration UI opened for "${baseConfig.projectName}". Submit the form to start the pipeline automatically.`
-              : `Configuration UI is ready for "${baseConfig.projectName}". Open the provided URL and submit the form to start the pipeline automatically.`,
-            statusFile,
-            configUrl,
-            dashboardUrl,
-            autoOpened,
-            headless,
-            aiOnlyEnforced: baseConfig.strictAIGeneration !== false,
-            nextSteps: [
-              `Monitor progress: check ${statusFile}`,
-              `Open and submit configuration UI: ${configUrl}`,
-              'Pipeline starts automatically right after configuration submission.',
-              `Dashboard URL: ${dashboardUrl}`,
-            ],
-          }, null, 2),
-        },
-      ],
-    };
   }
 
   /**
    * Analyze existing test failures
    */
   async handleAnalyzeFailures(params) {
-    Logger.mcp('Index', 'handleAnalyzeFailures called', { params });
+    Logger.mcp('Index', 'handleAnalyzeFailures called', { projectPath: params?.projectPath });
 
     const projectPath = params.projectPath || process.cwd();
     const testResultsPath = params.testResultsPath || `${projectPath}/test-results.json`;

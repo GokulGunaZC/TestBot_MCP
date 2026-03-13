@@ -67,7 +67,7 @@ export default function CreateTestsPage() {
                 View MCP Setup
               </Link>
               <a
-                href="https://github.com/krishsharma1008/TestBot_MCP"
+                href="#"
                 target="_blank"
                 rel="noopener noreferrer"
                 className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl backdrop-blur-md bg-white/[0.05] border border-white/10 text-[#F0F6FF] font-medium text-sm hover:bg-white/[0.08] transition-all duration-300"

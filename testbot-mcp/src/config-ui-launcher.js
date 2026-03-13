@@ -74,8 +74,10 @@ class ConfigUILauncher {
    * @returns {Promise<{configUrl: string, waitForConfig: Promise<Object>}>}
    */
   async launchNonBlocking(projectInfo = {}) {
+    // Clean up any existing server/promise before launching new one
     if (this.server || this.submissionPromise) {
-      throw new Error('Configuration UI launch already in progress');
+      Logger.warn('ConfigUILauncher', 'Cleaning up existing configuration UI session before launching new one');
+      this.cleanup();
     }
 
     this.submissionPromise = new Promise((resolve, reject) => {
@@ -88,15 +90,11 @@ class ConfigUILauncher {
       Logger.info('ConfigUILauncher', 'Server started', { port: this.config.port });
 
       const configURL = this.buildConfigURL(projectInfo);
-      const shouldAutoOpen = this.shouldAutoOpenBrowser(projectInfo);
-      Logger.info('ConfigUILauncher', shouldAutoOpen ? 'Opening configuration form' : 'Configuration form is available (headless mode)', {
+      Logger.info('ConfigUILauncher', 'Opening configuration form in browser', {
         url: configURL,
-        autoOpenBrowser: shouldAutoOpen,
       });
 
-      if (shouldAutoOpen) {
-        this.openInBrowser(configURL);
-      }
+      this.openInBrowser(configURL);
 
       this.timeoutHandle = setTimeout(() => {
         this.rejectSubmission(new Error('Configuration timeout - user did not complete the form within 5 minutes'));
@@ -104,7 +102,7 @@ class ConfigUILauncher {
 
       return {
         configUrl: configURL,
-        autoOpened: shouldAutoOpen,
+        autoOpened: true,
         waitForConfig: this.submissionPromise,
       };
     } catch (error) {
@@ -143,6 +141,12 @@ class ConfigUILauncher {
   }
 
   shouldAutoOpenBrowser(projectInfo = {}) {
+    // If autoOpenBrowser was explicitly set in constructor config, respect it
+    // The headless param in projectInfo is for Playwright execution, not config UI
+    if (this.config.autoOpenBrowser === true) {
+      return true;
+    }
+    
     const headless = resolveBoolean(projectInfo.headless, this.config.headless);
     if (headless) {
       return false;
@@ -152,14 +156,13 @@ class ConfigUILauncher {
 
   openInBrowser(configURL) {
     try {
-      const { exec } = require('child_process');
-      const cmd = process.platform === 'win32'
-        ? `start "" "${configURL}"`
-        : (process.platform === 'darwin' ? `open "${configURL}"` : `xdg-open "${configURL}"`);
-      exec(cmd, { windowsHide: true }, () => {});
-      Logger.info('ConfigUILauncher', 'Configuration form opened in browser');
+      const open = require('open');
+      Logger.info('ConfigUILauncher', 'Opening configuration form in system browser', { url: configURL });
+      open(configURL).catch((err) => {
+        Logger.warn('ConfigUILauncher', 'Could not auto-open browser', { error: err.message, url: configURL });
+      });
     } catch (error) {
-      Logger.warn('ConfigUILauncher', 'Could not auto-open browser', { error: error.message, url: configURL });
+      Logger.warn('ConfigUILauncher', 'Could not auto-open browser', { error: error.message, url: configURL, platform: process.platform });
     }
   }
 
@@ -211,6 +214,14 @@ class ConfigUILauncher {
    */
   startServer(projectInfo) {
     return new Promise((resolve, reject) => {
+      // Hard timeout: if we never bind after 30 s (e.g. close() callback never
+      // fires on Windows for a never-bound server) fail fast instead of hanging.
+      const globalTimeout = setTimeout(() => {
+        reject(new Error('Config UI server failed to start within 30 seconds'));
+      }, 30000);
+      const safeResolve = () => { clearTimeout(globalTimeout); resolve(); };
+      const safeReject  = (e) => { clearTimeout(globalTimeout); reject(e);  };
+
       // Find dashboard directory
       const dashboardPaths = [
         path.join(__dirname, '../dashboard/public'),
@@ -229,7 +240,7 @@ class ConfigUILauncher {
       
       if (!dashboardDir) {
         Logger.error('ConfigUILauncher', 'Configuration form not found', new Error('Missing dashboard/public/config-form.html'), { paths: dashboardPaths });
-        return reject(new Error('Configuration form not found. Please ensure dashboard/public/config-form.html exists.'));
+        return safeReject(new Error('Configuration form not found. Please ensure dashboard/public/config-form.html exists.'));
       }
       
       const stylesDir = path.join(dashboardDir, '../src/styles');
@@ -284,10 +295,10 @@ class ConfigUILauncher {
               Logger.info('ConfigUILauncher', 'Received valid configuration from user');
               
               res.writeHead(200, { 'Content-Type': 'application/json' });
-              res.end(JSON.stringify({ success: true, message: 'Configuration received' }));
-              
-              // Resolve the promise with the config
-              this.resolveSubmission(validation.value);
+              // Resolve only after response is fully flushed — prevents server.close() racing the response
+              res.end(JSON.stringify({ success: true, message: 'Configuration received' }), () => {
+                this.resolveSubmission(validation.value);
+              });
             } catch (error) {
               res.writeHead(400, { 'Content-Type': 'application/json' });
               res.end(JSON.stringify({ success: false, message: 'Invalid JSON payload' }));
@@ -345,19 +356,26 @@ class ConfigUILauncher {
         });
       });
       
-      this.server.on('error', (error) => {
+      this.server.once('error', (error) => {
         if (error.code === 'EADDRINUSE') {
-          // Try next port
+          // The server never bound to the port so there's nothing to close.
+          // Calling server.close() here can hang forever on Windows because the
+          // close-callback is only fired after all connections drain — but a
+          // never-bound server may never fire it in some Node.js versions.
+          // Skip close() and go straight to the next port.
+          this.server = null;
           this.config.port++;
           Logger.debug('ConfigUILauncher', `Port in use, trying next port`, { port: this.config.port });
-          this.startServer(projectInfo).then(resolve).catch(reject);
+          setImmediate(() => {
+            this.startServer(projectInfo).then(safeResolve).catch(safeReject);
+          });
         } else {
-          reject(error);
+          safeReject(error);
         }
       });
       
       this.server.listen(this.config.port, () => {
-        resolve();
+        safeResolve();
       });
     });
   }
@@ -372,7 +390,15 @@ class ConfigUILauncher {
     }
 
     if (this.server) {
-      this.server.close();
+      try {
+        this.server.close((err) => {
+          if (err) {
+            Logger.warn('ConfigUILauncher', 'Error closing server', err);
+          }
+        });
+      } catch (error) {
+        Logger.warn('ConfigUILauncher', 'Exception during server close', error);
+      }
       this.server = null;
     }
 

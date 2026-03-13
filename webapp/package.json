@@ -11,15 +11,14 @@
     "db:generate": "drizzle-kit generate",
     "db:migrate": "drizzle-kit migrate",
     "db:push": "drizzle-kit push",
-    "db:studio": "drizzle-kit studio",
-    "db:seed": "npx tsx src/lib/db/seed.ts"
+    "db:studio": "drizzle-kit studio"
   },
   "dependencies": {
-    "bcrypt": "^6.0.0",
+    "@supabase/ssr": "^0.9.0",
+    "@supabase/supabase-js": "^2.99.1",
     "dotenv": "^17.3.1",
     "drizzle-orm": "^0.45.1",
     "framer-motion": "^12.34.3",
-    "jose": "^6.1.3",
     "next": "16.1.6",
     "postgres": "^3.4.8",
     "react": "19.2.3",
@@ -28,7 +27,6 @@
   "devDependencies": {
     "@playwright/test": "^1.58.2",
     "@tailwindcss/postcss": "^4",
-    "@types/bcrypt": "^6.0.0",
     "@types/node": "^20",
     "@types/react": "^19",
     "@types/react-dom": "^19",

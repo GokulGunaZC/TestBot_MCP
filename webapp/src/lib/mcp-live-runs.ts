@@ -15,6 +15,15 @@ type TelemetryRow = {
   durationMs: number | null
   metadata: unknown
   occurredAt: Date | null
+  eventType: string | null
+}
+
+type LiveTest = {
+  n: string
+  su: string
+  f: string
+  s: string
+  d: number
 }
 
 type LiveRunSnapshot = {
@@ -29,6 +38,8 @@ type LiveRunSnapshot = {
   metadata: Record<string, unknown>
   firstSeenAt: Date
   lastSeenAt: Date
+  liveTests: LiveTest[] | null
+  generatedFiles: string[] | null
 }
 
 function clampText(value: unknown, fallback = ''): string {
@@ -79,8 +90,21 @@ function buildSyntheticLiveReport(snapshot: LiveRunSnapshot) {
   const projectName = getProjectName(snapshot)
   const baseMessage = snapshot.message || `Pipeline phase: ${snapshot.phase}`
 
-  const tests = snapshot.runStatus === 'failed'
-    ? [{
+  let tests
+  if (snapshot.liveTests && snapshot.liveTests.length > 0) {
+    tests = snapshot.liveTests.map((t, i) => ({
+      id: `live-${snapshot.runId}-test-${i}`,
+      title: t.n || `Test ${i + 1}`,
+      name: t.n || `Test ${i + 1}`,
+      suite: t.su || '',
+      file: t.f || '',
+      status: t.s || 'unknown',
+      duration: t.d || 0,
+      retries: 0,
+      attachments: { screenshots: [], videos: [], traces: [], other: [] },
+    }))
+  } else if (snapshot.runStatus === 'failed') {
+    tests = [{
       id: `live-${snapshot.runId}-pipeline-error`,
       title: `[PIPELINE_ERROR:${snapshot.errorCode || 'PIPELINE_FAILED'}] ${baseMessage}`,
       suite: 'pipeline',
@@ -92,14 +116,10 @@ function buildSyntheticLiveReport(snapshot: LiveRunSnapshot) {
         message: snapshot.reason || baseMessage,
         stack: null,
       },
-      attachments: {
-        screenshots: [],
-        videos: [],
-        traces: [],
-        other: [],
-      },
+      attachments: { screenshots: [], videos: [], traces: [], other: [] },
     }]
-    : [{
+  } else {
+    tests = [{
       id: `live-${snapshot.runId}-phase-${snapshot.phase}`,
       title: `[PIPELINE:${snapshot.phase}] ${baseMessage}`,
       suite: 'pipeline',
@@ -107,13 +127,20 @@ function buildSyntheticLiveReport(snapshot: LiveRunSnapshot) {
       status: snapshot.runStatus === 'passed' ? 'passed' : 'running',
       duration,
       retries: 0,
-      attachments: {
-        screenshots: [],
-        videos: [],
-        traces: [],
-        other: [],
-      },
+      attachments: { screenshots: [], videos: [], traces: [], other: [] },
     }]
+  }
+
+  const liveTotal = snapshot.liveTests ? snapshot.liveTests.length : total
+  const livePassed = snapshot.liveTests
+    ? snapshot.liveTests.filter(t => t.s === 'passed').length
+    : passed
+  const liveFailed = snapshot.liveTests
+    ? snapshot.liveTests.filter(t => t.s === 'failed').length
+    : failed
+  const liveSkipped = snapshot.liveTests
+    ? snapshot.liveTests.filter(t => t.s === 'skipped').length
+    : skipped
 
   return {
     metadata: {
@@ -128,15 +155,17 @@ function buildSyntheticLiveReport(snapshot: LiveRunSnapshot) {
         errorCode: snapshot.errorCode,
         message: snapshot.message,
         reason: snapshot.reason,
+        generatedFiles: snapshot.generatedFiles || [],
+        hasLiveTests: snapshot.liveTests !== null,
       },
     },
     stats: {
-      total,
-      passed,
-      failed,
-      skipped,
+      total: liveTotal,
+      passed: livePassed,
+      failed: liveFailed,
+      skipped: liveSkipped,
       duration,
-      passRate: total > 0 ? Math.round((passed / total) * 100) : 0,
+      passRate: liveTotal > 0 ? Math.round((livePassed / liveTotal) * 100) : 0,
     },
     tests,
     aiSummary: null,
@@ -148,15 +177,21 @@ function toLiveRunRow(snapshot: LiveRunSnapshot, userId: string) {
   const reportJson = buildSyntheticLiveReport(snapshot)
   const id = `live-${snapshot.runId}`
 
+  const lt = snapshot.liveTests
+  const rowTotal = lt ? lt.length : clampNumber(snapshot.metadata.total, 0)
+  const rowPassed = lt ? lt.filter(t => t.s === 'passed').length : clampNumber(snapshot.metadata.passed, 0)
+  const rowFailed = lt ? lt.filter(t => t.s === 'failed').length : clampNumber(snapshot.metadata.failed, snapshot.runStatus === 'failed' ? 1 : 0)
+  const rowSkipped = lt ? lt.filter(t => t.s === 'skipped').length : clampNumber(snapshot.metadata.skipped, 0)
+
   return {
     id,
     user_id: userId,
     creation_name: projectName,
     status: snapshot.runStatus,
-    total_tests: clampNumber(snapshot.metadata.total, 0),
-    passed_tests: clampNumber(snapshot.metadata.passed, 0),
-    failed_tests: clampNumber(snapshot.metadata.failed, snapshot.runStatus === 'failed' ? 1 : 0),
-    skipped_tests: clampNumber(snapshot.metadata.skipped, 0),
+    total_tests: rowTotal,
+    passed_tests: rowPassed,
+    failed_tests: rowFailed,
+    skipped_tests: rowSkipped,
     backend_pass_rate: null,
     frontend_pass_rate: null,
     duration_ms: snapshot.durationMs || null,
@@ -235,6 +270,7 @@ export async function getLiveRunSnapshotsForUser(userId: string, options?: {
       durationMs: mcpTelemetryEvents.durationMs,
       metadata: mcpTelemetryEvents.metadata,
       occurredAt: mcpTelemetryEvents.occurredAt,
+      eventType: mcpTelemetryEvents.eventType,
     })
     .from(mcpTelemetryEvents)
     .where(and(...conditions))
@@ -249,6 +285,8 @@ export async function getLiveRunSnapshotsForUser(userId: string, options?: {
     const occurredAt = row.occurredAt || new Date()
     const phase = normalizeTelemetryPhase(row.phase)
     const status = normalizeTelemetryStatus(row.status)
+    const eventType = clampText(row.eventType)
+    const meta = toMetadata(row.metadata)
 
     if (!byRunId.has(runId)) {
       byRunId.set(runId, {
@@ -260,9 +298,15 @@ export async function getLiveRunSnapshotsForUser(userId: string, options?: {
         reason: clampText(row.reason) || null,
         message: clampText(row.message) || null,
         durationMs: clampNumber(row.durationMs, 0),
-        metadata: toMetadata(row.metadata),
+        metadata: meta,
         firstSeenAt: occurredAt,
         lastSeenAt: occurredAt,
+        liveTests: eventType === 'test_results' && Array.isArray(meta.tests)
+          ? (meta.tests as LiveTest[])
+          : null,
+        generatedFiles: eventType === 'tests_generated' && Array.isArray(meta.files)
+          ? (meta.files as string[])
+          : null,
       })
       continue
     }
@@ -270,6 +314,12 @@ export async function getLiveRunSnapshotsForUser(userId: string, options?: {
     const existing = byRunId.get(runId)!
     if (occurredAt < existing.firstSeenAt) {
       existing.firstSeenAt = occurredAt
+    }
+    if (existing.liveTests === null && eventType === 'test_results' && Array.isArray(meta.tests)) {
+      existing.liveTests = meta.tests as LiveTest[]
+    }
+    if (existing.generatedFiles === null && eventType === 'tests_generated' && Array.isArray(meta.files)) {
+      existing.generatedFiles = meta.files as string[]
     }
   }
 

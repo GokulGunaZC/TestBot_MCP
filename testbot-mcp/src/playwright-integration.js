@@ -80,19 +80,26 @@ class PlaywrightIntegration {
       const invokesWebScript = /\bnpm\s+run\s+web\b|\byarn\s+web\b|\bpnpm\s+(?:run\s+)?web\b/i.test(command);
       const hasWebFlag = invokesWebScript || /\s--web(?:\s|$)/i.test(command);
       const hasPortFlag = /\s--port(?:=|\s)\d+/i.test(command);
+      const hasNonInteractive = /--non-interactive/i.test(command);
       const flags = [];
       if (!hasWebFlag) flags.push('--web');
       if (!hasPortFlag) flags.push(`--port ${configuredPort}`);
+      if (!hasNonInteractive) flags.push('--non-interactive');
 
       if (flags.length > 0) {
-        command += usesNpmScriptArgs
-          ? ` -- ${flags.join(' ')}`
-          : ` ${flags.join(' ')}`;
+        // If command already has a npm-script arg separator ' -- ', append flags
+        // directly (no second '--') to avoid "npm run web -- --port X -- --flag" syntax.
+        const alreadyHasSeparator = usesNpmScriptArgs && / -- /i.test(command);
+        command += alreadyHasSeparator
+          ? ` ${flags.join(' ')}`
+          : usesNpmScriptArgs
+            ? ` -- ${flags.join(' ')}`
+            : ` ${flags.join(' ')}`;
       }
       return command;
     };
 
-    if (/^npm\s+run\s+start\b/i.test(raw) && this.packageJson?.scripts?.web) {
+    if (/^npm\s+(?:run\s+)?start\b/i.test(raw) && this.packageJson?.scripts?.web) {
       return appendExpoFlags('npm run web', true);
     }
 
@@ -176,6 +183,19 @@ class PlaywrightIntegration {
       socket.once('timeout', () => finish(false));
       socket.once('error', () => finish(false));
     });
+  }
+
+  async findFreePort(startPort, maxAttempts = 20) {
+    for (let i = 0; i < maxAttempts; i++) {
+      const candidatePort = startPort + i;
+      if (candidatePort > 65535) break;
+      const inUse = await this.probeTcpPort('127.0.0.1', candidatePort, 500)
+        || await this.probeTcpPort('localhost', candidatePort, 500);
+      if (!inUse) {
+        return candidatePort;
+      }
+    }
+    return startPort;
   }
 
   stripAnsi(text) {
@@ -1144,13 +1164,34 @@ test.describe('${this.sanitizeString(scenario.name)}', () => {
   async startServer() {
     if (!this.config.startCommand) return;
 
+    const configuredPort = Number(this.config.port || 0);
+    if (configuredPort > 0) {
+      const portInUse = await this.probeTcpPort('127.0.0.1', configuredPort, 500)
+        || await this.probeTcpPort('localhost', configuredPort, 500);
+      if (portInUse) {
+        const freePort = await this.findFreePort(configuredPort + 1);
+        Logger.warn('PlaywrightIntegration', `Configured port ${configuredPort} is already in use. Switching to port ${freePort} to avoid testing the wrong server.`, {
+          originalPort: configuredPort,
+          newPort: freePort,
+        });
+        try {
+          const parsedBase = new URL(this.config.baseURL);
+          parsedBase.port = String(freePort);
+          this.config.baseURL = parsedBase.toString().replace(/\/$/, '') || `http://localhost:${freePort}`;
+        } catch {
+          this.config.baseURL = `http://localhost:${freePort}`;
+        }
+        this.config.port = freePort;
+      }
+    }
+
     return new Promise((resolve, reject) => {
       const effectiveStartCommand = this.normalizeStartCommandForHeadlessWeb(this.config.startCommand);
       Logger.info('PlaywrightIntegration', `Starting server: ${effectiveStartCommand}`);
       const detached = process.platform !== 'win32';
       const isExpoCommand = this.expoProject || /expo\s+start/i.test(effectiveStartCommand);
       const startupTimeoutMs = Math.max(
-        isExpoCommand ? 180000 : 10000,
+        isExpoCommand ? 420000 : 10000,
         Number(this.config.serverStartTimeoutMs || 90000)
       );
       const healthCheckIntervalMs = Math.max(250, Number(this.config.serverHealthCheckIntervalMs || 1000));
@@ -1166,9 +1207,9 @@ test.describe('${this.sanitizeString(scenario.name)}', () => {
       } catch {
         baseHost = 'localhost';
       }
-      const readinessLogPattern = /(listening on|running on|application startup complete|started server|ready in|serving on|development server at|uvicorn running|werkzeug)/i;
+      const readinessLogPattern = /(listening on|running on|application startup complete|started server|ready in|serving on|development server at|uvicorn running|werkzeug|metro waiting on|web is waiting on|web is running on|expo.*waiting|bundl(?:e|ing) complete|compiled successfully)/i;
       const expoDependencyValidationPattern = /(best compatibility with the installed expo version|dependency validation|expected version:)/i;
-      const expoNonInteractivePattern = /(non-interactive mode|input is required)/i;
+      const expoNonInteractivePattern = /(?:input(?:\s+is)?\s+required|cannot\s+prompt(?:\s+in\s+non.interactive)?|requires?\s+interactive\s+input|disabled\s+in\s+(?:ci|non.interactive)\s+mode)/i;
       const addProbeUrlCandidate = (value) => {
         if (!value) return false;
         let parsed;
@@ -1205,6 +1246,12 @@ test.describe('${this.sanitizeString(scenario.name)}', () => {
         }
         return false;
       };
+
+      // For Expo projects also probe the webpack-based web default port (19006)
+      if (isExpoCommand) {
+        addProbeUrlCandidate('http://localhost:19006/');
+        addProbeUrlCandidate('http://127.0.0.1:19006/');
+      }
 
       const addProbePortCandidate = (port, protocol = 'http:') => {
         const parsedPort = Number(port);
@@ -1256,17 +1303,42 @@ test.describe('${this.sanitizeString(scenario.name)}', () => {
         CI: process.env.CI || '1',
         EXPO_NO_DEPENDENCY_VALIDATION: process.env.EXPO_NO_DEPENDENCY_VALIDATION || '1',
         EXPO_NO_TELEMETRY: process.env.EXPO_NO_TELEMETRY || '1',
+        EXPO_NO_BROWSER: process.env.EXPO_NO_BROWSER || '1',
+        EXPO_NO_INTERACTIVE: process.env.EXPO_NO_INTERACTIVE || '1',
+        EXPO_SKIP_MANIFEST_VALIDATION_TOKEN: process.env.EXPO_SKIP_MANIFEST_VALIDATION_TOKEN || '1',
       };
+
+      // Open a log file for server startup output so we can diagnose issues
+      // even when the process buffers stdout/stderr (common on Windows non-TTY).
+      let serverLogStream = null;
+      try {
+        const logsDir = path.join(this.config.projectPath, 'testbot-reports', 'logs');
+        fs.mkdirSync(logsDir, { recursive: true });
+        const logFile = path.join(logsDir, `server-startup-${Date.now()}.log`);
+        serverLogStream = fs.createWriteStream(logFile, { flags: 'a' });
+      } catch {
+        // non-fatal
+      }
 
       this.serverProcess = spawn(effectiveStartCommand, {
         cwd: this.config.projectPath,
         shell: true,
         detached,
         env: serverEnv,
+        stdio: ['ignore', 'pipe', 'pipe'],
       });
+
+      // Write PID so the next TestBot run can kill this server if it is left
+      // running (e.g. after a crash, budget timeout, or Windsurf closure).
+      if (this.config.serverPidFile && this.serverProcess.pid) {
+        try { fs.writeFileSync(this.config.serverPidFile, String(this.serverProcess.pid)); } catch { /* non-fatal */ }
+      }
 
       const rememberLog = (chunk) => {
         const text = this.stripAnsi(String(chunk || '')).trim();
+        if (serverLogStream) {
+          try { serverLogStream.write(chunk); } catch { /* non-fatal */ }
+        }
         if (!text) return;
         const compact = text.length > 280 ? `${text.slice(0, 280)}...` : text;
         recentServerLogs.push(compact);
@@ -1364,8 +1436,10 @@ test.describe('${this.sanitizeString(scenario.name)}', () => {
             }
           }
 
-          // Fallback: if logs indicate readiness and TCP port is open, treat server as ready.
-          if (sawReadinessLogHint) {
+          // TCP fallback: always probe TCP after 30 s have elapsed, regardless of
+          // whether we captured any log hints (Expo buffers stdout on Windows non-TTY).
+          const elapsedMs = Date.now() - startedAt;
+          if (sawReadinessLogHint || elapsedMs >= 30000) {
             for (const probeUrl of [...dynamicProbeUrls]) {
               try {
                 const parsed = new URL(probeUrl);
@@ -1373,7 +1447,7 @@ test.describe('${this.sanitizeString(scenario.name)}', () => {
                 const host = parsed.hostname === '0.0.0.0' ? 'localhost' : (parsed.hostname || 'localhost');
                 const tcpReady = await this.probeTcpPort(host, tcpPort);
                 if (tcpReady) {
-                  Logger.info('PlaywrightIntegration', 'Server is ready (TCP readiness fallback)', { probeUrl });
+                  Logger.info('PlaywrightIntegration', 'Server is ready (TCP fallback)', { probeUrl, sawLogHint: sawReadinessLogHint, elapsedMs });
                   updateRuntimeBaseURL(lastDetectedProbeUrl || probeUrl);
                   finish();
                   return;
@@ -1403,14 +1477,32 @@ test.describe('${this.sanitizeString(scenario.name)}', () => {
       return;
     }
 
-    Logger.info('PlaywrightIntegration', 'Stopping server');
-    try {
-      process.kill(-this.serverProcess.pid);
-    } catch {
-      this.serverProcess.kill();
+    const proc = this.serverProcess;
+    this.serverProcess = null;
+    Logger.info('PlaywrightIntegration', 'Stopping server', { pid: proc.pid });
+
+    if (process.platform === 'win32') {
+      // On Windows, process.kill(-pid) is unsupported and only kills the shell
+      // wrapper — leaving npm/Next.js children alive and holding the port.
+      // taskkill /F /T /PID kills the entire process tree recursively.
+      try {
+        const { spawnSync } = require('child_process');
+        spawnSync('taskkill', ['/F', '/T', '/PID', String(proc.pid)], { stdio: 'ignore' });
+      } catch {
+        try { proc.kill('SIGKILL'); } catch { /* ignore */ }
+      }
+    } else {
+      try {
+        process.kill(-proc.pid);
+      } catch {
+        try { proc.kill(); } catch { /* ignore */ }
+      }
     }
 
-    this.serverProcess = null;
+    // Remove PID file now that the process is gone.
+    if (this.config.serverPidFile) {
+      try { fs.unlinkSync(this.config.serverPidFile); } catch { /* already deleted or never written */ }
+    }
   }
 
   sanitizeString(str) {
