@@ -25,6 +25,7 @@ const { McpServer } = require("@modelcontextprotocol/sdk/server/mcp.js");
 const { StdioServerTransport } = require("@modelcontextprotocol/sdk/server/stdio.js");
 const { z } = require('zod');
 
+const fetch = global.fetch || require('node-fetch');
 const Logger = require('./logger');
 const AutoDetector = require('./auto-detector');
 const PlaywrightIntegration = require('./playwright-integration');
@@ -643,6 +644,7 @@ class TestbotMCPServer {
         console.error('[DEBUG] testbot_configure called, projectPath:', args?.projectPath);
         Logger.mcp('Index', `Tool called: testbot_configure`, { projectPath: args?.projectPath });
         try {
+          await this.validateApiKey();
           const result = await this.handleConfigure(args);
           this.trackToolResult('testbot_configure', telemetryStartedAt);
           console.error('[DEBUG] testbot_configure returning result');
@@ -710,6 +712,7 @@ class TestbotMCPServer {
         console.error('[DEBUG] testbot_test_my_app called, projectPath:', args?.projectPath);
         Logger.mcp('Index', `Tool called: testbot_test_my_app`, { projectPath: args?.projectPath, testType: args?.testType });
         try {
+          await this.validateApiKey();
           const result = await this.handleTestMyApp(args);
           this.trackToolResult('testbot_test_my_app', telemetryStartedAt);
           console.error('[DEBUG] testbot_test_my_app returning result');
@@ -744,6 +747,7 @@ class TestbotMCPServer {
         const telemetryStartedAt = this.trackToolInvocation('testbot_analyze_failures', args);
         Logger.mcp('Index', `Tool called: testbot_analyze_failures`, { projectPath: args?.projectPath });
         try {
+          await this.validateApiKey();
           const result = await this.handleAnalyzeFailures(args);
           this.trackToolResult('testbot_analyze_failures', telemetryStartedAt);
           return result;
@@ -776,6 +780,7 @@ class TestbotMCPServer {
         const telemetryStartedAt = this.trackToolInvocation('testbot_generate_report', args);
         Logger.mcp('Index', `Tool called: testbot_generate_report`, { projectPath: args?.projectPath });
         try {
+          await this.validateApiKey();
           const result = await this.handleGenerateReport(args);
           this.trackToolResult('testbot_generate_report', telemetryStartedAt);
           return result;
@@ -793,6 +798,83 @@ class TestbotMCPServer {
         }
       }
     );
+  }
+
+  /**
+   * Validate the TESTBOT_API_KEY before executing any tool.
+   * Throws a descriptive error if the key is missing, invalid, expired, or credits are exhausted.
+   */
+  async validateApiKey() {
+    const apiKey = process.env.TESTBOT_API_KEY;
+    const dashboardUrl = process.env.TESTBOT_DASHBOARD_URL;
+
+    if (!apiKey) {
+      const err = new Error(
+        '❌ TestBot API key not configured.\n\n' +
+        'Add TESTBOT_API_KEY to your IDE\'s MCP server configuration:\n\n' +
+        '  Cursor  → Edit ~/.cursor/mcp.json\n' +
+        '  Windsurf → Edit ~/.codeium/windsurf/mcp_config.json\n\n' +
+        'In that file, under your testbot-mcp server entry, add an "env" block:\n\n' +
+        '  {\n' +
+        '    "mcpServers": {\n' +
+        '      "testbot-mcp": {\n' +
+        '        "command": "npx",\n' +
+        '        "args": ["-y", "@testbot/mcp"],\n' +
+        '        "env": {\n' +
+        '          "TESTBOT_API_KEY": "tb_your_key_here",\n' +
+        '          "TESTBOT_DASHBOARD_URL": "https://your-dashboard-url"\n' +
+        '        }\n' +
+        '      }\n' +
+        '    }\n' +
+        '  }\n\n' +
+        'Get your API key from the TestBot dashboard → API Keys.\n' +
+        'Then restart your IDE for the changes to take effect.'
+      );
+      err.code = 'KEY_MISSING';
+      throw err;
+    }
+
+    if (!dashboardUrl) {
+      return;
+    }
+
+    let response;
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 6000);
+      response = await fetch(`${dashboardUrl}/api/mcp-auth/validate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ api_key: apiKey }),
+        signal: controller.signal,
+      });
+      clearTimeout(timeout);
+    } catch (networkErr) {
+      Logger.warn('Index', 'API key validation request failed (network/timeout) — proceeding anyway', { error: networkErr.message });
+      return;
+    }
+
+    if (response.ok) {
+      return;
+    }
+
+    let data = {};
+    try { data = await response.json(); } catch (_) {}
+
+    const errorCode = data.error || 'KEY_INVALID';
+    const serverMessage = data.message || 'API key validation failed';
+
+    const USER_MESSAGES = {
+      KEY_INVALID: '❌ Invalid TestBot API key.\n\nVerify that TESTBOT_API_KEY in your IDE MCP config matches the key shown in the TestBot dashboard.\n\n  Cursor   → ~/.cursor/mcp.json\n  Windsurf → ~/.codeium/windsurf/mcp_config.json\n',
+      KEY_INACTIVE: '❌ Your TestBot API key has been deactivated.\n\nGenerate a new key in the TestBot dashboard → API Keys, then update the "env" section of your IDE MCP config file.',
+      KEY_EXPIRED: '❌ Your TestBot API key has expired.\n\nGenerate a new key in the TestBot dashboard → API Keys, then update the "env" section of your IDE MCP config file.',
+      NO_CREDITS: '❌ No TestBot credits remaining.\n\nPlease upgrade your plan or purchase more credits in the TestBot dashboard.',
+    };
+
+    const message = USER_MESSAGES[errorCode] || `❌ TestBot API key rejected: ${serverMessage}`;
+    const err = new Error(message);
+    err.code = errorCode;
+    throw err;
   }
 
   setupErrorHandling() {

@@ -193,7 +193,7 @@ export async function POST(request: NextRequest) {
 
     // Look up API key
     const [apiKeyRecord] = await db
-      .select({ id: apiKeys.id, userId: apiKeys.userId, isActive: apiKeys.isActive })
+      .select({ id: apiKeys.id, userId: apiKeys.userId, isActive: apiKeys.isActive, expiresAt: apiKeys.expiresAt })
       .from(apiKeys)
       .where(and(eq(apiKeys.keyHash, keyHash), eq(apiKeys.isActive, true)))
       .limit(1)
@@ -202,7 +202,25 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'Invalid or inactive API key' }, { status: 401 })
     }
 
+    if (apiKeyRecord.expiresAt && apiKeyRecord.expiresAt < new Date()) {
+      return NextResponse.json({ error: 'API key has expired' }, { status: 401 })
+    }
+
     const userId = apiKeyRecord.userId
+
+    // Pre-check credits before running
+    const [preCheckProfile] = await db
+      .select({ creditsRemaining: profiles.creditsRemaining })
+      .from(profiles)
+      .where(eq(profiles.id, userId))
+      .limit(1)
+
+    if (preCheckProfile && typeof preCheckProfile.creditsRemaining === 'number' && preCheckProfile.creditsRemaining <= 0) {
+      return NextResponse.json(
+        { error: 'No credits remaining. Please upgrade your plan or purchase more credits.' },
+        { status: 402 }
+      )
+    }
 
     // Extract stats from the report
     const stats = report.stats || {}
