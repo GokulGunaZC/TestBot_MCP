@@ -1460,16 +1460,15 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
     finishedAt: null,
   };
 
-  const defaultMode = (!process.env.OPENAI_API_KEY && process.env.TESTBOT_API_KEY)
-    ? 'saas-first'
-    : 'openai-first';
+  const isSaaSMode = !process.env.OPENAI_API_KEY && !!process.env.TESTBOT_API_KEY;
+  const defaultMode = isSaaSMode ? 'saas-first' : 'openai-first';
   const generationMode = strictAI
-    ? 'openai-only'
+    ? (isSaaSMode ? 'saas-only' : 'openai-only')
     : String(config.generationMode || defaultMode).toLowerCase();
   const allowOpenAI = !['template-only', 'saas-only', 'saas-first'].includes(generationMode);
   const allowTemplateByMode = !['openai-only', 'saas-only'].includes(generationMode);
   const allowTemplate = allowTemplateByMode && emergencyTemplates;
-  const allowSaaS = !strictAI && !['openai-only', 'template-only'].includes(generationMode);
+  const allowSaaS = !['openai-only', 'template-only'].includes(generationMode);
 
   const validateGeneratedTests = config.validateGeneratedTests !== false;
 
@@ -1572,8 +1571,8 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
 
   let result = null;
 
-  // In saas-first mode (npm users with only TESTBOT_API_KEY), try SaaS first
-  if (!result && allowSaaS && generationMode === 'saas-first') {
+  // In saas-first/saas-only mode (npm users with only TESTBOT_API_KEY), try SaaS first
+  if (!result && allowSaaS && (generationMode === 'saas-first' || generationMode === 'saas-only')) {
     result = await tryGenerator('saas', async () => {
       const testsDir = resetGeneratedTestsDir(config.projectPath);
       const saasResult = await maybeGenerateViaSaaS({
