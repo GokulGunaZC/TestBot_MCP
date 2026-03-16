@@ -6,14 +6,18 @@ import { hashApiKey } from '@/lib/utils/api-keys'
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o'
+const FALLBACK_MODEL = 'gpt-4o'
 const OPENAI_MAX_TOKENS = 4000
 const OPENAI_TEMPERATURE = 0.2
 const OPENAI_TIMEOUT = 180_000 // 3 minutes
 
 const MAX_FAILURES = 8
 
-// ── OpenAI Chat Completions call ──────────────────────────────────────
-async function callOpenAI(messages: Array<{ role: string; content: string }>) {
+// ── OpenAI Chat Completions call (with model fallback) ───────────────
+async function callOpenAIWithModel(
+  messages: Array<{ role: string; content: string }>,
+  model: string,
+) {
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), OPENAI_TIMEOUT)
 
@@ -25,7 +29,7 @@ async function callOpenAI(messages: Array<{ role: string; content: string }>) {
         Authorization: `Bearer ${OPENAI_API_KEY}`,
       },
       body: JSON.stringify({
-        model: OPENAI_MODEL,
+        model,
         messages,
         temperature: OPENAI_TEMPERATURE,
         max_tokens: OPENAI_MAX_TOKENS,
@@ -46,6 +50,22 @@ async function callOpenAI(messages: Array<{ role: string; content: string }>) {
     clearTimeout(timeout)
     if (error instanceof Error && error.name === 'AbortError')
       throw new Error('OpenAI request timed out (3 min)')
+    throw error
+  }
+}
+
+async function callOpenAI(messages: Array<{ role: string; content: string }>) {
+  try {
+    return await callOpenAIWithModel(messages, OPENAI_MODEL)
+  } catch (error) {
+    if (
+      OPENAI_MODEL !== FALLBACK_MODEL &&
+      error instanceof Error &&
+      (error.message.includes('does not exist') || error.message.includes('model_not_found'))
+    ) {
+      console.warn(`[analyze-failures] Model "${OPENAI_MODEL}" failed, falling back to "${FALLBACK_MODEL}"`)
+      return await callOpenAIWithModel(messages, FALLBACK_MODEL)
+    }
     throw error
   }
 }
