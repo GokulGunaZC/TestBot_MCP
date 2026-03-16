@@ -26,7 +26,8 @@ const OpenAITestGenerator = require('./test-generator-openai');
 const ResultsMerger = require('./results-merger');
 const ContextGatherer = require('./context-gatherer');
 const AgentContextRequester = require('./agent-context-requester');
-const JiraClient = require('./jira/client');
+let JiraClient;
+try { JiraClient = require('./jira/client'); } catch { JiraClient = null; }
 const ReportGenerator = require('./report-generator');
 const DashboardLauncher = require('./dashboard-launcher');
 const AIAnalyzer = require('./ai-providers/index');
@@ -1854,7 +1855,7 @@ async function runPipeline(config, runId) {
     // 1. Jira integration (optional)
     // -------------------------------------------------------
     let jiraStories = null;
-    if (config.jira?.enabled) {
+    if (config.jira?.enabled && JiraClient) {
       updateStatus(statusDir, 'jira', {
         runId,
         message: 'Fetching Jira stories...',
@@ -1867,6 +1868,8 @@ async function runPipeline(config, runId) {
         Logger.info('PipelineWorker', 'Fetched Jira stories', { count: stories.length });
         return stories;
       });
+    } else if (config.jira?.enabled && !JiraClient) {
+      Logger.warn('PipelineWorker', 'Jira integration requested but jira/client module not available');
     }
 
     // -------------------------------------------------------
