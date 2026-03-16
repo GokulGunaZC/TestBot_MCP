@@ -904,12 +904,17 @@ function resolveFailureAnalysisProvider(config = {}) {
   const openaiKey = process.env.OPENAI_API_KEY || null;
   const sarvamKey = process.env.SARVAM_API_KEY || process.env.AI_API_KEY || null;
 
+  const testbotApiKey = process.env.TESTBOT_API_KEY || null;
+
   if (!requestedProvider) {
     if (openaiKey) {
       return { provider: 'openai', apiKey: openaiKey };
     }
     if (sarvamKey) {
       return { provider: 'sarvam', apiKey: sarvamKey };
+    }
+    if (testbotApiKey) {
+      return { provider: 'saas', apiKey: testbotApiKey };
     }
     return { provider: 'openai', apiKey: null, reason: 'missing_openai_and_sarvam_keys' };
   }
@@ -1454,10 +1459,13 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
     finishedAt: null,
   };
 
+  const defaultMode = (!process.env.OPENAI_API_KEY && process.env.TESTBOT_API_KEY)
+    ? 'saas-first'
+    : 'openai-first';
   const generationMode = strictAI
     ? 'openai-only'
-    : String(config.generationMode || 'openai-first').toLowerCase();
-  const allowOpenAI = !['template-only', 'saas-only'].includes(generationMode);
+    : String(config.generationMode || defaultMode).toLowerCase();
+  const allowOpenAI = !['template-only', 'saas-only', 'saas-first'].includes(generationMode);
   const allowTemplateByMode = !['openai-only', 'saas-only'].includes(generationMode);
   const allowTemplate = allowTemplateByMode && emergencyTemplates;
   const allowSaaS = !strictAI && !['openai-only', 'template-only'].includes(generationMode);
@@ -1563,7 +1571,27 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
 
   let result = null;
 
-  if (allowOpenAI) {
+  // In saas-first mode (npm users with only TESTBOT_API_KEY), try SaaS first
+  if (!result && allowSaaS && generationMode === 'saas-first') {
+    result = await tryGenerator('saas', async () => {
+      const testsDir = resetGeneratedTestsDir(config.projectPath);
+      const saasResult = await maybeGenerateViaSaaS({
+        config,
+        context,
+        prdContent,
+        testsDir,
+        projectInfo,
+      });
+
+      if (!saasResult.generated) {
+        throw new Error(`SaaS generator produced no files (${saasResult.reason || 'unknown'})`);
+      }
+
+      return saasResult;
+    });
+  }
+
+  if (!result && allowOpenAI) {
     if (!process.env.OPENAI_API_KEY) {
       if (strictAI) {
         const error = new Error('OpenAI API key is required in strict AI generation mode');
@@ -1676,7 +1704,8 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
     });
   }
 
-  if (!result && allowSaaS) {
+  // SaaS fallback for non-saas-first modes (openai-first, template-first, etc.)
+  if (!result && allowSaaS && generationMode !== 'saas-first') {
     result = await tryGenerator('saas', async () => {
       const testsDir = resetGeneratedTestsDir(config.projectPath);
       const saasResult = await maybeGenerateViaSaaS({

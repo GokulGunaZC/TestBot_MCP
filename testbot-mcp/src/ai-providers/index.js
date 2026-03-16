@@ -7,11 +7,12 @@ const SarvamClient = require('./sarvam');
 const CascadeClient = require('./cascade');
 const WindsurfClient = require('./windsurf');
 const OpenAIClient = require('./openai');
+const SaaSClient = require('./saas-client');
 
 class AIAnalyzer {
   /**
    * Create an AI analyzer instance
-   * @param {string} provider - Provider name: 'sarvam', 'cascade', 'windsurf', or 'openai'
+   * @param {string} provider - Provider name: 'sarvam', 'cascade', 'windsurf', 'openai', or 'saas'
    * @param {string} apiKey - API key for the provider
    * @returns {Object} AI analyzer instance
    */
@@ -25,6 +26,8 @@ class AIAnalyzer {
         return new WindsurfClient();
       case 'openai':
         return new OpenAIClient({ apiKey });
+      case 'saas':
+        return new SaaSClient({ apiKey });
       default:
         console.warn(`Unknown AI provider: ${provider}, defaulting to Sarvam`);
         return new SarvamClient({ apiKey });

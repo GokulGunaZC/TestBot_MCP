@@ -1,11 +1,11 @@
 {
   "mcpServers": {
     "testbot-mcp": {
-      "command": "node",
-      "args": ["C:/Users/ShreyesPrabhuDesai/PersProjects/TestBot_MCP/testbot-mcp/src/index.js"],
+      "command": "npx",
+      "args": ["-y", "@testbot/mcp"],
       "env": {
-        "TESTBOT_DASHBOARD_URL": "http://localhost:3000",
-        "TESTBOT_API_KEY": "tb_a26028925bfff6684cc2100b0b8211b853360226e0d2217f7ee83cb069252d31"
+        "TESTBOT_API_KEY": "tb_your_api_key_here",
+        "TESTBOT_DASHBOARD_URL": "https://your-testbot-dashboard.com"
       }
     }
   }
