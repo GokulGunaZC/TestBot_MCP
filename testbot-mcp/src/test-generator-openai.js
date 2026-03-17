@@ -283,7 +283,7 @@ export default defineConfig({
   use: {
     baseURL: '${projectInfo.baseURL || 'http://localhost:3000'}',
     trace: 'retain-on-failure',
-    screenshot: 'on',
+    screenshot: 'only-on-failure',
     video: 'retain-on-failure',
   },
   projects: [

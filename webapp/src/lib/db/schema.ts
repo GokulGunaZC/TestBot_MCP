@@ -130,3 +130,26 @@ export const testListItems = pgTable('test_list_items', {
   testConfig: jsonb('test_config'),
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
 })
+
+export const testArtifacts = pgTable(
+  'test_artifacts',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    testRunId: uuid('test_run_id')
+      .notNull()
+      .references(() => testRuns.id, { onDelete: 'cascade' }),
+    testName: text('test_name').notNull(),
+    artifactType: text('artifact_type').notNull(), // 'screenshot', 'video', 'trace'
+    storageUrl: text('storage_url').notNull(), // Supabase Storage public URL
+    storagePath: text('storage_path').notNull(), // Path in bucket: test-artifacts/{runId}/{testName}/{type}/{filename}
+    fileName: text('file_name').notNull(),
+    fileSize: integer('file_size'), // bytes
+    contentType: text('content_type'),
+    metadata: jsonb('metadata'), // Additional info like timestamp, browser, viewport
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
+  },
+  (table) => [
+    index('test_artifacts_test_run_id_idx').on(table.testRunId),
+    index('test_artifacts_artifact_type_idx').on(table.artifactType),
+  ]
+)

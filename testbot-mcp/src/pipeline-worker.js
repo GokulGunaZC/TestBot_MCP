@@ -22,13 +22,13 @@ for (const envPath of dotenvPaths) {
 const PlaywrightIntegration = require('./playwright-integration');
 const PlaywrightMCPClient = require('./playwright-mcp-client');
 const PlaywrightMCPIntegration = require('./playwright-mcp-integration');
-const OpenAITestGenerator = require('./test-generator-openai');
 const ResultsMerger = require('./results-merger');
 const ContextGatherer = require('./context-gatherer');
 const AgentContextRequester = require('./agent-context-requester');
 let JiraClient;
 try { JiraClient = require('./jira/client'); } catch { JiraClient = null; }
 const ReportGenerator = require('./report-generator');
+const ArtifactUploader = require('./artifact-uploader');
 const DashboardLauncher = require('./dashboard-launcher');
 const AIAnalyzer = require('./ai-providers/index');
 const Logger = require('./logger');
@@ -222,18 +222,10 @@ function computePassRatePercent(results) {
   return (Number(results.passed || 0) / Number(results.total)) * 100;
 }
 
-function modeAllowsTemplateFallback(generationMode) {
-  const normalized = String(generationMode || 'openai-first').toLowerCase();
-  return normalized !== 'openai-only' && normalized !== 'saas-only';
-}
-
 function strictAIEnabled(config = {}) {
   return config.strictAIGeneration !== false;
 }
 
-function templatesEmergencyEnabled() {
-  return String(process.env.TESTBOT_ENABLE_TEMPLATES || '').toLowerCase() === 'true';
-}
 
 function countTestsInContent(content) {
   if (!content) return 0;
@@ -766,8 +758,8 @@ function buildUserFacingPipelineError(errorCode, error) {
     return `App server did not become reachable before timeout. Verify start command, base URL, and port settings in the config form.${detail}`;
   }
 
-  if (errorCode === 'OPENAI_KEY_MISSING') {
-    return 'OPENAI_API_KEY is missing for strict AI generation mode.';
+  if (errorCode === 'OPENAI_KEY_MISSING' || errorCode === 'MISSING_TESTBOT_API_KEY') {
+    return 'TESTBOT_API_KEY is required for AI test generation. Set it in your MCP config: "TESTBOT_API_KEY": "tb_your_key_here".';
   }
 
   return normalizedMessage;
@@ -900,51 +892,12 @@ function applyMouseCursorOverlayToGeneratedTests({ projectPath, enabled }) {
   };
 }
 
-function resolveFailureAnalysisProvider(config = {}) {
-  const requestedProvider = String(config.aiProvider || process.env.AI_PROVIDER || '').trim().toLowerCase();
-  const openaiKey = process.env.OPENAI_API_KEY || null;
-  const sarvamKey = process.env.SARVAM_API_KEY || process.env.AI_API_KEY || null;
-
+function resolveFailureAnalysisProvider() {
   const testbotApiKey = process.env.TESTBOT_API_KEY || null;
-
-  if (!requestedProvider) {
-    if (openaiKey) {
-      return { provider: 'openai', apiKey: openaiKey };
-    }
-    if (sarvamKey) {
-      return { provider: 'sarvam', apiKey: sarvamKey };
-    }
-    if (testbotApiKey) {
-      return { provider: 'saas', apiKey: testbotApiKey };
-    }
-    return { provider: 'openai', apiKey: null, reason: 'missing_openai_and_sarvam_keys' };
+  if (testbotApiKey) {
+    return { provider: 'saas', apiKey: testbotApiKey };
   }
-
-  if (requestedProvider === 'openai') {
-    return {
-      provider: 'openai',
-      apiKey: openaiKey,
-      reason: openaiKey ? null : 'missing_openai_key',
-    };
-  }
-
-  if (requestedProvider === 'sarvam') {
-    return {
-      provider: 'sarvam',
-      apiKey: sarvamKey,
-      reason: sarvamKey ? null : 'missing_sarvam_key',
-    };
-  }
-
-  if (requestedProvider === 'cascade' || requestedProvider === 'windsurf') {
-    return { provider: requestedProvider, apiKey: null };
-  }
-
-  return {
-    provider: requestedProvider,
-    apiKey: openaiKey || sarvamKey,
-    reason: (openaiKey || sarvamKey) ? null : 'missing_provider_key',
-  };
+  return { provider: null, reason: 'TESTBOT_API_KEY is required for AI failure analysis' };
 }
 
 function resetGeneratedTestsDir(projectPath) {
@@ -1009,6 +962,66 @@ function safeWriteGeneratedTest(testsDir, test, index, fallbackPrefix, usedFilen
     path: targetPath,
     filename: safeFilename,
   };
+}
+
+function ensurePlaywrightConfig(projectPath, projectInfo = {}) {
+  const candidates = [
+    'playwright.config.ts',
+    'playwright.config.js',
+    'playwright.config.mjs',
+    'playwright.config.cjs',
+  ];
+
+  // Check if config already exists
+  for (const name of candidates) {
+    const candidate = path.join(projectPath, name);
+    if (fs.existsSync(candidate)) {
+      Logger.debug('PipelineWorker', 'Playwright config already exists', { path: candidate });
+      return;
+    }
+  }
+
+  // Generate playwright.config.ts
+  const baseURL = projectInfo.baseURL || 'http://localhost:3000';
+  const startCommand = projectInfo.startCommand || '';
+  
+  const config = `import { defineConfig, devices } from '@playwright/test';
+
+export default defineConfig({
+  testDir: './tests/generated',
+  fullyParallel: true,
+  forbidOnly: !!process.env.CI,
+  retries: process.env.CI ? 2 : 0,
+  workers: process.env.CI ? 1 : undefined,
+  reporter: [
+    ['list'],
+    ['json', { outputFile: 'test-results/results.json' }],
+    ['html', { open: 'never' }],
+  ],
+  use: {
+    baseURL: '${baseURL}',
+    trace: 'retain-on-failure',
+    screenshot: 'only-on-failure',
+    video: 'retain-on-failure',
+  },
+  projects: [
+    {
+      name: 'chromium',
+      use: { ...devices['Desktop Chrome'] },
+    },
+  ],${startCommand ? `
+  webServer: {
+    command: '${startCommand}',
+    url: '${baseURL}',
+    reuseExistingServer: !process.env.CI,
+    timeout: 120 * 1000,
+  },` : ''}
+});
+`;
+
+  const configPath = path.join(projectPath, 'playwright.config.ts');
+  fs.writeFileSync(configPath, config, 'utf-8');
+  Logger.info('PipelineWorker', 'Created playwright.config.ts', { path: configPath });
 }
 
 function resolvePlaywrightConfig(projectPath) {
@@ -1405,28 +1418,79 @@ function auditGeneratedTestQuality({ projectPath, testType, context }) {
 
 async function maybeGenerateViaSaaS({ config, context, prdContent, testsDir, projectInfo }) {
   const testbotApiKey = process.env.TESTBOT_API_KEY;
-  if (!testbotApiKey || !context) {
-    return { generated: 0, files: [], skipped: true, reason: !testbotApiKey ? 'missing_testbot_api_key' : 'missing_context' };
+  if (!testbotApiKey) {
+    const err = new Error(
+      'Backend test generation requires TESTBOT_API_KEY.\n' +
+      'Please configure it in your MCP settings:\n' +
+      '{\n' +
+      '  "env": {\n' +
+      '    "TESTBOT_API_KEY": "tb_your_key_here",\n' +
+      '    "TESTBOT_DASHBOARD_URL": "https://your-testbot-dashboard.com"\n' +
+      '  }\n' +
+      '}'
+    );
+    err.code = 'MISSING_TESTBOT_API_KEY';
+    throw err;
+  }
+
+  if (!context) {
+    return { generated: 0, files: [], skipped: true, reason: 'missing_context' };
   }
 
   const dashboardUrl = process.env.TESTBOT_DASHBOARD_URL || 'http://localhost:3000';
   const fetchFn = global.fetch || require('node-fetch');
 
-  const response = await fetchFn(`${dashboardUrl}/api/generate-tests`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      api_key: testbotApiKey,
-      context,
-      testType: config.testType,
-      prd: prdContent || '',
-      projectInfo,
-    }),
-  });
+  const strictAI = strictAIEnabled(config);
+
+  let response;
+  try {
+    response = await fetchFn(`${dashboardUrl}/api/generate-tests`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        api_key: testbotApiKey,
+        context,
+        testType: config.testType,
+        prd: prdContent || '',
+        projectInfo,
+        options: {
+          includeSmoke: true,
+          includeWorkflows: true,
+          includeErrorStates: true,
+          strictAIGeneration: strictAI,
+          coverageProfile: config.coverageProfile || 'qa-max',
+          minGeneratedTests: toFiniteNumber(config.minGeneratedTests, 50),
+        },
+      }),
+    });
+  } catch (networkError) {
+    const err = new Error(
+      `Backend test generation failed: Cannot reach ${dashboardUrl}.\n` +
+      `Please check that TESTBOT_DASHBOARD_URL is correct and the server is running.\n` +
+      `Network error: ${networkError.message}`
+    );
+    err.code = 'BACKEND_UNREACHABLE';
+    throw err;
+  }
 
   if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`SaaS generation failed (${response.status}): ${text.slice(0, 300)}`);
+    const text = await response.text().catch(() => '');
+    let errorDetail = text.slice(0, 400);
+    try {
+      const parsed = JSON.parse(text);
+      if (parsed.error) errorDetail = parsed.error;
+    } catch { /* use raw text */ }
+
+    const err = new Error(
+      `Backend test generation failed (HTTP ${response.status}).\n` +
+      `Please check:\n` +
+      `- TESTBOT_API_KEY is valid and active\n` +
+      `- TESTBOT_DASHBOARD_URL points to the correct server\n` +
+      `- Your account has sufficient credits\n` +
+      `Error: ${errorDetail}`
+    );
+    err.code = response.status === 401 ? 'INVALID_API_KEY' : response.status === 402 ? 'INSUFFICIENT_CREDITS' : 'BACKEND_ERROR';
+    throw err;
   }
 
   const payload = await response.json();
@@ -1443,32 +1507,21 @@ async function maybeGenerateViaSaaS({ config, context, prdContent, testsDir, pro
     generated: files.length,
     files,
     provider: 'saas',
+    generationMeta: payload.generationMeta || null,
   };
 }
 
 async function generateWithFallbackChain({ config, context, prdContent, runBudget, projectInfo }) {
-  const strictAI = strictAIEnabled(config);
-  const emergencyTemplates = templatesEmergencyEnabled();
   const generationMeta = {
     provider: null,
     selectedGenerator: null,
     fallbackUsed: false,
-    aiOnlyEnforced: strictAI,
-    templateFallbackEnabled: emergencyTemplates,
+    aiOnlyEnforced: true,
+    templateFallbackEnabled: false,
     attempts: [],
     startedAt: new Date().toISOString(),
     finishedAt: null,
   };
-
-  const isSaaSMode = !process.env.OPENAI_API_KEY && !!process.env.TESTBOT_API_KEY;
-  const defaultMode = isSaaSMode ? 'saas-first' : 'openai-first';
-  const generationMode = strictAI
-    ? (isSaaSMode ? 'saas-only' : 'openai-only')
-    : String(config.generationMode || defaultMode).toLowerCase();
-  const allowOpenAI = !['template-only', 'saas-only', 'saas-first'].includes(generationMode);
-  const allowTemplateByMode = !['openai-only', 'saas-only'].includes(generationMode);
-  const allowTemplate = allowTemplateByMode && emergencyTemplates;
-  const allowSaaS = !['openai-only', 'template-only'].includes(generationMode);
 
   const validateGeneratedTests = config.validateGeneratedTests !== false;
 
@@ -1491,11 +1544,6 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
       testType: config.testType,
       context,
     });
-
-    if (generator === 'openai' && qualityAudit.riskyPatternHits > 0) {
-      qualityAudit.errors.push('openai_risky_assertions_detected');
-      qualityAudit.valid = false;
-    }
 
     if (!qualityAudit.valid) {
       const error = new Error(`${generator} generation failed quality audit: ${qualityAudit.errors.join(',')}`);
@@ -1541,7 +1589,7 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
 
       generationMeta.provider = generatorName;
       generationMeta.selectedGenerator = generatorName;
-      generationMeta.fallbackUsed = generationMeta.attempts.length > 0;
+      generationMeta.fallbackUsed = false;
       generationMeta.videoCursor = cursorOverlay;
       generationMeta.attempts.push({
         generator: generatorName,
@@ -1569,171 +1617,32 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
     }
   };
 
-  let result = null;
-
-  // In saas-first/saas-only mode (npm users with only TESTBOT_API_KEY), try SaaS first
-  if (!result && allowSaaS && (generationMode === 'saas-first' || generationMode === 'saas-only')) {
-    result = await tryGenerator('saas', async () => {
-      const testsDir = resetGeneratedTestsDir(config.projectPath);
-      const saasResult = await maybeGenerateViaSaaS({
-        config,
-        context,
-        prdContent,
-        testsDir,
-        projectInfo,
-      });
-
-      if (!saasResult.generated) {
-        throw new Error(`SaaS generator produced no files (${saasResult.reason || 'unknown'})`);
-      }
-
-      return saasResult;
+  const result = await tryGenerator('saas', async () => {
+    const testsDir = resetGeneratedTestsDir(config.projectPath);
+    const saasResult = await maybeGenerateViaSaaS({
+      config,
+      context,
+      prdContent,
+      testsDir,
+      projectInfo,
     });
-  }
 
-  if (!result && allowOpenAI) {
-    if (!process.env.OPENAI_API_KEY) {
-      if (strictAI) {
-        const error = new Error('OpenAI API key is required in strict AI generation mode');
-        error.code = 'OPENAI_KEY_MISSING';
-        generationMeta.finishedAt = new Date().toISOString();
-        error.generationMeta = generationMeta;
-        throw error;
-      }
-      generationMeta.attempts.push({
-        generator: 'openai',
-        status: 'skipped',
-        reason: 'missing_api_key',
-      });
-    } else {
-      result = await tryGenerator('openai', async () => {
-        const testsDir = resetGeneratedTestsDir(config.projectPath);
-        const generationStageCapMs = toFiniteNumber(runBudget?.stageCaps?.generation, DEFAULT_STAGE_CAPS_MS.generation);
-        const explicitOpenAITimeoutMs = toFiniteNumber(
-          config.openaiTimeoutMs || process.env.OPENAI_TIMEOUT_MS,
-          0
-        );
-        const openAITimeoutMs = explicitOpenAITimeoutMs > 0
-          ? explicitOpenAITimeoutMs
-          : Math.max(30000, Math.min(90000, Math.floor(generationStageCapMs / 4)));
-        const openAIMaxRetries = Number.isFinite(Number(config.openaiMaxRetries))
-          ? Math.max(0, Math.floor(Number(config.openaiMaxRetries)))
-          : strictAI
-            ? 1
-            : 2;
-        const openAIRetryBackoffMs = Number.isFinite(Number(config.openaiRetryBackoffMs))
-          ? Math.max(100, Math.floor(Number(config.openaiRetryBackoffMs)))
-          : 750;
-
-        const openaiGenerator = new OpenAITestGenerator({
-          projectPath: config.projectPath,
-          outputDir: 'tests/generated',
-          fallbackOnFailure: strictAI ? false : config.enableGeneratorFallback === true,
-          enforceValidation: config.validateGeneratedTests !== false,
-          syntaxValidationMode: config.syntaxValidationMode || 'fail-closed',
-          temperature: Number.isFinite(config.openaiTemperature) ? config.openaiTemperature : undefined,
-          timeout: openAITimeoutMs,
-          maxRetries: openAIMaxRetries,
-          retryBackoffMs: openAIRetryBackoffMs,
-        });
-
-        const files = await openaiGenerator.generateTests({
-          context: context || { pages: [], apiEndpoints: [], workflows: [] },
-          prd: prdContent || '',
-          testType: config.testType,
-          projectInfo,
-          options: {
-            includeSmoke: true,
-            includeWorkflows: true,
-            includeErrorStates: true,
-            coverageProfile: config.coverageProfile || 'qa-max',
-            minGeneratedTests: toFiniteNumber(config.minGeneratedTests, 50),
-            strictAIGeneration: strictAI,
-          },
-        });
-
-        if (!Array.isArray(files) || files.length === 0) {
-          const emptyError = new Error('OpenAI generated no files');
-          emptyError.code = 'AI_GENERATION_INSUFFICIENT';
-          throw emptyError;
-        }
-
-        if (strictAI) {
-          const nonAIFile = files.find((file) => {
-            const source = String(file.source || '').toLowerCase();
-            return source.includes('template') || source.includes('fallback');
-          });
-          if (nonAIFile) {
-            const sourceError = new Error(`Strict AI mode rejected non-AI source file: ${nonAIFile.filename}`);
-            sourceError.code = 'AI_GENERATION_INSUFFICIENT';
-            throw sourceError;
-          }
-        }
-
-        const summary = openaiGenerator.getSummary();
-        generationMeta.openai = summary;
-        return { generated: files.length, files };
-      });
+    if (!saasResult.generated) {
+      throw new Error(`Backend test generation produced no files (${saasResult.reason || 'unknown'})`);
     }
-  }
 
-  if (!result && allowTemplateByMode && !allowTemplate) {
-    generationMeta.attempts.push({
-      generator: 'template',
-      status: 'skipped',
-      reason: 'template_fallback_disabled_without_TESTBOT_ENABLE_TEMPLATES',
-    });
-  }
-
-  if (!result && allowTemplate) {
-    result = await tryGenerator('template', async () => {
-      resetGeneratedTestsDir(config.projectPath);
-      const templateGenerator = new PlaywrightMCPClient(config);
-      const generationResult = await templateGenerator.generateTests({
-        context: context || { pages: [], apiEndpoints: [], workflows: [] },
-        testType: config.testType,
-        projectPath: config.projectPath,
-        prdFile: config.prdFile,
-      });
-
-      if (!generationResult?.generated) {
-        throw new Error('Template generator returned no files');
-      }
-
-      return generationResult;
-    });
-  }
-
-  // SaaS fallback for non-saas-first modes (openai-first, template-first, etc.)
-  if (!result && allowSaaS && generationMode !== 'saas-first') {
-    result = await tryGenerator('saas', async () => {
-      const testsDir = resetGeneratedTestsDir(config.projectPath);
-      const saasResult = await maybeGenerateViaSaaS({
-        config,
-        context,
-        prdContent,
-        testsDir,
-        projectInfo,
-      });
-
-      if (!saasResult.generated) {
-        throw new Error(`SaaS generator produced no files (${saasResult.reason || 'unknown'})`);
-      }
-
-      return saasResult;
-    });
-  }
+    return saasResult;
+  });
 
   generationMeta.finishedAt = new Date().toISOString();
 
   if (!result) {
-    const failedAttempts = generationMeta.attempts.filter((attempt) => attempt.status === 'failed');
-    const primaryFailure = failedAttempts[failedAttempts.length - 1] || null;
-    const errorCode = primaryFailure?.errorCode || (strictAI ? 'AI_GENERATION_INSUFFICIENT' : 'GENERATION_FAILED');
+    const primaryFailure = generationMeta.attempts[generationMeta.attempts.length - 1] || null;
+    const errorCode = primaryFailure?.errorCode || 'GENERATION_FAILED';
     const reason = primaryFailure?.reason || null;
-    const message = strictAI
-      ? (reason ? `Strict AI generation failed: ${reason}` : 'Strict AI generation failed to produce valid tests')
-      : (reason ? `All test generation strategies failed: ${reason}` : 'All test generation strategies failed');
+    const message = reason
+      ? `Backend test generation failed: ${reason}`
+      : 'Backend test generation failed. Ensure TESTBOT_API_KEY is correctly configured and the backend is reachable.';
 
     const error = new Error(message);
     error.code = errorCode;
@@ -1967,12 +1876,8 @@ async function runPipeline(config, runId) {
       generationMeta = generationResult.generationMeta;
       fallbackUsed = !!generationMeta?.fallbackUsed;
 
-      if (aiOnlyEnforced && generationMeta?.selectedGenerator !== 'openai') {
-        const sourceError = new Error(`Strict AI mode requires OpenAI generator, received '${generationMeta?.selectedGenerator || 'unknown'}'`);
-        sourceError.code = 'AI_GENERATION_INSUFFICIENT';
-        sourceError.generationMeta = generationMeta;
-        throw sourceError;
-      }
+      // Ensure playwright.config.ts exists after test generation
+      ensurePlaywrightConfig(config.projectPath, projectInfo);
 
       const qualityScan = collectGenerationQuality(config.projectPath);
       const qualityGate = evaluateGenerationQualityGates({
@@ -2133,79 +2038,6 @@ async function runPipeline(config, runId) {
     });
     phaseResults = testResults.phaseResults || null;
 
-    const initialPassRate = computePassRatePercent(testResults);
-    const minOpenAIPassRate = toFiniteNumber(config.openaiMinPassRate || process.env.TESTBOT_OPENAI_MIN_PASS_RATE, 70);
-    const shouldRetryWithTemplate = (
-      generationMeta?.selectedGenerator === 'openai' &&
-      !strictAIEnabled(config) &&
-      templatesEmergencyEnabled() &&
-      modeAllowsTemplateFallback(config.generationMode) &&
-      initialPassRate < minOpenAIPassRate &&
-      getBudgetRemainingMs(runBudget) > 30000
-    );
-
-    if (shouldRetryWithTemplate) {
-      updateStatus(statusDir, 'rerun_template', {
-        runId,
-        message: `OpenAI suite pass rate ${initialPassRate.toFixed(2)}% is below threshold ${minOpenAIPassRate}%. Regenerating deterministic template suite.`,
-        generationMeta,
-        fallbackUsed,
-        aiOnlyEnforced,
-      }, telemetryReporter);
-
-      Logger.warn('PipelineWorker', 'OpenAI suite below pass-rate threshold; retrying with template fallback', {
-        initialPassRate: Number(initialPassRate.toFixed(2)),
-        minOpenAIPassRate,
-      });
-
-      const templateGenerationResult = await generateWithFallbackChain({
-        config: {
-          ...config,
-          generationMode: 'template-only',
-        },
-        context: codebaseContext,
-        prdContent,
-        runBudget,
-        projectInfo,
-      });
-
-      const retryExecutionTimeout = Math.max(1000, Math.min(getBudgetRemainingMs(runBudget), runBudget.stageCaps.execution));
-      const retryPlaywright = new PlaywrightIntegration({
-        ...config,
-        timeout: retryExecutionTimeout,
-      });
-      const retryResults = await withStageBudget(runBudget, 'execution', async () => retryPlaywright.runTests());
-      const retryPassRate = computePassRatePercent(retryResults);
-
-      generationMeta = {
-        ...generationMeta,
-        rerun: {
-          reason: 'low_openai_pass_rate',
-          threshold: minOpenAIPassRate,
-          initialPassRate: Number(initialPassRate.toFixed(2)),
-          templatePassRate: Number(retryPassRate.toFixed(2)),
-          templateGenerationMeta: templateGenerationResult.generationMeta,
-        },
-      };
-
-      if (retryPassRate >= initialPassRate) {
-        testResults = retryResults;
-        phaseResults = retryResults.phaseResults || phaseResults;
-        fallbackUsed = true;
-        generationMeta.selectedGenerator = 'template-after-openai';
-        generationMeta.fallbackUsed = true;
-        Logger.warn('PipelineWorker', 'Template fallback adopted after low OpenAI pass rate', {
-          initialPassRate: Number(initialPassRate.toFixed(2)),
-          templatePassRate: Number(retryPassRate.toFixed(2)),
-        });
-      } else {
-        Logger.warn('PipelineWorker', 'Template fallback retry produced lower pass rate; keeping OpenAI execution results', {
-          initialPassRate: Number(initialPassRate.toFixed(2)),
-          templatePassRate: Number(retryPassRate.toFixed(2)),
-        });
-      }
-    }
-
     updateStatus(statusDir, 'tests_complete', {
       runId,
       message: `Tests completed: ${testResults.passed}/${testResults.total} passed`,
@@ -2324,6 +2156,78 @@ async function runPipeline(config, runId) {
     });
 
     // -------------------------------------------------------
+    // 7. Upload artifacts for failed tests to Supabase Storage
+    // -------------------------------------------------------
+    // NOTE: This runs AFTER report generation so artifacts are copied to testbot-reports/artifacts
+    let artifactUploadResult = null;
+    if (testResults.failed > 0) {
+      try {
+        updateStatus(statusDir, 'uploading_artifacts', {
+          runId,
+          message: 'Uploading failure artifacts to storage...',
+          generationMeta,
+          fallbackUsed,
+          aiOnlyEnforced,
+          generationQuality,
+          requirementsCoverage,
+          phaseResults,
+        }, telemetryReporter);
+
+        const artifactUploader = new ArtifactUploader({
+          projectPath: config.projectPath,
+          dashboardUrl: process.env.TESTBOT_DASHBOARD_URL,
+          apiKey: process.env.TESTBOT_API_KEY,
+        });
+
+        artifactUploadResult = await artifactUploader.processAndUpload(runId, testResults);
+        
+        if (artifactUploadResult.success) {
+          Logger.info('PipelineWorker', `Uploaded ${artifactUploadResult.uploaded || 0} artifacts to storage`);
+          updateStatus(statusDir, 'artifacts_uploaded', {
+            runId,
+            message: `Uploaded ${artifactUploadResult.uploaded || 0} artifacts to storage`,
+            artifactsUploaded: artifactUploadResult.uploaded || 0,
+            generationMeta,
+            fallbackUsed,
+            aiOnlyEnforced,
+            generationQuality,
+            requirementsCoverage,
+            phaseResults,
+          }, telemetryReporter);
+        } else {
+          Logger.warn('PipelineWorker', 'Artifact upload failed', { reason: artifactUploadResult.reason });
+          updateStatus(statusDir, 'artifacts_upload_failed', {
+            runId,
+            message: `Artifact upload failed: ${artifactUploadResult.reason || 'unknown'}`,
+            reason: artifactUploadResult.reason,
+            error: artifactUploadResult.error,
+            generationMeta,
+            fallbackUsed,
+            aiOnlyEnforced,
+            generationQuality,
+            requirementsCoverage,
+            phaseResults,
+          }, telemetryReporter);
+        }
+      } catch (uploadError) {
+        Logger.warn('PipelineWorker', 'Artifact upload error', { error: uploadError.message });
+        updateStatus(statusDir, 'artifacts_upload_error', {
+          runId,
+          message: `Artifact upload error: ${uploadError.message}`,
+          error: uploadError.message,
+          generationMeta,
+          fallbackUsed,
+          aiOnlyEnforced,
+          generationQuality,
+          requirementsCoverage,
+          phaseResults,
+        }, telemetryReporter);
+      }
+    } else {
+      Logger.info('PipelineWorker', 'No failed tests - skipping artifact upload');
+    }
+
+    // -------------------------------------------------------
     // 8. Open dashboard
     // -------------------------------------------------------
     let dashboardUrl = null;
@@ -2359,6 +2263,11 @@ async function runPipeline(config, runId) {
       },
       reportPath: report.path,
       dashboardUrl: dashboardUrl || report.url,
+      artifactUploadResult: artifactUploadResult ? {
+        success: artifactUploadResult.success,
+        uploaded: artifactUploadResult.uploaded || 0,
+        reason: artifactUploadResult.reason,
+      } : null,
       generationMeta,
       fallbackUsed,
       aiOnlyEnforced,
