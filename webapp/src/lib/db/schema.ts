@@ -38,6 +38,7 @@ export const apiKeys = pgTable(
     lastUsedAt: timestamp('last_used_at', { withTimezone: true }),
     expiresAt: timestamp('expires_at', { withTimezone: true }),
     isActive: boolean('is_active').default(true),
+    revoked: boolean('revoked').default(false),
     createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
   },
   (table) => [index('api_keys_user_id_idx').on(table.userId), index('api_keys_key_hash_idx').on(table.keyHash)]
@@ -151,5 +152,60 @@ export const testArtifacts = pgTable(
   (table) => [
     index('test_artifacts_test_run_id_idx').on(table.testRunId),
     index('test_artifacts_artifact_type_idx').on(table.artifactType),
+  ]
+)
+
+export const idempotencyKeys = pgTable(
+  'idempotency_keys',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    idempotencyKey: text('idempotency_key').notNull(),
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => profiles.id, { onDelete: 'cascade' }),
+    endpoint: text('endpoint').notNull(),
+    responseHash: text('response_hash').notNull(),
+    responseBody: jsonb('response_body').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
+  },
+  (table) => [
+    index('idempotency_keys_key_user_idx').on(table.idempotencyKey, table.userId),
+    index('idempotency_keys_created_at_idx').on(table.createdAt),
+  ]
+)
+
+export const userFlags = pgTable(
+  'user_flags',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => profiles.id, { onDelete: 'cascade' }),
+    type: text('type').notNull(),
+    reason: text('reason').notNull(),
+    metadata: jsonb('metadata'),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
+  },
+  (table) => [
+    index('user_flags_user_id_idx').on(table.userId),
+    index('user_flags_type_idx').on(table.type),
+    index('user_flags_created_at_idx').on(table.createdAt),
+  ]
+)
+
+export const projectUsage = pgTable(
+  'project_usage',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    projectHash: text('project_hash').notNull(),
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => profiles.id, { onDelete: 'cascade' }),
+    lastSeenAt: timestamp('last_seen_at', { withTimezone: true }).defaultNow(),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
+  },
+  (table) => [
+    index('project_usage_hash_idx').on(table.projectHash),
+    index('project_usage_user_id_idx').on(table.userId),
   ]
 )

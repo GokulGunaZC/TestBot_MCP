@@ -3,6 +3,10 @@ import { and, eq } from 'drizzle-orm'
 import { db } from '@/lib/db'
 import { apiKeys, mcpTelemetryEvents } from '@/lib/db/schema'
 import { hashApiKey } from '@/lib/utils/api-keys'
+import { checkRateLimit } from '@/lib/rate-limit'
+import { logBlockedRequest } from '@/lib/security-logger'
+
+const ENDPOINT = '/api/mcp-telemetry/ingest'
 
 const MAX_STRING_LENGTH = 2000
 const MAX_REASON_LENGTH = 1200
@@ -100,33 +104,72 @@ function normalizeEvent(input: IncomingEvent) {
 }
 
 export async function POST(request: NextRequest) {
+  // Handle aborted or malformed bodies before any other logic
+  let body: unknown
   try {
-    const body = await request.json()
-    const apiKey = typeof body?.api_key === 'string' ? body.api_key.trim() : ''
-    const rawEvent: IncomingEvent | null = body?.event && typeof body.event === 'object'
-      ? body.event as IncomingEvent
+    body = await request.json()
+  } catch {
+    return NextResponse.json({ error: 'Invalid or empty request body' }, { status: 400 })
+  }
+
+  const safeBody = (body && typeof body === 'object' ? body : {}) as Record<string, unknown>
+
+  try {
+    // 1. API key presence check (header or body)
+    const rawHeaderKey = request.headers.get('x-api-key') ?? null
+    const apiKey: string = rawHeaderKey ?? (typeof safeBody.api_key === 'string' ? safeBody.api_key.trim() : '')
+    const rawEvent: IncomingEvent | null = safeBody.event && typeof safeBody.event === 'object'
+      ? safeBody.event as IncomingEvent
       : null
 
-    if (!apiKey || !rawEvent) {
+    if (!apiKey) {
+      logBlockedRequest({ type: 'MISSING_API_KEY', reason: 'No x-api-key header or api_key body field', endpoint: ENDPOINT })
+      return NextResponse.json({ error: 'Missing api_key' }, { status: 401 })
+    }
+
+    if (!rawEvent) {
       return NextResponse.json(
         { error: 'Missing required fields: api_key and event are required' },
         { status: 400 }
       )
     }
 
+    // 2. Authenticate — validate key, check isActive and NOT revoked, check expiry
     const keyHash = hashApiKey(apiKey)
     const [apiKeyRecord] = await db
-      .select({ id: apiKeys.id, userId: apiKeys.userId, isActive: apiKeys.isActive, expiresAt: apiKeys.expiresAt })
+      .select({ id: apiKeys.id, userId: apiKeys.userId, isActive: apiKeys.isActive, revoked: apiKeys.revoked, expiresAt: apiKeys.expiresAt })
       .from(apiKeys)
       .where(and(eq(apiKeys.keyHash, keyHash), eq(apiKeys.isActive, true)))
       .limit(1)
 
     if (!apiKeyRecord) {
+      logBlockedRequest({ type: 'INVALID_API_KEY', reason: 'Key not found or inactive', endpoint: ENDPOINT })
       return NextResponse.json({ error: 'Invalid or inactive API key' }, { status: 401 })
     }
 
+    if (apiKeyRecord.revoked) {
+      logBlockedRequest({ type: 'REVOKED_API_KEY', user_id: apiKeyRecord.userId, reason: 'API key has been revoked', endpoint: ENDPOINT })
+      return NextResponse.json({ error: 'API key has been revoked' }, { status: 401 })
+    }
+
     if (apiKeyRecord.expiresAt && apiKeyRecord.expiresAt < new Date()) {
+      logBlockedRequest({ type: 'EXPIRED_API_KEY', user_id: apiKeyRecord.userId, reason: 'API key has expired', endpoint: ENDPOINT })
       return NextResponse.json({ error: 'API key has expired' }, { status: 401 })
+    }
+
+    // 3. Rate limit check — telemetry uses a higher per-second burst allowance
+    const rateResult = await checkRateLimit({
+      keyHash,
+      userId: apiKeyRecord.userId,
+      endpoint: ENDPOINT,
+      limitPerSecond: parseInt(process.env.TELEMETRY_RATE_LIMIT_PER_SECOND ?? '60', 10),
+      limitPerMinute: parseInt(process.env.TELEMETRY_RATE_LIMIT_PER_MINUTE ?? '600', 10),
+    })
+    if (!rateResult.allowed) {
+      return NextResponse.json(
+        { error: 'RATE_LIMIT_EXCEEDED' },
+        { status: 429, headers: { 'Retry-After': String(rateResult.retryAfter ?? 1) } }
+      )
     }
 
     const event = normalizeEvent(rawEvent)

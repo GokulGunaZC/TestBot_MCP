@@ -712,6 +712,7 @@ export default function TestRunDetailPage() {
   const [filterStatus, setFilterStatus] = useState<string>('all');
   const [activePolling, setActivePolling] = useState(true);
   const lastRunSignatureRef = useRef<string | null>(null);
+  const pollFailCountRef = useRef(0);
 
   const [liveEvents, setLiveEvents] = useState<LiveEvent[]>([]);
   const [liveFiles, setLiveFiles] = useState<string[]>([]);
@@ -846,7 +847,14 @@ export default function TestRunDetailPage() {
       }
       fetch(`/api/test-runs/${id}`, { cache: 'no-store' })
         .then((res) => {
-          if (!res.ok) return null;
+          if (!res.ok) {
+            pollFailCountRef.current += 1;
+            if (pollFailCountRef.current >= 5) {
+              setActivePolling(false);
+            }
+            return null;
+          }
+          pollFailCountRef.current = 0;
           return res.json();
         })
         .then((json) => {
@@ -870,7 +878,10 @@ export default function TestRunDetailPage() {
           setActivePolling(isLiveOrRunning(nextRun));
         })
         .catch(() => {
-          // keep existing state, retry on next cycle
+          pollFailCountRef.current += 1;
+          if (pollFailCountRef.current >= 5) {
+            setActivePolling(false);
+          }
         });
     }, intervalMs);
 

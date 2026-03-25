@@ -39,3 +39,6 @@ npm-debug.log*
 
 # Debug
 debug/
+
+# Notebooks (local data exploration — never commit)
+notebooks/

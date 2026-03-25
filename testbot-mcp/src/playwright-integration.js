@@ -225,6 +225,34 @@ class PlaywrightIntegration {
     return null;
   }
 
+  ensurePlaywrightBrowsersInstalled() {
+    const browsersPath = process.env.PLAYWRIGHT_BROWSERS_PATH ||
+      path.join(process.env.HOME || process.env.USERPROFILE || '', '.cache', 'ms-playwright');
+
+    let hasChromium = false;
+    try {
+      if (fs.existsSync(browsersPath)) {
+        hasChromium = fs.readdirSync(browsersPath).some(dir => dir.startsWith('chromium'));
+      }
+    } catch {
+      // If we can't read the directory, assume browsers are missing
+    }
+
+    if (!hasChromium) {
+      Logger.info('PlaywrightIntegration', 'Chromium browser not found. Installing via playwright install...');
+      try {
+        execSync('npx playwright install chromium', {
+          cwd: this.config.projectPath,
+          stdio: 'pipe',
+          timeout: 180000,
+        });
+        Logger.info('PlaywrightIntegration', 'Chromium browser installed successfully');
+      } catch (error) {
+        Logger.warn('PlaywrightIntegration', 'Could not auto-install Chromium. Run manually: npx playwright install chromium', { error: error.message });
+      }
+    }
+  }
+
   ensurePlaywrightInstalled() {
     const projectPath = this.config.projectPath;
     const playwrightPath = path.join(projectPath, 'node_modules', '@playwright', 'test');
@@ -533,6 +561,7 @@ class PlaywrightIntegration {
 
   async executePlaywright({ project, lastFailed = false, grep, grepInvert } = {}) {
     this.ensurePlaywrightInstalled();
+    this.ensurePlaywrightBrowsersInstalled();
 
     const configPath = this.resolvePlaywrightConfig();
     const timeoutMs = Math.max(1000, this.config.timeout || 300000);

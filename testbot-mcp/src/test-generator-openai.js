@@ -611,6 +611,21 @@ IMPORTANT: Return ONLY valid JSON, no markdown code blocks.`;
 - Keep runtime bounded: use small burst sizes and clear thresholds
 - Include comments explaining each test category (contract/auth/error/stress)
 
+## Authentication Rules
+- CRITICAL: Check CONTEXT_JSON authPatterns before writing any auth helper.
+- If authPatterns contains type "Cookie" or "Session" (cookie/session-based auth, e.g. Supabase SSR):
+  - DO NOT extract a token from the login response body — there is no token field.
+  - Authenticate by creating a shared context: call the login endpoint once in beforeAll using request.newContext(), then reuse that context across tests. Playwright automatically carries session cookies.
+  - Example pattern:
+    let authedRequest;
+    test.beforeAll(async ({ playwright }) => {
+      const ctx = await playwright.request.newContext();
+      await ctx.post('/api/auth/login', { data: { email: '...', password: '...' } });
+      authedRequest = ctx;
+    });
+  - DO NOT write a loginAndGetToken() function or assert on body.token.
+- If authPatterns contains type "JWT" only (no Cookie/Session), use Bearer token extraction.
+
 ## Base URL: ${projectInfo.baseURL || 'http://localhost:3000'}
 
 ## Output Format
@@ -640,7 +655,7 @@ IMPORTANT: Return ONLY valid JSON, no markdown code blocks.`;
       task: 'Generate backend API tests with grounded status assertions, auth coverage, negative cases, and burst/stress checks.',
       requirements: [
         'Use only statuses/fields that are present in CONTEXT_JSON endpoint contracts or schemas.',
-        'For auth-protected endpoints include unauthenticated checks and authenticated success checks when token is available.',
+        'For auth-protected endpoints include unauthenticated checks. For authenticated checks: if authPatterns in CONTEXT_JSON shows Cookie or Session type, use a shared request.newContext() that carries session cookies — never extract body.token. If JWT only, use Bearer token.',
         'Add negative-path checks using bounded assertions when exact codes are unknown.',
         'Include a lightweight burst test (Promise.all with small N) and assert no 5xx responses.',
         'Cover and tag all API categories across the suite: [CAT:api_contract], [CAT:api_auth], [CAT:api_negative], [CAT:api_stress].',
@@ -981,7 +996,8 @@ Return only the JSON array of generated files.`;
 - Do not invent undocumented API status codes or response keys.
 - At least one API test file must include a lightweight stress/burst check using Promise.all with small N.
 - Prefer bounded assertions for unknown error codes (example: status >= 400 && status < 500).
-- Include explicit category tags across suite: [CAT:api_contract], [CAT:api_auth], [CAT:api_negative], [CAT:api_stress].`;
+- Include explicit category tags across suite: [CAT:api_contract], [CAT:api_auth], [CAT:api_negative], [CAT:api_stress].
+- FORBIDDEN: loginAndGetToken() helper that asserts body.token. If CONTEXT_JSON authPatterns shows Session or Cookie auth, use request.newContext() cookie jar pattern for authenticated requests.`;
     }
 
     if (['frontend', 'workflow', 'smoke', 'error'].includes(prefix)) {

@@ -259,7 +259,7 @@ export async function getLiveRunSnapshotsForUser(userId: string, options?: {
     conditions.push(eq(mcpTelemetryEvents.runId, options.runId))
   }
 
-  const rows: TelemetryRow[] = await db
+  const queryPromise = db
     .select({
       runId: mcpTelemetryEvents.runId,
       phase: mcpTelemetryEvents.phase,
@@ -276,6 +276,12 @@ export async function getLiveRunSnapshotsForUser(userId: string, options?: {
     .where(and(...conditions))
     .orderBy(desc(mcpTelemetryEvents.occurredAt))
     .limit(limit)
+
+  const timeoutPromise = new Promise<never>((_, reject) =>
+    setTimeout(() => reject(new Error('getLiveRunSnapshotsForUser: query timeout after 25s')), 25000)
+  )
+
+  const rows: TelemetryRow[] = await Promise.race([queryPromise, timeoutPromise])
 
   const byRunId = new Map<string, LiveRunSnapshot>()
   for (const row of rows) {

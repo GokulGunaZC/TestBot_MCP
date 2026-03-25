@@ -992,7 +992,7 @@ export default defineConfig({
   fullyParallel: true,
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 2 : 0,
-  workers: process.env.CI ? 1 : undefined,
+  workers: process.env.CI ? 1 : 2,
   reporter: [
     ['list'],
     ['json', { outputFile: 'test-results/results.json' }],
@@ -1009,13 +1009,7 @@ export default defineConfig({
       name: 'chromium',
       use: { ...devices['Desktop Chrome'] },
     },
-  ],${startCommand ? `
-  webServer: {
-    command: '${startCommand}',
-    url: '${baseURL}',
-    reuseExistingServer: !process.env.CI,
-    timeout: 120 * 1000,
-  },` : ''}
+  ],
 });
 `;
 
@@ -1740,6 +1734,17 @@ async function runPipeline(config, runId) {
             originalPort: configuredPort,
             newPort: freePort,
           });
+          // Clean up Next.js dev lock file — the existing server holds it and
+          // SIGKILL won't release it, so the new instance would fail to start.
+          const nextDevLock = path.join(config.projectPath, '.next', 'dev', 'lock');
+          try {
+            if (fs.existsSync(nextDevLock)) {
+              fs.unlinkSync(nextDevLock);
+              Logger.info('PipelineWorker', 'Removed stale Next.js dev lock file', { lockFile: nextDevLock });
+            }
+          } catch {
+            // non-fatal — best effort
+          }
           try {
             const parsedBase = new URL(config.baseURL);
             parsedBase.port = String(freePort);

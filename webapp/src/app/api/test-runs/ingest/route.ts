@@ -1,8 +1,18 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
-import { apiKeys, testRuns, profiles } from '@/lib/db/schema'
+import { apiKeys, testRuns } from '@/lib/db/schema'
 import { eq, and } from 'drizzle-orm'
 import { hashApiKey } from '@/lib/utils/api-keys'
+import { checkRateLimit } from '@/lib/rate-limit'
+import { deductCredit } from '@/lib/credits'
+import { checkConcurrencyLimit } from '@/lib/concurrency-limit'
+import { checkIdempotency, storeIdempotencyResult } from '@/lib/idempotency'
+import { validateTestRunIngest } from '@/lib/validation'
+import { runAbuseDetection } from '@/lib/abuse-detector'
+import { trackProjectUsage } from '@/lib/project-hash'
+import { logBlockedRequest } from '@/lib/security-logger'
+
+const ENDPOINT = '/api/test-runs/ingest'
 
 type AiLikeItem = {
   testName?: string
@@ -174,48 +184,86 @@ function buildAiAnalysisPayload(report: ReportPayload) {
 
 export async function POST(request: NextRequest) {
   try {
+    // 1. API key presence check (header or body)
+    const rawKey = request.headers.get('x-api-key') ?? null
     const body = await request.json()
-    const { api_key, creation_name, run_id, report } = body as {
-      api_key?: string
+    const { creation_name, run_id, report } = body as {
       creation_name?: string
       run_id?: string
       report?: ReportPayload
     }
+    const api_key: string = rawKey ?? (body as { api_key?: string })?.api_key ?? ''
 
-    if (!api_key || !report) {
+    if (!api_key) {
+      logBlockedRequest({ type: 'MISSING_API_KEY', reason: 'No x-api-key header or api_key body field', endpoint: ENDPOINT })
+      return NextResponse.json({ error: 'Missing api_key' }, { status: 401 })
+    }
+
+    if (!report) {
       return NextResponse.json(
         { error: 'Missing required fields: api_key and report are required' },
         { status: 400 }
       )
     }
 
+    // 2. Authenticate — validate key, check isActive and NOT revoked, check expiry
     const keyHash = hashApiKey(api_key)
-
-    // Look up API key
     const [apiKeyRecord] = await db
-      .select({ id: apiKeys.id, userId: apiKeys.userId, isActive: apiKeys.isActive, expiresAt: apiKeys.expiresAt })
+      .select({ id: apiKeys.id, userId: apiKeys.userId, isActive: apiKeys.isActive, revoked: apiKeys.revoked, expiresAt: apiKeys.expiresAt })
       .from(apiKeys)
       .where(and(eq(apiKeys.keyHash, keyHash), eq(apiKeys.isActive, true)))
       .limit(1)
 
     if (!apiKeyRecord) {
+      logBlockedRequest({ type: 'INVALID_API_KEY', reason: 'Key not found or inactive', endpoint: ENDPOINT })
       return NextResponse.json({ error: 'Invalid or inactive API key' }, { status: 401 })
     }
 
+    if (apiKeyRecord.revoked) {
+      logBlockedRequest({ type: 'REVOKED_API_KEY', user_id: apiKeyRecord.userId, reason: 'API key has been revoked', endpoint: ENDPOINT })
+      return NextResponse.json({ error: 'API key has been revoked' }, { status: 401 })
+    }
+
     if (apiKeyRecord.expiresAt && apiKeyRecord.expiresAt < new Date()) {
+      logBlockedRequest({ type: 'EXPIRED_API_KEY', user_id: apiKeyRecord.userId, reason: 'API key has expired', endpoint: ENDPOINT })
       return NextResponse.json({ error: 'API key has expired' }, { status: 401 })
     }
 
     const userId = apiKeyRecord.userId
 
-    // Pre-check credits before running
-    const [preCheckProfile] = await db
-      .select({ creditsRemaining: profiles.creditsRemaining })
-      .from(profiles)
-      .where(eq(profiles.id, userId))
-      .limit(1)
+    // 3. Rate limit check
+    const rateResult = await checkRateLimit({ keyHash, userId, endpoint: ENDPOINT })
+    if (!rateResult.allowed) {
+      return NextResponse.json(
+        { error: 'RATE_LIMIT_EXCEEDED' },
+        { status: 429, headers: { 'Retry-After': String(rateResult.retryAfter ?? 1) } }
+      )
+    }
 
-    if (preCheckProfile && typeof preCheckProfile.creditsRemaining === 'number' && preCheckProfile.creditsRemaining <= 0) {
+    // 4. Concurrency limit check
+    const concurrencyResult = await checkConcurrencyLimit({ userId, endpoint: ENDPOINT })
+    if (!concurrencyResult.allowed) {
+      return NextResponse.json({ error: 'CONCURRENT_LIMIT_EXCEEDED' }, { status: 429 })
+    }
+
+    // 5. Idempotency check
+    const idempotencyKey = request.headers.get('x-idempotency-key')
+    if (idempotencyKey) {
+      const idempotencyResult = await checkIdempotency({ idempotencyKey, userId, endpoint: ENDPOINT })
+      if (idempotencyResult.isDuplicate) {
+        return NextResponse.json(idempotencyResult.cachedBody)
+      }
+    }
+
+    // 6. Input validation
+    const validationError = validateTestRunIngest(body, userId, ENDPOINT)
+    if (validationError) {
+      return NextResponse.json(validationError, { status: 422 })
+    }
+
+    // 7. Credit gate — atomic decrement, fail-closed (throws on DB error)
+    const creditResult = await deductCredit({ userId, endpoint: ENDPOINT })
+    if (!creditResult.allowed) {
       return NextResponse.json(
         { error: 'No credits remaining. Please upgrade your plan or purchase more credits.' },
         { status: 402 }
@@ -297,29 +345,29 @@ export async function POST(request: NextRequest) {
       .set({ lastUsedAt: new Date() })
       .where(eq(apiKeys.id, apiKeyRecord.id))
 
-    // Deduct 1 credit
-    try {
-      const [profile] = await db
-        .select({ creditsRemaining: profiles.creditsRemaining })
-        .from(profiles)
-        .where(eq(profiles.id, userId))
-        .limit(1)
+    // Credit already deducted atomically above (Gate 7)
 
-      if (profile && typeof profile.creditsRemaining === 'number') {
-        await db
-          .update(profiles)
-          .set({ creditsRemaining: Math.max(0, profile.creditsRemaining - 1) })
-          .where(eq(profiles.id, userId))
-      }
-    } catch (creditError) {
-      console.warn('[Ingest] Failed to deduct credit:', creditError)
-    }
-
-    return NextResponse.json({
+    const responseBody = {
       success: true,
       test_run_id: testRun.id,
       dashboard_url: '/all-tests',
-    })
+    }
+
+    // Store idempotency result
+    if (idempotencyKey) {
+      await storeIdempotencyResult({ idempotencyKey, userId, endpoint: ENDPOINT, responseBody })
+    }
+
+    // Track project usage (non-blocking)
+    const projectPath = creation_name || report.metadata?.projectName
+    if (projectPath) {
+      trackProjectUsage({ projectPath, userId }).catch(() => undefined)
+    }
+
+    // Async abuse detection (non-blocking)
+    runAbuseDetection({ userId, apiKeyId: apiKeyRecord.id }).catch(() => undefined)
+
+    return NextResponse.json(responseBody)
   } catch (error) {
     console.error('[Ingest] Unexpected error:', error)
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })

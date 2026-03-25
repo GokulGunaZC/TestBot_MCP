@@ -532,6 +532,7 @@ class ContextGatherer {
     let hasNextAuth = false;
     let hasClerk = false;
     let hasAuth0 = false;
+    let hasCookieAuth = false;
     
     for (const file of files.slice(0, this.config.maxFiles)) {
       try {
@@ -545,6 +546,13 @@ class ContextGatherer {
         if (content.includes('next-auth') || content.includes('NextAuth')) hasNextAuth = true;
         if (content.includes('@clerk') || content.includes('clerk')) hasClerk = true;
         if (content.includes('@auth0') || content.includes('auth0')) hasAuth0 = true;
+        if (
+          content.includes('createSupabaseServerClient') ||
+          content.includes('createServerComponentClient') ||
+          content.includes('@supabase/ssr') ||
+          content.includes('supabase/auth-helpers') ||
+          (content.includes('cookies()') && content.includes('supabase'))
+        ) hasCookieAuth = true;
       } catch (error) {
         // Ignore errors
       }
@@ -553,8 +561,9 @@ class ContextGatherer {
     if (hasNextAuth) patterns.push({ type: 'NextAuth', description: 'NextAuth.js authentication' });
     if (hasClerk) patterns.push({ type: 'Clerk', description: 'Clerk authentication service' });
     if (hasAuth0) patterns.push({ type: 'Auth0', description: 'Auth0 authentication service' });
-    if (hasJWT) patterns.push({ type: 'JWT', description: 'JSON Web Token authentication' });
-    if (hasSession) patterns.push({ type: 'Session', description: 'Session-based authentication' });
+    if (hasCookieAuth) patterns.push({ type: 'Cookie', description: 'Cookie/session-based authentication — login response contains no token field; use request.newContext() cookie jar for authenticated API tests', cookieBased: true });
+    if (hasJWT && !hasCookieAuth) patterns.push({ type: 'JWT', description: 'JSON Web Token authentication' });
+    if (hasSession && !hasCookieAuth) patterns.push({ type: 'Session', description: 'Session-based authentication' });
     if (hasOAuth) patterns.push({ type: 'OAuth', description: 'OAuth authentication' });
     if (hasBasicAuth) patterns.push({ type: 'Basic', description: 'Basic HTTP authentication' });
     

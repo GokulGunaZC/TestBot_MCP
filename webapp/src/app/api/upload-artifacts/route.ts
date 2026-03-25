@@ -4,15 +4,24 @@ import { apiKeys, testArtifacts, testRuns } from '@/lib/db/schema'
 import { eq, and } from 'drizzle-orm'
 import { hashApiKey } from '@/lib/utils/api-keys'
 import { uploadArtifactsBatch, ensureBucketExists } from '@/lib/storage/supabase-storage'
+import { checkRateLimit } from '@/lib/rate-limit'
+import { validateArtifacts } from '@/lib/validation'
+import { logBlockedRequest } from '@/lib/security-logger'
+
+const ENDPOINT = '/api/upload-artifacts'
 
 export async function POST(request: NextRequest) {
   try {
-    // 1. Authenticate
     const body = await request.json()
-    const { api_key, run_id, artifacts } = body
+
+    // 1. API key presence check (header or body)
+    const rawKey = request.headers.get('x-api-key') ?? null
+    const api_key: string = rawKey ?? body?.api_key ?? ''
+    const { run_id, artifacts } = body
 
     if (!api_key) {
-      return NextResponse.json({ error: 'Missing api_key' }, { status: 400 })
+      logBlockedRequest({ type: 'MISSING_API_KEY', reason: 'No x-api-key header or api_key body field', endpoint: ENDPOINT })
+      return NextResponse.json({ error: 'Missing api_key' }, { status: 401 })
     }
 
     if (!run_id) {
@@ -23,18 +32,45 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'Missing or empty artifacts array' }, { status: 400 })
     }
 
+    // 2. Authenticate — validate key, check isActive and NOT revoked, check expiry
     const keyHash = hashApiKey(api_key)
     const [apiKeyRecord] = await db
-      .select({ id: apiKeys.id, userId: apiKeys.userId, isActive: apiKeys.isActive })
+      .select({ id: apiKeys.id, userId: apiKeys.userId, isActive: apiKeys.isActive, revoked: apiKeys.revoked, expiresAt: apiKeys.expiresAt })
       .from(apiKeys)
       .where(and(eq(apiKeys.keyHash, keyHash), eq(apiKeys.isActive, true)))
       .limit(1)
 
     if (!apiKeyRecord) {
+      logBlockedRequest({ type: 'INVALID_API_KEY', reason: 'Key not found or inactive', endpoint: ENDPOINT })
       return NextResponse.json({ error: 'Invalid or inactive API key' }, { status: 401 })
     }
 
+    if (apiKeyRecord.revoked) {
+      logBlockedRequest({ type: 'REVOKED_API_KEY', user_id: apiKeyRecord.userId, reason: 'API key has been revoked', endpoint: ENDPOINT })
+      return NextResponse.json({ error: 'API key has been revoked' }, { status: 401 })
+    }
+
+    if (apiKeyRecord.expiresAt && apiKeyRecord.expiresAt < new Date()) {
+      logBlockedRequest({ type: 'EXPIRED_API_KEY', user_id: apiKeyRecord.userId, reason: 'API key has expired', endpoint: ENDPOINT })
+      return NextResponse.json({ error: 'API key has expired' }, { status: 401 })
+    }
+
     const userId = apiKeyRecord.userId
+
+    // 3. Rate limit check
+    const rateResult = await checkRateLimit({ keyHash, userId, endpoint: ENDPOINT })
+    if (!rateResult.allowed) {
+      return NextResponse.json(
+        { error: 'RATE_LIMIT_EXCEEDED' },
+        { status: 429, headers: { 'Retry-After': String(rateResult.retryAfter ?? 1) } }
+      )
+    }
+
+    // 6. Input validation — artifact size
+    const artifactValidationError = validateArtifacts(artifacts, userId, ENDPOINT)
+    if (artifactValidationError) {
+      return NextResponse.json(artifactValidationError, { status: 422 })
+    }
 
     // 2. Verify test run exists and belongs to user
     const [testRun] = await db

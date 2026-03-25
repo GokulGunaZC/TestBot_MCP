@@ -1,8 +1,17 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
-import { apiKeys, profiles } from '@/lib/db/schema'
+import { apiKeys } from '@/lib/db/schema'
 import { eq, and } from 'drizzle-orm'
 import { hashApiKey } from '@/lib/utils/api-keys'
+import { checkRateLimit } from '@/lib/rate-limit'
+import { deductCredit } from '@/lib/credits'
+import { checkIdempotency, storeIdempotencyResult } from '@/lib/idempotency'
+import { validateAnalyzeFailures } from '@/lib/validation'
+import { checkAiGuard, recordAiCall } from '@/lib/ai-guard'
+import { runAbuseDetection } from '@/lib/abuse-detector'
+import { logBlockedRequest } from '@/lib/security-logger'
+
+const ENDPOINT = '/api/analyze-failures'
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o'
@@ -185,60 +194,92 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'Server OpenAI key not configured' }, { status: 503 })
     }
 
+    // 1. API key presence check (header or body)
+    const rawKey = request.headers.get('x-api-key') ?? null
     const body = await request.json()
-    const { api_key, failures } = body
+    const api_key: string = rawKey ?? body?.api_key ?? ''
 
-    // 1. Validate required fields
     if (!api_key) {
-      return NextResponse.json({ error: 'Missing api_key' }, { status: 400 })
+      logBlockedRequest({ type: 'MISSING_API_KEY', reason: 'No x-api-key header or api_key body field', endpoint: ENDPOINT })
+      return NextResponse.json({ error: 'Missing api_key' }, { status: 401 })
     }
+
+    const { failures } = body
 
     if (!failures || !Array.isArray(failures) || failures.length === 0) {
       return NextResponse.json({ error: 'Missing or empty failures array' }, { status: 400 })
     }
 
-    // 2. Authenticate
+    // 2. Authenticate — validate key, check isActive and NOT revoked, check expiry
     const keyHash = hashApiKey(api_key)
     const [apiKeyRecord] = await db
-      .select({ id: apiKeys.id, userId: apiKeys.userId, isActive: apiKeys.isActive })
+      .select({ id: apiKeys.id, userId: apiKeys.userId, isActive: apiKeys.isActive, revoked: apiKeys.revoked, expiresAt: apiKeys.expiresAt })
       .from(apiKeys)
       .where(and(eq(apiKeys.keyHash, keyHash), eq(apiKeys.isActive, true)))
       .limit(1)
 
     if (!apiKeyRecord) {
+      logBlockedRequest({ type: 'INVALID_API_KEY', reason: 'Key not found or inactive', endpoint: ENDPOINT })
       return NextResponse.json({ error: 'Invalid or inactive API key' }, { status: 401 })
+    }
+
+    if (apiKeyRecord.revoked) {
+      logBlockedRequest({ type: 'REVOKED_API_KEY', user_id: apiKeyRecord.userId, reason: 'API key has been revoked', endpoint: ENDPOINT })
+      return NextResponse.json({ error: 'API key has been revoked' }, { status: 401 })
+    }
+
+    if (apiKeyRecord.expiresAt && apiKeyRecord.expiresAt < new Date()) {
+      logBlockedRequest({ type: 'EXPIRED_API_KEY', user_id: apiKeyRecord.userId, reason: 'API key has expired', endpoint: ENDPOINT })
+      return NextResponse.json({ error: 'API key has expired' }, { status: 401 })
     }
 
     const userId = apiKeyRecord.userId
 
-    // 3. Check and deduct 1 credit
-    try {
-      const [profile] = await db
-        .select({ creditsRemaining: profiles.creditsRemaining })
-        .from(profiles)
-        .where(eq(profiles.id, userId))
-        .limit(1)
-
-      if (profile && typeof profile.creditsRemaining === 'number') {
-        if (profile.creditsRemaining <= 0) {
-          return NextResponse.json({ error: 'No credits remaining' }, { status: 402 })
-        }
-        await db
-          .update(profiles)
-          .set({ creditsRemaining: Math.max(0, profile.creditsRemaining - 1) })
-          .where(eq(profiles.id, userId))
-      }
-    } catch (e) {
-      console.warn('[analyze-failures] credit deduction failed:', e)
+    // 3. Rate limit check
+    const rateResult = await checkRateLimit({ keyHash, userId, endpoint: ENDPOINT })
+    if (!rateResult.allowed) {
+      return NextResponse.json(
+        { error: 'RATE_LIMIT_EXCEEDED' },
+        { status: 429, headers: { 'Retry-After': String(rateResult.retryAfter ?? 1) } }
+      )
     }
 
-    // 4. Update last_used_at
+    // 5. Idempotency check
+    const idempotencyKey = request.headers.get('x-idempotency-key')
+    if (idempotencyKey) {
+      const idempotencyResult = await checkIdempotency({ idempotencyKey, userId, endpoint: ENDPOINT })
+      if (idempotencyResult.isDuplicate) {
+        return NextResponse.json(idempotencyResult.cachedBody)
+      }
+    }
+
+    // 6. Input validation
+    const validationError = validateAnalyzeFailures(body, userId, ENDPOINT)
+    if (validationError) {
+      return NextResponse.json(validationError, { status: 422 })
+    }
+
+    // 7. AI cost guard
+    const aiGuardResult = await checkAiGuard({ userId, endpoint: ENDPOINT })
+    if (!aiGuardResult.allowed) {
+      return NextResponse.json({ error: 'RATE_LIMIT_EXCEEDED' }, { status: 429 })
+    }
+
+    // 8. Credit gate — atomic decrement, fail-closed (throws on DB error)
+    const creditResult = await deductCredit({ userId, endpoint: ENDPOINT })
+    if (!creditResult.allowed) {
+      return NextResponse.json({ error: 'No credits remaining' }, { status: 402 })
+    }
+
+    // Update last_used_at and record AI call
     await db
       .update(apiKeys)
       .set({ lastUsedAt: new Date() })
       .where(eq(apiKeys.id, apiKeyRecord.id))
 
-    // 5. Cap failures to max limit
+    await recordAiCall({ userId, apiKeyId: apiKeyRecord.id, endpoint: ENDPOINT })
+
+    // Cap failures to max limit
     const cappedFailures = failures.slice(0, MAX_FAILURES)
 
     // 6. Analyze each failure
@@ -288,10 +329,17 @@ export async function POST(request: NextRequest) {
       }),
     )
 
-    return NextResponse.json({
-      success: true,
-      analyses,
-    })
+    const responseBody = { success: true, analyses }
+
+    // 9. Store idempotency result
+    if (idempotencyKey) {
+      await storeIdempotencyResult({ idempotencyKey, userId, endpoint: ENDPOINT, responseBody })
+    }
+
+    // 10. Async abuse detection (non-blocking)
+    runAbuseDetection({ userId, apiKeyId: apiKeyRecord.id }).catch(() => undefined)
+
+    return NextResponse.json(responseBody)
   } catch (error) {
     console.error('[analyze-failures] error:', error)
     return NextResponse.json(
