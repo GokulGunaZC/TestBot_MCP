@@ -12,7 +12,7 @@ export default defineConfig({
     ['html', { open: 'never' }],
   ],
   use: {
-    baseURL: 'http://localhost:3001',
+    baseURL: 'http://localhost:3000',
     trace: 'retain-on-failure',
     screenshot: 'only-on-failure',
     video: 'retain-on-failure',
