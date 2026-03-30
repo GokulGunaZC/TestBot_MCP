@@ -32,7 +32,7 @@ async function callOpenAIWithModel(
         model,
         messages,
         temperature: OPENAI_TEMPERATURE,
-        max_tokens: OPENAI_MAX_TOKENS,
+        max_completion_tokens: OPENAI_MAX_TOKENS, // Use max_completion_tokens instead of max_tokens for newer models
       }),
       signal: controller.signal,
     })

@@ -927,6 +927,20 @@ export default function TestRunDetailPage() {
     t.suite === 'pipeline' && (t.name.startsWith('[PIPELINE') || t.name.startsWith('[PIPELINE_ERROR'));
   const hasRealTests = liveTestResults.length > 0 || normalisedTests.some(t => !isPipelineSynthetic(t));
   const displayTests = hasRealTests ? normalisedTests.filter(t => !isPipelineSynthetic(t)) : normalisedTests;
+  
+  // Count of real (non-synthetic) tests for accurate stats
+  const realTestsCount = normalisedTests.filter(t => !isPipelineSynthetic(t)).length;
+
+  // Extract generated test count from live events (e.g., "Generated 68 tests across 42 files")
+  const generatedTestCount = (() => {
+    for (const ev of liveEvents) {
+      if (ev.message) {
+        const match = ev.message.match(/Generated\s+(\d+)\s+tests/i);
+        if (match) return parseInt(match[1], 10);
+      }
+    }
+    return 0;
+  })();
 
   // Use live test results for stats when available (real-time updates)
   const livePassed = liveTestResults.filter(t => t.s === 'passed').length;
@@ -935,7 +949,10 @@ export default function TestRunDetailPage() {
   const liveTotal = liveTestResults.length;
   const hasLiveStats = liveTotal > 0;
 
-  const totalTests = hasLiveStats ? liveTotal : (testRun.total_tests || report?.summary?.total || report?.stats?.total || displayTests.length);
+  // Priority: live results > database stats > generated count > real test count
+  const totalTests = hasLiveStats 
+    ? liveTotal 
+    : (testRun.total_tests || report?.summary?.total || report?.stats?.total || generatedTestCount || realTestsCount);
   const passedTests = hasLiveStats ? livePassed : (testRun.passed_tests || report?.summary?.passed || report?.stats?.passed || displayTests.filter(t => ['passed', 'pass'].includes(t.status.toLowerCase())).length);
   const failedTests = hasLiveStats ? liveFailed : (testRun.failed_tests || report?.summary?.failed || report?.stats?.failed || displayTests.filter(t => ['failed', 'fail'].includes(t.status.toLowerCase())).length);
   const skippedTests = hasLiveStats ? liveSkipped : (testRun.skipped_tests || report?.summary?.skipped || report?.stats?.skipped || displayTests.filter(t => ['skipped', 'skip', 'pending'].includes(t.status.toLowerCase())).length);
@@ -1189,7 +1206,7 @@ export default function TestRunDetailPage() {
           <div className="px-6 py-4 border-b border-white/8 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
             <div>
               <h2 className="text-[#F0F6FF] font-semibold text-base">Test Results</h2>
-              <p className="text-[#4A6280] text-xs mt-0.5">{displayTests.length} individual tests — click a row to expand details</p>
+              <p className="text-[#4A6280] text-xs mt-0.5">{totalTests} individual tests — click a row to expand details</p>
             </div>
             {/* Filter buttons */}
             <div className="flex items-center gap-1.5">

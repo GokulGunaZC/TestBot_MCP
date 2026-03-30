@@ -507,12 +507,18 @@ class ReportGenerator {
             creation_name: projectName || path.basename(projectPath),
             run_id: runId || null,
             report,
+            project_path: projectPath,
           }),
         });
 
         if (response.ok) {
           const payload = await response.json();
           dashboardLink = `${dashboard_url}${payload.dashboard_url}`;
+          // Store the actual test_run_id returned by the server
+          if (payload.test_run_id) {
+            report.metadata.actualRunId = payload.test_run_id;
+            Logger.info('ReportGenerator', `Test run ingested with ID: ${payload.test_run_id}`);
+          }
         } else {
           Logger.warn('ReportGenerator', 'Dashboard sync failed', { status: response.status });
         }
@@ -525,6 +531,7 @@ class ReportGenerator {
       path: reportPath,
       latestPath,
       url: dashboardLink,
+      actualRunId: report.metadata.actualRunId || runId,
     };
   }
 }

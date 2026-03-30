@@ -175,11 +175,12 @@ function buildAiAnalysisPayload(report: ReportPayload) {
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json()
-    const { api_key, creation_name, run_id, report } = body as {
+    const { api_key, creation_name, run_id, report, project_path } = body as {
       api_key?: string
       creation_name?: string
       run_id?: string
       report?: ReportPayload
+      project_path?: string
     }
 
     if (!api_key || !report) {
@@ -288,6 +289,7 @@ export async function POST(request: NextRequest) {
         reportJson: reportWithRunId,
         aiAnalysis: aiAnalysisPayload,
         source: 'mcp',
+        projectPath: project_path || null,
       })
       .returning({ id: testRuns.id })
 
