@@ -378,8 +378,13 @@ function normaliseTest(t: ReportTest, idx: number, testRunId: string): Normalise
   const videoPaths = (att.videos || []).map(a => a.path || a.fullPath || a.name).filter(Boolean) as string[];
   const tracePaths = (att.traces || []).map(a => a.path || a.fullPath || a.name).filter(Boolean) as string[];
 
-  // Build artifact URLs
-  const toUrl = (p: string) => `/api/artifacts?testRunId=${testRunId}&file=${encodeURIComponent(p)}`;
+  // Extract test name for artifact matching
+  // The uploader stores transformed names with hash IDs, not the original title
+  // For now, just pass the original title and let the API do fuzzy matching
+  const testName = t.name ?? t.title ?? `Test ${idx + 1}`;
+
+  // Build artifact URLs with test name for proper DB matching
+  const toUrl = (p: string) => `/api/artifacts?testRunId=${testRunId}&file=${encodeURIComponent(p)}&testName=${encodeURIComponent(testName)}`;
 
   return {
     name: t.name ?? t.title ?? `Test ${idx + 1}`,
@@ -719,6 +724,11 @@ export default function TestRunDetailPage() {
   const [liveTestResults, setLiveTestResults] = useState<LiveTestResult[]>([]);
   const [pipelineOpen, setPipelineOpen] = useState(true);
   const [pipelineEnded, setPipelineEnded] = useState(false);
+  const [testResultsOpen, setTestResultsOpen] = useState(true);
+  const [aiAnalysisOpen, setAiAnalysisOpen] = useState(true);
+  
+  const testResultsHeaderRef = useRef<HTMLDivElement>(null);
+  const aiAnalysisHeaderRef = useRef<HTMLButtonElement>(null);
 
   const isLiveOrRunning = useCallback((run: TestRun | null) => {
     if (!run) return false;
@@ -1214,11 +1224,23 @@ export default function TestRunDetailPage() {
         </motion.div>
       ) : displayTests.length > 0 ? (
         <motion.div initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.35 }} className="glass-card rounded-2xl overflow-hidden">
-          <div className="px-6 py-4 border-b border-white/8 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-            <div>
-              <h2 className="text-[#F0F6FF] font-semibold text-base">Test Results</h2>
-              <p className="text-[#4A6280] text-xs mt-0.5">{totalTests} individual tests — click a row to expand details</p>
-            </div>
+          {/* Header with collapse toggle */}
+          <div ref={testResultsHeaderRef} className="px-6 py-4 border-b border-white/8 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <button
+              onClick={() => setTestResultsOpen(o => !o)}
+              className="flex items-center gap-3 text-left hover:opacity-80 transition-opacity"
+            >
+              <svg
+                width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"
+                className={`text-[#4A6280] transition-transform duration-200 flex-shrink-0 ${testResultsOpen ? 'rotate-180' : ''}`}
+              >
+                <polyline points="6 9 12 15 18 9" />
+              </svg>
+              <div>
+                <h2 className="text-[#F0F6FF] font-semibold text-base">Test Results</h2>
+                <p className="text-[#4A6280] text-xs mt-0.5">{totalTests} individual tests — click a row to expand details</p>
+              </div>
+            </button>
             {/* Filter buttons */}
             <div className="flex items-center gap-1.5">
               {(['all', 'passed', 'failed', 'skipped'] as const).map(f => (
@@ -1239,27 +1261,57 @@ export default function TestRunDetailPage() {
               ))}
             </div>
           </div>
-          <div className="overflow-x-auto">
-            <table className="w-full">
-              <thead>
-                <tr className="border-b border-white/5">
-                  <th className="text-left px-6 py-3 text-[#4A6280] text-xs font-semibold uppercase tracking-wider">Test Name</th>
-                  <th className="text-left px-4 py-3 text-[#4A6280] text-xs font-semibold uppercase tracking-wider">Suite / File</th>
-                  <th className="text-left px-4 py-3 text-[#4A6280] text-xs font-semibold uppercase tracking-wider">Status</th>
-                  <th className="text-left px-4 py-3 text-[#4A6280] text-xs font-semibold uppercase tracking-wider">Duration</th>
-                  <th className="text-left px-4 py-3 text-[#4A6280] text-xs font-semibold uppercase tracking-wider">Artifacts</th>
-                </tr>
-              </thead>
-              <tbody>
-                {filteredTests.map((t, i) => (
-                  <TestRow key={i} t={t} idx={i} />
-                ))}
-              </tbody>
-            </table>
-          </div>
-          {filteredTests.length === 0 && (
-            <div className="px-6 py-8 text-center text-[#4A6280] text-sm">No tests match the selected filter.</div>
-          )}
+
+          <AnimatePresence initial={false}>
+            {testResultsOpen && (
+              <motion.div
+                key="test-results-body"
+                initial={{ height: 0, opacity: 0 }}
+                animate={{ height: 'auto', opacity: 1 }}
+                exit={{ height: 0, opacity: 0 }}
+                transition={{ duration: 0.25 }}
+                style={{ overflow: 'hidden' }}
+              >
+                <div className="overflow-x-auto">
+                  <table className="w-full">
+                    <thead>
+                      <tr className="border-b border-white/5">
+                        <th className="text-left px-6 py-3 text-[#4A6280] text-xs font-semibold uppercase tracking-wider">Test Name</th>
+                        <th className="text-left px-4 py-3 text-[#4A6280] text-xs font-semibold uppercase tracking-wider">Suite / File</th>
+                        <th className="text-left px-4 py-3 text-[#4A6280] text-xs font-semibold uppercase tracking-wider">Status</th>
+                        <th className="text-left px-4 py-3 text-[#4A6280] text-xs font-semibold uppercase tracking-wider">Duration</th>
+                        <th className="text-left px-4 py-3 text-[#4A6280] text-xs font-semibold uppercase tracking-wider">Artifacts</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {filteredTests.map((t, i) => (
+                        <TestRow key={i} t={t} idx={i} />
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+                {filteredTests.length === 0 && (
+                  <div className="px-6 py-8 text-center text-[#4A6280] text-sm">No tests match the selected filter.</div>
+                )}
+                
+                {/* Footer collapse toggle */}
+                <button
+                  onClick={() => {
+                    setTestResultsOpen(false);
+                    setTimeout(() => {
+                      testResultsHeaderRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                    }, 100);
+                  }}
+                  className="w-full px-6 py-3 border-t border-white/8 flex items-center justify-center gap-2 text-[#4A6280] hover:text-[#F0F6FF] hover:bg-white/[0.02] transition-colors text-xs font-medium"
+                >
+                  <span>Collapse Test Results</span>
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                    <polyline points="18 15 12 9 6 15" />
+                  </svg>
+                </button>
+              </motion.div>
+            )}
+          </AnimatePresence>
         </motion.div>
       ) : null}
 
@@ -1267,7 +1319,18 @@ export default function TestRunDetailPage() {
       <AnimatePresence>
         {aiAnalysis.length > 0 && (
           <motion.div initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.5 }} className="glass-card rounded-2xl overflow-hidden">
-            <div className="px-6 py-4 border-b border-white/8 flex items-center gap-3">
+            {/* Header with collapse toggle */}
+            <button
+              ref={aiAnalysisHeaderRef}
+              onClick={() => setAiAnalysisOpen(o => !o)}
+              className="w-full px-6 py-4 border-b border-white/8 flex items-center gap-3 text-left hover:bg-white/[0.02] transition-colors"
+            >
+              <svg
+                width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"
+                className={`text-[#4A6280] transition-transform duration-200 flex-shrink-0 ${aiAnalysisOpen ? 'rotate-180' : ''}`}
+              >
+                <polyline points="6 9 12 15 18 9" />
+              </svg>
               <div className="w-8 h-8 rounded-lg bg-purple-500/10 border border-purple-500/20 flex items-center justify-center">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#A78BFA" strokeWidth="2">
                   <path d="M12 2a10 10 0 110 20A10 10 0 0112 2z" /><path d="M12 8v4l3 3" />
@@ -1277,62 +1340,92 @@ export default function TestRunDetailPage() {
                 <h2 className="text-[#F0F6FF] font-semibold text-base">AI Analysis</h2>
                 <p className="text-[#4A6280] text-xs">{aiAnalysis.length} issue{aiAnalysis.length !== 1 ? 's' : ''} analysed</p>
               </div>
-            </div>
-            <div className="p-5 flex flex-col gap-4">
-              {aiAnalysis.map((item, i) => {
-                const testName = safeString(item.testName ?? item.test ?? item.test_name) ?? `Issue ${i + 1}`;
-                const analysis = safeString(item.analysis);
-                const rootCause = safeString(item.root_cause ?? item.rootCause);
-                const fix = safeString(item.suggested_fix ?? item.suggestedFix ?? item.fix);
-                const testingRecommendations = safeString(item.testingRecommendations ?? item.testing_recommendations);
-                const confidence = getConfidencePercent(item.confidence);
-                return (
-                  <motion.div
-                    key={i}
-                    initial={{ opacity: 0, x: -8 }}
-                    animate={{ opacity: 1, x: 0 }}
-                    transition={{ delay: 0.55 + i * 0.08 }}
-                    className="rounded-xl bg-purple-500/5 border border-purple-500/10 p-4 flex flex-col gap-3"
+            </button>
+
+            <AnimatePresence initial={false}>
+              {aiAnalysisOpen && (
+                <motion.div
+                  key="ai-analysis-body"
+                  initial={{ height: 0, opacity: 0 }}
+                  animate={{ height: 'auto', opacity: 1 }}
+                  exit={{ height: 0, opacity: 0 }}
+                  transition={{ duration: 0.25 }}
+                  style={{ overflow: 'hidden' }}
+                >
+                  <div className="p-5 flex flex-col gap-4">
+                    {aiAnalysis.map((item, i) => {
+                      const testName = safeString(item.testName ?? item.test ?? item.test_name) ?? `Issue ${i + 1}`;
+                      const analysis = safeString(item.analysis);
+                      const rootCause = safeString(item.root_cause ?? item.rootCause);
+                      const fix = safeString(item.suggested_fix ?? item.suggestedFix ?? item.fix);
+                      const testingRecommendations = safeString(item.testingRecommendations ?? item.testing_recommendations);
+                      const confidence = getConfidencePercent(item.confidence);
+                      return (
+                        <motion.div
+                          key={i}
+                          initial={{ opacity: 0, x: -8 }}
+                          animate={{ opacity: 1, x: 0 }}
+                          transition={{ delay: 0.55 + i * 0.08 }}
+                          className="rounded-xl bg-purple-500/5 border border-purple-500/10 p-4 flex flex-col gap-3"
+                        >
+                          <div className="flex items-start justify-between gap-3">
+                            <div className="text-[#F0F6FF] font-semibold text-sm">{testName}</div>
+                            {confidence !== null && (
+                              <span className="flex-shrink-0 px-2 py-0.5 rounded-full text-xs font-semibold bg-purple-500/10 text-purple-300 border border-purple-500/20 whitespace-nowrap">
+                                {`${confidence}% confidence`}
+                              </span>
+                            )}
+                          </div>
+                          {analysis && (
+                            <div>
+                              <div className="text-[#4A6280] text-xs font-semibold uppercase tracking-wider mb-1">Analysis</div>
+                              <div className="text-[#8BA4C8] text-sm">{analysis}</div>
+                            </div>
+                          )}
+                          {rootCause && (
+                            <div>
+                              <div className="text-[#4A6280] text-xs font-semibold uppercase tracking-wider mb-1">Root Cause</div>
+                              <div className="text-[#8BA4C8] text-sm">{rootCause}</div>
+                            </div>
+                          )}
+                          {fix && (
+                            <div>
+                              <div className="text-[#4A6280] text-xs font-semibold uppercase tracking-wider mb-1">Suggested Fix</div>
+                              <div className="text-[#8BA4C8] text-sm">{fix}</div>
+                            </div>
+                          )}
+                          {testingRecommendations && (
+                            <div>
+                              <div className="text-[#4A6280] text-xs font-semibold uppercase tracking-wider mb-1">Verification</div>
+                              <div className="text-[#8BA4C8] text-sm">{testingRecommendations}</div>
+                            </div>
+                          )}
+                          {!analysis && !rootCause && !fix && (
+                            <div className="text-[#8BA4C8] text-sm">No structured AI details were provided for this issue.</div>
+                          )}
+                        </motion.div>
+                      );
+                    })}
+                  </div>
+
+                  {/* Footer collapse toggle */}
+                  <button
+                    onClick={() => {
+                      setAiAnalysisOpen(false);
+                      setTimeout(() => {
+                        aiAnalysisHeaderRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                      }, 100);
+                    }}
+                    className="w-full px-6 py-3 border-t border-white/8 flex items-center justify-center gap-2 text-[#4A6280] hover:text-[#F0F6FF] hover:bg-white/[0.02] transition-colors text-xs font-medium"
                   >
-                    <div className="flex items-start justify-between gap-3">
-                      <div className="text-[#F0F6FF] font-semibold text-sm">{testName}</div>
-                      {confidence !== null && (
-                        <span className="flex-shrink-0 px-2 py-0.5 rounded-full text-xs font-semibold bg-purple-500/10 text-purple-300 border border-purple-500/20 whitespace-nowrap">
-                          {`${confidence}% confidence`}
-                        </span>
-                      )}
-                    </div>
-                    {analysis && (
-                      <div>
-                        <div className="text-[#4A6280] text-xs font-semibold uppercase tracking-wider mb-1">Analysis</div>
-                        <div className="text-[#8BA4C8] text-sm">{analysis}</div>
-                      </div>
-                    )}
-                    {rootCause && (
-                      <div>
-                        <div className="text-[#4A6280] text-xs font-semibold uppercase tracking-wider mb-1">Root Cause</div>
-                        <div className="text-[#8BA4C8] text-sm">{rootCause}</div>
-                      </div>
-                    )}
-                    {fix && (
-                      <div>
-                        <div className="text-[#4A6280] text-xs font-semibold uppercase tracking-wider mb-1">Suggested Fix</div>
-                        <div className="text-[#8BA4C8] text-sm">{fix}</div>
-                      </div>
-                    )}
-                    {testingRecommendations && (
-                      <div>
-                        <div className="text-[#4A6280] text-xs font-semibold uppercase tracking-wider mb-1">Verification</div>
-                        <div className="text-[#8BA4C8] text-sm">{testingRecommendations}</div>
-                      </div>
-                    )}
-                    {!analysis && !rootCause && !fix && (
-                      <div className="text-[#8BA4C8] text-sm">No structured AI details were provided for this issue.</div>
-                    )}
-                  </motion.div>
-                );
-              })}
-            </div>
+                    <span>Collapse AI Analysis</span>
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                      <polyline points="18 15 12 9 6 15" />
+                    </svg>
+                  </button>
+                </motion.div>
+              )}
+            </AnimatePresence>
           </motion.div>
         )}
       </AnimatePresence>
