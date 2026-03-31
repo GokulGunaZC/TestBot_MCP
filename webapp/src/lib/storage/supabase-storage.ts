@@ -4,6 +4,7 @@
  */
 
 import { createClient } from '@supabase/supabase-js'
+import { createHash } from 'crypto'
 
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL!
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!
@@ -111,14 +112,12 @@ export async function uploadArtifact(params: UploadArtifactParams): Promise<Uplo
     throw new Error('Supabase not configured - set NEXT_PUBLIC_SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY')
   }
 
-  // Sanitize test name for file path
-  const sanitizedTestName = testName
-    .replace(/[^a-zA-Z0-9-_]/g, '_')
-    .replace(/_+/g, '_')
-    .substring(0, 100)
+  // Generate a short deterministic hash from testName to make paths unique per test.
+  // This prevents collisions for generic Playwright filenames like video.webm / test-failed-1.png.
+  const testHash = createHash('sha256').update(testName || 'unknown').digest('hex').substring(0, 12)
 
-  // Build storage path: test-artifacts/{runId}/{testName}/{type}/{fileName}
-  const storagePath = `${runId}/${sanitizedTestName}/${artifactType}/${fileName}`
+  // Build storage path: {runId}/{testHash}/{type}/{fileName}
+  const storagePath = `${runId}/${testHash}/${artifactType}/${fileName}`
 
   // Upload to Supabase Storage with retry
   console.log(`[SupabaseStorage] Uploading ${fileName} (${fileBuffer.length} bytes) to ${storagePath}`)

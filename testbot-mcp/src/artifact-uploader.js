@@ -80,49 +80,52 @@ class ArtifactUploader {
       
       // Process screenshots
       for (const screenshot of testArtifacts.screenshots || []) {
-        Logger.debug('ArtifactUploader', `Checking screenshot: ${screenshot.path}`);
-        if (screenshot.path && fs.existsSync(screenshot.path)) {
+        const screenshotPath = screenshot.fullPath || screenshot.path;
+        Logger.debug('ArtifactUploader', `Checking screenshot: ${screenshotPath}`);
+        if (screenshotPath && fs.existsSync(screenshotPath)) {
           artifacts.push({
-            fullPath: screenshot.path,
-            fileName: path.basename(screenshot.path),
+            fullPath: screenshotPath,
+            fileName: path.basename(screenshotPath),
             type: 'screenshot',
             contentType: screenshot.contentType || 'image/png',
             testName,
           });
         } else {
-          Logger.warn('ArtifactUploader', `Screenshot not found: ${screenshot.path}`);
+          Logger.warn('ArtifactUploader', `Screenshot not found: ${screenshotPath}`);
         }
       }
       
       // Process videos
       for (const video of testArtifacts.videos || []) {
-        Logger.debug('ArtifactUploader', `Checking video: ${video.path}`);
-        if (video.path && fs.existsSync(video.path)) {
+        const videoPath = video.fullPath || video.path;
+        Logger.debug('ArtifactUploader', `Checking video: ${videoPath}`);
+        if (videoPath && fs.existsSync(videoPath)) {
           artifacts.push({
-            fullPath: video.path,
-            fileName: path.basename(video.path),
+            fullPath: videoPath,
+            fileName: path.basename(videoPath),
             type: 'video',
             contentType: video.contentType || 'video/webm',
             testName,
           });
         } else {
-          Logger.warn('ArtifactUploader', `Video not found: ${video.path}`);
+          Logger.warn('ArtifactUploader', `Video not found: ${videoPath}`);
         }
       }
       
       // Process traces
       for (const trace of testArtifacts.traces || []) {
-        Logger.debug('ArtifactUploader', `Checking trace: ${trace.path}`);
-        if (trace.path && fs.existsSync(trace.path)) {
+        const tracePath = trace.fullPath || trace.path;
+        Logger.debug('ArtifactUploader', `Checking trace: ${tracePath}`);
+        if (tracePath && fs.existsSync(tracePath)) {
           artifacts.push({
-            fullPath: trace.path,
-            fileName: path.basename(trace.path),
+            fullPath: tracePath,
+            fileName: path.basename(tracePath),
             type: 'trace',
             contentType: trace.contentType || 'application/zip',
             testName,
           });
         } else {
-          Logger.warn('ArtifactUploader', `Trace not found: ${trace.path}`);
+          Logger.warn('ArtifactUploader', `Trace not found: ${tracePath}`);
         }
       }
     }
@@ -132,7 +135,15 @@ class ArtifactUploader {
     // ALWAYS try filesystem fallback if no artifacts found from test.artifacts
     if (artifacts.length === 0 && failedTests.length > 0) {
       Logger.warn('ArtifactUploader', 'No artifacts found via test.artifacts property, scanning filesystem...');
-      const fsArtifacts = this.collectFromFilesystem(failedTests);
+      // Pass failed tests so we can map directory names to actual test titles
+      const testTitleMap = {};
+      for (const test of failedTests) {
+        const title = test.title || test.name || 'unknown-test';
+        // Create a normalized key from the title for matching
+        const normalizedKey = title.toLowerCase().replace(/[^a-z0-9]/g, '');
+        testTitleMap[normalizedKey] = title;
+      }
+      const fsArtifacts = this.collectFromFilesystem(failedTests, testTitleMap);
       Logger.info('ArtifactUploader', `Filesystem scan found ${fsArtifacts.length} artifacts`);
       return fsArtifacts;
     }
@@ -142,8 +153,10 @@ class ArtifactUploader {
   
   /**
    * Fallback: Scan filesystem for artifacts when test.artifacts is empty
+   * @param {Array} failedTests - Array of failed test objects
+   * @param {Object} testTitleMap - Map of normalized test names to actual titles
    */
-  collectFromFilesystem(failedTests) {
+  collectFromFilesystem(failedTests, testTitleMap = {}) {
     const artifacts = [];
     const testResultsDir = path.join(this.config.projectPath, 'test-results');
     
@@ -153,6 +166,7 @@ class ArtifactUploader {
     }
     
     Logger.info('ArtifactUploader', `Scanning ${testResultsDir} for artifacts (${failedTests.length} failed tests)`);
+    Logger.debug('ArtifactUploader', `Test title map has ${Object.keys(testTitleMap).length} entries`);
     
     const scanDir = (dir) => {
       if (!fs.existsSync(dir)) return;
@@ -184,17 +198,34 @@ class ArtifactUploader {
             // Extract test name from parent directory name
             // Playwright creates dirs like: "test-title-hash-browser"
             const parentDir = path.basename(path.dirname(fullPath));
-            const testName = parentDir.split('-chromium')[0].split('-firefox')[0].split('-webkit')[0] || 'unknown-test';
+            const dirBasedName = parentDir.split('-chromium')[0].split('-firefox')[0].split('-webkit')[0] || 'unknown-test';
+            
+            // Try to find the actual test title by matching against testTitleMap
+            let actualTestTitle = dirBasedName; // fallback
+            if (Object.keys(testTitleMap).length > 0) {
+              // Normalize the directory name for matching
+              const normalizedDir = dirBasedName.toLowerCase().replace(/[^a-z0-9]/g, '');
+              
+              // Find best match in testTitleMap
+              for (const [normalizedKey, title] of Object.entries(testTitleMap)) {
+                if (normalizedDir.includes(normalizedKey.substring(0, 20)) || 
+                    normalizedKey.includes(normalizedDir.substring(0, 20))) {
+                  actualTestTitle = title;
+                  Logger.debug('ArtifactUploader', `Mapped directory "${dirBasedName}" to test title "${title}"`);
+                  break;
+                }
+              }
+            }
             
             artifacts.push({
               fullPath,
               fileName: entry.name,
               type,
               contentType,
-              testName,
+              testName: actualTestTitle, // Use the actual test title, not directory name
             });
             
-            Logger.debug('ArtifactUploader', `Found artifact: ${type} - ${entry.name}`);
+            Logger.debug('ArtifactUploader', `Found artifact: ${type} - ${entry.name} for test "${actualTestTitle}"`);
           }
         }
       }

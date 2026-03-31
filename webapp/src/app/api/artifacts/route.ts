@@ -76,6 +76,7 @@ export async function GET(request: NextRequest) {
   const { searchParams } = new URL(request.url)
   const testRunId = searchParams.get('testRunId')
   const filePath = searchParams.get('file')
+  const testName = searchParams.get('testName') // Used to disambiguate when multiple tests share the same filename
 
   if (!testRunId || !filePath) {
     return NextResponse.json({ error: 'Missing testRunId or file' }, { status: 400 })
@@ -92,32 +93,67 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({ error: 'Test run not found or unauthorized' }, { status: 404 })
   }
 
-  // Extract filename from path
+  // Extract filename from path (e.g., "artifacts/screenshots/foo.png" → "foo.png")
   const fileName = filePath.split('/').pop() || filePath
 
-  // Query test_artifacts table for matching artifact
-  const artifacts = await db
+  // Infer artifact type from path (e.g., "artifacts/screenshots/..." → "screenshot")
+  let artifactType: string | null = null
+  if (filePath.includes('/screenshots/') || filePath.includes('screenshot')) {
+    artifactType = 'screenshot'
+  } else if (filePath.includes('/videos/') || filePath.includes('video')) {
+    artifactType = 'video'
+  } else if (filePath.includes('/traces/') || filePath.includes('trace')) {
+    artifactType = 'trace'
+  }
+
+  // Look up artifact by fileName. Playwright generates unique hash-based names for custom artifacts,
+  // but built-in output (video.webm, test-failed-1.png, trace.zip) is generic and shared across tests.
+  // We fetch all matches and use testName to pick the right one when there are multiple.
+  const conditions = artifactType
+    ? and(
+        eq(testArtifacts.testRunId, testRunId),
+        eq(testArtifacts.fileName, fileName),
+        eq(testArtifacts.artifactType, artifactType)
+      )
+    : and(
+        eq(testArtifacts.testRunId, testRunId),
+        eq(testArtifacts.fileName, fileName)
+      )
+
+  const matches = await db
     .select({
       id: testArtifacts.id,
+      testName: testArtifacts.testName,
       storageUrl: testArtifacts.storageUrl,
       storagePath: testArtifacts.storagePath,
       fileName: testArtifacts.fileName,
       contentType: testArtifacts.contentType,
+      metadata: testArtifacts.metadata,
     })
     .from(testArtifacts)
-    .where(
-      and(
-        eq(testArtifacts.testRunId, testRunId),
-        eq(testArtifacts.fileName, fileName)
-      )
-    )
-    .limit(1)
+    .where(conditions)
+
+  let artifact = null
+  if (matches.length === 1) {
+    artifact = matches[0]
+  } else if (matches.length > 1) {
+    // Multiple tests produced an artifact with the same filename (e.g. video.webm).
+    // Use testName (exact, then case-insensitive) to pick the right one.
+    artifact = matches.find(a => a.testName === testName)
+      ?? matches.find(a => a.testName?.toLowerCase() === testName?.toLowerCase())
+      ?? matches[0] // last resort: first match
+  }
+
+  if (artifact) {
+    console.log(`[artifacts] DB record found for ${fileName} (run ${testRunId})${matches.length > 1 ? ` [disambiguated from ${matches.length} matches]` : ''}`)
+  } else {
+    console.log(`[artifacts] No DB record for ${fileName}, falling back to local filesystem`)
+  }
 
   // If artifact found in database, try Supabase Storage first
-  if (artifacts && artifacts.length > 0) {
-    const artifact = artifacts[0]
-    
+  if (artifact) {
     if (artifact.storageUrl) {
+      console.log(`[artifacts] Redirecting to Supabase: ${artifact.storageUrl.substring(0, 80)}...`)
       return NextResponse.redirect(artifact.storageUrl, 307)
     }
     
@@ -150,6 +186,17 @@ export async function GET(request: NextRequest) {
         )
       }
     }
+    
+    // Database record exists but artifact not found
+    console.error(`[artifacts] DB record exists but artifact not found in Supabase or local filesystem`)
+    return NextResponse.json(
+      {
+        error: 'Artifact not found',
+        message: 'Database record exists but file not available in Supabase Storage or local filesystem',
+        fileName,
+      },
+      { status: 404 }
+    )
   }
 
   // No database record (e.g., live test run) - search filesystem directly
