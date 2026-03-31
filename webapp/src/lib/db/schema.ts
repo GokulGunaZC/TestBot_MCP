@@ -64,6 +64,7 @@ export const testRuns = pgTable(
     aiAnalysis: jsonb('ai_analysis'),
     framework: text('framework'),
     source: text('source').default('mcp'),
+    projectPath: text('project_path'), // Local project path for artifact fallback
     createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow(),
   },
@@ -141,8 +142,8 @@ export const testArtifacts = pgTable(
       .references(() => testRuns.id, { onDelete: 'cascade' }),
     testName: text('test_name').notNull(),
     artifactType: text('artifact_type').notNull(), // 'screenshot', 'video', 'trace'
-    storageUrl: text('storage_url').notNull(), // Supabase Storage public URL
-    storagePath: text('storage_path').notNull(), // Path in bucket: test-artifacts/{runId}/{testName}/{type}/{filename}
+    storageUrl: text('storage_url'), // Supabase Storage public URL (nullable for fallback)
+    storagePath: text('storage_path'), // Path in bucket: test-artifacts/{runId}/{testName}/{type}/{filename}
     fileName: text('file_name').notNull(),
     fileSize: integer('file_size'), // bytes
     contentType: text('content_type'),

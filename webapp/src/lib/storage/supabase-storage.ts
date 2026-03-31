@@ -10,7 +10,9 @@ const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!
 const BUCKET_NAME = 'test-artifacts'
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-  throw new Error('Missing Supabase configuration for storage service')
+  console.warn('[SupabaseStorage] Missing Supabase configuration - storage uploads will be skipped')
+  console.warn('[SupabaseStorage] SUPABASE_URL present:', !!SUPABASE_URL)
+  console.warn('[SupabaseStorage] SUPABASE_SERVICE_ROLE_KEY present:', !!SUPABASE_SERVICE_ROLE_KEY)
 }
 
 // Create admin client with service role for server-side uploads
@@ -49,7 +51,7 @@ export async function ensureBucketExists(): Promise<void> {
   if (!bucketExists) {
     const { error } = await supabaseAdmin.storage.createBucket(BUCKET_NAME, {
       public: false, // Private bucket - use signed URLs
-      fileSizeLimit: 104857600, // 100MB
+      fileSizeLimit: 157286400, // 150MB per file
       allowedMimeTypes: [
         'image/png',
         'image/jpeg',
@@ -69,8 +71,45 @@ export async function ensureBucketExists(): Promise<void> {
 /**
  * Upload a test artifact to Supabase Storage
  */
+async function uploadWithRetry(
+  bucket: string,
+  path: string,
+  buffer: Buffer,
+  options: { contentType: string; cacheControl: string; upsert: boolean },
+  maxRetries = 3
+): Promise<{ error: Error | null }> {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    const result = await supabaseAdmin.storage.from(bucket).upload(path, buffer, options)
+    
+    if (!result.error) {
+      return result
+    }
+    
+    // Don't retry on certain errors
+    const errorMsg = result.error.message?.toLowerCase() || ''
+    if (errorMsg.includes('already exists') || errorMsg.includes('duplicate')) {
+      return result
+    }
+    
+    if (attempt < maxRetries) {
+      const delay = Math.min(1000 * Math.pow(2, attempt - 1), 5000)
+      console.log(`[SupabaseStorage] Retry ${attempt}/${maxRetries} after ${delay}ms...`)
+      await new Promise(resolve => setTimeout(resolve, delay))
+    } else {
+      return result
+    }
+  }
+  
+  return { error: new Error('Max retries exceeded') }
+}
+
 export async function uploadArtifact(params: UploadArtifactParams): Promise<UploadedArtifact> {
   const { runId, testName, artifactType, fileName, fileBuffer, contentType } = params
+
+  // Check if Supabase is configured
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+    throw new Error('Supabase not configured - set NEXT_PUBLIC_SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY')
+  }
 
   // Sanitize test name for file path
   const sanitizedTestName = testName
@@ -81,16 +120,31 @@ export async function uploadArtifact(params: UploadArtifactParams): Promise<Uplo
   // Build storage path: test-artifacts/{runId}/{testName}/{type}/{fileName}
   const storagePath = `${runId}/${sanitizedTestName}/${artifactType}/${fileName}`
 
-  // Upload to Supabase Storage
-  const { error } = await supabaseAdmin.storage.from(BUCKET_NAME).upload(storagePath, fileBuffer, {
-    contentType,
-    cacheControl: '3600',
-    upsert: false,
-  })
+  // Upload to Supabase Storage with retry
+  console.log(`[SupabaseStorage] Uploading ${fileName} (${fileBuffer.length} bytes) to ${storagePath}`)
+  
+  const { error } = await uploadWithRetry(
+    BUCKET_NAME,
+    storagePath,
+    fileBuffer,
+    {
+      contentType,
+      cacheControl: '3600',
+      upsert: false,
+    },
+    3 // max retries
+  )
 
   if (error) {
+    console.error(`[SupabaseStorage] Upload failed for ${fileName}:`, {
+      message: error.message,
+      name: error.name,
+      cause: error.cause,
+    })
     throw new Error(`Failed to upload artifact: ${error.message}`)
   }
+  
+  console.log(`[SupabaseStorage] Successfully uploaded ${fileName}`)
 
   // Get signed URL (valid for 1 year)
   const { data, error: signError } = await supabaseAdmin.storage

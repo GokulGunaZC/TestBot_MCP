@@ -19,7 +19,7 @@ Add this to your `webapp/.env.local`:
 ```env
 # Service role key for server-side operations (artifact uploads)
 # Found in: Supabase Dashboard → Settings → API → service_role key
-SUPABASE_SERVICE_ROLE_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+SUPABASE_SERVICE_ROLE_KEY=...
 ```
 
 **Where to find it:**

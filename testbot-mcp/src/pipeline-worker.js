@@ -2160,6 +2160,10 @@ async function runPipeline(config, runId) {
       });
     });
 
+    // Use the actual run ID returned from the server (if available)
+    const actualRunId = report.actualRunId || runId;
+    Logger.info('PipelineWorker', `Using run ID for artifact upload: ${actualRunId}`);
+
     // -------------------------------------------------------
     // 7. Upload artifacts for failed tests to Supabase Storage
     // -------------------------------------------------------
@@ -2178,20 +2182,36 @@ async function runPipeline(config, runId) {
           phaseResults,
         }, telemetryReporter);
 
+        updateStatus(statusDir, 'uploading_artifacts', {
+          runId,
+          message: 'Uploading test artifacts to storage...',
+          generationMeta,
+          fallbackUsed,
+          aiOnlyEnforced,
+          generationQuality,
+          requirementsCoverage,
+          phaseResults,
+        }, telemetryReporter);
+
         const artifactUploader = new ArtifactUploader({
           projectPath: config.projectPath,
           dashboardUrl: process.env.TESTBOT_DASHBOARD_URL,
           apiKey: process.env.TESTBOT_API_KEY,
         });
 
-        artifactUploadResult = await artifactUploader.processAndUpload(runId, testResults);
+        artifactUploadResult = await artifactUploader.processAndUpload(actualRunId, testResults);
         
         if (artifactUploadResult.success) {
-          Logger.info('PipelineWorker', `Uploaded ${artifactUploadResult.uploaded || 0} artifacts to storage`);
+          const uploadMsg = artifactUploadResult.failed 
+            ? `Uploaded ${artifactUploadResult.uploaded || 0} artifacts (${artifactUploadResult.failed} failed)`
+            : `Uploaded ${artifactUploadResult.uploaded || 0} artifacts to storage`;
+          
+          Logger.info('PipelineWorker', uploadMsg);
           updateStatus(statusDir, 'artifacts_uploaded', {
             runId,
-            message: `Uploaded ${artifactUploadResult.uploaded || 0} artifacts to storage`,
+            message: uploadMsg,
             artifactsUploaded: artifactUploadResult.uploaded || 0,
+            artifactsFailed: artifactUploadResult.failed || 0,
             generationMeta,
             fallbackUsed,
             aiOnlyEnforced,

@@ -187,14 +187,16 @@ export async function POST(request: NextRequest) {
     // 1. API key presence check (header or body)
     const rawKey = request.headers.get('x-api-key') ?? null
     const body = await request.json()
-    const { creation_name, run_id, report } = body as {
+    const { api_key, creation_name, run_id, report, project_path } = body as {
+      api_key?: string
       creation_name?: string
       run_id?: string
       report?: ReportPayload
+      project_path?: string
     }
-    const api_key: string = rawKey ?? (body as { api_key?: string })?.api_key ?? ''
+    const finalApiKey: string = rawKey ?? api_key ?? ''
 
-    if (!api_key) {
+    if (!finalApiKey) {
       logBlockedRequest({ type: 'MISSING_API_KEY', reason: 'No x-api-key header or api_key body field', endpoint: ENDPOINT })
       return NextResponse.json({ error: 'Missing api_key' }, { status: 401 })
     }
@@ -207,7 +209,7 @@ export async function POST(request: NextRequest) {
     }
 
     // 2. Authenticate — validate key, check isActive and NOT revoked, check expiry
-    const keyHash = hashApiKey(api_key)
+    const keyHash = hashApiKey(finalApiKey)
     const [apiKeyRecord] = await db
       .select({ id: apiKeys.id, userId: apiKeys.userId, isActive: apiKeys.isActive, revoked: apiKeys.revoked, expiresAt: apiKeys.expiresAt })
       .from(apiKeys)
@@ -336,6 +338,7 @@ export async function POST(request: NextRequest) {
         reportJson: reportWithRunId,
         aiAnalysis: aiAnalysisPayload,
         source: 'mcp',
+        projectPath: project_path || null,
       })
       .returning({ id: testRuns.id })
 
