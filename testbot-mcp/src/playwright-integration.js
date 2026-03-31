@@ -478,11 +478,15 @@ class PlaywrightIntegration {
     };
   }
 
-  buildPlaywrightArgs({ configPath, project, lastFailed = false, forceJsonReporter = false, grep, grepInvert } = {}) {
+  buildPlaywrightArgs({ configPath, project, lastFailed = false, forceJsonReporter = false, grep, grepInvert, outputDir } = {}) {
     const args = ['playwright', 'test'];
 
     if (configPath) {
       args.push('--config', configPath);
+    }
+
+    if (outputDir) {
+      args.push('--output', outputDir);
     }
 
     const artifacts = this.getArtifactPolicy();
@@ -559,7 +563,7 @@ class PlaywrightIntegration {
     });
   }
 
-  async executePlaywright({ project, lastFailed = false, grep, grepInvert } = {}) {
+  async executePlaywright({ project, lastFailed = false, grep, grepInvert, outputDir } = {}) {
     this.ensurePlaywrightInstalled();
     this.ensurePlaywrightBrowsersInstalled();
 
@@ -573,6 +577,7 @@ class PlaywrightIntegration {
       forceJsonReporter,
       grep,
       grepInvert,
+      outputDir,
     });
 
     const commandStartedAt = Date.now();
@@ -719,35 +724,20 @@ class PlaywrightIntegration {
 
   async runTwoPhaseExecution() {
     const gatePattern = '@phase2|@deep|@stress|@matrix|@load|@api-stress|@api-negative|@api-auth|@api-contract';
-    const phaseOne = await this.executePlaywright({ grepInvert: gatePattern });
-    const allowPhaseTwoOnGateFailure = this.config.allowPhase2OnGateFailure === true;
-
-    if (phaseOne.failed > 0 && !allowPhaseTwoOnGateFailure) {
-      return {
-        ...phaseOne,
-        phaseResults: {
-          phase1: {
-            status: 'failed',
-            total: Number(phaseOne.total || 0),
-            passed: Number(phaseOne.passed || 0),
-            failed: Number(phaseOne.failed || 0),
-            skipped: Number(phaseOne.skipped || 0),
-            duration: Number(phaseOne.duration || 0),
-          },
-          phase2: {
-            status: 'skipped',
-            total: 0,
-            passed: 0,
-            failed: 0,
-            skipped: 0,
-            duration: 0,
-            reason: 'phase1_failed',
-          },
-        },
-      };
-    }
+    
+    // Use separate output directories to prevent artifact overwriting
+    const phase1OutputDir = path.join(this.config.projectPath, 'test-results', 'phase1');
+    const phase2OutputDir = path.join(this.config.projectPath, 'test-results', 'phase2');
+    
+    const phaseOne = await this.executePlaywright({ 
+      grepInvert: gatePattern,
+      outputDir: phase1OutputDir
+    });
 
     if (!this.hasPhaseTwoTaggedTests()) {
+      // Move phase1 artifacts to main test-results directory
+      this.mergePhaseArtifacts([phase1OutputDir]);
+      
       return {
         ...phaseOne,
         phaseResults: {
@@ -772,8 +762,69 @@ class PlaywrightIntegration {
       };
     }
 
-    const phaseTwo = await this.executePlaywright({ grep: gatePattern });
+    const phaseTwo = await this.executePlaywright({ 
+      grep: gatePattern,
+      outputDir: phase2OutputDir
+    });
+    
+    // Merge artifacts from both phases into main test-results directory
+    this.mergePhaseArtifacts([phase1OutputDir, phase2OutputDir]);
+    
     return this.combinePhaseResults(phaseOne, phaseTwo);
+  }
+
+  mergePhaseArtifacts(phaseDirs) {
+    const mainResultsDir = path.join(this.config.projectPath, 'test-results');
+    
+    for (const phaseDir of phaseDirs) {
+      if (!fs.existsSync(phaseDir)) {
+        continue;
+      }
+      
+      try {
+        // Copy all artifacts from phase directory to main test-results
+        const items = fs.readdirSync(phaseDir);
+        
+        for (const item of items) {
+          const srcPath = path.join(phaseDir, item);
+          const destPath = path.join(mainResultsDir, item);
+          
+          const stat = fs.statSync(srcPath);
+          
+          if (stat.isDirectory()) {
+            // Copy directory recursively
+            this.copyDirRecursive(srcPath, destPath);
+          } else {
+            // Copy file
+            fs.copyFileSync(srcPath, destPath);
+          }
+        }
+        
+        Logger.info('PlaywrightIntegration', `Merged artifacts from ${path.basename(phaseDir)}`);
+      } catch (error) {
+        Logger.warn('PlaywrightIntegration', `Failed to merge artifacts from ${path.basename(phaseDir)}:`, error.message);
+      }
+    }
+  }
+
+  copyDirRecursive(src, dest) {
+    if (!fs.existsSync(dest)) {
+      fs.mkdirSync(dest, { recursive: true });
+    }
+    
+    const items = fs.readdirSync(src);
+    
+    for (const item of items) {
+      const srcPath = path.join(src, item);
+      const destPath = path.join(dest, item);
+      const stat = fs.statSync(srcPath);
+      
+      if (stat.isDirectory()) {
+        this.copyDirRecursive(srcPath, destPath);
+      } else {
+        fs.copyFileSync(srcPath, destPath);
+      }
+    }
   }
 
   /**

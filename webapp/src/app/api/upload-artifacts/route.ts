@@ -133,14 +133,19 @@ async function parseMultipartFormData(request: NextRequest): Promise<{
             const file = files[`artifact_${index}`]
             const metaStr = fields[`artifact_${index}_meta`]
             const meta = metaStr ? JSON.parse(metaStr) : {}
+            
+            const originalTestName = meta.test_name || 'unknown-test'
 
             artifacts.push({
-              testName: meta.test_name || 'unknown-test',
+              testName: originalTestName, // Keep original for now, will be sanitized later
               artifactType: meta.type || 'screenshot',
               fileName: file.filename || `artifact_${index}`,
               fileBuffer: file.buffer,
               contentType: file.mimeType || 'application/octet-stream',
-              metadata: meta.metadata || {},
+              metadata: {
+                ...meta.metadata || {},
+                original_test_name: originalTestName, // Store original for matching
+              },
             })
 
             index++
@@ -269,7 +274,7 @@ export async function POST(request: NextRequest) {
           fileName: uploaded?.fileName || artifact.fileName,
           fileSize: uploaded?.fileSize || artifact.fileBuffer.length,
           contentType: uploaded?.contentType || artifact.contentType,
-          metadata: artifact.metadata || null,
+          metadata: artifact.metadata, // Already has original_test_name
         })
 
         uploadResults.push({
