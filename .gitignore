@@ -42,3 +42,4 @@ debug/
 
 # Notebooks (local data exploration — never commit)
 notebooks/
+.claude/
