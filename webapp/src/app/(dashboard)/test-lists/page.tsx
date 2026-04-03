@@ -2,6 +2,7 @@
 
 import { useState, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
+import Link from 'next/link';
 import type { TestList } from '@/lib/types/database';
 
 function formatDate(iso: string | null) {
@@ -55,12 +56,18 @@ export default function TestListsPage() {
 
   const handleDelete = async (id: string) => {
     setDeletingId(id);
-    // Optimistic removal
-    setTimeout(() => {
+    try {
+      const res = await fetch(`/api/test-lists/${id}`, { method: 'DELETE' });
+      if (!res.ok) {
+        const json = await res.json();
+        throw new Error(json.error ?? 'Failed to delete list');
+      }
       setLists(prev => prev.filter(l => l.id !== id));
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : 'Failed to delete list');
+    } finally {
       setDeletingId(null);
-    }, 300);
-    // Note: DELETE API endpoint can be wired up later
+    }
   };
 
   const handleEdit = (list: TestList) => {
@@ -68,11 +75,26 @@ export default function TestListsPage() {
     setEditName(list.name);
   };
 
-  const handleSaveEdit = (id: string) => {
+  const handleSaveEdit = async (id: string) => {
     if (!editName.trim()) return;
-    // Optimistic update (PATCH endpoint can be wired up later)
+    const originalLists = [...lists];
+    // Optimistic update
     setLists(prev => prev.map(l => l.id === id ? { ...l, name: editName.trim() } : l));
     setEditingId(null);
+    try {
+      const res = await fetch(`/api/test-lists/${id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: editName.trim() }),
+      });
+      if (!res.ok) {
+        const json = await res.json();
+        throw new Error(json.error ?? 'Failed to update list');
+      }
+    } catch (err: unknown) {
+      setLists(originalLists);
+      setError(err instanceof Error ? err.message : 'Failed to update list');
+    }
   };
 
   const handleCreate = async () => {
@@ -248,7 +270,7 @@ export default function TestListsPage() {
                       <button onClick={() => setEditingId(null)} className="text-[#4A6280] hover:text-[#8BA4C8] text-xs px-2">Cancel</button>
                     </div>
                   ) : (
-                    <div className="font-semibold text-[#F0F6FF] text-sm mb-0.5 group-hover:text-[#60A5FA] transition-colors cursor-default">{list.name}</div>
+                    <Link href={`/test-lists/${list.id}`} className="font-semibold text-[#F0F6FF] text-sm mb-0.5 group-hover:text-[#60A5FA] transition-colors hover:underline">{list.name}</Link>
                   )}
                   <div className="flex items-center gap-3 text-xs text-[#4A6280]">
                     <span>{list.test_count ?? 0} tests</span>

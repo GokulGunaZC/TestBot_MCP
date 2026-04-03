@@ -68,6 +68,15 @@ export interface TestList {
   updated_at: string
 }
 
+export interface TestListItem {
+  id: string
+  list_id: string
+  test_run_id: string | null
+  test_name: string
+  test_config: Record<string, unknown> | null
+  created_at: string
+}
+
 export interface MCPTelemetryEvent {
   id: string
   user_id: string

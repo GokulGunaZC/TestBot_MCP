@@ -10,10 +10,10 @@ const PAGE_TITLES: Record<string, string> = {
   '/create-tests': 'Create Tests',
   '/all-tests': 'All Tests',
   '/test-lists': 'Test Lists',
-  '/monitoring': 'Monitoring',
+  // '/monitoring': 'Monitoring',
   '/profile': 'Profile',
   '/plan-billing': 'Plan & Billing',
-  '/github-app': 'GitHub App',
+  // '/github-app': 'GitHub App',
   '/api-keys': 'API Keys',
 };
 
