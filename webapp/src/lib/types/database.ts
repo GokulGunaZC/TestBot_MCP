@@ -11,9 +11,11 @@ export interface Profile {
   full_name: string | null
   avatar_url: string | null
   company: string | null
-  plan: 'starter' | 'pro' | 'enterprise'
+  plan: 'free' | 'starter' | 'team' | 'enterprise'
   credits_remaining: number
   credits_total: number
+  tokens_remaining: number
+  tokens_total: number
   onboarding_completed: boolean
   created_at: string
   updated_at: string

@@ -27,20 +27,20 @@ const SCENARIOS: Record<string, {
   updates: Record<string, unknown>
 }> = {
   reset: {
-    description: 'Baseline — starter plan, 100 credits, onboarding complete',
-    updates: { plan: 'starter', credits_remaining: 100, credits_total: 100, onboarding_completed: true },
+    description: 'Baseline — free plan, 240K tokens, onboarding complete',
+    updates: { plan: 'free', credits_remaining: 100, credits_total: 100, tokens_remaining: 240000, tokens_total: 240000, onboarding_completed: true },
+  },
+  'no-tokens': {
+    description: 'Zero tokens → token gate should return 402',
+    updates: { tokens_remaining: 0 },
   },
   'no-credits': {
-    description: 'Zero credits → credit gate should return 402',
+    description: 'Zero credits (legacy) — kept for backwards compat',
     updates: { credits_remaining: 0 },
   },
-  'low-credits': {
-    description: 'Single credit left → one request allowed, next blocked',
-    updates: { credits_remaining: 1 },
-  },
-  pro: {
-    description: 'Pro plan — 1000 credits',
-    updates: { plan: 'pro', credits_remaining: 1000, credits_total: 1000 },
+  starter: {
+    description: 'Starter plan — 2.4M tokens ($15/month, $12 cost at GPT-5.4 80/20 split)',
+    updates: { plan: 'starter', tokens_remaining: 2400000, tokens_total: 2400000 },
   },
   'no-onboarding': {
     description: 'Onboarding not completed',
@@ -74,7 +74,7 @@ async function main() {
 
   try {
     const [profile] = await sql`
-      SELECT id, email, plan, credits_remaining, credits_total, onboarding_completed, role
+      SELECT id, email, plan, credits_remaining, credits_total, tokens_remaining, tokens_total, onboarding_completed, role
       FROM profiles
       WHERE email = ${TEST_EMAIL}
       LIMIT 1
@@ -98,7 +98,7 @@ async function main() {
     }
 
     const [updated] = await sql`
-      SELECT id, email, plan, credits_remaining, credits_total, onboarding_completed, role, updated_at
+      SELECT id, email, plan, credits_remaining, credits_total, tokens_remaining, tokens_total, onboarding_completed, role, updated_at
       FROM profiles
       WHERE id = ${profile.id as string}
     `
@@ -107,8 +107,9 @@ async function main() {
     console.log(`  email              ${updated.email}`)
     console.log(`  id                 ${updated.id}`)
     console.log(`  plan               ${updated.plan}`)
+    console.log(`  tokens_remaining   ${updated.tokens_remaining}`)
+    console.log(`  tokens_total       ${updated.tokens_total}`)
     console.log(`  credits_remaining  ${updated.credits_remaining}`)
-    console.log(`  credits_total      ${updated.credits_total}`)
     console.log(`  onboarding         ${updated.onboarding_completed ? 'completed' : 'NOT completed'}`)
     console.log(`  role               ${updated.role}`)
     console.log(`  updated_at         ${updated.updated_at}`)

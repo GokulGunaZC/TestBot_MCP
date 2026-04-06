@@ -6,7 +6,7 @@ import { hashApiKey } from '@/lib/utils/api-keys'
 import { OpenAITestGenerator } from '@/lib/test-generation/openai-generator'
 import type { CapturedContext, GenerationOptions, ProjectInfo } from '@/lib/test-generation/types'
 import { checkRateLimit } from '@/lib/rate-limit'
-import { deductCredit } from '@/lib/credits'
+import { checkTokenBalance, deductTokens } from '@/lib/tokens'
 import { checkConcurrencyLimit } from '@/lib/concurrency-limit'
 import { checkIdempotency, storeIdempotencyResult } from '@/lib/idempotency'
 import { validateGenerateTests } from '@/lib/validation'
@@ -95,19 +95,10 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'RATE_LIMIT_EXCEEDED' }, { status: 429 })
     }
 
-    // 8. Business logic
-    const { context, testType, prd, projectInfo, options } = body
-
-    const ctx = (context || {}) as CapturedContext
-    const info = (projectInfo || {}) as ProjectInfo
-    const type = (testType || 'both') as 'frontend' | 'backend' | 'both'
-    const prdContent = (prd || '') as string
-    const genOptions = (options || {}) as GenerationOptions
-
-    // 8. Credit gate — atomic decrement, fail-closed (throws on DB error)
-    const creditResult = await deductCredit({ userId, endpoint: ENDPOINT })
-    if (!creditResult.allowed) {
-      return NextResponse.json({ error: 'No credits remaining' }, { status: 402 })
+    // 8. Token balance gate — check before making AI calls
+    const tokenCheck = await checkTokenBalance({ userId, endpoint: ENDPOINT })
+    if (!tokenCheck.allowed) {
+      return NextResponse.json({ error: 'No tokens remaining. Please renew your plan.' }, { status: 402 })
     }
 
     // Update last_used_at
@@ -116,8 +107,14 @@ export async function POST(request: NextRequest) {
       .set({ lastUsedAt: new Date() })
       .where(eq(apiKeys.id, apiKeyRecord.id))
 
-    // Record AI call for cost tracking
-    await recordAiCall({ userId, apiKeyId: apiKeyRecord.id, endpoint: ENDPOINT })
+    // Business logic
+    const { context, testType, prd, projectInfo, options } = body
+
+    const ctx = (context || {}) as CapturedContext
+    const info = (projectInfo || {}) as ProjectInfo
+    const type = (testType || 'both') as 'frontend' | 'backend' | 'both'
+    const prdContent = (prd || '') as string
+    const genOptions = (options || {}) as GenerationOptions
 
     const generator = new OpenAITestGenerator({
       apiKey: process.env.OPENAI_API_KEY,
@@ -137,6 +134,21 @@ export async function POST(request: NextRequest) {
     })
 
     const summary = generator.getSummary()
+
+    // Deduct actual tokens consumed and record AI call
+    const tokensConsumed = summary.tokenUsage.totalTokens
+    if (tokensConsumed > 0) {
+      await deductTokens({ userId, tokensUsed: tokensConsumed })
+      await recordAiCall({
+        userId,
+        apiKeyId: apiKeyRecord.id,
+        endpoint: ENDPOINT,
+        modelUsed: summary.tokenUsage.modelUsed ?? undefined,
+        tokensPrompt: summary.tokenUsage.promptTokens,
+        tokensCompletion: summary.tokenUsage.completionTokens,
+        tokensTotal: tokensConsumed,
+      })
+    }
 
     const responseBody = {
       success: true,

@@ -3,12 +3,15 @@ import { execSync } from 'child_process';
 import path from 'path';
 
 /**
- * Credit gate + API key gating tests for /api/test-runs/ingest
+ * Token gate + API key gating tests
  *
- * Requires a valid API key passed via env:
+ * Token gate → /api/generate-tests  (AI endpoint, checks tokens_remaining before calling OpenAI)
+ * API key auth → /api/test-runs/ingest  (fastest endpoint to test 401 without side-effects)
+ *
+ * Requires a valid API key:
  *   TEST_API_KEY=tb_xxx npx playwright test credit-gate
  *
- * Account state is set by the setup script BEFORE running each scenario:
+ * Account state is set by the setup script BEFORE each scenario:
  *   npx tsx scripts/setup-test-account.ts <scenario>
  */
 
@@ -30,6 +33,8 @@ const MINIMAL_REPORT = {
     tests: [{ title: 'sample test', status: 'passed' }],
   },
 };
+
+const MINIMAL_GENERATE_BODY = { api_key: VALID_KEY, context: {} };
 
 // Scenario-dependent tests mutate shared DB state; run serially to avoid races.
 test.describe.configure({ mode: 'serial' });
@@ -53,53 +58,32 @@ test.describe('API Key Gating [CAT:api_auth]', () => {
     const body = await res.json();
     expect(typeof body.error).toBe('string');
   });
+});
 
-  test('valid api_key without credits → 402 [scenario: no-credits]', async ({ request }) => {
+test.describe('Token Gate [CAT:api_token_gate]', () => {
+  test('zero tokens → 402 on generate-tests [scenario: no-tokens]', async ({ request }) => {
     test.skip(!VALID_KEY, 'TEST_API_KEY env var not set');
-    setupScenario('no-credits');
+    setupScenario('no-tokens');
 
-    const res = await request.post(`${BASE_URL}/api/test-runs/ingest`, {
+    const res = await request.post(`${BASE_URL}/api/generate-tests`, {
       headers: { 'x-api-key': VALID_KEY },
-      data: MINIMAL_REPORT,
+      data: MINIMAL_GENERATE_BODY,
     });
-    // This test must be run AFTER: npx tsx scripts/setup-test-account.ts no-credits
     expect(res.status()).toBe(402);
     const body = await res.json();
-    expect(body.error).toMatch(/no credits|credits remaining/i);
+    expect(body.error).toMatch(/no tokens/i);
   });
 
-  test('valid api_key with credits → 200 [scenario: reset]', async ({ request }) => {
+  test('tokens available → passes token gate [scenario: reset]', async ({ request }) => {
     test.skip(!VALID_KEY, 'TEST_API_KEY env var not set');
     setupScenario('reset');
 
-    const res = await request.post(`${BASE_URL}/api/test-runs/ingest`, {
+    const res = await request.post(`${BASE_URL}/api/generate-tests`, {
       headers: { 'x-api-key': VALID_KEY },
-      data: MINIMAL_REPORT,
+      data: MINIMAL_GENERATE_BODY,
     });
-    // This test must be run AFTER: npx tsx scripts/setup-test-account.ts reset
-    expect(res.status()).toBe(200);
-    const body = await res.json();
-    expect(body.success).toBe(true);
-    expect(typeof body.test_run_id).toBe('string');
-  });
-
-  test('last credit is consumed and next call gets 402 [scenario: low-credits]', async ({ request }) => {
-    test.skip(!VALID_KEY, 'TEST_API_KEY env var not set');
-    setupScenario('low-credits');
-
-    // First call should use the last credit → 200
-    const first = await request.post(`${BASE_URL}/api/test-runs/ingest`, {
-      headers: { 'x-api-key': VALID_KEY },
-      data: { ...MINIMAL_REPORT, report: { ...MINIMAL_REPORT.report, metadata: { projectName: 'low-credit-test-1' } } },
-    });
-    expect(first.status()).toBe(200);
-
-    // Second call should be blocked → 402
-    const second = await request.post(`${BASE_URL}/api/test-runs/ingest`, {
-      headers: { 'x-api-key': VALID_KEY },
-      data: { ...MINIMAL_REPORT, report: { ...MINIMAL_REPORT.report, metadata: { projectName: 'low-credit-test-2' } } },
-    });
-    expect(second.status()).toBe(402);
+    // Must not be blocked by token gate (402) — may be 200 or other non-402 status
+    expect(res.status()).not.toBe(402);
   });
 });
 

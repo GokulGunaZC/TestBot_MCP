@@ -2,8 +2,21 @@
 
 import { motion } from 'framer-motion';
 import Link from 'next/link';
+import { useEffect, useState } from 'react';
 
 export default function CreateTestsPage() {
+  const [outOfTokens, setOutOfTokens] = useState(false);
+
+  useEffect(() => {
+    fetch('/api/profile')
+      .then(r => r.ok ? r.json() : null)
+      .then(json => {
+        const remaining = json?.data?.tokens_remaining ?? json?.tokens_remaining ?? 1;
+        setOutOfTokens(Number(remaining) === 0);
+      })
+      .catch(() => {});
+  }, []);
+
   return (
     <motion.div
       initial={{ opacity: 0, y: 10 }}
@@ -14,6 +27,28 @@ export default function CreateTestsPage() {
       <h1 className="text-3xl font-bold text-[#F0F6FF] tracking-tight mb-8">
         Create Tests
       </h1>
+
+      {outOfTokens && (
+        <motion.div
+          initial={{ opacity: 0, y: -8 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="mb-6 flex items-start gap-3 px-4 py-3.5 rounded-xl bg-red-500/10 border border-red-500/25"
+        >
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#f87171" strokeWidth="2" className="mt-0.5 flex-shrink-0">
+            <path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>
+          </svg>
+          <div className="flex-1">
+            <p className="text-red-400 text-sm font-semibold">You&apos;ve run out of tokens</p>
+            <p className="text-red-300/70 text-xs mt-0.5">Test generation is blocked until you upgrade your plan.</p>
+          </div>
+          <Link
+            href="/plan-billing"
+            className="flex-shrink-0 px-3 py-1.5 rounded-lg bg-red-500/20 border border-red-500/30 text-red-300 text-xs font-semibold hover:bg-red-500/30 transition-colors"
+          >
+            Upgrade Plan
+          </Link>
+        </motion.div>
+      )}
 
       <motion.div
         initial={{ opacity: 0, y: 20 }}

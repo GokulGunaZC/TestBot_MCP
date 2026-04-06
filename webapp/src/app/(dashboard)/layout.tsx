@@ -24,13 +24,14 @@ export default async function DashboardLayout({
     .join('')
     .toUpperCase()
     .slice(0, 2) || userEmail[0].toUpperCase();
-  const creditsRemaining = profile?.creditsRemaining ?? 100;
-  const creditsTotal = profile?.creditsTotal ?? 100;
-  const plan = profile?.plan ?? 'starter';
+  const REAL_TOKENS_PER_UNIT = 4_800
+  const tokensRemaining = Math.floor((profile?.tokensRemaining ?? 240000) / REAL_TOKENS_PER_UNIT)
+  const tokensTotal = Math.floor((profile?.tokensTotal ?? 240000) / REAL_TOKENS_PER_UNIT)
+  const plan = profile?.plan ?? 'free'
 
   return (
     <div className="min-h-screen bg-[#050A18]">
-      <Sidebar creditsRemaining={creditsRemaining} creditsTotal={creditsTotal} plan={plan} />
+      <Sidebar tokensRemaining={tokensRemaining} tokensTotal={tokensTotal} plan={plan} />
       <div className="lg:ml-[260px] flex flex-col min-h-screen">
         <TopBar userEmail={userEmail} userInitials={initials} />
         <main className="flex-1 dot-grid relative">

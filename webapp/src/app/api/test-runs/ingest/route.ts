@@ -4,7 +4,6 @@ import { apiKeys, testRuns } from '@/lib/db/schema'
 import { eq, and } from 'drizzle-orm'
 import { hashApiKey } from '@/lib/utils/api-keys'
 import { checkRateLimit } from '@/lib/rate-limit'
-import { deductCredit } from '@/lib/credits'
 import { checkConcurrencyLimit } from '@/lib/concurrency-limit'
 import { checkIdempotency, storeIdempotencyResult } from '@/lib/idempotency'
 import { validateTestRunIngest } from '@/lib/validation'
@@ -261,15 +260,6 @@ export async function POST(request: NextRequest) {
     const validationError = validateTestRunIngest(body, userId, ENDPOINT)
     if (validationError) {
       return NextResponse.json(validationError, { status: 422 })
-    }
-
-    // 7. Credit gate — atomic decrement, fail-closed (throws on DB error)
-    const creditResult = await deductCredit({ userId, endpoint: ENDPOINT })
-    if (!creditResult.allowed) {
-      return NextResponse.json(
-        { error: 'No credits remaining. Please upgrade your plan or purchase more credits.' },
-        { status: 402 }
-      )
     }
 
     // Extract stats from the report

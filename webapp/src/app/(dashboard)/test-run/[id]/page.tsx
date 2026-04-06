@@ -788,7 +788,7 @@ export default function TestRunDetailPage() {
         }
       } catch { /* ignore malformed events */ }
     };
-    evtSource.onerror = () => { evtSource.close(); };
+    evtSource.onerror = () => { evtSource.close(); setPipelineEnded(true); };
     return () => { evtSource.close(); };
   }, [id, isLiveDetailId]); // eslint-disable-line react-hooks/exhaustive-deps
 

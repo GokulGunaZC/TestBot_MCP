@@ -4,7 +4,7 @@
  * Uses fetch-based API calls (both Chat Completions and Responses API)
  */
 
-import type { OpenAIClientConfig, OpenAIMessage } from './types'
+import type { OpenAIClientConfig, OpenAIMessage, OpenAIUsage, OpenAICallResult } from './types'
 
 export class OpenAIClient {
   config: Required<OpenAIClientConfig>
@@ -25,13 +25,13 @@ export class OpenAIClient {
         config.model ||
         process.env.OPENAI_MODEL ||
         process.env.OPENAI_CODEX_MODEL ||
-        'gpt-4o',
+        'gpt-5.4',
       chatFallbackModel:
         config.chatFallbackModel ||
         process.env.OPENAI_CHAT_FALLBACK_MODEL ||
         'gpt-4o',
       latestGPTModel:
-        config.latestGPTModel || process.env.OPENAI_LATEST_GPT_MODEL || 'gpt-4o',
+        config.latestGPTModel || process.env.OPENAI_LATEST_GPT_MODEL || 'gpt-5.4',
       modelFallbacks: Array.isArray(config.modelFallbacks)
         ? config.modelFallbacks
         : String(process.env.OPENAI_MODEL_FALLBACKS || '')
@@ -45,7 +45,7 @@ export class OpenAIClient {
     }
   }
 
-  async callOpenAI(messages: OpenAIMessage[], options: { model?: string } = {}): Promise<string> {
+  async callOpenAI(messages: OpenAIMessage[], options: { model?: string } = {}): Promise<OpenAICallResult> {
     const requestedModel = options.model || this.config.model
     const modelCandidates = this.buildPreferredModelList(requestedModel)
     let lastError: Error | null = null
@@ -56,7 +56,7 @@ export class OpenAIClient {
 
       for (const endpoint of endpointOrder) {
         try {
-          const text =
+          const result =
             endpoint === 'responses'
               ? await this.callResponsesAPI(messages, model)
               : await this.callChatCompletionsAPI(messages, model)
@@ -65,7 +65,7 @@ export class OpenAIClient {
             this.config.model = model
           }
 
-          return text
+          return { text: result.text, usage: result.usage, modelUsed: model }
         } catch (error) {
           lastError = error instanceof Error ? error : new Error(String(error))
         }
@@ -88,7 +88,7 @@ export class OpenAIClient {
       this.config.latestGPTModel,
       ...configuredFallbacks,
       this.config.chatFallbackModel,
-      'gpt-4o',
+      'gpt-5.4',
     ].filter(Boolean) as string[]
 
     return [...new Set(list)]
@@ -151,7 +151,7 @@ export class OpenAIClient {
     return null
   }
 
-  async callResponsesAPI(messages: OpenAIMessage[], model: string): Promise<string> {
+  async callResponsesAPI(messages: OpenAIMessage[], model: string): Promise<{ text: string; usage: OpenAIUsage }> {
     const controller = new AbortController()
     const timeout = setTimeout(() => controller.abort(), this.config.timeout)
 
@@ -175,10 +175,16 @@ export class OpenAIClient {
         throw new Error(`OpenAI responses API error: ${errorMsg}`)
       }
 
-      const data = await response.json()
+      const data = await response.json() as Record<string, unknown>
       const text = this.extractResponseText(data)
       if (!text) throw new Error('Responses API returned no text content')
-      return text
+      const rawUsage = data.usage as Record<string, unknown> | undefined
+      const usage: OpenAIUsage = {
+        promptTokens: (rawUsage?.input_tokens as number) ?? 0,
+        completionTokens: (rawUsage?.output_tokens as number) ?? 0,
+        totalTokens: (rawUsage?.total_tokens as number) ?? ((rawUsage?.input_tokens as number ?? 0) + (rawUsage?.output_tokens as number ?? 0)),
+      }
+      return { text, usage }
     } catch (error) {
       if (error instanceof Error && error.name === 'AbortError') {
         throw new Error(`OpenAI responses API request timeout (${Math.ceil(this.config.timeout / 1000)}s)`)
@@ -189,7 +195,7 @@ export class OpenAIClient {
     }
   }
 
-  async callChatCompletionsAPI(messages: OpenAIMessage[], model: string): Promise<string> {
+  async callChatCompletionsAPI(messages: OpenAIMessage[], model: string): Promise<{ text: string; usage: OpenAIUsage }> {
     const controller = new AbortController()
     const timeout = setTimeout(() => controller.abort(), this.config.timeout)
 
@@ -215,10 +221,16 @@ export class OpenAIClient {
         throw new Error(`OpenAI chat API error: ${errorMsg}`)
       }
 
-      const data = await response.json()
+      const data = await response.json() as Record<string, unknown>
       const text = this.extractResponseText(data)
       if (!text) throw new Error('Chat completions API returned no text content')
-      return text
+      const rawUsage = data.usage as Record<string, unknown> | undefined
+      const usage: OpenAIUsage = {
+        promptTokens: (rawUsage?.prompt_tokens as number) ?? 0,
+        completionTokens: (rawUsage?.completion_tokens as number) ?? 0,
+        totalTokens: (rawUsage?.total_tokens as number) ?? ((rawUsage?.prompt_tokens as number ?? 0) + (rawUsage?.completion_tokens as number ?? 0)),
+      }
+      return { text, usage }
     } catch (error) {
       if (error instanceof Error && error.name === 'AbortError') {
         throw new Error(`OpenAI chat API request timeout (${Math.ceil(this.config.timeout / 1000)}s)`)

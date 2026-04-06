@@ -11,6 +11,7 @@ type BlockedRequestType =
   | 'MULTI_ACCOUNT_PROJECT_DETECTED'
   | 'ABUSE_FLAG'
   | 'NO_CREDITS'
+  | 'NO_TOKENS'
 
 interface BlockedRequestLog {
   type: BlockedRequestType

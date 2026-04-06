@@ -2,6 +2,7 @@ import { db } from './db'
 import { mcpTelemetryEvents } from './db/schema'
 import { eq, and, gte, count } from 'drizzle-orm'
 import { logBlockedRequest, logAiCostSpike } from './security-logger'
+import { computeInternalCost } from './tokens'
 
 const AI_MAX_REQUESTS_PER_MINUTE = parseInt(process.env.AI_MAX_REQUESTS_PER_MINUTE ?? '20', 10)
 
@@ -46,8 +47,16 @@ export async function recordAiCall(params: {
   userId: string
   apiKeyId: string
   endpoint: string
+  modelUsed?: string
+  tokensPrompt?: number
+  tokensCompletion?: number
+  tokensTotal?: number
 }): Promise<void> {
   try {
+    const costUsd =
+      params.tokensPrompt !== undefined && params.tokensCompletion !== undefined
+        ? computeInternalCost(params.tokensPrompt, params.tokensCompletion).toFixed(8)
+        : null
     await db.insert(mcpTelemetryEvents).values({
       userId: params.userId,
       apiKeyId: params.apiKeyId,
@@ -56,6 +65,11 @@ export async function recordAiCall(params: {
       eventType: 'ai_call',
       status: 'info',
       success: true,
+      modelUsed: params.modelUsed ?? null,
+      tokensPrompt: params.tokensPrompt ?? null,
+      tokensCompletion: params.tokensCompletion ?? null,
+      tokensTotal: params.tokensTotal ?? null,
+      costUsd: costUsd,
     })
   } catch {
     // Non-blocking — don't fail the request if this insert fails
