@@ -150,13 +150,13 @@ export default function HomePage() {
               </svg>
               Test Locally (MCP)
             </Link>
-            <button className="flex items-center gap-2 text-[#8BA4C8] hover:text-[#F0F6FF] font-semibold px-5 py-2.5 rounded-xl text-sm border border-white/10 hover:border-blue-500/30 transition-all hover:bg-white/5">
+            {/* <button className="flex items-center gap-2 text-[#8BA4C8] hover:text-[#F0F6FF] font-semibold px-5 py-2.5 rounded-xl text-sm border border-white/10 hover:border-blue-500/30 transition-all hover:bg-white/5">
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                 <circle cx="12" cy="12" r="10" /><polygon points="10 8 16 12 10 16 10 8" />
               </svg>
               Test Deployed App
-            </button>
-            <a
+            </button> */}
+            {/* <a
               href="#"
               className="flex items-center gap-2 text-[#8BA4C8] hover:text-[#F0F6FF] font-semibold px-5 py-2.5 rounded-xl text-sm border border-white/10 hover:border-blue-500/30 transition-all hover:bg-white/5"
             >
@@ -164,7 +164,7 @@ export default function HomePage() {
                 <path d="M2 3h6a4 4 0 014 4v14a3 3 0 00-3-3H2z" /><path d="M22 3h-6a4 4 0 00-4 4v14a3 3 0 013-3h7z" />
               </svg>
               View Docs
-            </a>
+            </a> */}
           </div>
         </div>
       </motion.div>
