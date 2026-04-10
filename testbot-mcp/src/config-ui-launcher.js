@@ -18,6 +18,18 @@ const SUPPORTED_PRD_CONTENT_TYPES = new Set([
   'text/yaml',
 ]);
 
+const CREDENTIAL_SCHEMA = z.object({
+  role: z.string().max(100).optional(),
+  username: z.string().max(200).optional(),
+  password: z.string().max(200).optional(),
+});
+
+const PRD_FILE_SCHEMA = z.object({
+  name: z.string().min(1).max(255),
+  contentType: z.string().optional(),
+  textContent: z.string().min(1).max(500000),
+});
+
 const CONFIG_UI_PAYLOAD_SCHEMA = z.object({
   testType: z.enum(['frontend', 'backend', 'both']),
   scope: z.enum(['codebase', 'diff']).optional(),
@@ -25,15 +37,12 @@ const CONFIG_UI_PAYLOAD_SCHEMA = z.object({
   startCommand: z.string().min(1).max(500),
   generateTests: z.boolean(),
   openDashboard: z.boolean(),
-  credentials: z.object({
-    username: z.string().max(200).optional(),
-    password: z.string().max(200).optional(),
-  }).optional(),
-  prd: z.object({
-    name: z.string().min(1).max(255),
-    contentType: z.string().optional(),
-    textContent: z.string().min(1).max(500000),
-  }).optional().nullable(),
+  credentials: z.union([
+    CREDENTIAL_SCHEMA,
+    z.array(CREDENTIAL_SCHEMA).max(10),
+  ]).optional(),
+  prd: PRD_FILE_SCHEMA.optional().nullable(),
+  prdFiles: z.array(PRD_FILE_SCHEMA).max(5).optional().nullable(),
 });
 
 function resolveBoolean(value, fallback) {
@@ -187,6 +196,23 @@ class ConfigUILauncher {
         ok: false,
         message: `PRD content exceeds limit of ${this.config.maxPrdChars} characters`,
       };
+    }
+
+    if (Array.isArray(parsed.data.prdFiles)) {
+      for (const prdFile of parsed.data.prdFiles) {
+        if (prdFile.contentType && !SUPPORTED_PRD_CONTENT_TYPES.has(prdFile.contentType)) {
+          return {
+            ok: false,
+            message: `Unsupported PRD content type: ${prdFile.contentType}`,
+          };
+        }
+        if (prdFile.textContent && prdFile.textContent.length > this.config.maxPrdChars) {
+          return {
+            ok: false,
+            message: `PRD file "${prdFile.name}" exceeds limit of ${this.config.maxPrdChars} characters`,
+          };
+        }
+      }
     }
 
     return {

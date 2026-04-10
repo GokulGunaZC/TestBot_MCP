@@ -35,6 +35,18 @@ const DashboardLauncher = require('./dashboard-launcher');
 const ConfigUILauncher = require('./config-ui-launcher');
 const MCPTelemetryReporter = require('./mcp-telemetry');
 
+const CREDENTIAL_SCHEMA = z.object({
+  role: z.string().max(100).optional(),
+  username: z.string().max(200).optional(),
+  password: z.string().max(200).optional(),
+});
+
+const PRD_FILE_SCHEMA = z.object({
+  name: z.string().min(1).max(255),
+  contentType: z.string().min(1).max(128).optional(),
+  textContent: z.string().min(1).max(500000),
+});
+
 const UI_SUBMISSION_SCHEMA = z.object({
   testType: z.enum(['frontend', 'backend', 'both']),
   scope: z.enum(['codebase', 'diff']).optional(),
@@ -42,15 +54,12 @@ const UI_SUBMISSION_SCHEMA = z.object({
   startCommand: z.string().min(1).max(500),
   generateTests: z.boolean(),
   openDashboard: z.boolean(),
-  credentials: z.object({
-    username: z.string().max(200).optional(),
-    password: z.string().max(200).optional(),
-  }).optional(),
-  prd: z.object({
-    name: z.string().min(1).max(255),
-    contentType: z.string().min(1).max(128).optional(),
-    textContent: z.string().min(1).max(500000),
-  }).optional().nullable(),
+  credentials: z.union([
+    CREDENTIAL_SCHEMA,
+    z.array(CREDENTIAL_SCHEMA).max(10),
+  ]).optional(),
+  prd: PRD_FILE_SCHEMA.optional().nullable(),
+  prdFiles: z.array(PRD_FILE_SCHEMA).max(5).optional().nullable(),
 });
 
 const WORKFLOW_OBJECT_SCHEMA = z.object({
@@ -234,6 +243,46 @@ class TestbotMCPServer {
     return filePath;
   }
 
+  persistUploadedPrdFiles(statusDir, prdFiles) {
+    if (!Array.isArray(prdFiles) || prdFiles.length === 0) {
+      return [];
+    }
+
+    const allowedExtensions = new Set(['.md', '.txt', '.json', '.yaml', '.yml']);
+    const savedPaths = [];
+
+    prdFiles.forEach((prdPayload, index) => {
+      if (!prdPayload?.textContent) return;
+
+      const originalName = path.basename(prdPayload.name || `uploaded-prd-${index}.md`);
+      const ext = path.extname(originalName).toLowerCase();
+      const safeExt = allowedExtensions.has(ext) ? ext : '.md';
+      const baseName = path.basename(originalName, ext).replace(/[^a-zA-Z0-9_-]/g, '_');
+      const fileName = `uploaded-prd-${index}-${baseName}${safeExt}`;
+      const filePath = path.join(statusDir, fileName);
+
+      fs.writeFileSync(filePath, prdPayload.textContent, 'utf-8');
+      savedPaths.push(filePath);
+    });
+
+    return savedPaths;
+  }
+
+  normalizeCredentials(credentials) {
+    if (!credentials) return undefined;
+    
+    if (Array.isArray(credentials)) {
+      const validCreds = credentials.filter(c => c.username || c.password);
+      return validCreds.length > 0 ? validCreds : undefined;
+    }
+    
+    if (credentials.username || credentials.password) {
+      return [credentials];
+    }
+    
+    return undefined;
+  }
+
   validateUISubmission(rawConfig) {
     const parsed = UI_SUBMISSION_SCHEMA.safeParse(rawConfig);
     if (!parsed.success) {
@@ -380,6 +429,9 @@ class TestbotMCPServer {
       });
 
       const prdFile = this.persistUploadedPrd(statusDir, validatedConfig.prd);
+      const prdFiles = this.persistUploadedPrdFiles(statusDir, validatedConfig.prdFiles);
+      const normalizedCredentials = this.normalizeCredentials(validatedConfig.credentials);
+
       const finalConfig = {
         ...baseConfig,
         testType: validatedConfig.testType,
@@ -388,11 +440,12 @@ class TestbotMCPServer {
         startCommand: validatedConfig.startCommand,
         baseURL: validatedConfig.baseURL,
         port: this.extractPortFromBaseURL(validatedConfig.baseURL, baseConfig.port),
-        prdFile,
+        prdFile: prdFile || (prdFiles.length > 0 ? prdFiles[0] : undefined),
+        prdFiles: prdFiles.length > 0 ? prdFiles : (prdFile ? [prdFile] : []),
       };
 
-      if (validatedConfig.credentials?.username || validatedConfig.credentials?.password) {
-        finalConfig.testCredentials = validatedConfig.credentials;
+      if (normalizedCredentials && normalizedCredentials.length > 0) {
+        finalConfig.testCredentials = normalizedCredentials;
       }
 
       this.writeRunStatus(statusFile, {
