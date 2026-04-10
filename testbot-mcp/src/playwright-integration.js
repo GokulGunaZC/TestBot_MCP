@@ -24,6 +24,23 @@ class PlaywrightIntegration {
         : Number(process.env.TESTBOT_SERVER_HEALTHCHECK_INTERVAL_MS || 1000),
       testType: config.testType || 'both',
       timeout: config.timeout || 300000,
+      playwrightRetries: Number.isFinite(Number(config.playwrightRetries))
+        ? Math.max(0, Math.floor(Number(config.playwrightRetries)))
+        : Number.isFinite(Number(process.env.TESTBOT_PLAYWRIGHT_RETRIES))
+          ? Math.max(0, Math.floor(Number(process.env.TESTBOT_PLAYWRIGHT_RETRIES)))
+          : 1,
+      testTimeoutMs: Number.isFinite(Number(config.testTimeoutMs))
+        ? Math.max(1000, Number(config.testTimeoutMs))
+        : Number(process.env.TESTBOT_PLAYWRIGHT_TEST_TIMEOUT_MS || 60000),
+      expectTimeoutMs: Number.isFinite(Number(config.expectTimeoutMs))
+        ? Math.max(1000, Number(config.expectTimeoutMs))
+        : Number(process.env.TESTBOT_PLAYWRIGHT_EXPECT_TIMEOUT_MS || 10000),
+      actionTimeoutMs: Number.isFinite(Number(config.actionTimeoutMs))
+        ? Math.max(1000, Number(config.actionTimeoutMs))
+        : Number(process.env.TESTBOT_PLAYWRIGHT_ACTION_TIMEOUT_MS || 15000),
+      navigationTimeoutMs: Number.isFinite(Number(config.navigationTimeoutMs))
+        ? Math.max(1000, Number(config.navigationTimeoutMs))
+        : Number(process.env.TESTBOT_PLAYWRIGHT_NAVIGATION_TIMEOUT_MS || 30000),
       browserMode: config.browserMode || 'chromium',
       artifactMode: config.artifactMode || 'hybrid',
       phaseMode: config.phaseMode || 'two-phase',
@@ -517,6 +534,14 @@ class PlaywrightIntegration {
       args.push('--reporter', 'json');
     }
 
+    if (!configPath && Number.isInteger(this.config.playwrightRetries)) {
+      args.push('--retries', String(Math.max(0, this.config.playwrightRetries)));
+    }
+
+    if (!configPath && Number.isFinite(Number(this.config.testTimeoutMs))) {
+      args.push('--timeout', String(Math.max(1000, Number(this.config.testTimeoutMs))));
+    }
+
     return args;
   }
 
@@ -878,9 +903,11 @@ class PlaywrightIntegration {
       testCases = `
   test('renders home page', async ({ page }) => {
     const response = await page.goto('/');
+    await page.waitForLoadState('domcontentloaded');
+    await page.waitForLoadState('networkidle').catch(() => {});
     expect(response).not.toBeNull();
     expect((response?.status() || 0)).toBeLessThan(500);
-    await expect(page.locator('body')).toBeVisible();
+    await expect(page.locator('main, [role="main"], body').first()).toBeVisible({ timeout: 10000 });
   });
 `;
     } else {
@@ -888,9 +915,11 @@ class PlaywrightIntegration {
         testCases += `
   test('${this.sanitizeString(criterion)}', async ({ page }) => {
     const response = await page.goto('/');
+    await page.waitForLoadState('domcontentloaded');
+    await page.waitForLoadState('networkidle').catch(() => {});
     expect(response).not.toBeNull();
     expect((response?.status() || 0)).toBeLessThan(500);
-    await expect(page.locator('body')).toBeVisible();
+    await expect(page.locator('main, [role="main"], body').first()).toBeVisible({ timeout: 10000 });
   });
 `;
       });
@@ -912,9 +941,11 @@ const { test, expect } = require('@playwright/test');
 test.describe('${this.sanitizeString(scenario.name)}', () => {
   test('${this.sanitizeString(scenario.name)}', async ({ page }) => {
     const response = await page.goto('/');
+    await page.waitForLoadState('domcontentloaded');
+    await page.waitForLoadState('networkidle').catch(() => {});
     expect(response).not.toBeNull();
     expect((response?.status() || 0)).toBeLessThan(500);
-    await expect(page.locator('body')).toBeVisible();
+    await expect(page.locator('main, [role="main"], body').first()).toBeVisible({ timeout: 10000 });
   });
 });
 `;

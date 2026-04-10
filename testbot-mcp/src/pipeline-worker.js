@@ -386,18 +386,31 @@ function collectGenerationQuality(projectPath) {
   };
 }
 
-function buildRequirementsCoverage({ prdContent, projectPath }) {
+function buildRequirementsCoverage({ prdContent, prdContents, projectPath }) {
   const fallback = {
     totalRequirements: 0,
     mappedRequirements: 0,
     uncoveredRequirements: [],
   };
 
-  if (!prdContent || !String(prdContent).trim()) {
+  const allPrdContent = [];
+  if (prdContent && String(prdContent).trim()) {
+    allPrdContent.push(String(prdContent));
+  }
+  if (Array.isArray(prdContents)) {
+    for (const content of prdContents) {
+      if (content && String(content).trim()) {
+        allPrdContent.push(String(content));
+      }
+    }
+  }
+
+  if (allPrdContent.length === 0) {
     return fallback;
   }
 
-  const requirementMatches = String(prdContent).match(/\b(?:REQ|AC|US)[-_ ]?\d+\b/gi) || [];
+  const combinedPrdContent = allPrdContent.join('\n');
+  const requirementMatches = combinedPrdContent.match(/\b(?:REQ|AC|US)[-_ ]?\d+\b/gi) || [];
   const normalizedRequirements = [...new Set(requirementMatches.map((item) => item.toUpperCase().replace(/\s+/g, '-')))];
   if (normalizedRequirements.length === 0) {
     return fallback;
@@ -1884,23 +1897,42 @@ async function runPipeline(config, runId) {
     }
 
     // -------------------------------------------------------
-    // 3. Read PRD file if specified
+    // 3. Read PRD file(s) if specified
     // -------------------------------------------------------
     let prdContent = null;
+    const prdContents = [];
+
     if (config.prdFile) {
       try {
         prdContent = fs.readFileSync(config.prdFile, 'utf-8');
+        prdContents.push(prdContent);
         Logger.info('PipelineWorker', 'Read PRD file', { path: config.prdFile, length: prdContent.length });
       } catch (error) {
         Logger.warn('PipelineWorker', 'Could not read PRD file', { path: config.prdFile, reason: error.message });
       }
     }
 
+    if (Array.isArray(config.prdFiles) && config.prdFiles.length > 0) {
+      for (const prdFilePath of config.prdFiles) {
+        if (prdFilePath === config.prdFile) continue;
+        try {
+          const content = fs.readFileSync(prdFilePath, 'utf-8');
+          prdContents.push(content);
+          Logger.info('PipelineWorker', 'Read additional PRD file', { path: prdFilePath, length: content.length });
+        } catch (error) {
+          Logger.warn('PipelineWorker', 'Could not read PRD file', { path: prdFilePath, reason: error.message });
+        }
+      }
+    }
+
+    const combinedPrdContent = prdContents.length > 0 ? prdContents.join('\n\n---\n\n') : null;
+
     const projectInfo = {
       name: config.projectName,
       framework: codebaseContext?.projectStructure?.framework || 'Unknown',
       baseURL: config.baseURL,
       startCommand: config.startCommand,
+      testCredentials: config.testCredentials,
     };
 
     // -------------------------------------------------------
@@ -1916,7 +1948,7 @@ async function runPipeline(config, runId) {
       const generationResult = await generateWithFallbackChain({
         config,
         context: codebaseContext,
-        prdContent,
+        prdContent: combinedPrdContent,
         runBudget,
         projectInfo,
       });
@@ -1939,7 +1971,8 @@ async function runPipeline(config, runId) {
       }
       generationQuality = qualityGate.result;
       requirementsCoverage = buildRequirementsCoverage({
-        prdContent,
+        prdContent: combinedPrdContent,
+        prdContents,
         projectPath: config.projectPath,
       });
 
