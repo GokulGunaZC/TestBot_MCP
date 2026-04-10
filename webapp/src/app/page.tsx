@@ -9,8 +9,8 @@ import Pricing from '@/components/marketing/Pricing';
 import Footer from '@/components/marketing/Footer';
 
 export const metadata = {
-  title: 'TestBot MCP — AI-Powered Testing Agent',
-  description: 'TestBot MCP is an AI-native testing agent that auto-generates, runs, and analyzes tests from a single natural language command in your IDE.',
+  title: 'Healix MCP — AI-Powered Testing Agent',
+  description: 'Healix MCP is an AI-native testing agent that auto-generates, runs, and analyzes tests from a single natural language command in your IDE.',
 };
 
 export default function MarketingPage() {
@@ -40,14 +40,14 @@ export default function MarketingPage() {
                 Ready to eliminate manual testing?
               </h2>
               <p className="text-[#a0a0a0] text-lg mb-10 font-mono">
-                Set up TestBot MCP in under 5 minutes. No credit card required.
+                Set up Healix MCP in under 5 minutes. No credit card required.
               </p>
 
               <div className="flex flex-col sm:flex-row gap-4 justify-center items-center mb-10">
                 {[
-                  { step: '01', label: 'Install via npm', code: 'npm install -g testbot-mcp' },
-                  { step: '02', label: 'Add to IDE config', code: 'testbot-mcp init' },
-                  { step: '03', label: 'Say the magic words', code: '"Test my app using testbot mcp"' },
+                  { step: '01', label: 'Install via npm', code: 'npm install -g healix-mcp' },
+                  { step: '02', label: 'Add to IDE config', code: 'healix-mcp init' },
+                  { step: '03', label: 'Say the magic words', code: '"Test my app using healix mcp"' },
                 ].map(({ step, label, code }) => (
                   <div key={step} className="glass-card px-5 py-3 text-sm flex items-start gap-3 text-left">
                     <span className="font-mono font-bold text-white text-xs border border-white px-1.5 py-0.5 flex-shrink-0">{step}</span>

@@ -1,6 +1,6 @@
 /**
  * Results Merger
- * Merges test results from multiple sources (TestBot direct execution + Playwright MCP)
+ * Merges test results from multiple sources (Healix direct execution + Playwright MCP)
  * Combines artifacts and deduplicates tests
  */
 
@@ -18,7 +18,7 @@ class ResultsMerger {
   }
 
   /**
-   * Merge results from TestBot direct execution and Playwright MCP
+   * Merge results from Healix direct execution and Playwright MCP
    */
   mergeResults(directResults, mcpResults) {
     Logger.info('ResultsMerger', 'Merging results from parallel executions...');

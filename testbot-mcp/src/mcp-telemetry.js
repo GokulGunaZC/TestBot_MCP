@@ -48,9 +48,9 @@ function isTestRuntime() {
 
 class MCPTelemetryReporter {
   constructor(config = {}) {
-    const apiKey = config.apiKey || process.env.TESTBOT_API_KEY || null;
-    const dashboardUrl = config.dashboardUrl || process.env.TESTBOT_DASHBOARD_URL || null;
-    const telemetryEnv = String(process.env.TESTBOT_MCP_TELEMETRY || '').trim().toLowerCase();
+    const apiKey = config.apiKey || process.env.HEALIX_API_KEY || null;
+    const dashboardUrl = config.dashboardUrl || process.env.HEALIX_DASHBOARD_URL || null;
+    const telemetryEnv = String(process.env.HEALIX_MCP_TELEMETRY || '').trim().toLowerCase();
     const enabledByEnv = telemetryEnv ? !['0', 'false', 'off', 'no'].includes(telemetryEnv) : true;
     const explicitEnable = config.enabled;
     const enabled = explicitEnable !== undefined ? explicitEnable : enabledByEnv;
@@ -58,8 +58,8 @@ class MCPTelemetryReporter {
     this.config = {
       apiKey,
       dashboardUrl,
-      source: config.source || 'testbot-mcp',
-      timeoutMs: Number(config.timeoutMs || process.env.TESTBOT_MCP_TELEMETRY_TIMEOUT_MS || 2500),
+      source: config.source || 'healix-mcp',
+      timeoutMs: Number(config.timeoutMs || process.env.HEALIX_MCP_TELEMETRY_TIMEOUT_MS || 2500),
       enabled: enabled && !!apiKey && !!dashboardUrl && !isTestRuntime(),
     };
   }
@@ -74,7 +74,7 @@ class MCPTelemetryReporter {
 
     return {
       source: clampString(this.config.source, 80),
-      toolName: clampString(input.toolName || 'testbot_test_my_app', 120),
+      toolName: clampString(input.toolName || 'healix_test_my_app', 120),
       eventType: clampString(input.eventType || 'status', 80),
       runId: clampString(input.runId, 160),
       phase: clampString(input.phase, 120),

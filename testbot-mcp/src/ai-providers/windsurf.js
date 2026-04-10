@@ -11,7 +11,7 @@ class WindsurfClient {
   constructor(config = {}) {
     this.config = {
       mode: config.mode || 'file',
-      tempDir: config.tempDir || '.testbot-windsurf',
+      tempDir: config.tempDir || '.healix-windsurf',
       model: config.model || 'cascade-codex-5.1',
       timeout: config.timeout || 120000,
       ...config,

@@ -15,19 +15,19 @@ function getMcpConfig(ide: string) {
   const dashboardUrl = typeof window !== 'undefined' ? window.location.origin : 'https://your-app.vercel.app';
   return `{
   "mcpServers": {
-    "testbot-mcp": {
+    "healix-mcp": {
       "command": "npx",
-      "args": ["-y", "@testbot/mcp@latest"],
+      "args": ["-y", "@healix/mcp@latest"],
       "env": {
-        "TESTBOT_API_KEY": "<your-api-key>",
-        "TESTBOT_DASHBOARD_URL": "${dashboardUrl}"
+        "HEALIX_API_KEY": "<your-api-key>",
+        "HEALIX_DASHBOARD_URL": "${dashboardUrl}"
       }
     }
   }
 }`;
 }
 
-const MAGIC_PROMPT = 'Hey, help me to test this project with TestBot MCP.';
+const MAGIC_PROMPT = 'Hey, help me to test this project with Healix MCP.';
 
 function CopyButton({ text, small = false }: { text: string; small?: boolean }) {
   const [copied, setCopied] = useState(false);
@@ -136,7 +136,7 @@ export default function McpSetupModal({ isOpen, onClose }: McpSetupModalProps) {
               {/* Header */}
               <div className="flex items-center justify-between p-6 border-b border-white/10">
                 <div>
-                  <h2 className="text-[#F0F6FF] font-bold text-lg">Quick Install — TestBot MCP</h2>
+                  <h2 className="text-[#F0F6FF] font-bold text-lg">Quick Install — Healix MCP</h2>
                   <p className="text-[#4A6280] text-xs mt-0.5">Step {step} of 3</p>
                 </div>
                 <button
@@ -177,7 +177,7 @@ export default function McpSetupModal({ isOpen, onClose }: McpSetupModalProps) {
                   <motion.div initial={{ opacity: 0, x: 16 }} animate={{ opacity: 1, x: 0 }}>
                     <h3 className="text-[#F0F6FF] font-semibold text-base mb-2">Step 1: Create an API Key</h3>
                     <p className="text-[#8BA4C8] text-sm mb-6">
-                      Create an API key to connect TestBot to your IDE. Keep this key safe — you won&apos;t see it again.
+                      Create an API key to connect Healix MCP to your IDE. Keep this key safe — you won&apos;t see it again.
                     </p>
 
                     {!apiKey ? (
@@ -342,7 +342,7 @@ export default function McpSetupModal({ isOpen, onClose }: McpSetupModalProps) {
                         <div>
                           <div className="text-emerald-400 font-semibold text-sm mb-1">You&apos;re all set!</div>
                           <p className="text-[#8BA4C8] text-xs leading-relaxed">
-                            TestBot MCP will auto-detect your project, generate tests, run them, and open a beautiful results dashboard.
+                            Healix MCP will auto-detect your project, generate tests, run them, and open a beautiful results dashboard.
                           </p>
                         </div>
                       </div>

@@ -1,8 +1,8 @@
 /**
- * Testbot MCP Server
+ * Healix MCP Server
  * One-command testing with AI-powered analysis for any project
  *
- * Usage: User says "test my app using testbot mcp" in Cursor/Windsurf
+ * Usage: User says "test my app using healix mcp" in Cursor/Windsurf
  */
 
 // Load environment variables - try multiple paths since CWD varies when launched from IDE
@@ -102,12 +102,12 @@ function resolveBoolean(value, fallback) {
   return fallback;
 }
 
-class TestbotMCPServer {
+class HealixMCPServer {
   constructor() {
     Logger.initialize();
-    console.error('[DEBUG] TestBot MCP Server starting - VERSION WITH ZOD SCHEMAS');
+    console.error('[DEBUG] Healix MCP Server starting - VERSION WITH ZOD SCHEMAS');
     this.server = new McpServer({
-      name: "testbot-mcp",
+      name: "healix-mcp",
       version: "1.1.0"
     });
     this.telemetryReporter = this.createTelemetryReporter();
@@ -181,7 +181,7 @@ class TestbotMCPServer {
       : (phase === 'error' || phase === 'error_reported' ? 'error' : 'info');
 
     this.emitTelemetry({
-      toolName: 'testbot_test_my_app',
+      toolName: 'healix_test_my_app',
       eventType: 'run_status',
       runId,
       phase: statusPayload.phase,
@@ -340,7 +340,7 @@ class TestbotMCPServer {
   }
 
   resolveHeadlessPreference(params = {}) {
-    const envHeadless = resolveBoolean(process.env.TESTBOT_HEADLESS, true);
+    const envHeadless = resolveBoolean(process.env.HEALIX_HEADLESS, true);
     return resolveBoolean(params.headless, envHeadless);
   }
 
@@ -348,7 +348,7 @@ class TestbotMCPServer {
     if (headless) {
       return false;
     }
-    const envAutoOpen = resolveBoolean(process.env.TESTBOT_AUTO_OPEN_BROWSER, false);
+    const envAutoOpen = resolveBoolean(process.env.HEALIX_AUTO_OPEN_BROWSER, false);
     return resolveBoolean(params.autoOpenBrowser, envAutoOpen);
   }
 
@@ -419,7 +419,7 @@ class TestbotMCPServer {
         aiOnlyEnforced: baseConfig.strictAIGeneration !== false,
       });
       this.emitTelemetry({
-        toolName: 'testbot_test_my_app',
+        toolName: 'healix_test_my_app',
         eventType: 'config_ui',
         runId,
         phase: 'config_received',
@@ -482,7 +482,7 @@ class TestbotMCPServer {
         aiOnlyEnforced: baseConfig.strictAIGeneration !== false,
       });
       this.emitTelemetry({
-        toolName: 'testbot_test_my_app',
+        toolName: 'healix_test_my_app',
         eventType: 'config_ui',
         runId,
         phase: 'error',
@@ -505,12 +505,12 @@ class TestbotMCPServer {
     const workerPath = path.join(__dirname, 'pipeline-worker.js');
     Logger.info('Index', `Forking pipeline worker in background`, { runId, projectPath: config.projectPath });
 
-    // ── Kill any previous TestBot pipeline worker ────────────────────────────
+    // ── Kill any previous Healix pipeline worker ────────────────────────────
     // The worker is unref()'d so it survives Windsurf closure. If a previous run
     // is still in-flight (e.g. stuck in AI generation), kill it before starting
     // a new one. We ONLY kill what we wrote into this PID file — nothing else.
-    const testbotReportsDir = path.join(config.projectPath, 'testbot-reports');
-    const workerPidFile = path.join(testbotReportsDir, '.testbot-worker.pid');
+    const healixReportsDir = path.join(config.projectPath, 'healix-reports');
+    const workerPidFile = path.join(healixReportsDir, '.healix-worker.pid');
     const _killWorkerPid = (pidFile) => {
       if (!fs.existsSync(pidFile)) return;
       let pid;
@@ -522,12 +522,12 @@ class TestbotMCPServer {
           } else {
             try { process.kill(-pid, 'SIGKILL'); } catch { try { process.kill(pid, 'SIGKILL'); } catch { /* gone */ } }
           }
-          Logger.info('Index', 'Killed leftover TestBot pipeline worker', { pid });
+          Logger.info('Index', 'Killed leftover Healix pipeline worker', { pid });
         } catch { /* already gone */ }
       }
       try { fs.unlinkSync(pidFile); } catch { /* ignore */ }
     };
-    try { fs.mkdirSync(testbotReportsDir, { recursive: true }); } catch { /* ignore */ }
+    try { fs.mkdirSync(healixReportsDir, { recursive: true }); } catch { /* ignore */ }
     _killWorkerPid(workerPidFile);
     // ────────────────────────────────────────────────────────────────────────
 
@@ -536,7 +536,7 @@ class TestbotMCPServer {
     // overflow the buffer and block child.send() until the child drains it —
     // but the child hasn't started reading yet — causing a permanent deadlock.
     const resolvedStatusDir = statusDir || path.join(
-      config.projectPath, 'testbot-reports', '.runs', runId
+      config.projectPath, 'healix-reports', '.runs', runId
     );
     const configTempFile = path.join(resolvedStatusDir, 'pipeline-config.json');
     let useTempFile = false;
@@ -567,7 +567,7 @@ class TestbotMCPServer {
       }
     } catch (sendErr) {
       sendError = sendErr;
-      process.stderr.write(`[TESTBOT] Failed to send config to worker: ${sendErr.message}\n`);
+      process.stderr.write(`[HEALIX] Failed to send config to worker: ${sendErr.message}\n`);
     }
 
     // Disconnect IPC and unref so MCP server is not blocked
@@ -581,7 +581,7 @@ class TestbotMCPServer {
     // instead of hanging for 30 minutes.
     const WORKER_TERMINAL_PHASES = new Set(['completed', 'error', 'error_reported', 'failed']);
     const crashStatusFile = path.join(
-      config.projectPath, 'testbot-reports', '.runs', runId, 'status.json'
+      config.projectPath, 'healix-reports', '.runs', runId, 'status.json'
     );
     child.on('exit', (code, signal) => {
       // Always clean up the PID file so it never lingers as a stale kill-target.
@@ -602,7 +602,7 @@ class TestbotMCPServer {
             ? `Pipeline worker exited before completing (no error code). Last phase: ${existingPhase || 'unknown'}.`
             : `Pipeline worker crashed (exit code ${code}${signal ? ', signal ' + signal : ''}). Last phase: ${existingPhase || 'unknown'}.`;
           const errorCode = isCleanButUnfinished ? 'WORKER_SILENT_EXIT' : 'WORKER_CRASH';
-          process.stderr.write(`[TESTBOT] ${message}\n`);
+          process.stderr.write(`[HEALIX] ${message}\n`);
           fs.writeFileSync(crashStatusFile, JSON.stringify({
             runId,
             phase: 'error',
@@ -612,7 +612,7 @@ class TestbotMCPServer {
           }));
         }
       } catch (e) {
-        process.stderr.write(`[TESTBOT] Could not write crash status: ${e.message}\n`);
+        process.stderr.write(`[HEALIX] Could not write crash status: ${e.message}\n`);
       }
     });
 
@@ -627,7 +627,7 @@ class TestbotMCPServer {
           timestamp: new Date().toISOString(),
         }));
       } catch (e) {
-        process.stderr.write(`[TESTBOT] Could not write IPC-send error status: ${e.message}\n`);
+        process.stderr.write(`[HEALIX] Could not write IPC-send error status: ${e.message}\n`);
       }
     }
 
@@ -640,7 +640,7 @@ class TestbotMCPServer {
 
     Logger.info('Index', `Pipeline worker forked`, { pid: child.pid, runId });
     this.emitTelemetry({
-      toolName: 'testbot_test_my_app',
+      toolName: 'healix_test_my_app',
       eventType: 'worker_spawned',
       runId,
       status: 'info',
@@ -671,7 +671,7 @@ class TestbotMCPServer {
         if (status.phase && status.phase !== lastPhase) {
           lastPhase = status.phase;
           // Keep stderr writes small to avoid Windows pipe-blocking
-          process.stderr.write(`[TESTBOT] phase=${status.phase}\n`);
+          process.stderr.write(`[HEALIX] phase=${status.phase}\n`);
         }
         if (TERMINAL_PHASES.has(status.phase)) {
           return status;
@@ -685,26 +685,26 @@ class TestbotMCPServer {
 
   registerTools() {
     this.server.registerTool(
-      'testbot_configure',
+      'healix_configure',
       {
-        description: 'Analyze a project and return configuration options before testing. Use this first to understand the project structure, then use the returned configuration with testbot_test_my_app. Returns detected settings and questions for the user to answer.',
+        description: 'Analyze a project and return configuration options before testing. Use this first to understand the project structure, then use the returned configuration with healix_test_my_app. Returns detected settings and questions for the user to answer.',
         inputSchema: z.object({
           projectPath: z.string().optional().describe('Path to the project to analyze (defaults to current workspace)'),
         }),
       },
       async (args, extra) => {
-        const telemetryStartedAt = this.trackToolInvocation('testbot_configure', args);
-        console.error('[DEBUG] testbot_configure called, projectPath:', args?.projectPath);
-        Logger.mcp('Index', `Tool called: testbot_configure`, { projectPath: args?.projectPath });
+        const telemetryStartedAt = this.trackToolInvocation('healix_configure', args);
+        console.error('[DEBUG] healix_configure called, projectPath:', args?.projectPath);
+        Logger.mcp('Index', `Tool called: healix_configure`, { projectPath: args?.projectPath });
         try {
           await this.validateApiKey();
           const result = await this.handleConfigure(args);
-          this.trackToolResult('testbot_configure', telemetryStartedAt);
-          console.error('[DEBUG] testbot_configure returning result');
+          this.trackToolResult('healix_configure', telemetryStartedAt);
+          console.error('[DEBUG] healix_configure returning result');
           return result;
         } catch (error) {
-          this.trackToolResult('testbot_configure', telemetryStartedAt, error);
-          console.error('[DEBUG] testbot_configure error:', error.message);
+          this.trackToolResult('healix_configure', telemetryStartedAt, error);
+          console.error('[DEBUG] healix_configure error:', error.message);
           return {
             content: [
               {
@@ -719,7 +719,7 @@ class TestbotMCPServer {
     );
 
     this.server.registerTool(
-      'testbot_test_my_app',
+      'healix_test_my_app',
       {
         description: 'Test your application end-to-end with AI-powered analysis. Opens a configuration UI by default, then generates tests, runs them, analyzes failures with AI, and opens a dashboard with results. Strict AI-only generation is enabled by default. Returns immediately with a run ID and config URL while awaiting configuration.',
         inputSchema: z.object({
@@ -759,20 +759,20 @@ class TestbotMCPServer {
         }),
       },
       async (args, extra) => {
-        const telemetryStartedAt = this.trackToolInvocation('testbot_test_my_app', args);
+        const telemetryStartedAt = this.trackToolInvocation('healix_test_my_app', args);
         // NOTE: Do NOT JSON.stringify full args here — on Windows stderr is a synchronous
         // pipe write; writing 10-50KB of codebaseContext JSON blocks the event loop (4KB pipe buffer).
-        console.error('[DEBUG] testbot_test_my_app called, projectPath:', args?.projectPath);
-        Logger.mcp('Index', `Tool called: testbot_test_my_app`, { projectPath: args?.projectPath, testType: args?.testType });
+        console.error('[DEBUG] healix_test_my_app called, projectPath:', args?.projectPath);
+        Logger.mcp('Index', `Tool called: healix_test_my_app`, { projectPath: args?.projectPath, testType: args?.testType });
         try {
           await this.validateApiKey();
           const result = await this.handleTestMyApp(args);
-          this.trackToolResult('testbot_test_my_app', telemetryStartedAt);
-          console.error('[DEBUG] testbot_test_my_app returning result');
+          this.trackToolResult('healix_test_my_app', telemetryStartedAt);
+          console.error('[DEBUG] healix_test_my_app returning result');
           return result;
         } catch (error) {
-          this.trackToolResult('testbot_test_my_app', telemetryStartedAt, error);
-          console.error('[DEBUG] testbot_test_my_app error:', error.message);
+          this.trackToolResult('healix_test_my_app', telemetryStartedAt, error);
+          console.error('[DEBUG] healix_test_my_app error:', error.message);
           return {
             content: [
               {
@@ -787,7 +787,7 @@ class TestbotMCPServer {
     );
 
     this.server.registerTool(
-      'testbot_analyze_failures',
+      'healix_analyze_failures',
       {
         description: 'Analyze existing test failures with AI without running new tests',
         inputSchema: z.object({
@@ -797,15 +797,15 @@ class TestbotMCPServer {
         }),
       },
       async (args, extra) => {
-        const telemetryStartedAt = this.trackToolInvocation('testbot_analyze_failures', args);
-        Logger.mcp('Index', `Tool called: testbot_analyze_failures`, { projectPath: args?.projectPath });
+        const telemetryStartedAt = this.trackToolInvocation('healix_analyze_failures', args);
+        Logger.mcp('Index', `Tool called: healix_analyze_failures`, { projectPath: args?.projectPath });
         try {
           await this.validateApiKey();
           const result = await this.handleAnalyzeFailures(args);
-          this.trackToolResult('testbot_analyze_failures', telemetryStartedAt);
+          this.trackToolResult('healix_analyze_failures', telemetryStartedAt);
           return result;
         } catch (error) {
-          this.trackToolResult('testbot_analyze_failures', telemetryStartedAt, error);
+          this.trackToolResult('healix_analyze_failures', telemetryStartedAt, error);
           return {
             content: [
               {
@@ -820,7 +820,7 @@ class TestbotMCPServer {
     );
 
     this.server.registerTool(
-      'testbot_generate_report',
+      'healix_generate_report',
       {
         description: 'Generate a dashboard report from existing test results',
         inputSchema: z.object({
@@ -830,15 +830,15 @@ class TestbotMCPServer {
         }),
       },
       async (args, extra) => {
-        const telemetryStartedAt = this.trackToolInvocation('testbot_generate_report', args);
-        Logger.mcp('Index', `Tool called: testbot_generate_report`, { projectPath: args?.projectPath });
+        const telemetryStartedAt = this.trackToolInvocation('healix_generate_report', args);
+        Logger.mcp('Index', `Tool called: healix_generate_report`, { projectPath: args?.projectPath });
         try {
           await this.validateApiKey();
           const result = await this.handleGenerateReport(args);
-          this.trackToolResult('testbot_generate_report', telemetryStartedAt);
+          this.trackToolResult('healix_generate_report', telemetryStartedAt);
           return result;
         } catch (error) {
-          this.trackToolResult('testbot_generate_report', telemetryStartedAt, error);
+          this.trackToolResult('healix_generate_report', telemetryStartedAt, error);
           return {
             content: [
               {
@@ -854,33 +854,33 @@ class TestbotMCPServer {
   }
 
   /**
-   * Validate the TESTBOT_API_KEY before executing any tool.
+   * Validate the HEALIX_API_KEY before executing any tool.
    * Throws a descriptive error if the key is missing, invalid, expired, or credits are exhausted.
    */
   async validateApiKey() {
-    const apiKey = process.env.TESTBOT_API_KEY;
-    const dashboardUrl = process.env.TESTBOT_DASHBOARD_URL;
+    const apiKey = process.env.HEALIX_API_KEY;
+    const dashboardUrl = process.env.HEALIX_DASHBOARD_URL;
 
     if (!apiKey) {
       const err = new Error(
-        '❌ TestBot API key not configured.\n\n' +
-        'Add TESTBOT_API_KEY to your IDE\'s MCP server configuration:\n\n' +
+        '❌ Healix API key not configured.\n\n' +
+        'Add HEALIX_API_KEY to your IDE\'s MCP server configuration:\n\n' +
         '  Cursor  → Edit ~/.cursor/mcp.json\n' +
         '  Windsurf → Edit ~/.codeium/windsurf/mcp_config.json\n\n' +
-        'In that file, under your testbot-mcp server entry, add an "env" block:\n\n' +
+        'In that file, under your healix-mcp server entry, add an "env" block:\n\n' +
         '  {\n' +
         '    "mcpServers": {\n' +
-        '      "testbot-mcp": {\n' +
+        '      "healix-mcp": {\n' +
         '        "command": "npx",\n' +
-        '        "args": ["-y", "@testbot/mcp"],\n' +
+        '        "args": ["-y", "@healix/mcp"],\n' +
         '        "env": {\n' +
-        '          "TESTBOT_API_KEY": "tb_your_key_here",\n' +
-        '          "TESTBOT_DASHBOARD_URL": "https://your-dashboard-url"\n' +
+        '          "HEALIX_API_KEY": "tb_your_key_here",\n' +
+        '          "HEALIX_DASHBOARD_URL": "https://your-dashboard-url"\n' +
         '        }\n' +
         '      }\n' +
         '    }\n' +
         '  }\n\n' +
-        'Get your API key from the TestBot dashboard → API Keys.\n' +
+        'Get your API key from the Healix dashboard → API Keys.\n' +
         'Then restart your IDE for the changes to take effect.'
       );
       err.code = 'KEY_MISSING';
@@ -918,13 +918,13 @@ class TestbotMCPServer {
     const serverMessage = data.message || 'API key validation failed';
 
     const USER_MESSAGES = {
-      KEY_INVALID: '❌ Invalid TestBot API key.\n\nVerify that TESTBOT_API_KEY in your IDE MCP config matches the key shown in the TestBot dashboard.\n\n  Cursor   → ~/.cursor/mcp.json\n  Windsurf → ~/.codeium/windsurf/mcp_config.json\n',
-      KEY_INACTIVE: '❌ Your TestBot API key has been deactivated.\n\nGenerate a new key in the TestBot dashboard → API Keys, then update the "env" section of your IDE MCP config file.',
-      KEY_EXPIRED: '❌ Your TestBot API key has expired.\n\nGenerate a new key in the TestBot dashboard → API Keys, then update the "env" section of your IDE MCP config file.',
-      NO_CREDITS: '❌ No TestBot credits remaining.\n\nPlease upgrade your plan or purchase more credits in the TestBot dashboard.',
+      KEY_INVALID: '❌ Invalid Healix API key.\n\nVerify that HEALIX_API_KEY in your IDE MCP config matches the key shown in the Healix dashboard.\n\n  Cursor   → ~/.cursor/mcp.json\n  Windsurf → ~/.codeium/windsurf/mcp_config.json\n',
+      KEY_INACTIVE: '❌ Your Healix API key has been deactivated.\n\nGenerate a new key in the Healix dashboard → API Keys, then update the "env" section of your IDE MCP config file.',
+      KEY_EXPIRED: '❌ Your Healix API key has expired.\n\nGenerate a new key in the Healix dashboard → API Keys, then update the "env" section of your IDE MCP config file.',
+      NO_CREDITS: '❌ No Healix credits remaining.\n\nPlease upgrade your plan or purchase more credits in the Healix dashboard.',
     };
 
-    const message = USER_MESSAGES[errorCode] || `❌ TestBot API key rejected: ${serverMessage}`;
+    const message = USER_MESSAGES[errorCode] || `❌ Healix API key rejected: ${serverMessage}`;
     const err = new Error(message);
     err.code = errorCode;
     throw err;
@@ -932,11 +932,11 @@ class TestbotMCPServer {
 
   setupErrorHandling() {
     process.on('uncaughtException', (error) => {
-      Logger.error('Index', `[Testbot MCP Uncaught Exception]`, error);
+      Logger.error('Index', `[Healix MCP Uncaught Exception]`, error);
     });
 
     process.on('unhandledRejection', (reason, promise) => {
-      Logger.error('Index', `[Testbot MCP Unhandled Rejection]`, { reason, promise });
+      Logger.error('Index', `[Healix MCP Unhandled Rejection]`, { reason, promise });
     });
 
     process.on('SIGINT', async () => {
@@ -997,7 +997,7 @@ class TestbotMCPServer {
         },
         prdFiles: prdFiles,
         jiraAvailable: hasJiraConfig,
-        aiProviderAvailable: !!process.env.TESTBOT_API_KEY,
+        aiProviderAvailable: !!process.env.HEALIX_API_KEY,
 
         // Questions for the user to answer
         questions: [
@@ -1297,7 +1297,7 @@ Return the JSON structure above based on what you find in the codebase.
 
     // 3. Generate a unique run ID
     const runId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    const statusDir = path.join(baseConfig.projectPath, 'testbot-reports', '.runs', runId);
+    const statusDir = path.join(baseConfig.projectPath, 'healix-reports', '.runs', runId);
     const statusFile = path.join(statusDir, 'status.json');
     fs.mkdirSync(statusDir, { recursive: true });
 
@@ -1310,7 +1310,7 @@ Return the JSON structure above based on what you find in the codebase.
       aiOnlyEnforced: baseConfig.strictAIGeneration !== false,
     });
     this.emitTelemetry({
-      toolName: 'testbot_test_my_app',
+      toolName: 'healix_test_my_app',
       eventType: 'run_created',
       runId,
       status: 'info',
@@ -1324,7 +1324,7 @@ Return the JSON structure above based on what you find in the codebase.
       },
     });
 
-    const dashboardUrl = process.env.TESTBOT_DASHBOARD_URL || 'http://localhost:3000';
+    const dashboardUrl = process.env.HEALIX_DASHBOARD_URL || 'http://localhost:3000';
     const headless = this.resolveHeadlessPreference(params);
     const autoOpenBrowser = this.resolveAutoOpenBrowserPreference(params, headless);
     let configUrl = null;
@@ -1365,7 +1365,7 @@ Return the JSON structure above based on what you find in the codebase.
           aiOnlyEnforced: baseConfig.strictAIGeneration !== false,
         });
         this.emitTelemetry({
-          toolName: 'testbot_test_my_app',
+          toolName: 'healix_test_my_app',
           eventType: 'config_ui',
           runId,
           phase: 'awaiting_config_ui',
@@ -1373,7 +1373,7 @@ Return the JSON structure above based on what you find in the codebase.
           success: true,
           message: 'Configuration UI ready and awaiting submission',
         });
-        process.stderr.write(`[TESTBOT] Config form: ${configUrl} — open and submit to start testing.\n`);
+        process.stderr.write(`[HEALIX] Config form: ${configUrl} — open and submit to start testing.\n`);
       } catch (error) {
         this.writeRunStatus(statusFile, {
           runId,
@@ -1439,7 +1439,7 @@ Return the JSON structure above based on what you find in the codebase.
       };
     }
 
-    const analyzer = AIAnalyzer.create('saas', process.env.TESTBOT_API_KEY);
+    const analyzer = AIAnalyzer.create('saas', process.env.HEALIX_API_KEY);
     const analysis = await analyzer.analyzeFailures(testResults.failures);
 
     return {
@@ -1478,8 +1478,8 @@ Return the JSON structure above based on what you find in the codebase.
       testResults,
       aiAnalysis: null,
       jiraData: null,
-      api_key: process.env.TESTBOT_API_KEY,
-      dashboard_url: process.env.TESTBOT_DASHBOARD_URL || 'http://localhost:3000',
+      api_key: process.env.HEALIX_API_KEY,
+      dashboard_url: process.env.HEALIX_DASHBOARD_URL || 'http://localhost:3000',
     });
 
     let dashboardUrl = null;
@@ -1507,14 +1507,14 @@ Return the JSON structure above based on what you find in the codebase.
   async start() {
     const transport = new StdioServerTransport();
     await this.server.connect(transport);
-    Logger.info('Index', 'Testbot MCP server started');
+    Logger.info('Index', 'Healix MCP server started');
   }
 }
 
 // Start the server
 if (require.main === module) {
-  const server = new TestbotMCPServer();
+  const server = new HealixMCPServer();
   server.start().catch(console.error);
 }
 
-module.exports = TestbotMCPServer;
+module.exports = HealixMCPServer;

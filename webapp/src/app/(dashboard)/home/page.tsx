@@ -135,7 +135,7 @@ export default function HomePage() {
         </div>
 
         <div className="relative p-8">
-          <h2 className="text-[#F0F6FF] font-bold text-2xl mb-2">Get Started with TestBot MCP</h2>
+          <h2 className="text-[#F0F6FF] font-bold text-2xl mb-2">Get Started with Healix MCP</h2>
           <p className="text-[#8BA4C8] text-sm mb-6 max-w-lg">
             Start your automated testing for free. Connect your IDE and generate comprehensive tests with a single command.
           </p>

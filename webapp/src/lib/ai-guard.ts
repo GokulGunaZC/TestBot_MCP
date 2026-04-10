@@ -51,7 +51,7 @@ export async function recordAiCall(params: {
     await db.insert(mcpTelemetryEvents).values({
       userId: params.userId,
       apiKeyId: params.apiKeyId,
-      source: 'testbot-webapp',
+      source: 'healix-webapp',
       toolName: params.endpoint,
       eventType: 'ai_call',
       status: 'info',

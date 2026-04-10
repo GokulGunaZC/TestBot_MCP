@@ -40,7 +40,7 @@ export default function Navbar() {
             </svg>
           </div>
           <span className="text-white font-bold text-lg font-mono tracking-tight">
-            TESTBOT<span className="text-[#a0a0a0]">_MCP</span>
+            HEALIX<span className="text-[#a0a0a0]">_MCP</span>
           </span>
         </a>
 

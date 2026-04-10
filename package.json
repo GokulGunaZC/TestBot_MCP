@@ -1,7 +1,7 @@
 {
-  "name": "testbot-mcp-workspace",
+  "name": "healix-mcp-workspace",
   "version": "1.0.0",
-  "description": "Testbot MCP",
+  "description": "Healix MCP",
   "main": "index.js",
   "scripts": {
     "dev:webapp": "npm run dev -w webapp",
@@ -18,7 +18,7 @@
     "url": "git+https://github.com/krishsharma1008/TestBot_MCP.git"
   },
   "keywords": [],
-  "author": "",
+  "author": "Zapminds",
   "license": "MIT",
   "devDependencies": {
     "@playwright/mcp": "^0.0.61",

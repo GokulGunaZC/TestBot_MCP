@@ -16,9 +16,9 @@ const spaceMono = Space_Mono({
 })
 
 export const metadata: Metadata = {
-  title: 'TestBot MCP',
+  title: 'Healix MCP',
   description:
-    'AI-powered test automation platform. Run, analyze, and manage your tests with TestBot MCP.',
+    'AI-powered test automation platform. Run, analyze, and manage your tests with Healix MCP.',
   keywords: ['testing', 'automation', 'AI', 'MCP', 'QA'],
 }
 

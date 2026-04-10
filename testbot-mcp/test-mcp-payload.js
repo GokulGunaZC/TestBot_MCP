@@ -26,7 +26,7 @@ setTimeout(() => {
     id: 2,
     method: "tools/call",
     params: {
-      name: "testbot_test_my_app",
+      name: "healix_test_my_app",
       arguments: {
         projectPath: "c:\\Users\\ShreyesPrabhuDesai\\PersProjects\\thea"
       }
