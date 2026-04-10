@@ -6,7 +6,7 @@ const STEPS = [
   {
     num: '01',
     title: 'Auto-Detect',
-    desc: 'TestBot scans your package.json, playwright.config.js, and environment to detect framework, port, start command, and base URL. Zero config needed.',
+    desc: 'Healix scans your package.json, playwright.config.js, and environment to detect framework, port, start command, and base URL. Zero config needed.',
     tags: ['React', 'Next.js', 'Express', 'Django', '+more'],
     icon: (
       <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
@@ -17,7 +17,7 @@ const STEPS = [
   {
     num: '02',
     title: 'AI Test Generation',
-    desc: 'No tests? No problem. TestBot analyzes your codebase — pages, API endpoints, forms, auth flows — and generates comprehensive Playwright tests using OpenAI.',
+    desc: 'No tests? No problem. Healix analyzes your codebase — pages, API endpoints, forms, auth flows — and generates comprehensive Playwright tests using OpenAI.',
     tags: ['OpenAI GPT-4', 'Playwright', 'Jira Stories'],
     icon: (
       <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
@@ -67,7 +67,7 @@ export default function HowItWorks() {
             <span className="text-[#a0a0a0]">Fully autonomous testing.</span>
           </h2>
           <p className="text-[#a0a0a0] text-base max-w-2xl mx-auto leading-relaxed font-mono">
-            TestBot MCP orchestrates your entire testing pipeline from a single natural language prompt — no setup scripts, no YAML configs, no manual effort.
+            Healix MCP orchestrates your entire testing pipeline from a single natural language prompt — no setup scripts, no YAML configs, no manual effort.
           </p>
         </motion.div>
 

@@ -160,7 +160,7 @@ export default function Sidebar({ creditsRemaining = 130, creditsTotal = 500, pl
             </svg>
           </div>
           <span className="text-white font-black text-sm font-mono tracking-tight uppercase">
-            TESTBOT_MCP
+            HEALIX_MCP
           </span>
         </Link>
       </div>

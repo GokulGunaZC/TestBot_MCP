@@ -83,7 +83,7 @@ export default function DashboardPreview() {
               {/* Header row */}
               <div className="flex items-center justify-between mb-6">
                 <div>
-                  <h3 className="text-white font-black text-base uppercase tracking-wide font-mono">TestBot MCP — Test Results</h3>
+                  <h3 className="text-white font-black text-base uppercase tracking-wide font-mono">Healix MCP — Test Results</h3>
                   <span className="text-[#505050] text-xs font-mono">Run 5 mins ago</span>
                 </div>
                 <span className="y2k-badge">

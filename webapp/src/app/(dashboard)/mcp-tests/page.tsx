@@ -131,9 +131,9 @@ export default function McpTestsPage() {
           </svg>
         </div>
         <div className="relative p-8">
-          <h2 className="text-[#F0F6FF] font-bold text-xl mb-2">TestBot MCP Server</h2>
+          <h2 className="text-[#F0F6FF] font-bold text-xl mb-2">Healix MCP Server</h2>
           <p className="text-[#8BA4C8] text-sm mb-5 max-w-lg">
-            Connect TestBot to your AI code editor via the Model Context Protocol. Generate, run, and analyze tests with a single natural language command.
+            Connect Healix to your AI code editor via the Model Context Protocol. Generate, run, and analyze tests with a single natural language command.
           </p>
           <div className="flex gap-3">
             <button
@@ -164,7 +164,7 @@ export default function McpTestsPage() {
       >
         <span className="text-xl flex-shrink-0">💡</span>
         <p className="text-[#8BA4C8] text-sm leading-relaxed">
-          Simply type <span className="text-[#F0F6FF] font-semibold italic">&quot;Hey, test this project with TestBot MCP&quot;</span> in your AI code editor and we&apos;ll take care of the rest.
+          Simply type <span className="text-[#F0F6FF] font-semibold italic">&quot;Hey, test this project with Healix MCP&quot;</span> in your AI code editor and we&apos;ll take care of the rest.
         </p>
       </motion.div>
 

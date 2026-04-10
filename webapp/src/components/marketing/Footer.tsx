@@ -33,7 +33,7 @@ export default function Footer() {
                 </svg>
               </div>
               <span className="text-white font-black text-base font-mono tracking-tight uppercase">
-                TestBot_MCP
+                Healix_MCP
               </span>
             </a>
             <p className="text-[#505050] text-xs leading-relaxed mb-5 font-mono">
@@ -105,7 +105,7 @@ export default function Footer() {
         {/* Bottom bar */}
         <div className="flex flex-col md:flex-row items-center justify-between gap-4 pt-8 border-t-2 border-[#333]">
           <p className="text-[#505050] text-xs font-mono uppercase tracking-widest">
-            &copy; 2025 TestBot MCP — Built for AI-native developers
+            &copy; 2025 Healix MCP — Built for AI-native developers
           </p>
           <div className="flex gap-6">
             <a href="#" className="text-[#505050] hover:text-white text-xs font-mono uppercase tracking-widest transition-colors">Privacy</a>

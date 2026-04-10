@@ -41,8 +41,8 @@ export default function CreateTestsPage() {
               Create Tests with Your AI Code Editor
             </h2>
             <p className="text-[#8BA4C8] mb-6 leading-relaxed">
-              TestBot MCP integrates directly into your IDE. Simply type a natural language command
-              and TestBot will auto-generate, run, and analyze tests for your project.
+              Healix MCP integrates directly into your IDE. Simply type a natural language command
+              and Healix will auto-generate, run, and analyze tests for your project.
             </p>
 
             <div className="backdrop-blur-md bg-white/[0.04] border border-white/10 rounded-xl p-4 mb-6">
@@ -51,7 +51,7 @@ export default function CreateTestsPage() {
                 <span className="text-sm text-[#8BA4C8]">Type this in your AI code editor:</span>
               </div>
               <p className="font-mono text-[#F0F6FF] text-sm">
-                &ldquo;Hey, help me to test this project with TestBot MCP.&rdquo;
+                &ldquo;Hey, help me to test this project with Healix MCP.&rdquo;
               </p>
             </div>
 
@@ -90,7 +90,7 @@ export default function CreateTestsPage() {
         className="mt-8 grid grid-cols-1 md:grid-cols-3 gap-4"
       >
         {[
-          { step: '1', title: 'Install MCP Server', desc: 'Add TestBot MCP to your IDE configuration' },
+          { step: '1', title: 'Install MCP Server', desc: 'Add Healix MCP to your IDE configuration' },
           { step: '2', title: 'Add API Key', desc: 'Generate and configure your API key' },
           { step: '3', title: 'Start Testing', desc: 'Type a command and let AI generate tests' },
         ].map((item, i) => (
