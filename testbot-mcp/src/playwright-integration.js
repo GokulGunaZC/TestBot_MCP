@@ -18,10 +18,10 @@ class PlaywrightIntegration {
       startCommand: config.startCommand,
       serverStartTimeoutMs: Number.isFinite(Number(config.serverStartTimeoutMs))
         ? Number(config.serverStartTimeoutMs)
-        : Number(process.env.TESTBOT_SERVER_START_TIMEOUT_MS || 90000),
+        : Number(process.env.HEALIX_SERVER_START_TIMEOUT_MS || 90000),
       serverHealthCheckIntervalMs: Number.isFinite(Number(config.serverHealthCheckIntervalMs))
         ? Number(config.serverHealthCheckIntervalMs)
-        : Number(process.env.TESTBOT_SERVER_HEALTHCHECK_INTERVAL_MS || 1000),
+        : Number(process.env.HEALIX_SERVER_HEALTHCHECK_INTERVAL_MS || 1000),
       testType: config.testType || 'both',
       timeout: config.timeout || 300000,
       playwrightRetries: Number.isFinite(Number(config.playwrightRetries))
@@ -1423,7 +1423,7 @@ test.describe('${this.sanitizeString(scenario.name)}', () => {
       // even when the process buffers stdout/stderr (common on Windows non-TTY).
       let serverLogStream = null;
       try {
-        const logsDir = path.join(this.config.projectPath, 'testbot-reports', 'logs');
+        const logsDir = path.join(this.config.projectPath, 'healix-reports', 'logs');
         fs.mkdirSync(logsDir, { recursive: true });
         const logFile = path.join(logsDir, `server-startup-${Date.now()}.log`);
         serverLogStream = fs.createWriteStream(logFile, { flags: 'a' });
@@ -1439,7 +1439,7 @@ test.describe('${this.sanitizeString(scenario.name)}', () => {
         stdio: ['ignore', 'pipe', 'pipe'],
       });
 
-      // Write PID so the next TestBot run can kill this server if it is left
+      // Write PID so the next Healix run can kill this server if it is left
       // running (e.g. after a crash, budget timeout, or Windsurf closure).
       if (this.config.serverPidFile && this.serverProcess.pid) {
         try { fs.writeFileSync(this.config.serverPidFile, String(this.serverProcess.pid)); } catch { /* non-fatal */ }

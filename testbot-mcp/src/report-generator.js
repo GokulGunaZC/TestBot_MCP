@@ -210,7 +210,7 @@ class ReportGenerator {
     this.ensureDir(artifactsDir);
 
     const copiedMap = new Map();
-    const maxBytes = Number(process.env.TESTBOT_MAX_ARTIFACT_BYTES || 50 * 1024 * 1024);
+    const maxBytes = Number(process.env.HEALIX_MAX_ARTIFACT_BYTES || 50 * 1024 * 1024);
     const context = {
       artifactsDir,
       reportsDir,
@@ -346,7 +346,7 @@ class ReportGenerator {
             confidence: analysis.confidence,
             affectedFiles: this.stripAnsiAndNormalize(analysis.affectedFiles),
             testingRecommendations: this.stripAnsiAndNormalize(analysis.testingRecommendations),
-            aiProvider: 'testbot',
+            aiProvider: 'healix',
             model: analysis.model || 'sarvam-m',
           };
         }
@@ -432,7 +432,7 @@ class ReportGenerator {
     dashboard_url,
   }) {
     const timestamp = new Date().toISOString();
-    const reportsDir = path.join(projectPath, 'testbot-reports');
+    const reportsDir = path.join(projectPath, 'healix-reports');
     this.ensureDir(reportsDir);
 
     if (!testResults) {
@@ -463,7 +463,7 @@ class ReportGenerator {
         projectName: this.stripAnsiAndNormalize(projectName || path.basename(projectPath)),
         projectPath: this.normalizePathForReport(projectPath),
         version: '1.0.0',
-        generator: 'testbot-mcp',
+        generator: 'healix-mcp',
         runId: this.stripAnsiAndNormalize(runId || null),
         generationMeta: generationMeta || null,
         fallbackUsed: Boolean(fallbackUsed),

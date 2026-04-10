@@ -4,13 +4,13 @@ const Logger = require('../logger');
 
 class SaaSClient {
   constructor({ apiKey, dashboardUrl } = {}) {
-    this.apiKey = apiKey || process.env.TESTBOT_API_KEY;
-    this.dashboardUrl = (dashboardUrl || process.env.TESTBOT_DASHBOARD_URL || 'http://localhost:3000').replace(/\/+$/, '');
+    this.apiKey = apiKey || process.env.HEALIX_API_KEY;
+    this.dashboardUrl = (dashboardUrl || process.env.HEALIX_DASHBOARD_URL || 'http://localhost:3000').replace(/\/+$/, '');
     this.timeout = 120_000; // 2 min timeout
   }
 
   async analyzeFailures(failures) {
-    if (!this.apiKey) throw new Error('TESTBOT_API_KEY is required for SaaS failure analysis');
+    if (!this.apiKey) throw new Error('HEALIX_API_KEY is required for SaaS failure analysis');
     if (!Array.isArray(failures) || failures.length === 0) return [];
 
     const fetchFn = global.fetch || require('node-fetch');

@@ -14,7 +14,7 @@ class AgentContextRequester {
   constructor(config = {}) {
     this.config = {
       projectPath: config.projectPath || process.cwd(),
-      promptDir: config.promptDir || '.testbot',
+      promptDir: config.promptDir || '.healix',
       responseTimeout: config.responseTimeout || 60000, // 1 minute
       ...config,
     };
@@ -28,7 +28,7 @@ class AgentContextRequester {
     const projectName = autoContext.projectStructure?.name || 
       path.basename(this.config.projectPath);
     
-    const prompt = `# TestBot Context Request
+    const prompt = `# Healix Context Request
 
 I'm generating E2E Playwright tests for the "${projectName}" project.
 

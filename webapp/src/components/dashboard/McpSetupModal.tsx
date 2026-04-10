@@ -15,12 +15,12 @@ function getMcpConfig(ide: string) {
   const dashboardUrl = typeof window !== 'undefined' ? window.location.origin : 'https://your-app.vercel.app';
   return `{
   "mcpServers": {
-    "testbot-mcp": {
+    "healix-mcp": {
       "command": "npx",
-      "args": ["-y", "@testbot/mcp@latest"],
+      "args": ["-y", "@healix/mcp@latest"],
       "env": {
-        "TESTBOT_API_KEY": "<your-api-key>",
-        "TESTBOT_DASHBOARD_URL": "${dashboardUrl}"
+        "HEALIX_API_KEY": "<your-api-key>",
+        "HEALIX_DASHBOARD_URL": "${dashboardUrl}"
       }
     }
   }

@@ -58,8 +58,8 @@ function resolveBoolean(value, fallback) {
 
 class ConfigUILauncher {
   constructor(config = {}) {
-    const envHeadless = process.env.TESTBOT_HEADLESS;
-    const envAutoOpen = process.env.TESTBOT_AUTO_OPEN_BROWSER;
+    const envHeadless = process.env.HEALIX_HEADLESS;
+    const envAutoOpen = process.env.HEALIX_AUTO_OPEN_BROWSER;
     this.config = {
       ...config,
       port: config.port || 54321,

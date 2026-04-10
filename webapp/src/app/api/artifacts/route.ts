@@ -8,7 +8,7 @@ import path from 'path'
 
 /**
  * Search for artifact file in local filesystem
- * Artifacts are stored in: {projectPath}/testbot-reports/artifacts/
+ * Artifacts are stored in: {projectPath}/healix-reports/artifacts/
  */
 function searchLocalArtifact(fileName: string, projectPath: string | null): string | null {
   if (!projectPath) {
@@ -16,8 +16,8 @@ function searchLocalArtifact(fileName: string, projectPath: string | null): stri
     return null
   }
 
-  // Artifacts are copied to testbot-reports/artifacts/ during report generation
-  const artifactsBaseDir = path.join(projectPath, 'testbot-reports', 'artifacts')
+  // Artifacts are copied to healix-reports/artifacts/ during report generation
+  const artifactsBaseDir = path.join(projectPath, 'healix-reports', 'artifacts')
 
   console.log(`[artifacts] Searching for ${fileName} in ${artifactsBaseDir}...`)
 

@@ -31,8 +31,8 @@ class ArtifactUploader {
   constructor(config = {}) {
     this.config = {
       projectPath: config.projectPath || process.cwd(),
-      dashboardUrl: config.dashboardUrl || process.env.TESTBOT_DASHBOARD_URL || 'http://localhost:3000',
-      apiKey: config.apiKey || process.env.TESTBOT_API_KEY,
+      dashboardUrl: config.dashboardUrl || process.env.HEALIX_DASHBOARD_URL || 'http://localhost:3000',
+      apiKey: config.apiKey || process.env.HEALIX_API_KEY,
       ...config,
     };
     

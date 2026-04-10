@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>TestBot Configuration</title>
+    <title>Healix Configuration</title>
     <!-- Google Fonts: Space Grotesk + Space Mono -->
     <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700;900&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
     <script src="https://cdn.tailwindcss.com"></script>
@@ -192,6 +192,21 @@
             margin-bottom: 8px;
         }
 
+        .section-badge-required {
+            display: inline-flex;
+            align-items: center;
+            background: #000000;
+            border: 2px solid #ffffff;
+            color: #f57474;
+            font-family: var(--font-mono);
+            font-size: 10px;
+            font-weight: 700;
+            letter-spacing: 0.12em;
+            text-transform: uppercase;
+            padding: 2px 10px;
+            margin-bottom: 8px;
+        }
+
         /* ── URL preview block ── */
         .url-preview {
             background: #1a1a1a;
@@ -297,7 +312,7 @@
         <!-- Header -->
         <div class="flex items-center gap-4 mb-2">
             <div style="display:inline-flex;align-items:center;background:#000000;border:2px solid #ffffff;color:#ffffff;font-family:'Space Mono',monospace;font-size:11px;font-weight:700;letter-spacing:0.12em;text-transform:uppercase;padding:4px 12px;box-shadow:3px 3px 0 #ffffff;">
-                &#x2713; TESTBOT_MCP
+                &#x2713; HEALIX_MCP
             </div>
         </div>
 
@@ -308,7 +323,7 @@
             
             <!-- Section 1 -->
             <div>
-                <span class="section-badge">01 — Required</span>
+                <span class="section-badge-required">01 — Required</span>
                 <h3 style="font-size:1.1rem;font-weight:700;margin:4px 0 4px;color:#ffffff;">Testing Types</h3>
                 <p style="font-size:13px;color:#a0a0a0;margin-bottom:14px;">Select your testing types.</p>
                 <div class="brutal-card p-6">
@@ -328,7 +343,7 @@
 
             <!-- Section 2 -->
             <div>
-                <span class="section-badge">02 — Required</span>
+                <span class="section-badge-required">02 — Required</span>
                 <h3 style="font-size:1.1rem;font-weight:700;margin:4px 0 4px;color:#ffffff;">Execution Settings</h3>
                 <p style="font-size:13px;color:#a0a0a0;margin-bottom:14px;">Choose test generation and run behavior before launching the pipeline.</p>
                 <div class="brutal-card p-6">
@@ -336,7 +351,7 @@
                         <div class="field-label" style="padding-top:11px;">Start Command</div>
                         <div style="flex:1;">
                             <input type="text" id="startCommand" class="input-glass" placeholder="npm run dev">
-                            <p style="font-size:12px;color:#505050;margin-top:8px;">Command used by TestBot to start your app server if needed.</p>
+                            <p style="font-size:12px;color:#505050;margin-top:8px;">Command used by Healix to start your app server if needed.</p>
                         </div>
                     </div>
                     <div class="field-row flex items-center gap-4" style="margin-top:20px;">
@@ -346,7 +361,7 @@
                                 <div class="toggle-btn active" data-value="true">Yes</div>
                                 <div class="toggle-btn" data-value="false">No</div>
                             </div>
-                            <p style="font-size:12px;color:#505050;margin-top:8px;">When disabled, TestBot runs existing tests only.</p>
+                            <p style="font-size:12px;color:#505050;margin-top:8px;">When disabled, Healix runs existing tests only.</p>
                         </div>
                     </div>
                 </div>
@@ -366,7 +381,7 @@
             </div>
 
             <div>
-                <span class="section-badge">04 — Required</span>
+                <span class="section-badge-required">04 — Required</span>
                 <h3 style="font-size:1.1rem;font-weight:700;margin:4px 0 4px;color:#ffffff;">Local Server Port</h3>
                 <p style="font-size:13px;color:#a0a0a0;margin-bottom:14px;">Port where your local server is running e.g. 3000 in localhost:3000. If there is a specific path you want to test, enter it in the Path field.</p>
                 <div class="brutal-card p-6">
@@ -387,7 +402,7 @@
                         <div id="baseUrlPreview">http://localhost:5173/</div>
                     </div>
                     <div class="info-banner" style="margin-top:10px;">
-                        <div style="font-size:12px;font-family:'Space Mono',monospace;color:#a0a0a0;">// dev servers may crash under concurrent load &mdash; frontend tests capped at 15</div>
+                        <!-- <div style="font-size:12px;font-family:'Space Mono',monospace;color:#a0a0a0;">// dev servers may crash under concurrent load &mdash; frontend tests capped at 15</div> -->
                     </div>
                 </div>
             </div>
@@ -784,7 +799,7 @@
 
                 successOverlay.classList.remove('hidden');
             } catch (error) {
-                showError(error.message || 'Could not send configuration to TestBot server.');
+                showError(error.message || 'Could not send configuration to Healix server.');
                 submitBtn.disabled = false;
                 submitBtn.textContent = 'Run Tests →';
             }

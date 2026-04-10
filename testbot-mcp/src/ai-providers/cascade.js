@@ -119,7 +119,7 @@ class CascadeClient {
    */
   async createAnalysisRequest(prompt, failure) {
     // Save request for Cascade to process
-    const tempDir = path.join(process.cwd(), '.testbot-cascade');
+    const tempDir = path.join(process.cwd(), '.healix-cascade');
     if (!fs.existsSync(tempDir)) {
       fs.mkdirSync(tempDir, { recursive: true });
     }
