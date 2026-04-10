@@ -16,8 +16,8 @@ export default function Footer() {
 
   const resourceLinks = [
     // { href: 'https://github.com/krishsharma1008/TestBot_MCP', label: 'GitHub', external: true },
-    { href: 'mailto:zapminds@zapcg.com', label: 'Report a Bug', external: true },
-    { href: 'mailto:zapminds@zapcg.com', label: 'Contact' },
+    { href: 'mailto:krish.sharma@zapcg.com', label: 'Report a Bug', external: true },
+    { href: 'mailto:krish.sharma@zapcg.com', label: 'Contact' },
   ];
 
   return (
