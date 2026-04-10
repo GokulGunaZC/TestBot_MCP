@@ -107,7 +107,7 @@ const NAV_SECTIONS: NavSection[] = [
       },
       {
         href: '/plan-billing',
-        label: 'Plan & Billing',
+        label: 'Usage & Billing',
         icon: (
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
             <rect x="1" y="4" width="22" height="16" rx="0" ry="0" />

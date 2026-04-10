@@ -17,6 +17,7 @@ const PLANS = [
     credits: 500,
     features: ['500 test credits/month', 'MCP integration', 'Basic analytics', 'Community support'],
     cta: 'Current Plan',
+    ctaHref: '#',
     highlighted: false,
   },
   {
@@ -34,6 +35,7 @@ const PLANS = [
       'Email support',
     ],
     cta: 'Upgrade to Pro',
+    ctaHref: 'mailto:Swathi.Dharshna@zapcg.com',
     highlighted: true,
   },
   {
@@ -51,6 +53,7 @@ const PLANS = [
       '24/7 priority support',
     ],
     cta: 'Contact Sales',
+    ctaHref: 'mailto:Swathi.Dharshna@zapcg.com',
     highlighted: false,
   },
 ] as const
@@ -65,6 +68,7 @@ function CreditsMeter({ remaining, total }: { remaining: number; total: number }
         <span className="text-text-secondary">Credits remaining</span>
         <span className="text-text-primary font-semibold">
           {remaining.toLocaleString()} / {total.toLocaleString()}
+          <span className="text-text-muted text-xs mt-1.5"> credits left</span>
         </span>
       </div>
       <div className="h-2.5 rounded-full bg-white/8 overflow-hidden">
@@ -134,11 +138,11 @@ export default function PlanBillingPage() {
                     </Badge>
                   </div>
                 </div>
-                {currentPlan !== 'enterprise' && (
+                {/* {currentPlan !== 'enterprise' && (
                   <Button variant="secondary" size="sm">
                     Manage Billing
                   </Button>
-                )}
+                )} */}
               </div>
               <CreditsMeter
                 remaining={profile?.credits_remaining ?? 0}
@@ -189,15 +193,16 @@ export default function PlanBillingPage() {
                     </li>
                   ))}
                 </ul>
-
-                <Button
-                  variant={isCurrent ? 'secondary' : plan.highlighted ? 'primary' : 'secondary'}
-                  size="md"
-                  className="w-full"
-                  disabled={isCurrent}
-                >
-                  {isCurrent ? 'Current Plan' : plan.cta}
-                </Button>
+                <a href={plan.ctaHref}>
+                  <Button
+                    variant={isCurrent ? 'secondary' : plan.highlighted ? 'primary' : 'secondary'}
+                    size="md"
+                    className="w-full"
+                    disabled={isCurrent}
+                  >
+                    {isCurrent ? 'Current Plan' : plan.cta}
+                  </Button>
+                </a>
               </Card>
             )
           })}
