@@ -217,8 +217,8 @@ function useCountUp(target: number, duration = 1200, delay = 0) {
 
 // ─── Sub-components ──────────────────────────────────────────────────────────
 
-function KpiCard({ label, value, sub, color, delay }: {
-  label: string; value: number; sub?: string; color: string; delay: number;
+function KpiCard({ label, value, sub, color, delay, loading }: {
+  label: string; value: number; sub?: string; color: string; delay: number; loading?: boolean;
 }) {
   const displayed = useCountUp(value, 1000, delay);
   return (
@@ -229,7 +229,18 @@ function KpiCard({ label, value, sub, color, delay }: {
       className="glass-card rounded-2xl p-5 flex flex-col gap-1"
     >
       <span className="text-[#4A6280] text-xs font-semibold uppercase tracking-wider">{label}</span>
-      <span className={`text-3xl font-bold ${color}`}>{displayed}{sub}</span>
+      {loading ? (
+        <div className="relative mt-1 h-9 w-14 rounded-lg bg-white/5 overflow-hidden">
+          <motion.div
+            className="absolute inset-y-0 w-1/2 rounded-lg"
+            style={{ background: 'linear-gradient(90deg, transparent, rgba(255,255,255,0.07), transparent)' }}
+            animate={{ left: ['-50%', '150%'] }}
+            transition={{ duration: 1.4, repeat: Infinity, ease: 'linear', repeatDelay: 0.4 }}
+          />
+        </div>
+      ) : (
+        <span className={`text-3xl font-bold ${color}`}>{displayed}{sub}</span>
+      )}
     </motion.div>
   );
 }
@@ -637,6 +648,15 @@ function LiveTimeline({ events, liveFiles, pipelineEnded }: {
   liveFiles: string[];
   pipelineEnded: boolean;
 }) {
+  const [now, setNow] = useState(() => Date.now());
+
+  // Tick every second while the pipeline is still running so the elapsed timer updates
+  useEffect(() => {
+    if (pipelineEnded) return;
+    const interval = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(interval);
+  }, [pipelineEnded]);
+
   const displayEvents = events.filter(e =>
     e.eventType !== 'test_results' &&
     e.eventType !== 'test_file_generated' &&
@@ -656,13 +676,35 @@ function LiveTimeline({ events, liveFiles, pipelineEnded }: {
         const showFiles = liveFiles.length > 0 && (hasTestsGenEvent ? isTestsGen : isGeneratingPhase);
         const effectiveIsLast = isLast && !isTerminal && !pipelineEnded;
         const time = ev.occurredAt ? new Date(ev.occurredAt).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true }) : '';
+
+        // Live elapsed timer for the currently active step
+        let elapsedLabel = '';
+        if (effectiveIsLast && ev.occurredAt) {
+          const elapsedSec = Math.max(0, Math.floor((now - new Date(ev.occurredAt).getTime()) / 1000));
+          if (elapsedSec >= 2) {
+            elapsedLabel = elapsedSec < 60
+              ? `${elapsedSec}s`
+              : `${Math.floor(elapsedSec / 60)}m ${elapsedSec % 60}s`;
+          }
+        }
+
         return (
           <div key={ev.id} className="flex gap-3 group">
             <div className="flex flex-col items-center">
               <PhaseIcon phase={isTerminal ? ev.phase : (effectiveIsLast ? ev.phase : 'done')} isLast={effectiveIsLast} />
-              {i < displayEvents.length - 1 && (
+              {i < displayEvents.length - 1 ? (
                 <div className="w-px h-full min-h-[16px] bg-white/10 mt-0.5" />
-              )}
+              ) : effectiveIsLast ? (
+                // Animated flowing connector below the active step to signal work in progress
+                <div className="w-px flex-1 min-h-[12px] mt-0.5 relative overflow-hidden bg-blue-400/10">
+                  <motion.div
+                    className="absolute left-0 right-0 h-8"
+                    style={{ background: 'linear-gradient(to bottom, rgba(96,165,250,0.35), transparent)' }}
+                    animate={{ y: ['-100%', '200%'] }}
+                    transition={{ duration: 1.4, repeat: Infinity, ease: 'linear' }}
+                  />
+                </div>
+              ) : null}
             </div>
             <div className="pb-3 flex-1 min-w-0">
               <div className="flex items-center gap-2 flex-wrap">
@@ -670,6 +712,9 @@ function LiveTimeline({ events, liveFiles, pipelineEnded }: {
                 {time && <span className="text-[#4A6280] text-[10px] font-mono">{time}</span>}
                 {ev.durationMs != null && ev.durationMs > 0 && (
                   <span className="text-[#4A6280] text-[10px] font-mono">{(ev.durationMs / 1000).toFixed(1)}s</span>
+                )}
+                {elapsedLabel && (
+                  <span className="text-blue-400/60 text-[10px] font-mono tabular-nums">→ {elapsedLabel}</span>
                 )}
               </div>
               {ev.message && (
@@ -696,6 +741,17 @@ function LiveTimeline({ events, liveFiles, pipelineEnded }: {
                 </div>
               )}
 
+              {/* Indeterminate shimmer progress bar — only on the active (last, non-terminal) step */}
+              {effectiveIsLast && (
+                <div className="relative mt-2 h-0.5 rounded-full overflow-hidden bg-blue-500/10">
+                  <motion.div
+                    className="absolute inset-y-0 rounded-full"
+                    style={{ width: '45%', background: 'linear-gradient(90deg, transparent, rgba(96,165,250,0.55), transparent)' }}
+                    animate={{ left: ['-45%', '100%'] }}
+                    transition={{ duration: 1.6, repeat: Infinity, ease: 'linear', repeatDelay: 0.15 }}
+                  />
+                </div>
+              )}
             </div>
           </div>
         );
@@ -726,13 +782,15 @@ export default function TestRunDetailPage() {
   const [pipelineEnded, setPipelineEnded] = useState(false);
   const [testResultsOpen, setTestResultsOpen] = useState(true);
   const [aiAnalysisOpen, setAiAnalysisOpen] = useState(true);
-  
+
   const testResultsHeaderRef = useRef<HTMLDivElement>(null);
   const aiAnalysisHeaderRef = useRef<HTMLButtonElement>(null);
+  const evtSourceRef = useRef<EventSource | null>(null);
 
   const isLiveOrRunning = useCallback((run: TestRun | null) => {
     if (!run) return false;
-    if (isLiveDetailId) return true;
+    // For real ingested runs trust their status directly.
+    // For synthetic live runs (is_live=true) keep polling until the real run appears.
     const status = String(run.status || '').toLowerCase();
     const phase = String(run.current_phase || '').toLowerCase();
     if (run.is_live) return true;
@@ -751,12 +809,16 @@ export default function TestRunDetailPage() {
       'reporting',
       'tests_complete',
     ].includes(phase);
-  }, [isLiveDetailId]);
+  }, []);
 
   useEffect(() => {
     if (!id || !isLiveDetailId) return;
     const evtSource = new EventSource(`/api/test-runs/${id}/stream`);
+    evtSourceRef.current = evtSource;
+    let retryCount = 0;
+
     evtSource.onmessage = (e: MessageEvent) => {
+      retryCount = 0;
       try {
         const data = JSON.parse(e.data) as LiveEvent & { type: string };
         if (data.type === 'event') {
@@ -778,9 +840,10 @@ export default function TestRunDetailPage() {
           }
         } else if (data.type === 'done') {
           evtSource.close();
+          evtSourceRef.current = null;
           setActivePolling(false);
           setPipelineEnded(true);
-          // Final fetch to pick up completed state & report
+          // Final fetch to pick up completed state & report (Fix 1 returns real ingested run)
           fetch(`/api/test-runs/${id}`, { cache: 'no-store' })
             .then(res => res.ok ? res.json() : null)
             .then(json => { if (json?.data) setTestRun(json.data); })
@@ -788,8 +851,19 @@ export default function TestRunDetailPage() {
         }
       } catch { /* ignore malformed events */ }
     };
-    evtSource.onerror = () => { evtSource.close(); };
-    return () => { evtSource.close(); };
+    evtSource.onerror = () => {
+      retryCount++;
+      if (retryCount > 10) {
+        evtSource.close();
+        evtSourceRef.current = null;
+        setActivePolling(false);
+      }
+      // else: let EventSource auto-reconnect (native browser behavior)
+    };
+    return () => {
+      evtSource.close();
+      evtSourceRef.current = null;
+    };
   }, [id, isLiveDetailId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
@@ -825,6 +899,16 @@ export default function TestRunDetailPage() {
         if (signature !== lastRunSignatureRef.current) {
           lastRunSignatureRef.current = signature;
           setTestRun(nextRun);
+        }
+
+        // When the real ingested run is returned for a live-prefixed URL,
+        // mark the pipeline as ended and close the SSE connection.
+        if (isLiveDetailId && nextRun && !nextRun.is_live) {
+          setPipelineEnded(true);
+          if (evtSourceRef.current) {
+            evtSourceRef.current.close();
+            evtSourceRef.current = null;
+          }
         }
 
         setNotFound(false);
@@ -885,6 +969,15 @@ export default function TestRunDetailPage() {
             lastRunSignatureRef.current = signature;
             setTestRun(nextRun);
           }
+          // When the real ingested run is returned for a live-prefixed URL,
+          // mark the pipeline as ended and close the SSE connection.
+          if (isLiveDetailId && nextRun && !nextRun.is_live) {
+            setPipelineEnded(true);
+            if (evtSourceRef.current) {
+              evtSourceRef.current.close();
+              evtSourceRef.current = null;
+            }
+          }
           setActivePolling(isLiveOrRunning(nextRun));
         })
         .catch(() => {
@@ -941,7 +1034,7 @@ export default function TestRunDetailPage() {
   const liveMeta = report?.metadata?.live || null;
   const liveRunId = report?.metadata?.runId || report?.metadata?.run_id || testRun.run_id || null;
   const rawTests: ReportTest[] = report?.tests ?? report?.results ?? [];
-  const normalisedTests = rawTests.map((t, i) => normaliseTest(t, i, id));
+  const normalisedTests = rawTests.map((t, i) => normaliseTest(t, i, testRun.id));
 
   // Filter tests — strip synthetic pipeline rows when we have real test data
   const isPipelineSynthetic = (t: NormalisedTest) =>
@@ -978,6 +1071,9 @@ export default function TestRunDetailPage() {
   const failedTests = hasLiveStats ? liveFailed : (testRun.failed_tests || report?.summary?.failed || report?.stats?.failed || displayTests.filter(t => ['failed', 'fail'].includes(t.status.toLowerCase())).length);
   const skippedTests = hasLiveStats ? liveSkipped : (testRun.skipped_tests || report?.summary?.skipped || report?.stats?.skipped || displayTests.filter(t => ['skipped', 'skip', 'pending'].includes(t.status.toLowerCase())).length);
   const passRate = totalTests > 0 ? Math.round((passedTests / totalTests) * 100) : 0;
+
+  // True while Playwright is executing but no individual results have streamed in yet
+  const isRunningPhase = !pipelineEnded && liveEvents.some(e => (e.phase || '').toLowerCase() === 'running');
   const filteredTests = filterStatus === 'all'
     ? displayTests
     : displayTests.filter(t => {
@@ -1166,12 +1262,22 @@ export default function TestRunDetailPage() {
       )}
 
       {/* KPI cards */}
+      {isRunningPhase && !hasLiveStats && (
+        <motion.div
+          initial={{ opacity: 0, y: 6 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="flex items-center gap-2 px-3 py-2 rounded-xl bg-blue-500/5 border border-blue-500/15 w-fit"
+        >
+          <span className="w-1.5 h-1.5 rounded-full bg-blue-400 animate-pulse flex-shrink-0" />
+          <span className="text-blue-300/70 text-xs font-medium">Tests executing — results will stream in as they complete</span>
+        </motion.div>
+      )}
       <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-5 gap-4">
         <KpiCard label="Total Tests" value={totalTests} color="text-[#F0F6FF]" delay={0} />
-        <KpiCard label="Passed" value={passedTests} color="text-emerald-400" delay={80} />
-        <KpiCard label="Failed" value={failedTests} color="text-red-400" delay={160} />
-        <KpiCard label="Skipped" value={skippedTests} color="text-amber-400" delay={240} />
-        <KpiCard label="Pass Rate" value={passRate} sub="%" color={passRate >= 80 ? 'text-emerald-400' : 'text-red-400'} delay={320} />
+        <KpiCard label="Passed" value={passedTests} color="text-emerald-400" delay={80} loading={isRunningPhase && !hasLiveStats} />
+        <KpiCard label="Failed" value={failedTests} color="text-red-400" delay={160} loading={isRunningPhase && !hasLiveStats} />
+        <KpiCard label="Skipped" value={skippedTests} color="text-amber-400" delay={240} loading={isRunningPhase && !hasLiveStats} />
+        <KpiCard label="Pass Rate" value={passRate} sub="%" color={passRate >= 80 ? 'text-emerald-400' : 'text-red-400'} delay={320} loading={isRunningPhase && !hasLiveStats} />
       </div>
 
       {/* Status distribution bar */}

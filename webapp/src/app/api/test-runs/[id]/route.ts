@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { getCurrentUser } from '@/lib/auth/session'
 import { db } from '@/lib/db'
 import { testRuns } from '@/lib/db/schema'
-import { eq, and } from 'drizzle-orm'
+import { eq, and, sql } from 'drizzle-orm'
 import { extractRunIdFromReport, getLiveRunsForUser } from '@/lib/mcp-live-runs'
 
 export async function GET(
@@ -21,6 +21,49 @@ export async function GET(
         return NextResponse.json({ error: 'Invalid live run id' }, { status: 400 })
       }
 
+      // Prefer a real ingested run when it exists — ingest happens during the
+      // 'reporting' phase, well before 'completed', so this fires as soon as
+      // results are available and returns full report_json + ai_analysis.
+      const [ingestedRow] = await db
+        .select()
+        .from(testRuns)
+        .where(
+          and(
+            eq(testRuns.userId, user.id),
+            sql`${testRuns.reportJson}->'metadata'->>'runId' = ${runId}`
+          )
+        )
+        .orderBy(testRuns.createdAt)
+        .limit(1)
+
+      if (ingestedRow) {
+        const data = {
+          id: ingestedRow.id,
+          user_id: ingestedRow.userId,
+          creation_name: ingestedRow.creationName,
+          status: ingestedRow.status,
+          total_tests: ingestedRow.totalTests,
+          passed_tests: ingestedRow.passedTests,
+          failed_tests: ingestedRow.failedTests,
+          skipped_tests: ingestedRow.skippedTests,
+          backend_pass_rate: ingestedRow.backendPassRate ? Number(ingestedRow.backendPassRate) : null,
+          frontend_pass_rate: ingestedRow.frontendPassRate ? Number(ingestedRow.frontendPassRate) : null,
+          duration_ms: ingestedRow.durationMs,
+          report_json: ingestedRow.reportJson,
+          ai_analysis: ingestedRow.aiAnalysis,
+          framework: ingestedRow.framework,
+          source: ingestedRow.source,
+          created_at: ingestedRow.createdAt?.toISOString() ?? null,
+          updated_at: ingestedRow.updatedAt?.toISOString() ?? null,
+          run_id: extractRunIdFromReport(ingestedRow.reportJson),
+          current_phase: null,
+          error_code: null,
+          is_live: false,
+        }
+        return NextResponse.json({ data })
+      }
+
+      // Fall back to synthetic live data while the run is still in progress
       const [liveRun] = await getLiveRunsForUser(user.id, { runId, windowHours: 72, limit: 1500 })
       if (!liveRun) {
         return NextResponse.json({ error: 'Test run not found' }, { status: 404 })

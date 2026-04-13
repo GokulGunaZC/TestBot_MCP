@@ -2056,10 +2056,40 @@ async function runPipeline(config, runId) {
     }, telemetryReporter);
 
     const executionTimeout = Math.max(1000, Math.min(getBudgetRemainingMs(runBudget), runBudget.stageCaps.execution));
+
+    // Throttled real-time test progress: buffer results and flush every 1.5s
+    // so each completed test emits a telemetry event without flooding the API.
+    const pendingProgress = [];
+    let progressFlushTimer = null;
+    const flushProgress = () => {
+      progressFlushTimer = null;
+      const batch = pendingProgress.splice(0);
+      if (!batch.length || !telemetryReporter || !telemetryReporter.isEnabled()) return;
+      for (const t of batch) {
+        telemetryReporter.emitBackground({
+          toolName: 'healix_test_my_app',
+          eventType: 'test_result',
+          runId,
+          phase: 'running',
+          status: t.status === 'failed' ? 'error' : 'info',
+          success: t.status !== 'failed',
+          message: t.name,
+          metadata: { test: { n: t.name, su: '', f: '', s: t.status, d: t.durationMs } },
+        });
+      }
+    };
+    const onTestProgress = (t) => {
+      pendingProgress.push(t);
+      if (!progressFlushTimer) {
+        progressFlushTimer = setTimeout(flushProgress, 1500);
+      }
+    };
+
     playwright = new PlaywrightIntegration({
       ...config,
       timeout: executionTimeout,
       serverPidFile,
+      onTestProgress: telemetryReporter && telemetryReporter.isEnabled() ? onTestProgress : undefined,
     });
 
     const mcpParallelEnabled =
