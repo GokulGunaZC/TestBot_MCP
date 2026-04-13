@@ -254,6 +254,8 @@ class ReportGenerator {
   async copyPlaywrightHTMLReport(projectPath, reportsDir) {
     try {
       const possibleLocations = [
+        path.join(projectPath, 'healix-reports', 'html-report'),
+        path.join(projectPath, 'healix-report'),
         path.join(projectPath, 'playwright-report'),
         path.join(projectPath, 'test-results', 'playwright-report'),
       ];
@@ -266,7 +268,12 @@ class ReportGenerator {
         return;
       }
 
-      const destReportDir = path.join(reportsDir, 'playwright-report');
+      const destReportDir = path.join(reportsDir, 'html-report');
+
+      if (path.resolve(sourceReportDir) === path.resolve(destReportDir)) {
+        return;
+      }
+
       if (fs.existsSync(destReportDir)) {
         fs.rmSync(destReportDir, { recursive: true, force: true });
       }

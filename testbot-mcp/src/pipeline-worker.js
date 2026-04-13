@@ -1000,8 +1000,8 @@ export default defineConfig({
   workers: process.env.CI ? 1 : 2,
   reporter: [
     ['list'],
-    ['json', { outputFile: 'test-results/results.json' }],
-    ['html', { open: 'never' }],
+    ['json', { outputFile: 'healix-reports/results/results.json' }],
+    ['html', { open: 'never', outputFolder: 'healix-reports/html-report' }],
   ],
   use: {
     baseURL: '${baseURL}',
