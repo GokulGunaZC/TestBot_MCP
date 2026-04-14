@@ -1,6 +1,7 @@
 'use client';
 
 import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { useRouter } from 'next/navigation';
 import Link from 'next/link';
 import { motion } from 'framer-motion';
 import McpSetupModal from '@/components/dashboard/McpSetupModal';
@@ -56,6 +57,7 @@ function hasActivePipelineRuns(runs: TestRun[]): boolean {
 }
 
 export default function McpTestsPage() {
+  const router = useRouter();
   const [modalOpen, setModalOpen] = useState(false);
   const [search, setSearch] = useState('');
   const [sort, setSort] = useState<'date' | 'name'>('date');
@@ -225,10 +227,11 @@ export default function McpTestsPage() {
                 {paginated.map((test) => (
                   <tr
                     key={test.id}
-                    className="border-b border-white/5 last:border-0 hover:bg-white/[0.02] transition-all"
+                    onClick={() => router.push(`/test-run/${test.id}`)}
+                    className="border-b border-white/5 last:border-0 hover:bg-white/[0.02] transition-all cursor-pointer group"
                   >
                     <td className="px-6 py-4">
-                      <Link href={`/test-run/${test.id}`} className="text-[#F0F6FF] text-sm font-medium hover:text-[#60A5FA] transition-colors">
+                      <Link href={`/test-run/${test.id}`} onClick={e => e.stopPropagation()} className="text-[#F0F6FF] text-sm font-medium group-hover:text-[#60A5FA] transition-colors">
                         {test.creation_name}
                       </Link>
                       {(test.current_phase || test.error_code || test.is_live) && (

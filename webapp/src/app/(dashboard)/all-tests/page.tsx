@@ -1,6 +1,7 @@
 'use client';
 
 import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { useRouter } from 'next/navigation';
 import { motion, AnimatePresence } from 'framer-motion';
 import Link from 'next/link';
 import type { TestRun } from '@/lib/types/database';
@@ -102,6 +103,7 @@ function buildGroups(runs: TestRun[]): TestRunGroup[] {
 }
 
 export default function AllTestsPage() {
+  const router = useRouter();
   const [tests, setTests] = useState<TestRun[]>([]);
   const [total, setTotal] = useState(0);
   const [totalPages, setTotalPages] = useState(1);
@@ -470,6 +472,7 @@ export default function AllTestsPage() {
                     {tests.map((test) => (
                       <tr
                         key={test.id}
+                        onClick={() => router.push(`/test-run/${test.id}`)}
                         className="border-b border-white/5 last:border-0 hover:bg-white/[0.02] transition-all cursor-pointer group"
                       >
                         <td className="px-6 py-4">

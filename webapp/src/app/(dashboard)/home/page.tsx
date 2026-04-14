@@ -1,6 +1,7 @@
 'use client';
 
 import { useState, useEffect } from 'react';
+import { useRouter } from 'next/navigation';
 import Link from 'next/link';
 import { motion } from 'framer-motion';
 import type { TestRun, TestList, Profile } from '@/lib/types/database';
@@ -67,6 +68,7 @@ function SkeletonListItem() {
 }
 
 export default function HomePage() {
+  const router = useRouter();
   const [loading, setLoading] = useState(true);
   const [recentTests, setRecentTests] = useState<TestRun[]>([]);
   const [testLists, setTestLists] = useState<TestList[]>([]);
@@ -220,6 +222,7 @@ export default function HomePage() {
                         initial={{ opacity: 0 }}
                         animate={{ opacity: 1 }}
                         transition={{ delay: i * 0.06 }}
+                        onClick={() => router.push(`/test-run/${test.id}`)}
                         className="border-b border-white/5 last:border-0 hover:bg-white/[0.02] hover:shadow-[inset_0_0_20px_rgba(59,130,246,0.05)] transition-all cursor-pointer group"
                       >
                         <td className="px-6 py-4">
