@@ -1,10 +1,10 @@
 {
-  "name": "@testbot/mcp",
+  "name": "@healix/mcp",
   "version": "1.2.0",
-  "description": "Testbot MCP Server",
+  "description": "Healix MCP Server",
   "main": "src/index.js",
   "bin": {
-    "testbot-mcp": "bin/testbot-mcp.js"
+    "healix-mcp": "bin/healix-mcp.js"
   },
   "scripts": {
     "start": "node src/index.js",
@@ -21,7 +21,7 @@
     "openai",
     "test-generation"
   ],
-  "author": "",
+  "author": "Zapminds",
   "license": "MIT",
   "files": [
     "bin/",

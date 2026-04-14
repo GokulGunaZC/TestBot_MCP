@@ -6,7 +6,7 @@ const INTEGRATIONS = [
   {
     letter: 'C',
     name: 'Cursor',
-    desc: 'AI-first IDE. Say "test my app" and TestBot takes over.',
+    desc: 'AI-first IDE. Say "test this project" and Healix takes over.',
     status: 'Supported',
     primary: true,
   },
@@ -64,7 +64,7 @@ export default function Integrations() {
             <span className="text-[#a0a0a0]">Simple to connect.</span>
           </h2>
           <p className="text-[#a0a0a0] text-base max-w-xl mx-auto font-mono">
-            TestBot MCP plugs directly into the tools your team already uses — no migration, no disruption.
+            Healix MCP plugs directly into the tools your team already uses — no migration, no disruption.
           </p>
         </motion.div>
 
@@ -81,7 +81,7 @@ export default function Integrations() {
                 <path d="M12 24l7 7 17-17" stroke="black" strokeWidth="4" strokeLinecap="round" strokeLinejoin="round" />
               </svg>
             </div>
-            <span className="text-white font-black text-xs font-mono uppercase tracking-widest">TESTBOT_MCP</span>
+            <span className="text-white font-black text-xs font-mono uppercase tracking-widest">HEALIX_MCP</span>
           </div>
         </motion.div>
 

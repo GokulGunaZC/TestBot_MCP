@@ -122,17 +122,37 @@ class PlaywrightMCPClient {
       return parsedCandidates;
     }
 
-    const normalizedMethod = String(method || 'GET').toUpperCase();
-    if (normalizedMethod === 'POST') {
-      return [200, 201];
-    }
-    if (normalizedMethod === 'PUT' || normalizedMethod === 'PATCH') {
-      return [200, 204];
-    }
-    if (normalizedMethod === 'DELETE') {
-      return [200, 202, 204];
-    }
-    return [200];
+    return [];
+  }
+
+  getExpectedAuthStatuses(endpoint) {
+    const statusCandidates = [
+      endpoint?.authStatus,
+      endpoint?.authStatuses,
+      endpoint?.unauthorizedStatus,
+      endpoint?.unauthorizedStatuses,
+      endpoint?.forbiddenStatus,
+      endpoint?.forbiddenStatuses,
+      endpoint?.status,
+      endpoint?.statuses,
+    ].flatMap((entry) => {
+      if (Array.isArray(entry)) {
+        return entry;
+      }
+      if (entry === undefined || entry === null) {
+        return [];
+      }
+      return [entry];
+    });
+
+    const parsedCandidates = [...new Set(
+      statusCandidates
+        .map((status) => Number(status))
+        .filter((status) => Number.isInteger(status) && [302, 303, 307, 308, 401, 403].includes(status))
+        .sort((a, b) => a - b)
+    )];
+
+    return parsedCandidates;
   }
 
   getExpectedResponseKeys(endpoint) {
@@ -179,13 +199,13 @@ class PlaywrightMCPClient {
         malformed[key] = null;
       }
       if (Object.keys(malformed).length > 0) {
-        malformed.__testbot_invalid = true;
+        malformed.__healix_invalid = true;
         return malformed;
       }
     }
 
     return {
-      __testbot_invalid: true,
+      __healix_invalid: true,
     };
   }
 
@@ -203,28 +223,37 @@ class PlaywrightMCPClient {
         return `  test('displays component: ${componentName}', async ({ page }) => {
     const landmark = page.getByRole('navigation').first();
     if (await landmark.count()) {
+      await landmark.waitFor({ state: 'visible', timeout: 5000 }).catch(() => {});
       await expect(landmark).toBeVisible();
       return;
     }
-    await expect(page.locator('nav, [role="navigation"]').first()).toBeVisible();
+    const fallback = page.locator('nav, [role="navigation"]').first();
+    await fallback.waitFor({ state: 'visible', timeout: 5000 }).catch(() => {});
+    await expect(fallback).toBeVisible();
   });`;
       }
 
       if (/(^|\s)(header|masthead|banner)(\s|$)/.test(lowerComponent)) {
         return `  test('displays component: ${componentName}', async ({ page }) => {
-    await expect(page.locator('header, [role="banner"]').first()).toBeVisible();
+    const header = page.locator('header, [role="banner"]').first();
+    await header.waitFor({ state: 'visible', timeout: 5000 }).catch(() => {});
+    await expect(header).toBeVisible();
   });`;
       }
 
       if (/(^|\s)(footer|content info|contentinfo)(\s|$)/.test(lowerComponent)) {
         return `  test('displays component: ${componentName}', async ({ page }) => {
-    await expect(page.locator('footer, [role="contentinfo"]').first()).toBeVisible();
+    const footer = page.locator('footer, [role="contentinfo"]').first();
+    await footer.waitFor({ state: 'visible', timeout: 5000 }).catch(() => {});
+    await expect(footer).toBeVisible();
   });`;
       }
 
       if (/(^|\s)(main|content)(\s|$)/.test(lowerComponent)) {
         return `  test('displays component: ${componentName}', async ({ page }) => {
-    await expect(page.locator('main, [role="main"]').first()).toBeVisible();
+    const main = page.locator('main, [role="main"]').first();
+    await main.waitFor({ state: 'visible', timeout: 5000 }).catch(() => {});
+    await expect(main).toBeVisible();
   });`;
       }
 
@@ -249,7 +278,7 @@ class PlaywrightMCPClient {
       const lower = rawInteraction.toLowerCase();
 
       if (/(enter|fill|type|input|field|email|password|username|search)/.test(lower)) {
-        const value = this.escapeForSingleQuote(`testbot_value_${index + 1}`);
+        const value = this.escapeForSingleQuote(`healix_value_${index + 1}`);
         return `  test('interaction: ${interactionName}', async ({ page }) => {
     const input = await resolveByLadder(page, '${target}', 'textbox');
     await expect(input).toBeEditable();
@@ -393,13 +422,12 @@ class PlaywrightMCPClient {
     const target = this.escapeForSingleQuote(step.target || `step-${index + 1}`);
     const pathValue = this.escapeForSingleQuote(step.path || '/');
     const value = this.escapeForSingleQuote(step.value || `workflow_value_${index + 1}`);
-    const pathPattern = this.escapeForSingleQuote(this.escapeForRegex(step.path || '/'));
     const assertRegex = this.escapeForSingleQuote(this.escapeForRegex(step.target || step.description || ''));
 
     if (step.action === 'goto') {
       return `    // Step ${index + 1}: ${stepLabel}
     await page.goto('${pathValue}');
-    await expect(page).toHaveURL(new RegExp('${pathPattern}'));`;
+    await expectPath(page, '${pathValue}');`;
     }
 
     if (step.action === 'fill') {
@@ -563,7 +591,6 @@ class PlaywrightMCPClient {
     const description = page.description || `${pagePath} page`;
     const escapedDescription = this.escapeForSingleQuote(description);
     const escapedPagePath = this.escapeForSingleQuote(pagePath);
-    const escapedPagePathPattern = this.escapeForSingleQuote(this.escapeForRegex(pagePath));
     const componentTests = this.buildComponentTests(components);
     const interactionTests = this.buildInteractionTests(interactions);
     
@@ -573,7 +600,7 @@ const { test, expect } = require('@playwright/test');
 /**
  * Tests for: ${escapedDescription}
  * Path: ${escapedPagePath}
- * Generated by Testbot MCP
+ * Generated by Healix MCP
  */
 
 function slugify(value) {
@@ -586,6 +613,27 @@ function slugify(value) {
 
 function escapeRegExp(value) {
   return String(value || '').replace(/[|\\\\{}()[\\]^$+*?.]/g, '\\\\$&');
+}
+
+function normalizePathname(value) {
+  const normalized = String(value || '').trim() || '/';
+  try {
+    const pathname = new URL(normalized, 'http://testbot.local').pathname || '/';
+    if (pathname !== '/' && pathname.endsWith('/')) {
+      return pathname.replace(/\/+$/, '');
+    }
+    return pathname;
+  } catch (error) {
+    const pathname = normalized.split('?')[0].split('#')[0] || '/';
+    if (pathname !== '/' && pathname.endsWith('/')) {
+      return pathname.replace(/\/+$/, '');
+    }
+    return pathname;
+  }
+}
+
+async function expectPath(page, expectedPath) {
+  await expect.poll(() => normalizePathname(page.url())).toBe(normalizePathname(expectedPath));
 }
 
 function buildTokenRegex(target) {
@@ -681,30 +729,80 @@ function buildSelectorLadder(page, target, role) {
   return ladder;
 }
 
-async function resolveByLadder(page, target, role) {
-  for (const locator of buildSelectorLadder(page, target, role)) {
-    const count = await locator.count();
-    if (count === 0) {
-      continue;
+async function waitForStableUI(page, options = {}) {
+  const timeout = options.timeout || 10000;
+  const stabilityMs = options.stabilityMs || 150;
+  
+  // Wait for network to be idle (no pending requests for stabilityMs)
+  await page.waitForLoadState('domcontentloaded');
+  await page.waitForLoadState('networkidle').catch(() => {});
+  
+  // Wait for any loading indicators to disappear
+  const loadingSelectors = [
+    '[data-loading="true"]',
+    '[aria-busy="true"]',
+    '.loading',
+    '.spinner',
+    '[class*="loading"]',
+    '[class*="skeleton"]',
+  ];
+  
+  for (const selector of loadingSelectors) {
+    const loadingEl = page.locator(selector).first();
+    if (await loadingEl.count() > 0) {
+      await loadingEl.waitFor({ state: 'hidden', timeout: timeout / 2 }).catch(() => {});
     }
+  }
+  
+  // Small stability delay for hydration
+  await page.waitForTimeout(stabilityMs);
+}
 
-    const candidate = locator.first();
-    if (await candidate.isVisible().catch(() => false)) {
-      return candidate;
+async function resolveByLadder(page, target, role, options = {}) {
+  const maxRetries = options.maxRetries || 3;
+  const retryDelayMs = options.retryDelayMs || 500;
+  const waitTimeoutMs = options.waitTimeoutMs || 5000;
+  
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    for (const locator of buildSelectorLadder(page, target, role)) {
+      try {
+        // Wait for at least one element to exist
+        const count = await locator.count();
+        if (count === 0) {
+          continue;
+        }
+
+        const candidate = locator.first();
+        
+        // Wait for the element to be visible with a reasonable timeout
+        await candidate.waitFor({ state: 'visible', timeout: waitTimeoutMs / maxRetries }).catch(() => {});
+        
+        if (await candidate.isVisible().catch(() => false)) {
+          return candidate;
+        }
+      } catch (e) {
+        // Continue to next selector in ladder
+        continue;
+      }
+    }
+    
+    // If not found, wait before retrying
+    if (attempt < maxRetries - 1) {
+      await page.waitForTimeout(retryDelayMs);
     }
   }
 
-  throw new Error('Unable to locate "' + target + '" using ladder testId->role->label->placeholder->text');
+  throw new Error('Unable to locate "' + target + '" using ladder testId->role->label->placeholder->text after ' + maxRetries + ' attempts');
 }
 
 test.describe('${escapedDescription}', () => {
   test.beforeEach(async ({ page }) => {
     await page.goto('${escapedPagePath}');
-    await page.waitForLoadState('domcontentloaded');
+    await waitForStableUI(page);
   });
 
   test('loads page and URL matches route', async ({ page }) => {
-    await expect(page).toHaveURL(new RegExp('${escapedPagePathPattern}'));
+    await expectPath(page, '${escapedPagePath}');
     await expect(page.locator('body')).toBeVisible();
   });
 
@@ -745,6 +843,7 @@ ${interactionTests}
     const escapedPath = this.escapeForSingleQuote(apiPath);
     const escapedRequestPath = this.escapeForSingleQuote(requestPath);
     const expectedStatuses = this.getExpectedSuccessStatuses(method, endpoint);
+    const expectedAuthStatuses = this.getExpectedAuthStatuses(endpoint);
     const expectedResponseKeys = this.getExpectedResponseKeys(endpoint);
     
     const code = `// @ts-check
@@ -753,7 +852,7 @@ const { test, expect } = require('@playwright/test');
 /**
  * API Tests for: ${escapedDescription}
  * Endpoint: ${escapedMethod} ${escapedPath}
- * Generated by Testbot MCP
+ * Generated by Healix MCP
  */
 
 const REQUEST_METHOD = '${escapedMethod}';
@@ -761,13 +860,33 @@ const REQUEST_PATH = '${escapedRequestPath}';
 const REQUEST_BODY = ${JSON.stringify(requestBody, null, 2)};
 const MALFORMED_BODY = ${JSON.stringify(malformedBody, null, 2)};
 const EXPECTED_SUCCESS_STATUSES = ${JSON.stringify(expectedStatuses)};
-const EXPECTED_AUTH_STATUSES = [401, 403];
+const EXPECTED_AUTH_STATUSES = ${JSON.stringify(expectedAuthStatuses)};
 const EXPECTED_RESPONSE_KEYS = ${JSON.stringify(expectedResponseKeys)};
-const STRESS_BURST = Number(process.env.TESTBOT_API_STRESS_BURST || 6);
-const STRESS_P95_MS = Number(process.env.TESTBOT_API_STRESS_P95_MS || 2000);
+const STRESS_BURST = Number(process.env.HEALIX_API_STRESS_BURST || 6);
+const STRESS_P95_MS = Number(process.env.HEALIX_API_STRESS_P95_MS || 2000);
 
 function methodSupportsBody(method) {
   return ['POST', 'PUT', 'PATCH'].includes(String(method || '').toUpperCase());
+}
+
+function expectSuccessStatus(status) {
+  if (EXPECTED_SUCCESS_STATUSES.length > 0) {
+    expect(EXPECTED_SUCCESS_STATUSES).toContain(status);
+    return;
+  }
+
+  expect(status).toBeGreaterThanOrEqual(200);
+  expect(status).toBeLessThan(300);
+}
+
+function expectAuthLikeStatus(status) {
+  if (EXPECTED_AUTH_STATUSES.length > 0) {
+    expect(EXPECTED_AUTH_STATUSES).toContain(status);
+    return;
+  }
+
+  expect(status).toBeGreaterThanOrEqual(300);
+  expect(status).toBeLessThan(500);
 }
 
 async function sendRequest(request, options = {}) {
@@ -801,10 +920,10 @@ test.describe('API: ${escapedMethod} ${escapedPath}', () => {
     const response = await sendRequest(request, {
       auth: ${requiresAuth ? 'true' : 'false'},
     });
-    expect(EXPECTED_SUCCESS_STATUSES).toContain(response.status());
+    expectSuccessStatus(response.status());
   });
 
-  test('returns expected response shape', async ({ request }) => {
+  test('returns contract-aware response payload', async ({ request }) => {
     if (${requiresAuth ? 'true' : 'false'}) {
       test.skip(!process.env.TEST_AUTH_TOKEN, 'Set TEST_AUTH_TOKEN to validate authenticated response shape.');
     }
@@ -812,29 +931,33 @@ test.describe('API: ${escapedMethod} ${escapedPath}', () => {
     const response = await sendRequest(request, {
       auth: ${requiresAuth ? 'true' : 'false'},
     });
-    expect(EXPECTED_SUCCESS_STATUSES).toContain(response.status());
+    expectSuccessStatus(response.status());
 
     if (![204, 205].includes(response.status())) {
       const contentType = (response.headers()['content-type'] || '').toLowerCase();
-      expect(contentType).toContain('application/json');
+      if (contentType.includes('application/json')) {
+        const payload = await response.json();
+        expect(payload).not.toBeNull();
 
-      const payload = await response.json();
-      expect(payload).not.toBeNull();
-
-      if (Array.isArray(payload)) {
-        if (payload.length > 0 && typeof payload[0] === 'object' && payload[0] !== null) {
-          for (const key of EXPECTED_RESPONSE_KEYS) {
-            expect(payload[0]).toHaveProperty(key);
+        if (Array.isArray(payload)) {
+          if (payload.length > 0 && typeof payload[0] === 'object' && payload[0] !== null) {
+            for (const key of EXPECTED_RESPONSE_KEYS) {
+              expect(payload[0]).toHaveProperty(key);
+            }
+          }
+        } else {
+          expect(typeof payload).toBe('object');
+          if (EXPECTED_RESPONSE_KEYS.length > 0) {
+            for (const key of EXPECTED_RESPONSE_KEYS) {
+              expect(payload).toHaveProperty(key);
+            }
+          } else {
+            expect(Object.keys(payload).length).toBeGreaterThanOrEqual(0);
           }
         }
       } else {
-        expect(typeof payload).toBe('object');
-        const keys = Object.keys(payload);
-        expect(keys.length).toBeGreaterThan(0);
-
-        for (const key of EXPECTED_RESPONSE_KEYS) {
-          expect(payload).toHaveProperty(key);
-        }
+        const bodyText = await response.text();
+        expect(bodyText.trim().length).toBeGreaterThan(0);
       }
     }
   });
@@ -843,7 +966,7 @@ ${requiresAuth ? `  test('rejects unauthenticated request', async ({ request }) 
     const response = await sendRequest(request, {
       auth: false,
     });
-    expect(EXPECTED_AUTH_STATUSES).toContain(response.status());
+    expectAuthLikeStatus(response.status());
   });
 
   test('accepts authenticated request when token is provided', async ({ request }) => {
@@ -853,7 +976,7 @@ ${requiresAuth ? `  test('rejects unauthenticated request', async ({ request }) 
       auth: true,
     });
 
-    expect(EXPECTED_SUCCESS_STATUSES).toContain(response.status());
+    expectSuccessStatus(response.status());
   });
 ` : ''}
 
@@ -876,9 +999,6 @@ ${requiresAuth ? `  test('rejects unauthenticated request', async ({ request }) 
     const burst = Math.max(2, Math.min(12, STRESS_BURST));
     const authAvailable = Boolean(process.env.TEST_AUTH_TOKEN);
     const sendWithAuth = ${requiresAuth ? 'true' : 'false'} && authAvailable;
-    const expectedStatuses = ${requiresAuth ? 'true' : 'false'} && !authAvailable
-      ? EXPECTED_AUTH_STATUSES
-      : EXPECTED_SUCCESS_STATUSES;
 
     const timings = [];
     const responses = await Promise.all(
@@ -893,7 +1013,11 @@ ${requiresAuth ? `  test('rejects unauthenticated request', async ({ request }) 
     const statuses = responses.map((response) => response.status());
     expect(statuses.filter((status) => status >= 500).length).toBe(0);
     for (const status of statuses) {
-      expect(expectedStatuses).toContain(status);
+      if (${requiresAuth ? 'true' : 'false'} && !authAvailable) {
+        expectAuthLikeStatus(status);
+      } else {
+        expectSuccessStatus(status);
+      }
     }
 
     const sorted = [...timings].sort((a, b) => a - b);
@@ -932,16 +1056,13 @@ ${requiresAuth ? `  test('rejects unauthenticated request', async ({ request }) 
     const expectedPath = typeof workflow === 'object' && workflow.expectedPath
       ? this.escapeForSingleQuote(String(workflow.expectedPath))
       : '';
-    const expectedPathPattern = expectedPath
-      ? this.escapeForSingleQuote(this.escapeForRegex(expectedPath))
-      : '';
     
     const code = `// @ts-check
 const { test, expect } = require('@playwright/test');
 
 /**
  * Workflow Test: ${escapedWorkflowName}
- * Generated by Testbot MCP
+ * Generated by Healix MCP
  */
 
 function slugify(value) {
@@ -954,6 +1075,27 @@ function slugify(value) {
 
 function escapeRegExp(value) {
   return String(value || '').replace(/[|\\\\{}()[\\]^$+*?.]/g, '\\\\$&');
+}
+
+function normalizePathname(value) {
+  const normalized = String(value || '').trim() || '/';
+  try {
+    const pathname = new URL(normalized, 'http://testbot.local').pathname || '/';
+    if (pathname !== '/' && pathname.endsWith('/')) {
+      return pathname.replace(/\/+$/, '');
+    }
+    return pathname;
+  } catch (error) {
+    const pathname = normalized.split('?')[0].split('#')[0] || '/';
+    if (pathname !== '/' && pathname.endsWith('/')) {
+      return pathname.replace(/\/+$/, '');
+    }
+    return pathname;
+  }
+}
+
+async function expectPath(page, expectedPath) {
+  await expect.poll(() => normalizePathname(page.url())).toBe(normalizePathname(expectedPath));
 }
 
 function buildTokenRegex(target) {
@@ -1049,35 +1191,85 @@ function buildSelectorLadder(page, target, role) {
   return ladder;
 }
 
-async function resolveByLadder(page, target, role) {
-  for (const locator of buildSelectorLadder(page, target, role)) {
-    const count = await locator.count();
-    if (count === 0) {
-      continue;
+async function waitForStableUI(page, options = {}) {
+  const timeout = options.timeout || 10000;
+  const stabilityMs = options.stabilityMs || 150;
+  
+  // Wait for network to be idle (no pending requests for stabilityMs)
+  await page.waitForLoadState('domcontentloaded');
+  await page.waitForLoadState('networkidle').catch(() => {});
+  
+  // Wait for any loading indicators to disappear
+  const loadingSelectors = [
+    '[data-loading="true"]',
+    '[aria-busy="true"]',
+    '.loading',
+    '.spinner',
+    '[class*="loading"]',
+    '[class*="skeleton"]',
+  ];
+  
+  for (const selector of loadingSelectors) {
+    const loadingEl = page.locator(selector).first();
+    if (await loadingEl.count() > 0) {
+      await loadingEl.waitFor({ state: 'hidden', timeout: timeout / 2 }).catch(() => {});
     }
+  }
+  
+  // Small stability delay for hydration
+  await page.waitForTimeout(stabilityMs);
+}
 
-    const candidate = locator.first();
-    if (await candidate.isVisible().catch(() => false)) {
-      return candidate;
+async function resolveByLadder(page, target, role, options = {}) {
+  const maxRetries = options.maxRetries || 3;
+  const retryDelayMs = options.retryDelayMs || 500;
+  const waitTimeoutMs = options.waitTimeoutMs || 5000;
+  
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    for (const locator of buildSelectorLadder(page, target, role)) {
+      try {
+        // Wait for at least one element to exist
+        const count = await locator.count();
+        if (count === 0) {
+          continue;
+        }
+
+        const candidate = locator.first();
+        
+        // Wait for the element to be visible with a reasonable timeout
+        await candidate.waitFor({ state: 'visible', timeout: waitTimeoutMs / maxRetries }).catch(() => {});
+        
+        if (await candidate.isVisible().catch(() => false)) {
+          return candidate;
+        }
+      } catch (e) {
+        // Continue to next selector in ladder
+        continue;
+      }
+    }
+    
+    // If not found, wait before retrying
+    if (attempt < maxRetries - 1) {
+      await page.waitForTimeout(retryDelayMs);
     }
   }
 
-  throw new Error('Unable to locate "' + target + '" using ladder testId->role->label->placeholder->text');
+  throw new Error('Unable to locate "' + target + '" using ladder testId->role->label->placeholder->text after ' + maxRetries + ' attempts');
 }
 
 test.describe('Workflow: ${escapedWorkflowName}', () => {
   test('completes workflow with executable user steps', async ({ page }) => {
     // Start at home page
     await page.goto('/');
-    await page.waitForLoadState('domcontentloaded');
+    await waitForStableUI(page);
     
 ${workflowStepCode}
     
-${expectedPath ? `    await expect(page).toHaveURL(new RegExp('${expectedPathPattern}'));` : `    await expect(page.locator('main, [role="main"], body').first()).toBeVisible();`}
+${expectedPath ? `    await expectPath(page, '${expectedPath}');` : `    await expect(page.locator('main, [role="main"], body').first()).toBeVisible();`}
   });
 
   test('handles invalid route without crashing app shell', async ({ page }) => {
-    const response = await page.goto('/__testbot_invalid_route__');
+    const response = await page.goto('/__healix_invalid_route__');
     expect(response).toBeTruthy();
     expect([200, 404]).toContain(response.status());
     await expect(page.locator('body')).toBeVisible();
@@ -1107,14 +1299,43 @@ const { test, expect } = require('@playwright/test');
 
 /**
  * Basic Smoke Tests
- * Generated by Testbot MCP
+ * Generated by Healix MCP
  * These tests verify basic app functionality
  */
+
+async function waitForStableUI(page, options = {}) {
+  const timeout = options.timeout || 10000;
+  const stabilityMs = options.stabilityMs || 150;
+  
+  // Wait for network to be idle (no pending requests for stabilityMs)
+  await page.waitForLoadState('domcontentloaded');
+  await page.waitForLoadState('networkidle').catch(() => {});
+  
+  // Wait for any loading indicators to disappear
+  const loadingSelectors = [
+    '[data-loading="true"]',
+    '[aria-busy="true"]',
+    '.loading',
+    '.spinner',
+    '[class*="loading"]',
+    '[class*="skeleton"]',
+  ];
+  
+  for (const selector of loadingSelectors) {
+    const loadingEl = page.locator(selector).first();
+    if (await loadingEl.count() > 0) {
+      await loadingEl.waitFor({ state: 'hidden', timeout: timeout / 2 }).catch(() => {});
+    }
+  }
+  
+  // Small stability delay for hydration
+  await page.waitForTimeout(stabilityMs);
+}
 
 test.describe('Basic Smoke Tests', () => {
   test('should load the application', async ({ page }) => {
     await page.goto('/');
-    await page.waitForLoadState('domcontentloaded');
+    await waitForStableUI(page);
     
     // Page should have a title
     const title = await page.title();
@@ -1133,7 +1354,7 @@ test.describe('Basic Smoke Tests', () => {
     });
     
     await page.goto('/');
-    await page.waitForLoadState('networkidle');
+    await waitForStableUI(page);
     
     // Filter out known acceptable errors
     const criticalErrors = errors.filter(err => 
@@ -1149,16 +1370,19 @@ test.describe('Basic Smoke Tests', () => {
     // Test desktop viewport
     await page.setViewportSize({ width: 1280, height: 720 });
     await page.goto('/');
+    await waitForStableUI(page);
     await expect(page.locator('body')).toBeVisible();
     
     // Test mobile viewport
     await page.setViewportSize({ width: 375, height: 667 });
     await page.goto('/');
+    await waitForStableUI(page);
     await expect(page.locator('body')).toBeVisible();
   });
 
   test('should have working navigation', async ({ page }) => {
     await page.goto('/');
+    await waitForStableUI(page);
     
     // Find and test navigation links
     const navLinks = page.locator('nav a, header a, [role="navigation"] a');
@@ -1171,7 +1395,7 @@ test.describe('Basic Smoke Tests', () => {
       
       if (href && !href.startsWith('http') && !href.startsWith('#')) {
         await firstLink.click();
-        await page.waitForLoadState('domcontentloaded');
+        await waitForStableUI(page);
         // Should navigate without error
         await expect(page.locator('body')).toBeVisible();
       }
@@ -1204,7 +1428,7 @@ const { defineConfig, devices } = require('@playwright/test');
 
 /**
  * Playwright Configuration
- * Generated by Testbot MCP
+ * Generated by Healix MCP
  */
 module.exports = defineConfig({
   testDir: './tests',

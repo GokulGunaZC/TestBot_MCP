@@ -1,5 +1,5 @@
 /**
- * Central Logger for TestBot MCP Server
+ * Central Logger for Healix MCP Server
  * Outputs rich logs to stderr (required for MCP) and robustly to files.
  */
 const fs = require('fs');
@@ -12,8 +12,8 @@ class Logger {
   static mcpLogPath;
   static errorLogPath;
   static redactionConfig = {
-    enabled: process.env.TESTBOT_LOG_REDACTION !== 'false',
-    level: process.env.TESTBOT_LOG_REDACTION_LEVEL || 'strict',
+    enabled: process.env.HEALIX_LOG_REDACTION !== 'false',
+    level: process.env.HEALIX_LOG_REDACTION_LEVEL || 'strict',
   };
   static SENSITIVE_KEY_PATTERN = /(password|passwd|token|api[_-]?key|secret|authorization|cookie|session|credential)/i;
   static SENSITIVE_VALUE_PATTERNS = [
@@ -36,7 +36,7 @@ class Logger {
       }
     } catch (e) {
       // Fallback to minimal logging if no permission
-      console.error(`[Testbot] [Logger] Failed to create logs directory: ${e.message}`);
+      console.error(`[Healix] [Logger] Failed to create logs directory: ${e.message}`);
     }
 
     this.mcpLogPath = path.join(this.logsDir, 'mcp.log');

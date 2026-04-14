@@ -66,7 +66,7 @@ export default function LoginPage() {
             </svg>
           </div>
           <h1 className="text-2xl font-bold text-text-primary">Welcome back</h1>
-          <p className="text-text-muted text-sm mt-1">Sign in to your TestBot MCP account</p>
+          <p className="text-text-muted text-sm mt-1">Sign in to your Healix account</p>
         </div>
 
         {/* Error message */}

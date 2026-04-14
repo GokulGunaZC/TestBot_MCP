@@ -64,6 +64,7 @@ const PLANS = [
       'SSO/SAML + compliance',
     ],
     cta: 'Contact Sales',
+    ctaHref: 'mailto:Swathi.Dharshna@zapcg.com',
     highlighted: false,
   },
 ] as const
@@ -154,11 +155,11 @@ export default function PlanBillingPage() {
                     </Badge>
                   </div>
                 </div>
-                {currentPlan !== 'enterprise' && (
+                {/* {currentPlan !== 'enterprise' && (
                   <Button variant="secondary" size="sm">
                     Manage Billing
                   </Button>
-                )}
+                )} */}
               </div>
               <TokenMeter
                 remaining={profile?.tokens_remaining ?? 0}
@@ -210,15 +211,16 @@ export default function PlanBillingPage() {
                     </li>
                   ))}
                 </ul>
-
-                <Button
-                  variant={isCurrent ? 'secondary' : plan.highlighted ? 'primary' : 'secondary'}
-                  size="md"
-                  className="w-full"
-                  disabled={isCurrent}
-                >
-                  {isCurrent ? 'Current Plan' : plan.cta}
-                </Button>
+                <a href={plan.ctaHref}>
+                  <Button
+                    variant={isCurrent ? 'secondary' : plan.highlighted ? 'primary' : 'secondary'}
+                    size="md"
+                    className="w-full"
+                    disabled={isCurrent}
+                  >
+                    {isCurrent ? 'Current Plan' : plan.cta}
+                  </Button>
+                </a>
               </Card>
             )
           })}

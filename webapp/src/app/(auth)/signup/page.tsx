@@ -79,7 +79,7 @@ export default function SignupPage() {
             </svg>
           </div>
           <h1 className="text-2xl font-bold text-text-primary">Create your account</h1>
-          <p className="text-text-muted text-sm mt-1">Start automating tests with TestBot MCP</p>
+          <p className="text-text-muted text-sm mt-1">Start automating tests with Healix</p>
         </div>
 
         <AnimatePresence mode="wait">

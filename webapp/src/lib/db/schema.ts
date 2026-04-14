@@ -85,7 +85,7 @@ export const mcpTelemetryEvents = pgTable(
       .notNull()
       .references(() => profiles.id, { onDelete: 'cascade' }),
     apiKeyId: uuid('api_key_id').references(() => apiKeys.id, { onDelete: 'set null' }),
-    source: text('source').notNull().default('testbot-mcp'),
+    source: text('source').notNull().default('healix-mcp'),
     toolName: text('tool_name').notNull(),
     eventType: text('event_type').notNull(),
     runId: text('run_id'),

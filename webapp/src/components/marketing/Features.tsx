@@ -15,7 +15,7 @@ const FEATURES = [
     extra: (
       <div className="mt-4 bg-black border-2 border-[#333] p-4 font-mono text-xs">
         <div className="text-[#505050]">// In your IDE chat</div>
-        <div className="text-white mt-1">&quot;Test my app using testbot mcp&quot;</div>
+        <div className="text-white mt-1">&quot;Test this project using healix mcp&quot;</div>
         <div className="text-[#a0a0a0] mt-2">&gt; Auto-detects config...</div>
         <div className="text-[#a0a0a0]">&gt; Generating 12 tests...</div>
         <div className="text-white font-bold">&gt; + 11 passed, 1 analyzed</div>
@@ -66,7 +66,7 @@ const FEATURES = [
       </svg>
     ),
     title: 'Jira Integration',
-    desc: 'Connect your Jira project and TestBot automatically fetches user stories, generating tests directly from acceptance criteria.',
+    desc: 'Connect your Jira project and Healix automatically fetches user stories, generating tests directly from acceptance criteria.',
   },
   {
     icon: (
@@ -85,7 +85,7 @@ const FEATURES = [
       </svg>
     ),
     title: 'Multiple AI Providers',
-    desc: 'Plug in your preferred AI backend. TestBot supports Sarvam AI, OpenAI GPT-4, Cascade, and Windsurf — switchable with a single env variable.',
+    desc: 'Plug in your preferred AI backend. Healix supports Sarvam AI, OpenAI GPT-4, Cascade, and Windsurf — switchable with a single env variable.',
     extra: (
       <div className="mt-4 flex flex-wrap gap-2">
         {['Sarvam AI', 'OpenAI', 'Cascade', 'Windsurf'].map(p => (
@@ -113,7 +113,7 @@ export default function Features() {
             <span className="text-[#a0a0a0]">Nothing you don&apos;t.</span>
           </h2>
           <p className="text-[#a0a0a0] text-base max-w-xl mx-auto font-mono">
-            TestBot MCP is purpose-built for AI-native development teams who want testing to just work.
+            Healix MCP is purpose-built for AI-native development teams who want testing to just work.
           </p>
         </motion.div>
 

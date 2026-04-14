@@ -1,6 +1,6 @@
 /**
  * Pipeline Worker
- * Runs the full TestBot pipeline in a background process.
+ * Runs the full Healix pipeline in a background process.
  * Receives config via IPC from the MCP server, runs independently.
  */
 
@@ -59,18 +59,18 @@ const STRICT_AI_REQUIRED_CATEGORIES = [
   'api_stress',
 ];
 
-const CURSOR_FIXTURE_BASENAME = '__testbot-fixture';
+const CURSOR_FIXTURE_BASENAME = '__healix-fixture';
 const CURSOR_OVERLAY_INIT_SCRIPT = `
 (() => {
-  if (window.__testbotCursorOverlayInstalled) return;
-  window.__testbotCursorOverlayInstalled = true;
+  if (window.__healixCursorOverlayInstalled) return;
+  window.__healixCursorOverlayInstalled = true;
 
   const ensureCursor = () => {
-    const existing = document.getElementById('__testbot-cursor-overlay');
+    const existing = document.getElementById('__healix-cursor-overlay');
     if (existing) return existing;
 
     const dot = document.createElement('div');
-    dot.id = '__testbot-cursor-overlay';
+    dot.id = '__healix-cursor-overlay';
     dot.setAttribute('aria-hidden', 'true');
     dot.style.cssText = [
       'position:fixed',
@@ -101,7 +101,7 @@ const CURSOR_OVERLAY_INIT_SCRIPT = `
   };
 
   const hide = () => {
-    const dot = document.getElementById('__testbot-cursor-overlay');
+    const dot = document.getElementById('__healix-cursor-overlay');
     if (dot) dot.style.opacity = '0';
   };
 
@@ -111,20 +111,20 @@ const CURSOR_OVERLAY_INIT_SCRIPT = `
 })();
 `;
 
-// ── TestBot PID-file helpers ────────────────────────────────────────────────
-// We write a PID file for every process TestBot starts (dev server, worker).
+// ── Healix PID-file helpers ────────────────────────────────────────────────
+// We write a PID file for every process Healix starts (dev server, worker).
 // On the next run startup we read these files and kill only those PIDs —
 // never any unrelated user process.
 
-const TESTBOT_SERVER_PID_FILENAME  = '.testbot-server.pid';
-const TESTBOT_WORKER_PID_FILENAME  = '.testbot-worker.pid';
+const HEALIX_SERVER_PID_FILENAME  = '.healix-server.pid';
+const HEALIX_WORKER_PID_FILENAME  = '.healix-worker.pid';
 
 /**
- * Kill a process tree identified by a PID file TestBot previously wrote.
+ * Kill a process tree identified by a PID file Healix previously wrote.
  * Silently no-ops if the file is missing or the process is already gone.
  * Removes the file regardless.
  */
-function killOrphanedTestbotProcess(pidFile, label) {
+function killOrphanedHealixProcess(pidFile, label) {
   if (!fs.existsSync(pidFile)) return;
   let pid;
   try {
@@ -139,7 +139,7 @@ function killOrphanedTestbotProcess(pidFile, label) {
       } else {
         try { process.kill(-pid, 'SIGKILL'); } catch { try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ } }
       }
-      Logger.info('PipelineWorker', `Killed leftover TestBot ${label} process`, { pid });
+      Logger.info('PipelineWorker', `Killed leftover Healix ${label} process`, { pid });
     } catch { /* process already gone — ignore */ }
   }
 
@@ -147,9 +147,9 @@ function killOrphanedTestbotProcess(pidFile, label) {
 }
 
 /**
- * Write a PID to a TestBot-owned PID file so it can be cleaned up later.
+ * Write a PID to a Healix-owned PID file so it can be cleaned up later.
  */
-function writeTestbotPidFile(pidFile, pid) {
+function writeHealixPidFile(pidFile, pid) {
   try { fs.writeFileSync(pidFile, String(pid)); } catch { /* non-fatal */ }
 }
 
@@ -161,10 +161,10 @@ function toFiniteNumber(value, fallback) {
 }
 
 function createRunBudget(config = {}) {
-  const totalMs = toFiniteNumber(config.maxRunMs || process.env.TESTBOT_RUN_BUDGET_MS, DEFAULT_TOTAL_BUDGET_MS);
+  const totalMs = toFiniteNumber(config.maxRunMs || process.env.HEALIX_RUN_BUDGET_MS, DEFAULT_TOTAL_BUDGET_MS);
   const stageCaps = {};
   for (const [stage, fallback] of Object.entries(DEFAULT_STAGE_CAPS_MS)) {
-    const envKey = `TESTBOT_STAGE_${stage.toUpperCase()}_MS`;
+    const envKey = `HEALIX_STAGE_${stage.toUpperCase()}_MS`;
     stageCaps[stage] = toFiniteNumber(config.stageCaps?.[stage] || process.env[envKey], fallback);
   }
 
@@ -172,7 +172,7 @@ function createRunBudget(config = {}) {
   const coverageProfile = String(config.coverageProfile || 'qa-max').toLowerCase();
   const twoPhase = String(config.phaseMode || 'two-phase') === 'two-phase';
 
-  const hasExplicitGenerationCap = Boolean(config.stageCaps?.generation) || Boolean(process.env.TESTBOT_STAGE_GENERATION_MS);
+  const hasExplicitGenerationCap = Boolean(config.stageCaps?.generation) || Boolean(process.env.HEALIX_STAGE_GENERATION_MS);
   if (strictAI && !hasExplicitGenerationCap) {
     const requestedMinTests = toFiniteNumber(config.minGeneratedTests, 50);
     const adaptiveGenerationCap = coverageProfile === 'exhaustive' || requestedMinTests >= 75
@@ -184,7 +184,7 @@ function createRunBudget(config = {}) {
   }
 
   // Scale execution cap for heavier profiles / two-phase mode
-  const hasExplicitExecutionCap = Boolean(config.stageCaps?.execution) || Boolean(process.env.TESTBOT_STAGE_EXECUTION_MS);
+  const hasExplicitExecutionCap = Boolean(config.stageCaps?.execution) || Boolean(process.env.HEALIX_STAGE_EXECUTION_MS);
   if (!hasExplicitExecutionCap) {
     const adaptiveExecutionCap = coverageProfile === 'exhaustive'
       ? 2400000
@@ -386,18 +386,31 @@ function collectGenerationQuality(projectPath) {
   };
 }
 
-function buildRequirementsCoverage({ prdContent, projectPath }) {
+function buildRequirementsCoverage({ prdContent, prdContents, projectPath }) {
   const fallback = {
     totalRequirements: 0,
     mappedRequirements: 0,
     uncoveredRequirements: [],
   };
 
-  if (!prdContent || !String(prdContent).trim()) {
+  const allPrdContent = [];
+  if (prdContent && String(prdContent).trim()) {
+    allPrdContent.push(String(prdContent));
+  }
+  if (Array.isArray(prdContents)) {
+    for (const content of prdContents) {
+      if (content && String(content).trim()) {
+        allPrdContent.push(String(content));
+      }
+    }
+  }
+
+  if (allPrdContent.length === 0) {
     return fallback;
   }
 
-  const requirementMatches = String(prdContent).match(/\b(?:REQ|AC|US)[-_ ]?\d+\b/gi) || [];
+  const combinedPrdContent = allPrdContent.join('\n');
+  const requirementMatches = combinedPrdContent.match(/\b(?:REQ|AC|US)[-_ ]?\d+\b/gi) || [];
   const normalizedRequirements = [...new Set(requirementMatches.map((item) => item.toUpperCase().replace(/\s+/g, '-')))];
   if (normalizedRequirements.length === 0) {
     return fallback;
@@ -577,7 +590,7 @@ function emitPipelineTelemetry(reporter, payload) {
 
   const status = phaseToTelemetryStatus(payload.phase);
   reporter.emitBackground({
-    toolName: 'testbot_test_my_app',
+    toolName: 'healix_test_my_app',
     eventType: 'pipeline_status',
     runId: payload.runId,
     phase: payload.phase,
@@ -727,11 +740,11 @@ function buildUserFacingPipelineError(errorCode, error) {
   }
 
   if (errorCode === 'EXPO_NON_INTERACTIVE_PROMPT') {
-    return 'Expo requested interactive input while TestBot is running headless. Update start command/env to non-interactive mode and fixed port values.';
+    return 'Expo requested interactive input while Healix is running headless. Update start command/env to non-interactive mode and fixed port values.';
   }
 
   if (errorCode === 'PLAYWRIGHT_DEPENDENCY_MISSING') {
-    return 'Playwright test runtime could not be resolved while validating generated tests. TestBot attempted to auto-link @playwright/test; install it in the target project if this persists.';
+    return 'Playwright test runtime could not be resolved while validating generated tests. Healix attempted to auto-link @playwright/test; install it in the target project if this persists.';
   }
 
   if (errorCode === 'GENERATION_VALIDATION_FAILED') {
@@ -750,8 +763,8 @@ function buildUserFacingPipelineError(errorCode, error) {
     return `App server did not become reachable before timeout. Verify start command, base URL, and port settings in the config form.${detail}`;
   }
 
-  if (errorCode === 'OPENAI_KEY_MISSING' || errorCode === 'MISSING_TESTBOT_API_KEY') {
-    return 'TESTBOT_API_KEY is required for AI test generation. Set it in your MCP config: "TESTBOT_API_KEY": "tb_your_key_here".';
+  if (errorCode === 'OPENAI_KEY_MISSING' || errorCode === 'MISSING_HEALIX_API_KEY') {
+    return 'HEALIX_API_KEY is required for AI test generation. Set it in your MCP config: "HEALIX_API_KEY": "tb_your_key_here".';
   }
 
   return normalizedMessage;
@@ -766,7 +779,7 @@ function isVideoCursorEnabled(config = {}) {
     return false;
   }
 
-  const envValue = String(process.env.TESTBOT_VIDEO_CURSOR || '').trim().toLowerCase();
+  const envValue = String(process.env.HEALIX_VIDEO_CURSOR || '').trim().toLowerCase();
   if (!envValue) {
     return true;
   }
@@ -885,11 +898,11 @@ function applyMouseCursorOverlayToGeneratedTests({ projectPath, enabled }) {
 }
 
 function resolveFailureAnalysisProvider() {
-  const testbotApiKey = process.env.TESTBOT_API_KEY || null;
-  if (testbotApiKey) {
-    return { provider: 'saas', apiKey: testbotApiKey };
+  const healixApiKey = process.env.HEALIX_API_KEY || null;
+  if (healixApiKey) {
+    return { provider: 'saas', apiKey: healixApiKey };
   }
-  return { provider: null, reason: 'TESTBOT_API_KEY is required for AI failure analysis' };
+  return { provider: null, reason: 'HEALIX_API_KEY is required for AI failure analysis' };
 }
 
 function resetGeneratedTestsDir(projectPath) {
@@ -1272,7 +1285,7 @@ function auditGeneratedTestQuality({ projectPath, testType, context }) {
   const checkValidityPattern = /\.checkValidity\(/i;
   const riskyUiPattern = /page\.pause\(/i;
   const riskyPhrasesPattern = /(invalid credentials|email is required|password is required|network error|try again|not found|does not exist|cannot find)/gi;
-  const enforcePhraseRiskGates = String(process.env.TESTBOT_ENFORCE_PHRASE_RISK_GATES || '').toLowerCase() === 'true';
+  const enforcePhraseRiskGates = String(process.env.HEALIX_ENFORCE_PHRASE_RISK_GATES || '').toLowerCase() === 'true';
   const knownCorpus = new Set();
 
   const collectKnownText = (value) => {
@@ -1332,7 +1345,7 @@ function auditGeneratedTestQuality({ projectPath, testType, context }) {
     const isApiFile = /request\.(get|post|put|patch|delete|fetch)\(/i.test(content) || /api/i.test(name);
     if (isApiFile) {
       summary.apiFiles += 1;
-      if (/Promise\.all|TESTBOT_API_STRESS_BURST|burst|p95|percentile/i.test(content)) {
+      if (/Promise\.all|HEALIX_API_STRESS_BURST|burst|p95|percentile/i.test(content)) {
         summary.hasApiBurstCoverage = true;
       }
     } else {
@@ -1451,19 +1464,19 @@ function installMissingDependencies(projectPath, testsDir) {
 }
 
 async function maybeGenerateViaSaaS({ config, context, prdContent, testsDir, projectInfo }) {
-  const testbotApiKey = process.env.TESTBOT_API_KEY;
-  if (!testbotApiKey) {
+  const healixApiKey = process.env.HEALIX_API_KEY;
+  if (!healixApiKey) {
     const err = new Error(
-      'Backend test generation requires TESTBOT_API_KEY.\n' +
+      'Backend test generation requires HEALIX_API_KEY.\n' +
       'Please configure it in your MCP settings:\n' +
       '{\n' +
       '  "env": {\n' +
-      '    "TESTBOT_API_KEY": "tb_your_key_here",\n' +
-      '    "TESTBOT_DASHBOARD_URL": "https://your-testbot-dashboard.com"\n' +
+      '    "HEALIX_API_KEY": "tb_your_key_here",\n' +
+      '    "HEALIX_DASHBOARD_URL": "https://your-healix-dashboard.com"\n' +
       '  }\n' +
       '}'
     );
-    err.code = 'MISSING_TESTBOT_API_KEY';
+    err.code = 'MISSING_HEALIX_API_KEY';
     throw err;
   }
 
@@ -1471,7 +1484,7 @@ async function maybeGenerateViaSaaS({ config, context, prdContent, testsDir, pro
     return { generated: 0, files: [], skipped: true, reason: 'missing_context' };
   }
 
-  const dashboardUrl = process.env.TESTBOT_DASHBOARD_URL || 'http://localhost:3000';
+  const dashboardUrl = process.env.HEALIX_DASHBOARD_URL || 'http://localhost:3000';
   const fetchFn = global.fetch || require('node-fetch');
 
   const strictAI = strictAIEnabled(config);
@@ -1482,7 +1495,7 @@ async function maybeGenerateViaSaaS({ config, context, prdContent, testsDir, pro
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        api_key: testbotApiKey,
+        api_key: healixApiKey,
         context,
         testType: config.testType,
         prd: prdContent || '',
@@ -1500,7 +1513,7 @@ async function maybeGenerateViaSaaS({ config, context, prdContent, testsDir, pro
   } catch (networkError) {
     const err = new Error(
       `Backend test generation failed: Cannot reach ${dashboardUrl}.\n` +
-      `Please check that TESTBOT_DASHBOARD_URL is correct and the server is running.\n` +
+      `Please check that HEALIX_DASHBOARD_URL is correct and the server is running.\n` +
       `Network error: ${networkError.message}`
     );
     err.code = 'BACKEND_UNREACHABLE';
@@ -1518,8 +1531,8 @@ async function maybeGenerateViaSaaS({ config, context, prdContent, testsDir, pro
     const err = new Error(
       `Backend test generation failed (HTTP ${response.status}).\n` +
       `Please check:\n` +
-      `- TESTBOT_API_KEY is valid and active\n` +
-      `- TESTBOT_DASHBOARD_URL points to the correct server\n` +
+      `- HEALIX_API_KEY is valid and active\n` +
+      `- HEALIX_DASHBOARD_URL points to the correct server\n` +
       `- Your account has sufficient credits\n` +
       `Error: ${errorDetail}`
     );
@@ -1679,7 +1692,7 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
     const reason = primaryFailure?.reason || null;
     const message = reason
       ? `Backend test generation failed: ${reason}`
-      : 'Backend test generation failed. Ensure TESTBOT_API_KEY is correctly configured and the backend is reachable.';
+      : 'Backend test generation failed. Ensure HEALIX_API_KEY is correctly configured and the backend is reachable.';
 
     const error = new Error(message);
     error.code = errorCode;
@@ -1712,7 +1725,7 @@ async function maybeRunFailureTriage({ config, testResults, runBudget }) {
     return null;
   }
 
-  const limit = toFiniteNumber(config.aiFailureLimit || process.env.TESTBOT_AI_TRIAGE_LIMIT, 8);
+  const limit = toFiniteNumber(config.aiFailureLimit || process.env.HEALIX_AI_TRIAGE_LIMIT, 8);
   const failures = testResults.failures.slice(0, limit);
 
   return withStageBudget(runBudget, 'aiTriage', async () => {
@@ -1726,15 +1739,15 @@ async function maybeRunFailureTriage({ config, testResults, runBudget }) {
  * Main pipeline function.
  */
 async function runPipeline(config, runId) {
-  const statusDir = path.join(config.projectPath, 'testbot-reports', '.runs', runId);
+  const statusDir = path.join(config.projectPath, 'healix-reports', '.runs', runId);
   ensureDir(statusDir);
   const telemetryReporter = new MCPTelemetryReporter();
 
-  // Kill any leftover TestBot-started dev server from a previous run.
-  // We only kill what TestBot wrote into this PID file — nothing else.
-  const testbotReportsDir = path.join(config.projectPath, 'testbot-reports');
-  const serverPidFile = path.join(testbotReportsDir, TESTBOT_SERVER_PID_FILENAME);
-  killOrphanedTestbotProcess(serverPidFile, 'dev-server');
+  // Kill any leftover Healix-started dev server from a previous run.
+  // We only kill what Healix wrote into this PID file — nothing else.
+  const healixReportsDir = path.join(config.projectPath, 'healix-reports');
+  const serverPidFile = path.join(healixReportsDir, HEALIX_SERVER_PID_FILENAME);
+  killOrphanedHealixProcess(serverPidFile, 'dev-server');
 
   const runBudget = createRunBudget(config);
   let generationMeta = null;
@@ -1884,23 +1897,42 @@ async function runPipeline(config, runId) {
     }
 
     // -------------------------------------------------------
-    // 3. Read PRD file if specified
+    // 3. Read PRD file(s) if specified
     // -------------------------------------------------------
     let prdContent = null;
+    const prdContents = [];
+
     if (config.prdFile) {
       try {
         prdContent = fs.readFileSync(config.prdFile, 'utf-8');
+        prdContents.push(prdContent);
         Logger.info('PipelineWorker', 'Read PRD file', { path: config.prdFile, length: prdContent.length });
       } catch (error) {
         Logger.warn('PipelineWorker', 'Could not read PRD file', { path: config.prdFile, reason: error.message });
       }
     }
 
+    if (Array.isArray(config.prdFiles) && config.prdFiles.length > 0) {
+      for (const prdFilePath of config.prdFiles) {
+        if (prdFilePath === config.prdFile) continue;
+        try {
+          const content = fs.readFileSync(prdFilePath, 'utf-8');
+          prdContents.push(content);
+          Logger.info('PipelineWorker', 'Read additional PRD file', { path: prdFilePath, length: content.length });
+        } catch (error) {
+          Logger.warn('PipelineWorker', 'Could not read PRD file', { path: prdFilePath, reason: error.message });
+        }
+      }
+    }
+
+    const combinedPrdContent = prdContents.length > 0 ? prdContents.join('\n\n---\n\n') : null;
+
     const projectInfo = {
       name: config.projectName,
       framework: codebaseContext?.projectStructure?.framework || 'Unknown',
       baseURL: config.baseURL,
       startCommand: config.startCommand,
+      testCredentials: config.testCredentials,
     };
 
     // -------------------------------------------------------
@@ -1916,7 +1948,7 @@ async function runPipeline(config, runId) {
       const generationResult = await generateWithFallbackChain({
         config,
         context: codebaseContext,
-        prdContent,
+        prdContent: combinedPrdContent,
         runBudget,
         projectInfo,
       });
@@ -1939,7 +1971,8 @@ async function runPipeline(config, runId) {
       }
       generationQuality = qualityGate.result;
       requirementsCoverage = buildRequirementsCoverage({
-        prdContent,
+        prdContent: combinedPrdContent,
+        prdContents,
         projectPath: config.projectPath,
       });
 
@@ -1964,7 +1997,7 @@ async function runPipeline(config, runId) {
 
         for (const filePath of generatedTestFiles) {
           telemetryReporter.emitBackground({
-            toolName: 'testbot_test_my_app',
+            toolName: 'healix_test_my_app',
             eventType: 'test_file_generated',
             runId,
             phase: 'generating',
@@ -1980,7 +2013,7 @@ async function runPipeline(config, runId) {
         }
 
         telemetryReporter.emitBackground({
-          toolName: 'testbot_test_my_app',
+          toolName: 'healix_test_my_app',
           eventType: 'tests_generated',
           runId,
           phase: 'generating',
@@ -2115,7 +2148,7 @@ async function runPipeline(config, runId) {
 
       for (const t of simplifiedTests) {
         telemetryReporter.emitBackground({
-          toolName: 'testbot_test_my_app',
+          toolName: 'healix_test_my_app',
           eventType: 'test_result',
           runId,
           phase: 'tests_complete',
@@ -2134,7 +2167,7 @@ async function runPipeline(config, runId) {
       }
 
       telemetryReporter.emitBackground({
-        toolName: 'testbot_test_my_app',
+        toolName: 'healix_test_my_app',
         eventType: 'test_results',
         runId,
         phase: 'tests_complete',
@@ -2183,8 +2216,8 @@ async function runPipeline(config, runId) {
 
     const report = await withStageBudget(runBudget, 'reporting', async () => {
       const reportGen = new ReportGenerator();
-      const testbotApiKey = process.env.TESTBOT_API_KEY;
-      const testbotDashboardUrl = process.env.TESTBOT_DASHBOARD_URL || 'http://localhost:3000';
+      const healixApiKey = process.env.HEALIX_API_KEY;
+      const healixDashboardUrl = process.env.HEALIX_DASHBOARD_URL || 'http://localhost:3000';
 
       return reportGen.generate({
         projectPath: config.projectPath,
@@ -2198,8 +2231,8 @@ async function runPipeline(config, runId) {
         requirementsCoverage,
         phaseResults,
         fallbackUsed,
-        api_key: testbotApiKey,
-        dashboard_url: testbotDashboardUrl,
+        api_key: healixApiKey,
+        dashboard_url: healixDashboardUrl,
       });
     });
 
@@ -2210,7 +2243,7 @@ async function runPipeline(config, runId) {
     // -------------------------------------------------------
     // 7. Upload artifacts for failed tests to Supabase Storage
     // -------------------------------------------------------
-    // NOTE: This runs AFTER report generation so artifacts are copied to testbot-reports/artifacts
+    // NOTE: This runs AFTER report generation so artifacts are copied to healix-reports/artifacts
     let artifactUploadResult = null;
     if (testResults.failed > 0) {
       try {
@@ -2238,8 +2271,8 @@ async function runPipeline(config, runId) {
 
         const artifactUploader = new ArtifactUploader({
           projectPath: config.projectPath,
-          dashboardUrl: process.env.TESTBOT_DASHBOARD_URL,
-          apiKey: process.env.TESTBOT_API_KEY,
+          dashboardUrl: process.env.HEALIX_DASHBOARD_URL,
+          apiKey: process.env.HEALIX_API_KEY,
         });
 
         artifactUploadResult = await artifactUploader.processAndUpload(actualRunId, testResults);
@@ -2400,7 +2433,7 @@ async function runPipeline(config, runId) {
     try {
       const reportGen = new ReportGenerator();
       const syntheticFailure = {
-        testName: `[PIPELINE_ERROR:${errorCode}] TestBot pipeline failed before/while execution`,
+        testName: `[PIPELINE_ERROR:${errorCode}] Healix pipeline failed before/while execution`,
         file: 'pipeline-worker.js',
         status: 'failed',
         duration: 0,
@@ -2438,8 +2471,8 @@ async function runPipeline(config, runId) {
         failures: [syntheticFailure],
       };
 
-      const testbotApiKey = process.env.TESTBOT_API_KEY;
-      const testbotDashboardUrl = process.env.TESTBOT_DASHBOARD_URL || 'http://localhost:3000';
+      const healixApiKey = process.env.HEALIX_API_KEY;
+      const healixDashboardUrl = process.env.HEALIX_DASHBOARD_URL || 'http://localhost:3000';
       const errorReport = await reportGen.generate({
         projectPath: config.projectPath,
         projectName: config.projectName,
@@ -2452,8 +2485,8 @@ async function runPipeline(config, runId) {
         requirementsCoverage,
         phaseResults,
         fallbackUsed,
-        api_key: testbotApiKey,
-        dashboard_url: testbotDashboardUrl,
+        api_key: healixApiKey,
+        dashboard_url: healixDashboardUrl,
       });
 
       updateStatus(statusDir, 'error_reported', {

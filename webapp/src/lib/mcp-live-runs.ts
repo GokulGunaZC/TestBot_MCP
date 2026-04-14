@@ -253,7 +253,7 @@ export async function getLiveRunSnapshotsForUser(userId: string, options?: {
     eq(mcpTelemetryEvents.userId, userId),
     gte(mcpTelemetryEvents.occurredAt, since),
     isNotNull(mcpTelemetryEvents.runId),
-    eq(mcpTelemetryEvents.toolName, 'testbot_test_my_app'),
+    eq(mcpTelemetryEvents.toolName, 'healix_test_my_app'),
   ]
   if (options?.runId) {
     conditions.push(eq(mcpTelemetryEvents.runId, options.runId))

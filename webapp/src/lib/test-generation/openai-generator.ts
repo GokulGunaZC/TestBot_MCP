@@ -1071,7 +1071,7 @@ Return JSON array only.`
 
     if (prefix === 'api' && validFiles.length > 0) {
       const hasStressCoverage = validFiles.some((file) =>
-        /Promise\.all|TESTBOT_API_STRESS_BURST|burst|p95|percentile/i.test(file.content)
+        /Promise\.all|HEALIX_API_STRESS_BURST|burst|p95|percentile/i.test(file.content)
       )
       if (!hasStressCoverage) {
         throw new Error('Generated API suite missing burst/stress coverage')
@@ -1821,8 +1821,8 @@ const REQUEST_PATH = ${JSON.stringify(endpointPath)};
 const DEFAULT_BODY = ${JSON.stringify(requestBody, null, 2)};
 const EXPECTED_SUCCESS_STATUSES = ${JSON.stringify(successStatuses)};
 const EXPECTED_AUTH_STATUSES = [401, 403];
-const STRESS_BURST = Number(process.env.TESTBOT_API_STRESS_BURST || 6);
-const STRESS_P95_MS = Number(process.env.TESTBOT_API_STRESS_P95_MS || 2000);
+const STRESS_BURST = Number(process.env.HEALIX_API_STRESS_BURST || 6);
+const STRESS_P95_MS = Number(process.env.HEALIX_API_STRESS_P95_MS || 2000);
 
 function methodSupportsBody(method: string) {
   return ['POST', 'PUT', 'PATCH'].includes(String(method || '').toUpperCase());
@@ -1907,7 +1907,7 @@ ${baseUrlComment}
 // Fallback reason: ${reason}
 test.describe('Fallback error handling checks', () => {
   test('invalid route is handled with explicit not-found behavior', async ({ page }) => {
-    const response = await page.goto('/__testbot_invalid_route__');
+    const response = await page.goto('/__healix_invalid_route__');
     expect(response).not.toBeNull();
     const status = response?.status() ?? 0;
     if (status !== 404) {

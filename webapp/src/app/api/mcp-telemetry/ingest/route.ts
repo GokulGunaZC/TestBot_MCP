@@ -87,8 +87,8 @@ function normalizeEvent(input: IncomingEvent) {
   const success = typeof input.success === 'boolean' ? input.success : status === 'success'
 
   return {
-    source: clampString(input.source, 80) || 'testbot-mcp',
-    toolName: clampString(input.toolName, 120) || 'testbot_test_my_app',
+    source: clampString(input.source, 80) || 'healix-mcp',
+    toolName: clampString(input.toolName, 120) || 'healix_test_my_app',
     eventType: clampString(input.eventType, 80) || 'status',
     runId: clampString(input.runId, 180),
     phase: clampString(input.phase, 120),
