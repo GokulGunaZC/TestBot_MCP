@@ -733,7 +733,7 @@ function summarizeGenerationAttemptError(error) {
 }
 
 function buildUserFacingPipelineError(errorCode, error) {
-  const normalizedMessage = normalizeErrorText(error?.message) || 'Pipeline execution failed';
+  const normalizedMessage = normalizeErrorText(error?.message) || 'Healix run failed';
 
   if (errorCode === 'EXPO_DEPENDENCY_VALIDATION_FAILED') {
     return 'Expo blocked server startup due to dependency version validation. Set compatible dependency versions (for example via `npx expo install --check`) or rerun with dependency validation disabled for CI automation.';
@@ -744,18 +744,18 @@ function buildUserFacingPipelineError(errorCode, error) {
   }
 
   if (errorCode === 'PLAYWRIGHT_DEPENDENCY_MISSING') {
-    return 'Playwright test runtime could not be resolved while validating generated tests. Healix attempted to auto-link @playwright/test; install it in the target project if this persists.';
+    return 'Test runtime could not be resolved while validating generated tests. Healix attempted to auto-link the test runner; install @playwright/test in the target project if this persists.';
   }
 
   if (errorCode === 'GENERATION_VALIDATION_FAILED') {
     if (/playwright_list_failed/i.test(normalizedMessage)) {
-      return 'Generated tests failed pre-run validation (`playwright test --list`). This is usually caused by missing Playwright runtime dependencies or invalid generated imports.';
+      return 'Generated tests failed pre-run validation. This is usually caused by missing test runner dependencies or invalid generated imports.';
     }
     return `Generated tests did not pass validation gates. ${normalizedMessage}`;
   }
 
   if (errorCode === 'TIME_BUDGET_EXCEEDED') {
-    return 'Pipeline exceeded the configured time budget before tests could complete. Increase time budget or reduce generation/execution scope.';
+    return 'Healix exceeded the configured time budget before tests could complete. Increase time budget or reduce generation/execution scope.';
   }
 
   if (errorCode === 'SERVER_START_TIMEOUT') {
@@ -1760,7 +1760,7 @@ async function runPipeline(config, runId) {
 
   updateStatus(statusDir, 'started', {
     runId,
-    message: 'Pipeline started',
+    message: 'Healix started',
     project: config.projectName,
     budgetMs: runBudget.totalMs,
     aiOnlyEnforced,
@@ -2047,7 +2047,7 @@ async function runPipeline(config, runId) {
     // -------------------------------------------------------
     updateStatus(statusDir, 'running', {
       runId,
-      message: 'Running Playwright tests...',
+      message: 'Running tests...',
       generationMeta,
       fallbackUsed,
       aiOnlyEnforced,
@@ -2463,7 +2463,7 @@ async function runPipeline(config, runId) {
     try {
       const reportGen = new ReportGenerator();
       const syntheticFailure = {
-        testName: `[PIPELINE_ERROR:${errorCode}] Healix pipeline failed before/while execution`,
+        testName: `[HEALIX_ERROR:${errorCode}] Healix run failed before/while execution`,
         file: 'pipeline-worker.js',
         status: 'failed',
         duration: 0,

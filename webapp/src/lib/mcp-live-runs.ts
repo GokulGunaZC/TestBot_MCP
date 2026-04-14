@@ -88,7 +88,7 @@ function buildSyntheticLiveReport(snapshot: LiveRunSnapshot) {
   const skipped = clampNumber(snapshot.metadata.skipped, 0)
   const duration = snapshot.durationMs
   const projectName = getProjectName(snapshot)
-  const baseMessage = snapshot.message || `Pipeline phase: ${snapshot.phase}`
+  const baseMessage = snapshot.message || `Healix phase: ${snapshot.phase}`
 
   let tests
   if (snapshot.liveTests && snapshot.liveTests.length > 0) {
@@ -105,10 +105,10 @@ function buildSyntheticLiveReport(snapshot: LiveRunSnapshot) {
     }))
   } else if (snapshot.runStatus === 'failed') {
     tests = [{
-      id: `live-${snapshot.runId}-pipeline-error`,
-      title: `[PIPELINE_ERROR:${snapshot.errorCode || 'PIPELINE_FAILED'}] ${baseMessage}`,
-      suite: 'pipeline',
-      file: 'pipeline',
+      id: `live-${snapshot.runId}-healix-error`,
+      title: `[HEALIX_ERROR:${snapshot.errorCode || 'HEALIX_FAILED'}] ${baseMessage}`,
+      suite: 'Healix',
+      file: 'healix',
       status: 'failed',
       duration,
       retries: 0,
@@ -121,9 +121,9 @@ function buildSyntheticLiveReport(snapshot: LiveRunSnapshot) {
   } else {
     tests = [{
       id: `live-${snapshot.runId}-phase-${snapshot.phase}`,
-      title: `[PIPELINE:${snapshot.phase}] ${baseMessage}`,
-      suite: 'pipeline',
-      file: 'pipeline',
+      title: `[HEALIX:${snapshot.phase}] ${baseMessage}`,
+      suite: 'Healix',
+      file: 'healix',
       status: snapshot.runStatus === 'passed' ? 'passed' : 'running',
       duration,
       retries: 0,

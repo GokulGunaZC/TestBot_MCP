@@ -451,7 +451,7 @@ class HealixMCPServer {
       this.writeRunStatus(statusFile, {
         runId,
         phase: 'starting_pipeline',
-        message: 'Validated configuration. Starting pipeline worker...',
+        message: 'Validated configuration. Starting Healix worker...',
         project: baseConfig.projectName,
         aiOnlyEnforced: finalConfig.strictAIGeneration !== false,
       });
@@ -461,7 +461,7 @@ class HealixMCPServer {
       this.writeRunStatus(statusFile, {
         runId,
         phase: 'started',
-        message: 'Pipeline worker starting...',
+        message: 'Healix starting...',
         project: baseConfig.projectName,
         aiOnlyEnforced: finalConfig.strictAIGeneration !== false,
       });
@@ -1305,7 +1305,7 @@ Return the JSON structure above based on what you find in the codebase.
     this.writeRunStatus(statusFile, {
       runId,
       phase: 'queued',
-      message: 'Pipeline queued.',
+      message: 'Healix run queued.',
       project: baseConfig.projectName,
       aiOnlyEnforced: baseConfig.strictAIGeneration !== false,
     });
