@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import Link from 'next/link';
 import type { TestRun } from '@/lib/types/database';
@@ -8,6 +8,15 @@ import type { TestRun } from '@/lib/types/database';
 const PAGE_SIZE_OPTIONS = [10, 25, 50];
 const ACTIVE_REFRESH_INTERVAL_MS = 10000;
 const IDLE_REFRESH_INTERVAL_MS = 45000;
+
+interface TestRunGroup {
+  name: string;
+  runs: TestRun[];
+  totalTests: number;
+  passedTests: number;
+  latestStatus: TestRun['status'];
+  latestDate: string;
+}
 
 function hasActivePipelineRuns(runs: TestRun[]): boolean {
   return runs.some((run) => {
@@ -70,6 +79,28 @@ function SkeletonRow() {
   );
 }
 
+function buildGroups(runs: TestRun[]): TestRunGroup[] {
+  const map = new Map<string, TestRun[]>();
+  for (const run of runs) {
+    const key = run.creation_name || 'Untitled Test';
+    if (!map.has(key)) map.set(key, []);
+    map.get(key)!.push(run);
+  }
+  return Array.from(map.entries()).map(([name, groupRuns]) => {
+    const sorted = [...groupRuns].sort(
+      (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
+    );
+    return {
+      name,
+      runs: sorted,
+      totalTests: sorted.reduce((s, r) => s + (r.total_tests || 0), 0),
+      passedTests: sorted.reduce((s, r) => s + (r.passed_tests || 0), 0),
+      latestStatus: sorted[0].status,
+      latestDate: sorted[0].created_at,
+    };
+  }).sort((a, b) => new Date(b.latestDate).getTime() - new Date(a.latestDate).getTime());
+}
+
 export default function AllTestsPage() {
   const [tests, setTests] = useState<TestRun[]>([]);
   const [total, setTotal] = useState(0);
@@ -84,6 +115,8 @@ export default function AllTestsPage() {
   const [sortBy, setSortBy] = useState<'date' | 'name' | 'status'>('date');
   const [pageSize, setPageSize] = useState(25);
   const [page, setPage] = useState(1);
+  const [groupByName, setGroupByName] = useState(false);
+  const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
 
   // Debounce search input
   useEffect(() => {
@@ -187,6 +220,16 @@ export default function AllTestsPage() {
     setPage(1);
   };
 
+  const toggleGroup = (name: string) => {
+    setExpandedGroups(prev => {
+      const next = new Set(prev);
+      if (next.has(name)) next.delete(name); else next.add(name);
+      return next;
+    });
+  };
+
+  const groups = groupByName ? buildGroups(tests) : [];
+
   return (
     <div className="max-w-7xl mx-auto flex flex-col gap-5">
       {/* Header */}
@@ -244,6 +287,23 @@ export default function AllTestsPage() {
               <option value="name">Sort: Name</option>
               <option value="status">Sort: Status</option>
             </select>
+            <button
+              onClick={() => {
+                setGroupByName(v => !v);
+                setExpandedGroups(new Set());
+              }}
+              className={`flex items-center gap-1.5 px-3 py-2.5 text-sm rounded-xl border transition-all cursor-pointer ${
+                groupByName
+                  ? 'bg-blue-500/20 border-blue-500/40 text-[#60A5FA]'
+                  : 'input-glass border-transparent text-[#8BA4C8] hover:text-[#F0F6FF]'
+              }`}
+            >
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <rect x="3" y="3" width="7" height="7" rx="1" /><rect x="14" y="3" width="7" height="7" rx="1" />
+                <rect x="3" y="14" width="7" height="7" rx="1" /><rect x="14" y="14" width="7" height="7" rx="1" />
+              </svg>
+              Group
+            </button>
           </div>
         </div>
 
@@ -300,53 +360,154 @@ export default function AllTestsPage() {
                 </tr>
               </thead>
               <AnimatePresence mode="wait">
-                <motion.tbody
-                  key={`${page}-${statusFilter}-${sortBy}-${debouncedSearch}`}
-                  initial={{ opacity: 0 }}
-                  animate={{ opacity: 1 }}
-                  exit={{ opacity: 0 }}
-                  transition={{ duration: 0.2 }}
-                >
-                  {tests.map((test) => (
-                    <tr
-                      key={test.id}
-                      className="border-b border-white/5 last:border-0 hover:bg-white/[0.02] transition-all cursor-pointer group"
-                    >
-                      <td className="px-6 py-4">
-                        <Link
-                          href={`/test-run/${test.id}`}
-                          className="text-[#F0F6FF] text-sm font-medium group-hover:text-[#60A5FA] transition-colors"
-                        >
-                          {test.creation_name || 'Untitled Test'}
-                        </Link>
-                        {(test.current_phase || test.error_code || test.is_live) && (
-                          <div className="text-[11px] text-[#60A5FA] mt-1 font-mono">
-                            {test.is_live ? 'live' : 'run'}{test.current_phase ? ` · ${test.current_phase}` : ''}{test.error_code ? ` · ${test.error_code}` : ''}
-                          </div>
-                        )}
-                      </td>
-                      <td className="px-4 py-4">
-                        <StatusCell pass={test.passed_tests} total={test.total_tests} />
-                      </td>
-                      <td className="px-4 py-4">
-                        <span className={`px-2 py-0.5 rounded-full text-xs font-semibold ${
-                          test.status === 'passed'
-                            ? 'bg-emerald-500/10 text-emerald-400'
-                            : test.status === 'failed'
-                            ? 'bg-red-500/10 text-red-400'
-                            : test.status === 'running'
-                            ? 'bg-blue-500/10 text-blue-400'
-                            : 'bg-amber-500/10 text-amber-400'
-                        }`}>
-                          {test.status}
-                        </span>
-                      </td>
-                      <td className="px-4 py-4">
-                        <span className="text-[#4A6280] text-xs font-mono whitespace-nowrap">{formatDateTime(test.created_at)}</span>
-                      </td>
-                    </tr>
-                  ))}
-                </motion.tbody>
+                {groupByName ? (
+                  <motion.tbody
+                    key={`grouped-${page}-${statusFilter}-${sortBy}-${debouncedSearch}`}
+                    initial={{ opacity: 0 }}
+                    animate={{ opacity: 1 }}
+                    exit={{ opacity: 0 }}
+                    transition={{ duration: 0.2 }}
+                  >
+                    {groups.map((group) => {
+                      const isOpen = expandedGroups.has(group.name);
+                      return (
+                        <React.Fragment key={`group-${group.name}`}>
+                          <tr
+                            onClick={() => toggleGroup(group.name)}
+                            className="border-b border-white/8 bg-white/[0.03] hover:bg-white/[0.05] transition-all cursor-pointer select-none"
+                          >
+                            <td className="px-6 py-3.5">
+                              <div className="flex items-center gap-2.5">
+                                <svg
+                                  width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"
+                                  className={`text-[#60A5FA] transition-transform duration-200 flex-shrink-0 ${isOpen ? 'rotate-90' : ''}`}
+                                >
+                                  <polyline points="9 18 15 12 9 6" />
+                                </svg>
+                                <span className="text-[#F0F6FF] text-sm font-semibold">{group.name}</span>
+                                <span className="px-1.5 py-0.5 rounded-md bg-white/8 text-[#8BA4C8] text-[11px] font-medium">
+                                  {group.runs.length} run{group.runs.length !== 1 ? 's' : ''}
+                                </span>
+                              </div>
+                            </td>
+                            <td className="px-4 py-3.5">
+                              <StatusCell pass={group.passedTests} total={group.totalTests} />
+                            </td>
+                            <td className="px-4 py-3.5">
+                              <span className={`px-2 py-0.5 rounded-full text-xs font-semibold ${
+                                group.latestStatus === 'passed'
+                                  ? 'bg-emerald-500/10 text-emerald-400'
+                                  : group.latestStatus === 'failed'
+                                  ? 'bg-red-500/10 text-red-400'
+                                  : group.latestStatus === 'running'
+                                  ? 'bg-blue-500/10 text-blue-400'
+                                  : 'bg-amber-500/10 text-amber-400'
+                              }`}>
+                                {group.latestStatus}
+                              </span>
+                            </td>
+                            <td className="px-4 py-3.5">
+                              <span className="text-[#4A6280] text-xs font-mono whitespace-nowrap">{formatDateTime(group.latestDate)}</span>
+                            </td>
+                          </tr>
+                          {isOpen && group.runs.map((test, idx) => (
+                            <tr
+                              key={test.id}
+                              className={`border-b border-white/[0.04] last:border-white/8 hover:bg-white/[0.02] transition-all cursor-pointer group ${
+                                idx === group.runs.length - 1 ? 'border-b border-white/8' : ''
+                              }`}
+                            >
+                              <td className="px-6 py-3">
+                                <div className="flex items-center gap-2.5 pl-5">
+                                  <div className="w-px h-4 bg-white/10 flex-shrink-0" />
+                                  <Link
+                                    href={`/test-run/${test.id}`}
+                                    onClick={e => e.stopPropagation()}
+                                    className="text-[#C8D9EF] text-sm group-hover:text-[#60A5FA] transition-colors"
+                                  >
+                                    {test.creation_name || 'Untitled Test'}
+                                  </Link>
+                                  {(test.current_phase || test.error_code || test.is_live) && (
+                                    <div className="text-[11px] text-[#60A5FA] font-mono">
+                                      {test.is_live ? 'live' : 'run'}{test.current_phase ? ` · ${test.current_phase}` : ''}{test.error_code ? ` · ${test.error_code}` : ''}
+                                    </div>
+                                  )}
+                                </div>
+                              </td>
+                              <td className="px-4 py-3">
+                                <StatusCell pass={test.passed_tests} total={test.total_tests} />
+                              </td>
+                              <td className="px-4 py-3">
+                                <span className={`px-2 py-0.5 rounded-full text-xs font-semibold ${
+                                  test.status === 'passed'
+                                    ? 'bg-emerald-500/10 text-emerald-400'
+                                    : test.status === 'failed'
+                                    ? 'bg-red-500/10 text-red-400'
+                                    : test.status === 'running'
+                                    ? 'bg-blue-500/10 text-blue-400'
+                                    : 'bg-amber-500/10 text-amber-400'
+                                }`}>
+                                  {test.status}
+                                </span>
+                              </td>
+                              <td className="px-4 py-3">
+                                <span className="text-[#4A6280] text-xs font-mono whitespace-nowrap">{formatDateTime(test.created_at)}</span>
+                              </td>
+                            </tr>
+                          ))}
+                        </React.Fragment>
+                      );
+                    })}
+                  </motion.tbody>
+                ) : (
+                  <motion.tbody
+                    key={`${page}-${statusFilter}-${sortBy}-${debouncedSearch}`}
+                    initial={{ opacity: 0 }}
+                    animate={{ opacity: 1 }}
+                    exit={{ opacity: 0 }}
+                    transition={{ duration: 0.2 }}
+                  >
+                    {tests.map((test) => (
+                      <tr
+                        key={test.id}
+                        className="border-b border-white/5 last:border-0 hover:bg-white/[0.02] transition-all cursor-pointer group"
+                      >
+                        <td className="px-6 py-4">
+                          <Link
+                            href={`/test-run/${test.id}`}
+                            className="text-[#F0F6FF] text-sm font-medium group-hover:text-[#60A5FA] transition-colors"
+                          >
+                            {test.creation_name || 'Untitled Test'}
+                          </Link>
+                          {(test.current_phase || test.error_code || test.is_live) && (
+                            <div className="text-[11px] text-[#60A5FA] mt-1 font-mono">
+                              {test.is_live ? 'live' : 'run'}{test.current_phase ? ` · ${test.current_phase}` : ''}{test.error_code ? ` · ${test.error_code}` : ''}
+                            </div>
+                          )}
+                        </td>
+                        <td className="px-4 py-4">
+                          <StatusCell pass={test.passed_tests} total={test.total_tests} />
+                        </td>
+                        <td className="px-4 py-4">
+                          <span className={`px-2 py-0.5 rounded-full text-xs font-semibold ${
+                            test.status === 'passed'
+                              ? 'bg-emerald-500/10 text-emerald-400'
+                              : test.status === 'failed'
+                              ? 'bg-red-500/10 text-red-400'
+                              : test.status === 'running'
+                              ? 'bg-blue-500/10 text-blue-400'
+                              : 'bg-amber-500/10 text-amber-400'
+                          }`}>
+                            {test.status}
+                          </span>
+                        </td>
+                        <td className="px-4 py-4">
+                          <span className="text-[#4A6280] text-xs font-mono whitespace-nowrap">{formatDateTime(test.created_at)}</span>
+                        </td>
+                      </tr>
+                    ))}
+                  </motion.tbody>
+                )}
               </AnimatePresence>
             </table>
           )}

@@ -410,6 +410,109 @@ function normaliseTest(t: ReportTest, idx: number, testRunId: string): Normalise
   };
 }
 
+// ─── Category helpers ─────────────────────────────────────────────────────────
+
+function extractCategory(name: string): string {
+  const match = name.match(/\[CAT:([^\]]+)\]/i);
+  if (!match) return 'uncategorized';
+  return match[1].trim().toLowerCase().replace(/[\s-]+/g, '_').replace(/[^a-z0-9_]/g, '');
+}
+
+const CATEGORY_META: Record<string, { label: string; color: string; border: string; dot: string }> = {
+  form_validation:   { label: 'Form Validation',    color: 'text-blue-400',    border: 'border-blue-500/20',   dot: 'bg-blue-400' },
+  ui_flow:           { label: 'UI Flow',             color: 'text-purple-400',  border: 'border-purple-500/20', dot: 'bg-purple-400' },
+  workflow_journey:  { label: 'Workflow / Journey',  color: 'text-indigo-400',  border: 'border-indigo-500/20', dot: 'bg-indigo-400' },
+  api_contract:      { label: 'API Contract',        color: 'text-teal-400',    border: 'border-teal-500/20',   dot: 'bg-teal-400' },
+  api_auth:          { label: 'API Auth',            color: 'text-amber-400',   border: 'border-amber-500/20',  dot: 'bg-amber-400' },
+  api_negative:      { label: 'API Negative',        color: 'text-red-400',     border: 'border-red-500/20',    dot: 'bg-red-400' },
+  api_stress:        { label: 'API Stress',          color: 'text-orange-400',  border: 'border-orange-500/20', dot: 'bg-orange-400' },
+  uncategorized:     { label: 'Uncategorized',       color: 'text-[#4A6280]',   border: 'border-white/10',      dot: 'bg-[#4A6280]' },
+};
+
+function getCategoryMeta(cat: string) {
+  if (CATEGORY_META[cat]) return CATEGORY_META[cat];
+  const label = cat.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+  return { label, color: 'text-[#8BA4C8]', border: 'border-white/10', dot: 'bg-[#8BA4C8]' };
+}
+
+const API_CATS = new Set(['api_contract', 'api_auth', 'api_negative', 'api_stress']);
+const FRONTEND_CATS = new Set(['ui_flow', 'form_validation', 'workflow_journey']);
+
+// Words that, when found as a filename segment, unambiguously denote a test type.
+// Add any new type here and it will automatically get its own main-type group.
+const TYPE_KEYWORD_MAP: Record<string, string> = {
+  smoke:         'smoke',
+  sanity:        'smoke',
+  e2e:           'e2e',
+  integration:   'integration',
+  regression:    'regression',
+  workflow:      'workflow',
+  journey:       'workflow',
+  performance:   'performance',
+  perf:          'performance',
+  load:          'load',
+  stress:        'stress',
+  burst:         'stress',
+  accessibility: 'accessibility',
+  a11y:          'accessibility',
+  visual:        'visual',
+  snapshot:      'visual',
+  contract:      'api',
+  api:           'api',
+  expansion:     'expansion',
+  error:         'error',
+  frontend:      'frontend',
+  ui:            'frontend',
+};
+
+// Feature-name prefixes common in filenames that are NOT test types — ignore these
+// when deciding type from a segment (e.g. auth-forms.spec.ts → 'auth' is a feature).
+const FEATURE_SEGMENTS = new Set([
+  'auth', 'user', 'users', 'home', 'page', 'pages', 'test', 'spec',
+  'main', 'index', 'app', 'dashboard', 'settings', 'profile', 'login',
+  'signup', 'register', 'admin', 'public', 'private', 'shared',
+]);
+
+function extractMainType(name: string, suite: string): string {
+  const fileBase = (suite || '')
+    .toLowerCase()
+    .replace(/\.spec\.(ts|js)$/i, '')
+    .replace(/^(fallback|healix)[-_]/, '');
+
+  // 1. Scan every segment of the filename for a type keyword
+  const segments = fileBase.split(/[-_./\\]/);
+  for (const seg of segments) {
+    if (TYPE_KEYWORD_MAP[seg]) return TYPE_KEYWORD_MAP[seg];
+  }
+
+  // 2. CAT tag inference (most explicit per-test signal)
+  const cat = extractCategory(name);
+  if (API_CATS.has(cat)) return 'api';
+  if (FRONTEND_CATS.has(cat)) return 'frontend';
+
+  // 3. No keyword match and no CAT tag — use first non-feature segment of the
+  //    filename as the type so new/unknown file conventions still surface correctly.
+  const firstMeaningful = segments.find(s => s.length > 1 && !FEATURE_SEGMENTS.has(s));
+  if (firstMeaningful) return firstMeaningful;
+
+  // 4. Absolute fallback (generic file with no usable signal)
+  return 'other';
+}
+
+const MAIN_TYPE_META: Record<string, { label: string; color: string; bg: string; dot: string; order: number }> = {
+  smoke:     { label: 'Smoke',     color: 'text-sky-400',     bg: 'bg-sky-500/[0.07]',     dot: 'bg-sky-400',     order: 0 },
+  frontend:  { label: 'Frontend',  color: 'text-violet-400',  bg: 'bg-violet-500/[0.07]',  dot: 'bg-violet-400',  order: 1 },
+  api:       { label: 'API',       color: 'text-teal-400',    bg: 'bg-teal-500/[0.07]',    dot: 'bg-teal-400',    order: 2 },
+  workflow:  { label: 'Workflow',  color: 'text-indigo-400',  bg: 'bg-indigo-500/[0.07]',  dot: 'bg-indigo-400',  order: 3 },
+  expansion: { label: 'Enhanced Coverage', color: 'text-slate-400',   bg: 'bg-slate-500/[0.07]',   dot: 'bg-slate-400',   order: 4 },
+};
+
+function getMainTypeMeta(type: string) {
+  if (MAIN_TYPE_META[type]) return MAIN_TYPE_META[type];
+  const label = type.charAt(0).toUpperCase() + type.slice(1);
+  return { label, color: 'text-[#8BA4C8]', bg: 'bg-white/[0.02]', dot: 'bg-[#8BA4C8]', order: 99 };
+}
+
 // ─── Expandable test row ─────────────────────────────────────────────────────
 
 function TestRow({ t, idx }: { t: NormalisedTest; idx: number }) {
@@ -575,16 +678,115 @@ function TestRow({ t, idx }: { t: NormalisedTest; idx: number }) {
   );
 }
 
+// ─── Category group (sub-category collapsible tbody section) ─────────────────
+
+function CategoryGroup({ category, tests, indented = false }: { category: string; tests: NormalisedTest[]; indented?: boolean }) {
+  const [open, setOpen] = useState(true);
+  const meta = getCategoryMeta(category);
+  const passed = tests.filter(t => ['passed', 'pass'].includes(t.status.toLowerCase())).length;
+  const failed = tests.filter(t => ['failed', 'fail'].includes(t.status.toLowerCase())).length;
+  const skipped = tests.filter(t => ['skipped', 'skip', 'pending'].includes(t.status.toLowerCase())).length;
+  const px = indented ? 'pl-10 pr-5' : 'px-5';
+
+  return (
+    <tbody>
+      {/* Sub-category header row */}
+      <tr
+        className="cursor-pointer select-none border-b border-white/5 bg-white/[0.015] hover:bg-white/[0.03] transition-colors"
+        onClick={() => setOpen(o => !o)}
+      >
+        <td colSpan={5} className={`${px} py-2`}>
+          <div className="flex items-center gap-2.5">
+            <svg
+              width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"
+              className={`flex-shrink-0 text-[#4A6280] transition-transform duration-150 ${open ? 'rotate-90' : ''}`}
+            >
+              <polyline points="9 18 15 12 9 6" />
+            </svg>
+            <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${meta.dot}`} />
+            <span className={`text-[11px] font-semibold uppercase tracking-wider ${meta.color}`}>{meta.label}</span>
+            <span className="text-[#4A6280] text-[11px]">{tests.length} test{tests.length !== 1 ? 's' : ''}</span>
+            <div className="flex items-center gap-2 ml-1">
+              {passed > 0 && <span className="text-emerald-400 text-[11px]">{passed}✓</span>}
+              {failed > 0 && <span className="text-red-400 text-[11px]">{failed}✗</span>}
+              {skipped > 0 && <span className="text-amber-400 text-[11px]">{skipped}–</span>}
+            </div>
+          </div>
+        </td>
+      </tr>
+      {/* Test rows */}
+      {open && tests.map((t, i) => <TestRow key={i} t={t} idx={i} />)}
+    </tbody>
+  );
+}
+
+// ─── Main type group (top-level collapsible section) ─────────────────────────
+
+function MainTypeGroup({ mainType, subGroups }: { mainType: string; subGroups: [string, NormalisedTest[]][] }) {
+  const [open, setOpen] = useState(true);
+  const meta = getMainTypeMeta(mainType);
+  const allTests = subGroups.flatMap(([, tests]) => tests);
+  const passed = allTests.filter(t => ['passed', 'pass'].includes(t.status.toLowerCase())).length;
+  const failed = allTests.filter(t => ['failed', 'fail'].includes(t.status.toLowerCase())).length;
+  const skipped = allTests.filter(t => ['skipped', 'skip', 'pending'].includes(t.status.toLowerCase())).length;
+  const isSingleUncategorised = subGroups.length === 1 && subGroups[0][0] === 'uncategorized';
+
+  return (
+    <>
+      <tbody>
+        {/* Main type header row */}
+        <tr
+          className={`cursor-pointer select-none border-b border-white/10 ${meta.bg} hover:brightness-110 transition-all`}
+          onClick={() => setOpen(o => !o)}
+        >
+          <td colSpan={5} className="px-4 py-3">
+            <div className="flex items-center gap-3">
+              <svg
+                width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"
+                className={`flex-shrink-0 text-[#4A6280] transition-transform duration-150 ${open ? 'rotate-90' : ''}`}
+              >
+                <polyline points="9 18 15 12 9 6" />
+              </svg>
+              <span className={`w-2.5 h-2.5 rounded-full flex-shrink-0 ${meta.dot}`} />
+              <span className={`text-sm font-bold ${meta.color}`}>{meta.label}</span>
+              <span className="text-[#4A6280] text-xs">{allTests.length} test{allTests.length !== 1 ? 's' : ''}</span>
+              <div className="flex items-center gap-3 ml-1">
+                {passed > 0 && <span className="text-emerald-400 text-xs font-medium">{passed} passed</span>}
+                {failed > 0 && <span className="text-red-400 text-xs font-medium">{failed} failed</span>}
+                {skipped > 0 && <span className="text-amber-400 text-xs font-medium">{skipped} skipped</span>}
+              </div>
+              {!isSingleUncategorised && (
+                <span className="ml-auto text-[#4A6280] text-[11px]">{subGroups.length} sub-categor{subGroups.length === 1 ? 'y' : 'ies'}</span>
+              )}
+            </div>
+          </td>
+        </tr>
+      </tbody>
+      {/* Sub-category groups rendered as sibling tbodies */}
+      {open && (isSingleUncategorised
+        ? (
+          <tbody>
+            {subGroups[0][1].map((t, i) => <TestRow key={i} t={t} idx={i} />)}
+          </tbody>
+        )
+        : subGroups.map(([subCat, tests]) => (
+          <CategoryGroup key={subCat} category={subCat} tests={tests} indented />
+        ))
+      )}
+    </>
+  );
+}
+
 // ─── Phase display helpers ───────────────────────────────────────────────────
 
 const PHASE_LABELS: Record<string, string> = {
-  started: 'Pipeline Started',
+  started: 'Healix Started',
   port_conflict: 'Port Conflict',
   jira: 'Fetching Jira Stories',
   context: 'Gathering Context',
   context_enrichment: 'Enriching Context',
   generating: 'Generating Tests',
-  running: 'Running Playwright Tests',
+  running: 'Running Tests',
   tests_complete: 'Tests Complete',
   analyzing: 'Analyzing Failures',
   reporting: 'Generating Report',
@@ -593,8 +795,8 @@ const PHASE_LABELS: Record<string, string> = {
   artifacts_upload_failed: 'Artifact Upload Failed',
   artifacts_upload_error: 'Artifact Upload Error',
   dashboard: 'Opening Dashboard',
-  completed: 'Pipeline Complete',
-  error: 'Pipeline Error',
+  completed: 'Healix run Complete',
+  error: 'Healix Error',
   error_reported: 'Error Reported',
 };
 
@@ -657,11 +859,17 @@ function LiveTimeline({ events, liveFiles, pipelineEnded }: {
     return () => clearInterval(interval);
   }, [pipelineEnded]);
 
-  const displayEvents = events.filter(e =>
+  const filteredEvents = events.filter(e =>
     e.eventType !== 'test_results' &&
     e.eventType !== 'test_file_generated' &&
     e.eventType !== 'test_result'
   );
+  // Deduplicate: keep only the last event per phase (multiple events per phase are repetitive)
+  const phaseMap = new Map<string, LiveEvent>();
+  for (const e of filteredEvents) {
+    phaseMap.set(e.phase ?? '__unknown__', e);
+  }
+  const displayEvents = Array.from(phaseMap.values());
   if (displayEvents.length === 0) return null;
   // Decide which single event owns files to avoid duplicates
   const hasTestsGenEvent = displayEvents.some(e => e.eventType === 'tests_generated');
@@ -713,8 +921,11 @@ function LiveTimeline({ events, liveFiles, pipelineEnded }: {
                 {ev.durationMs != null && ev.durationMs > 0 && (
                   <span className="text-[#4A6280] text-[10px] font-mono">{(ev.durationMs / 1000).toFixed(1)}s</span>
                 )}
-                {elapsedLabel && (
-                  <span className="text-blue-400/60 text-[10px] font-mono tabular-nums">→ {elapsedLabel}</span>
+                {effectiveIsLast && (
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" className="text-blue-400/70 flex-shrink-0 animate-spin" style={{animationDuration: '2s'}}>
+                    <circle cx="12" cy="12" r="10"/>
+                    <polyline points="12 6 12 12 16 14"/>
+                  </svg>
                 )}
               </div>
               {ev.message && (
@@ -771,6 +982,7 @@ export default function TestRunDetailPage() {
   const [loading, setLoading] = useState(true);
   const [notFound, setNotFound] = useState(false);
   const [filterStatus, setFilterStatus] = useState<string>('all');
+  const [groupByCategory, setGroupByCategory] = useState(true);
   const [activePolling, setActivePolling] = useState(true);
   const lastRunSignatureRef = useRef<string | null>(null);
   const pollFailCountRef = useRef(0);
@@ -1038,7 +1250,7 @@ export default function TestRunDetailPage() {
 
   // Filter tests — strip synthetic pipeline rows when we have real test data
   const isPipelineSynthetic = (t: NormalisedTest) =>
-    t.suite === 'pipeline' && (t.name.startsWith('[PIPELINE') || t.name.startsWith('[PIPELINE_ERROR'));
+    (t.suite === 'pipeline' || t.suite === 'Healix') && (t.name.startsWith('[PIPELINE') || t.name.startsWith('[HEALIX'));
   const hasRealTests = liveTestResults.length > 0 || normalisedTests.some(t => !isPipelineSynthetic(t));
   const displayTests = hasRealTests ? normalisedTests.filter(t => !isPipelineSynthetic(t)) : normalisedTests;
   
@@ -1083,6 +1295,30 @@ export default function TestRunDetailPage() {
         if (filterStatus === 'skipped') return s === 'skipped' || s === 'skip' || s === 'pending';
         return true;
       });
+
+  // Two-level grouping: mainType → subCat → tests
+  const hierarchicalTests: [string, [string, NormalisedTest[]][]][] = (() => {
+    if (!groupByCategory) return [];
+    const typeMap = new Map<string, Map<string, NormalisedTest[]>>();
+    for (const t of filteredTests) {
+      const mainType = extractMainType(t.name, t.suite);
+      const subCat = extractCategory(t.name);
+      if (!typeMap.has(mainType)) typeMap.set(mainType, new Map());
+      const subMap = typeMap.get(mainType)!;
+      if (!subMap.has(subCat)) subMap.set(subCat, []);
+      subMap.get(subCat)!.push(t);
+    }
+    return [...typeMap.entries()]
+      .sort(([a], [b]) => getMainTypeMeta(a).order - getMainTypeMeta(b).order)
+      .map(([mainType, subMap]) => [
+        mainType,
+        [...subMap.entries()].sort(([a], [b]) => {
+          if (a === 'uncategorized') return 1;
+          if (b === 'uncategorized') return -1;
+          return getCategoryMeta(a).label.localeCompare(getCategoryMeta(b).label);
+        }),
+      ]);
+  })();
 
   // Count artifacts across all tests
   const totalScreenshots = normalisedTests.reduce((sum, t) => sum + t.screenshots.length, 0);
@@ -1163,7 +1399,7 @@ export default function TestRunDetailPage() {
                 )}
               </div>
               <div>
-                <div className="text-[#D8E8FF] font-semibold text-sm">Pipeline Activity</div>
+                <div className="text-[#D8E8FF] font-semibold text-sm">Healix Activity</div>
                 <div className="text-[#4A6280] text-[11px] font-mono">
                   {pipelineEnded ? 'completed' : (testRun.current_phase || liveMeta?.phase || testRun.status)}
                   {testRun.error_code || liveMeta?.errorCode ? ` · error: ${testRun.error_code || liveMeta?.errorCode}` : ''}
@@ -1173,11 +1409,15 @@ export default function TestRunDetailPage() {
             </div>
             <div className="flex items-center gap-2">
               {liveEvents.length > 0 && (() => {
-                const pipelineCount = liveEvents.filter(e =>
-                  e.eventType !== 'test_results' &&
-                  e.eventType !== 'test_file_generated' &&
-                  e.eventType !== 'test_result'
-                ).length;
+                const pipelineCount = (() => {
+                  const seen = new Set<string>();
+                  for (const e of liveEvents) {
+                    if (e.eventType !== 'test_results' && e.eventType !== 'test_file_generated' && e.eventType !== 'test_result') {
+                      seen.add(e.phase ?? '__unknown__');
+                    }
+                  }
+                  return seen.size;
+                })();
                 return (
                   <div className="flex items-center gap-1.5">
                     <span className="px-2 py-0.5 rounded-full bg-blue-500/10 border border-blue-500/20 text-blue-300 text-[10px] font-semibold">
@@ -1249,7 +1489,7 @@ export default function TestRunDetailPage() {
                 {pipelineEnded && (
                   <div className="border-t border-white/8 px-5 py-3 flex items-center gap-2">
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#34D399" strokeWidth="3"><polyline points="20 6 9 17 4 12" /></svg>
-                    <span className="text-emerald-400 text-xs font-semibold">Pipeline complete</span>
+                    <span className="text-emerald-400 text-xs font-semibold">Healix run complete</span>
                     {liveTotal > 0 && (
                       <span className="text-[#4A6280] text-xs">— {livePassed}/{liveTotal} tests passed ({Math.round((livePassed / liveTotal) * 100)}%)</span>
                     )}
@@ -1347,8 +1587,8 @@ export default function TestRunDetailPage() {
                 <p className="text-[#4A6280] text-xs mt-0.5">{totalTests} individual tests — click a row to expand details</p>
               </div>
             </button>
-            {/* Filter buttons */}
-            <div className="flex items-center gap-1.5">
+            {/* Filter + Group buttons */}
+            <div className="flex items-center gap-1.5 flex-wrap">
               {(['all', 'passed', 'failed', 'skipped'] as const).map(f => (
                 <button
                   key={f}
@@ -1365,6 +1605,22 @@ export default function TestRunDetailPage() {
                   {f === 'all' ? `All (${displayTests.length})` : f === 'passed' ? `Passed (${passedTests})` : f === 'failed' ? `Failed (${failedTests})` : `Skipped (${skippedTests})`}
                 </button>
               ))}
+              <div className="w-px h-4 bg-white/10 mx-1" />
+              <button
+                onClick={() => setGroupByCategory(g => !g)}
+                title="Group tests by category"
+                className={`flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold transition-all border ${
+                  groupByCategory
+                    ? 'bg-violet-500/15 text-violet-300 border-violet-500/30'
+                    : 'bg-white/5 text-[#4A6280] border-transparent hover:border-white/10'
+                }`}
+              >
+                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+                  <rect x="3" y="3" width="7" height="7" rx="1" /><rect x="14" y="3" width="7" height="7" rx="1" />
+                  <rect x="3" y="14" width="7" height="7" rx="1" /><rect x="14" y="14" width="7" height="7" rx="1" />
+                </svg>
+                Group
+              </button>
             </div>
           </div>
 
@@ -1389,11 +1645,17 @@ export default function TestRunDetailPage() {
                         <th className="text-left px-4 py-3 text-[#4A6280] text-xs font-semibold uppercase tracking-wider">Artifacts</th>
                       </tr>
                     </thead>
-                    <tbody>
-                      {filteredTests.map((t, i) => (
-                        <TestRow key={i} t={t} idx={i} />
-                      ))}
-                    </tbody>
+                    {groupByCategory ? (
+                      hierarchicalTests.map(([mainType, subGroups]) => (
+                        <MainTypeGroup key={mainType} mainType={mainType} subGroups={subGroups} />
+                      ))
+                    ) : (
+                      <tbody>
+                        {filteredTests.map((t, i) => (
+                          <TestRow key={i} t={t} idx={i} />
+                        ))}
+                      </tbody>
+                    )}
                   </table>
                 </div>
                 {filteredTests.length === 0 && (
