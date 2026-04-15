@@ -256,26 +256,6 @@ function StatusBadge({ status }: { status: string }) {
   return <span className="px-2 py-0.5 rounded-full text-xs font-semibold bg-blue-500/10 text-blue-400">{s}</span>;
 }
 
-function StatusBar({ passed, failed, skipped, total }: { passed: number; failed: number; skipped: number; total: number }) {
-  if (total === 0) return null;
-  const pPct = (passed / total) * 100;
-  const fPct = (failed / total) * 100;
-  const sPct = (skipped / total) * 100;
-  return (
-    <div className="flex flex-col gap-2">
-      <div className="flex h-3 rounded-full overflow-hidden bg-white/5">
-        <motion.div initial={{ width: 0 }} animate={{ width: `${pPct}%` }} transition={{ duration: 0.8, delay: 0.3 }} className="h-full bg-emerald-500" />
-        <motion.div initial={{ width: 0 }} animate={{ width: `${fPct}%` }} transition={{ duration: 0.8, delay: 0.5 }} className="h-full bg-red-500" />
-        <motion.div initial={{ width: 0 }} animate={{ width: `${sPct}%` }} transition={{ duration: 0.8, delay: 0.7 }} className="h-full bg-amber-500" />
-      </div>
-      <div className="flex items-center gap-4 text-xs text-[#4A6280]">
-        <span className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-full bg-emerald-500 inline-block" />{passed} passed</span>
-        <span className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-full bg-red-500 inline-block" />{failed} failed</span>
-        {skipped > 0 && <span className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-full bg-amber-500 inline-block" />{skipped} skipped</span>}
-      </div>
-    </div>
-  );
-}
 
 // ─── Artifact viewer components ──────────────────────────────────────────────
 
@@ -420,9 +400,9 @@ function extractCategory(name: string): string {
 
 const CATEGORY_META: Record<string, { label: string; color: string; border: string; dot: string }> = {
   form_validation:   { label: 'Form Validation',    color: 'text-blue-400',    border: 'border-blue-500/20',   dot: 'bg-blue-400' },
-  ui_flow:           { label: 'UI Flow',             color: 'text-purple-400',  border: 'border-purple-500/20', dot: 'bg-purple-400' },
-  workflow_journey:  { label: 'Workflow / Journey',  color: 'text-indigo-400',  border: 'border-indigo-500/20', dot: 'bg-indigo-400' },
-  api_contract:      { label: 'API Contract',        color: 'text-teal-400',    border: 'border-teal-500/20',   dot: 'bg-teal-400' },
+  ui_flow:           { label: 'UI Flow',             color: 'text-fuchsia-400', border: 'border-fuchsia-500/20',dot: 'bg-fuchsia-400' },
+  workflow_journey:  { label: 'Workflow / Journey',  color: 'text-pink-400',    border: 'border-pink-500/20',   dot: 'bg-pink-400' },
+  api_contract:      { label: 'API Contract',        color: 'text-cyan-400',    border: 'border-cyan-500/20',   dot: 'bg-cyan-400' },
   api_auth:          { label: 'API Auth',            color: 'text-amber-400',   border: 'border-amber-500/20',  dot: 'bg-amber-400' },
   api_negative:      { label: 'API Negative',        color: 'text-red-400',     border: 'border-red-500/20',    dot: 'bg-red-400' },
   api_stress:        { label: 'API Stress',          color: 'text-orange-400',  border: 'border-orange-500/20', dot: 'bg-orange-400' },
@@ -513,9 +493,111 @@ function getMainTypeMeta(type: string) {
   return { label, color: 'text-[#8BA4C8]', bg: 'bg-white/[0.02]', dot: 'bg-[#8BA4C8]', order: 99 };
 }
 
+const SECTION_BORDER: Record<string, string> = {
+  smoke:     'border-sky-400/60',
+  frontend:  'border-violet-400/60',
+  api:       'border-teal-400/60',
+  workflow:  'border-indigo-400/60',
+  expansion: 'border-slate-400/60',
+};
+
+type SectionCounts = { passed: number; failed: number; skipped: number };
+interface SectionDatum {
+  key: string;
+  totals: SectionCounts;
+  subs: { key: string; counts: SectionCounts }[];
+}
+
+function SectionOverview({ sections }: { sections: SectionDatum[] }) {
+  const R = 24;
+  const CIRC = 2 * Math.PI * R;
+  const count = sections.length;
+  const cols = count <= 1 ? 1 : count <= 2 ? 2 : count <= 6 ? 3 : 4;
+  const remainder = count % cols;
+  const leadingSpacers = remainder === 0 ? 0 : Math.floor((cols - remainder) / 2);
+  const colsClass = cols === 1 ? 'grid-cols-1' : cols === 2 ? 'grid-cols-2' : cols === 3 ? 'grid-cols-3' : 'grid-cols-4';
+  const lastRowStart = remainder === 0 ? count : count - remainder;
+  const firstRows = sections.slice(0, lastRowStart);
+  const lastRow = sections.slice(lastRowStart);
+
+  const renderSection = ({ key, totals, subs }: SectionDatum) => {
+        const meta = getMainTypeMeta(key);
+        const border = SECTION_BORDER[key] ?? 'border-white/20';
+        const total = totals.passed + totals.failed + totals.skipped;
+        const rate = total > 0 ? Math.round((totals.passed / total) * 100) : 0;
+        const rateColor = rate >= 70 ? 'text-emerald-400' : rate >= 40 ? 'text-amber-400' : 'text-red-400';
+        const subParts = [
+          totals.failed > 0 ? `${totals.failed} failed` : null,
+          totals.skipped > 0 ? `${totals.skipped} skipped` : null,
+          totals.passed > 0 ? `${totals.passed} passed` : null,
+        ].filter(Boolean).join(' · ');
+        return (
+          <div key={key} className={`border-l-2 ${border} pl-3 flex flex-col gap-2`}>
+            {/* Section header: name + overall inline */}
+            <div className="flex items-center gap-2">
+              <span className={`text-xs font-semibold ${meta.color}`}>{meta.label}</span>
+              <span className={`text-xs font-bold tabular-nums ${rateColor}`}>{rate}%</span>
+              <span className="text-[#4A6280] text-[11px]">{subParts}</span>
+            </div>
+            {/* Subcategory arc-progress circles */}
+            {subs.length > 0 && (
+              <div className="flex flex-wrap gap-3">
+                {subs.map(({ key: subKey, counts }) => {
+                  const subMeta = getCategoryMeta(subKey);
+                  const subTotal = counts.passed + counts.failed + counts.skipped;
+                  const subRate = subTotal > 0 ? Math.round((counts.passed / subTotal) * 100) : 0;
+                  const stroke = subRate >= 70 ? '#34d399' : subRate >= 40 ? '#fbbf24' : '#f87171';
+                  const offset = CIRC * (1 - subRate / 100);
+                  return (
+                    <div key={subKey} className="flex flex-col items-center gap-1">
+                      <div className="relative w-14 h-14">
+                        <svg width="56" height="56" viewBox="0 0 56 56">
+                          <circle cx="28" cy="28" r={R} fill="none" stroke="rgba(255,255,255,0.06)" strokeWidth="3.5" />
+                          <circle
+                            cx="28" cy="28" r={R}
+                            fill="none"
+                            stroke={stroke}
+                            strokeWidth="3.5"
+                            strokeLinecap="round"
+                            strokeDasharray={CIRC}
+                            strokeDashoffset={offset}
+                            transform="rotate(-90 28 28)"
+                          />
+                        </svg>
+                        <div className="absolute inset-0 flex items-center justify-center">
+                          <span className="text-[11px] font-bold tabular-nums" style={{ color: stroke }}>{subRate}%</span>
+                        </div>
+                      </div>
+                      <span className="text-[#8BA4C8] text-[10px] text-center leading-tight max-w-[56px]">{subMeta.label}</span>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        );
+  };
+
+  return (
+    <div className="flex flex-col gap-4">
+      {firstRows.length > 0 && (
+        <div className={`grid ${colsClass} gap-x-6 gap-y-4`}>
+          {firstRows.map(s => renderSection(s))}
+        </div>
+      )}
+      {lastRow.length > 0 && (
+        <div className={`grid ${colsClass} gap-x-6 gap-y-4`}>
+          {Array.from({ length: leadingSpacers }).map((_, i) => <div key={`sp-${i}`} />)}
+          {lastRow.map(s => renderSection(s))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ─── Expandable test row ─────────────────────────────────────────────────────
 
-function TestRow({ t, idx }: { t: NormalisedTest; idx: number }) {
+function TestRow({ t, idx, indented = false }: { t: NormalisedTest; idx: number; indented?: boolean }) {
   const [expanded, setExpanded] = useState(false);
   const hasDetails = !!(t.error || t.screenshots.length || t.videos.length || t.traces.length || t.errorObj);
   const isFailed = ['failed', 'fail'].includes(t.status.toLowerCase());
@@ -530,7 +612,7 @@ function TestRow({ t, idx }: { t: NormalisedTest; idx: number }) {
         className={`border-b border-white/5 last:border-0 transition-all ${hasDetails ? 'cursor-pointer hover:bg-white/[0.03]' : 'hover:bg-white/[0.02]'}`}
         onClick={() => hasDetails && setExpanded(!expanded)}
       >
-        <td className="px-6 py-3">
+        <td className={`${indented ? 'pl-14 pr-6' : 'px-6'} py-3`}>
           <div className="flex items-center gap-2">
             {hasDetails && (
               <svg
@@ -715,7 +797,7 @@ function CategoryGroup({ category, tests, indented = false }: { category: string
         </td>
       </tr>
       {/* Test rows */}
-      {open && tests.map((t, i) => <TestRow key={i} t={t} idx={i} />)}
+      {open && tests.map((t, i) => <TestRow key={i} t={t} idx={i} indented={indented} />)}
     </tbody>
   );
 }
@@ -994,6 +1076,7 @@ export default function TestRunDetailPage() {
   const [pipelineEnded, setPipelineEnded] = useState(false);
   const [testResultsOpen, setTestResultsOpen] = useState(true);
   const [aiAnalysisOpen, setAiAnalysisOpen] = useState(true);
+  const [overviewOpen, setOverviewOpen] = useState(false);
 
   const testResultsHeaderRef = useRef<HTMLDivElement>(null);
   const aiAnalysisHeaderRef = useRef<HTMLButtonElement>(null);
@@ -1283,7 +1366,6 @@ export default function TestRunDetailPage() {
   const failedTests = hasLiveStats ? liveFailed : (testRun.failed_tests || report?.summary?.failed || report?.stats?.failed || displayTests.filter(t => ['failed', 'fail'].includes(t.status.toLowerCase())).length);
   const skippedTests = hasLiveStats ? liveSkipped : (testRun.skipped_tests || report?.summary?.skipped || report?.stats?.skipped || displayTests.filter(t => ['skipped', 'skip', 'pending'].includes(t.status.toLowerCase())).length);
   const passRate = totalTests > 0 ? Math.round((passedTests / totalTests) * 100) : 0;
-
   // True while Playwright is executing but no individual results have streamed in yet
   const isRunningPhase = !pipelineEnded && liveEvents.some(e => (e.phase || '').toLowerCase() === 'running');
   const filteredTests = filterStatus === 'all'
@@ -1512,26 +1594,90 @@ export default function TestRunDetailPage() {
           <span className="text-blue-300/70 text-xs font-medium">Tests executing — results will stream in as they complete</span>
         </motion.div>
       )}
-      <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-5 gap-4">
+      <div className="grid grid-cols-2 sm:grid-cols-5 gap-4">
         <KpiCard label="Total Tests" value={totalTests} color="text-[#F0F6FF]" delay={0} />
         <KpiCard label="Passed" value={passedTests} color="text-emerald-400" delay={80} loading={isRunningPhase && !hasLiveStats} />
         <KpiCard label="Failed" value={failedTests} color="text-red-400" delay={160} loading={isRunningPhase && !hasLiveStats} />
         <KpiCard label="Skipped" value={skippedTests} color="text-amber-400" delay={240} loading={isRunningPhase && !hasLiveStats} />
-        <KpiCard label="Pass Rate" value={passRate} sub="%" color={passRate >= 80 ? 'text-emerald-400' : 'text-red-400'} delay={320} loading={isRunningPhase && !hasLiveStats} />
+        <KpiCard label="Pass Rate" value={passRate} sub="%" color={passRate >= 70 ? 'text-emerald-400' : passRate >= 40 ? 'text-amber-400' : 'text-red-400'} delay={320} loading={isRunningPhase && !hasLiveStats} />
       </div>
 
-      {/* Status distribution bar */}
-      {totalTests > 0 && (
-        <motion.div initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.3 }} className="glass-card rounded-2xl p-5">
-          <h2 className="text-[#F0F6FF] font-semibold text-sm mb-4">Status Distribution</h2>
-          <StatusBar passed={passedTests} failed={failedTests} skipped={skippedTests} total={totalTests} />
-        </motion.div>
-      )}
+      {/* Results by Section */}
+      {totalTests > 0 && (() => {
+        const sourceTests = hasLiveStats
+          ? liveTestResults.map(t => ({ name: t.n, suite: t.su, status: t.s }))
+          : displayTests.map(t => ({ name: t.name, suite: t.suite, status: t.status }));
+
+        type Counts = { passed: number; failed: number; skipped: number };
+        const sectionMap = new Map<string, { totals: Counts; subs: Map<string, Counts> }>();
+        for (const t of sourceTests) {
+          const mainKey = extractMainType(t.name, t.suite);
+          const subKey = extractCategory(t.name);
+          if (!sectionMap.has(mainKey)) sectionMap.set(mainKey, { totals: { passed: 0, failed: 0, skipped: 0 }, subs: new Map() });
+          const section = sectionMap.get(mainKey)!;
+          if (!section.subs.has(subKey)) section.subs.set(subKey, { passed: 0, failed: 0, skipped: 0 });
+          const s = t.status.toLowerCase();
+          const increment = (c: Counts) => { if (s === 'passed' || s === 'pass') c.passed++; else if (s === 'failed' || s === 'fail') c.failed++; else c.skipped++; };
+          increment(section.totals);
+          increment(section.subs.get(subKey)!);
+        }
+
+        const sections = [...sectionMap.entries()]
+          .sort(([a], [b]) => getMainTypeMeta(a).order - getMainTypeMeta(b).order);
+
+        if (sections.length === 0) return null;
+
+        const sectionData: SectionDatum[] = sections.map(([mainKey, { totals, subs }]) => ({
+          key: mainKey,
+          totals,
+          subs: [...subs.entries()]
+            .filter(([k]) => k !== 'uncategorized')
+            .sort(([a], [b]) => getCategoryMeta(a).label.localeCompare(getCategoryMeta(b).label))
+            .map(([k, counts]) => ({ key: k, counts })),
+        }));
+
+        return (
+          <motion.div initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.3 }} className="glass-card rounded-2xl p-5">
+            <button
+              onClick={() => setOverviewOpen(o => !o)}
+              className="w-full flex items-center justify-between mb-0 group"
+            >
+              <h2 className="text-[#F0F6FF] font-semibold text-sm">Overview</h2>
+              <div className="flex items-center gap-2">
+                <span className="text-[#4A6280] text-xs">{overviewOpen ? 'Click to collapse' : 'Click to expand'}</span>
+                <motion.svg
+                  animate={{ rotate: overviewOpen ? 0 : -90 }}
+                  transition={{ duration: 0.2 }}
+                  width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"
+                  className="text-[#4A6280] flex-shrink-0"
+                >
+                  <polyline points="6 9 12 15 18 9" />
+                </motion.svg>
+              </div>
+            </button>
+            <AnimatePresence initial={false}>
+              {overviewOpen && (
+                <motion.div
+                  initial={{ opacity: 0, height: 0 }}
+                  animate={{ opacity: 1, height: 'auto' }}
+                  exit={{ opacity: 0, height: 0 }}
+                  transition={{ duration: 0.2 }}
+                  className="overflow-hidden"
+                >
+                  <div className="mt-3">
+                    <SectionOverview sections={sectionData} />
+                  </div>
+                </motion.div>
+              )}
+            </AnimatePresence>
+          </motion.div>
+        );
+      })()}
 
       {/* Artifacts summary */}
       {(totalScreenshots + totalVideos + totalTraces) > 0 && (
         <motion.div initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.32 }} className="glass-card rounded-2xl p-5">
-          <h2 className="text-[#F0F6FF] font-semibold text-sm mb-3">Playwright Artifacts</h2>
+          <h2 className="text-[#F0F6FF] font-semibold text-sm mb-3">Test Artifacts</h2>
           <div className="flex items-center gap-4">
             {totalScreenshots > 0 && (
               <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-blue-500/5 border border-blue-500/15">

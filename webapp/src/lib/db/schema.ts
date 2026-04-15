@@ -62,6 +62,7 @@ export const testRuns = pgTable(
     durationMs: integer('duration_ms'),
     reportJson: jsonb('report_json'),
     aiAnalysis: jsonb('ai_analysis'),
+    coverageMetrics: jsonb('coverage_metrics'),
     framework: text('framework'),
     source: text('source').default('mcp'),
     projectPath: text('project_path'), // Local project path for artifact fallback
