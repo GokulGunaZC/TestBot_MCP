@@ -399,20 +399,20 @@ function extractCategory(name: string): string {
 }
 
 const CATEGORY_META: Record<string, { label: string; color: string; border: string; dot: string }> = {
-  form_validation:   { label: 'Form Validation',    color: 'text-blue-400',    border: 'border-blue-500/20',   dot: 'bg-blue-400' },
-  ui_flow:           { label: 'UI Flow',             color: 'text-fuchsia-400', border: 'border-fuchsia-500/20',dot: 'bg-fuchsia-400' },
-  workflow_journey:  { label: 'Workflow / Journey',  color: 'text-pink-400',    border: 'border-pink-500/20',   dot: 'bg-pink-400' },
-  api_contract:      { label: 'API Contract',        color: 'text-cyan-400',    border: 'border-cyan-500/20',   dot: 'bg-cyan-400' },
-  api_auth:          { label: 'API Auth',            color: 'text-amber-400',   border: 'border-amber-500/20',  dot: 'bg-amber-400' },
-  api_negative:      { label: 'API Negative',        color: 'text-red-400',     border: 'border-red-500/20',    dot: 'bg-red-400' },
-  api_stress:        { label: 'API Stress',          color: 'text-orange-400',  border: 'border-orange-500/20', dot: 'bg-orange-400' },
-  uncategorized:     { label: 'Uncategorized',       color: 'text-[#4A6280]',   border: 'border-white/10',      dot: 'bg-[#4A6280]' },
+  form_validation:   { label: 'Form Validation',    color: 'text-[#8BA4C8]', border: 'border-[#8BA4C8]/30', dot: 'bg-[#8BA4C8]' },
+  ui_flow:           { label: 'UI Flow',             color: 'text-[#8BA4C8]', border: 'border-[#8BA4C8]/30', dot: 'bg-[#8BA4C8]' },
+  workflow_journey:  { label: 'Workflow / Journey',  color: 'text-[#8BA4C8]', border: 'border-[#8BA4C8]/30', dot: 'bg-[#8BA4C8]' },
+  api_contract:      { label: 'API Contract',        color: 'text-[#8BA4C8]', border: 'border-[#8BA4C8]/30', dot: 'bg-[#8BA4C8]' },
+  api_auth:          { label: 'API Auth',            color: 'text-[#8BA4C8]', border: 'border-[#8BA4C8]/30', dot: 'bg-[#8BA4C8]' },
+  api_negative:      { label: 'API Negative',        color: 'text-[#8BA4C8]', border: 'border-[#8BA4C8]/30', dot: 'bg-[#8BA4C8]' },
+  api_stress:        { label: 'API Stress',          color: 'text-[#8BA4C8]', border: 'border-[#8BA4C8]/30', dot: 'bg-[#8BA4C8]' },
+  uncategorized:     { label: 'Uncategorized',       color: 'text-[#8BA4C8]', border: 'border-[#8BA4C8]/30', dot: 'bg-[#8BA4C8]' },
 };
 
 function getCategoryMeta(cat: string) {
   if (CATEGORY_META[cat]) return CATEGORY_META[cat];
   const label = cat.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
-  return { label, color: 'text-[#8BA4C8]', border: 'border-white/10', dot: 'bg-[#8BA4C8]' };
+  return { label, color: 'text-[#8BA4C8]', border: 'border-[#8BA4C8]/30', dot: 'bg-[#8BA4C8]' };
 }
 
 const API_CATS = new Set(['api_contract', 'api_auth', 'api_negative', 'api_stress']);
@@ -480,25 +480,25 @@ function extractMainType(name: string, suite: string): string {
 }
 
 const MAIN_TYPE_META: Record<string, { label: string; color: string; bg: string; dot: string; order: number }> = {
-  smoke:     { label: 'Smoke',     color: 'text-sky-400',     bg: 'bg-sky-500/[0.07]',     dot: 'bg-sky-400',     order: 0 },
-  frontend:  { label: 'Frontend',  color: 'text-violet-400',  bg: 'bg-violet-500/[0.07]',  dot: 'bg-violet-400',  order: 1 },
-  api:       { label: 'API',       color: 'text-teal-400',    bg: 'bg-teal-500/[0.07]',    dot: 'bg-teal-400',    order: 2 },
-  workflow:  { label: 'Workflow',  color: 'text-indigo-400',  bg: 'bg-indigo-500/[0.07]',  dot: 'bg-indigo-400',  order: 3 },
-  expansion: { label: 'Enhanced Coverage', color: 'text-slate-400',   bg: 'bg-slate-500/[0.07]',   dot: 'bg-slate-400',   order: 4 },
+  smoke:     { label: 'Smoke',            color: 'text-[#C8DEFF]', bg: 'bg-white/[0.04]', dot: 'bg-[#C8DEFF]', order: 0 },
+  frontend:  { label: 'Frontend',         color: 'text-[#C8DEFF]', bg: 'bg-white/[0.04]', dot: 'bg-[#C8DEFF]', order: 1 },
+  api:       { label: 'API',              color: 'text-[#C8DEFF]', bg: 'bg-white/[0.04]', dot: 'bg-[#C8DEFF]', order: 2 },
+  workflow:  { label: 'Workflow',         color: 'text-[#C8DEFF]', bg: 'bg-white/[0.04]', dot: 'bg-[#C8DEFF]', order: 3 },
+  expansion: { label: 'Enhanced Coverage', color: 'text-[#C8DEFF]', bg: 'bg-white/[0.04]', dot: 'bg-[#C8DEFF]', order: 4 },
 };
 
 function getMainTypeMeta(type: string) {
   if (MAIN_TYPE_META[type]) return MAIN_TYPE_META[type];
   const label = type.charAt(0).toUpperCase() + type.slice(1);
-  return { label, color: 'text-[#8BA4C8]', bg: 'bg-white/[0.02]', dot: 'bg-[#8BA4C8]', order: 99 };
+  return { label, color: 'text-[#C8DEFF]', bg: 'bg-white/[0.04]', dot: 'bg-[#C8DEFF]', order: 99 };
 }
 
 const SECTION_BORDER: Record<string, string> = {
-  smoke:     'border-sky-400/60',
-  frontend:  'border-violet-400/60',
-  api:       'border-teal-400/60',
-  workflow:  'border-indigo-400/60',
-  expansion: 'border-slate-400/60',
+  smoke:     'border-[#C8DEFF]/40',
+  frontend:  'border-[#C8DEFF]/40',
+  api:       'border-[#C8DEFF]/40',
+  workflow:  'border-[#C8DEFF]/40',
+  expansion: 'border-[#C8DEFF]/40',
 };
 
 type SectionCounts = { passed: number; failed: number; skipped: number };
@@ -597,9 +597,14 @@ function SectionOverview({ sections }: { sections: SectionDatum[] }) {
 
 // ─── Expandable test row ─────────────────────────────────────────────────────
 
-function TestRow({ t, idx, indented = false }: { t: NormalisedTest; idx: number; indented?: boolean }) {
+function TestRow({ t, idx, indented = false, aiAnalysis = [] }: { t: NormalisedTest; idx: number; indented?: boolean; aiAnalysis?: AiAnalysisItem[] }) {
   const [expanded, setExpanded] = useState(false);
-  const hasDetails = !!(t.error || t.screenshots.length || t.videos.length || t.traces.length || t.errorObj);
+  const matchedAi = aiAnalysis.find(item => {
+    const aiName = safeString(item.testName ?? item.test ?? item.test_name);
+    if (!aiName) return false;
+    return aiName.toLowerCase().trim() === t.name.toLowerCase().trim();
+  }) ?? null;
+  const hasDetails = !!(t.error || t.screenshots.length || t.videos.length || t.traces.length || t.errorObj || matchedAi);
   const isFailed = ['failed', 'fail'].includes(t.status.toLowerCase());
   const failureInsight = t.error ? buildFailureInsight(t.error) : null;
 
@@ -614,13 +619,15 @@ function TestRow({ t, idx, indented = false }: { t: NormalisedTest; idx: number;
       >
         <td className={`${indented ? 'pl-14 pr-6' : 'px-6'} py-3`}>
           <div className="flex items-center gap-2">
-            {hasDetails && (
+            {hasDetails ? (
               <svg
                 width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"
                 className={`flex-shrink-0 text-[#4A6280] transition-transform ${expanded ? 'rotate-90' : ''}`}
               >
                 <polyline points="9 18 15 12 9 6" />
               </svg>
+            ) : (
+              <span className="w-[14px] h-[14px] flex-shrink-0 inline-block" />
             )}
             <div>
               <div className="text-[#F0F6FF] text-sm font-medium">{t.name}</div>
@@ -751,6 +758,58 @@ function TestRow({ t, idx, indented = false }: { t: NormalisedTest; idx: number;
                     </div>
                   </div>
                 )}
+
+                {/* Inline AI Analysis */}
+                {matchedAi && (() => {
+                  const analysis = safeString(matchedAi.analysis);
+                  const rootCause = safeString(matchedAi.root_cause ?? matchedAi.rootCause);
+                  const fix = safeString(matchedAi.suggested_fix ?? matchedAi.suggestedFix ?? matchedAi.fix);
+                  const testingRecommendations = safeString(matchedAi.testingRecommendations ?? matchedAi.testing_recommendations);
+                  const confidence = getConfidencePercent(matchedAi.confidence);
+                  return (
+                    <div className="rounded-xl bg-purple-500/5 border border-purple-500/10 p-4 flex flex-col gap-3">
+                      <div className="flex items-center justify-between gap-3">
+                        <div className="flex items-center gap-2">
+                          <div className="w-6 h-6 rounded-md bg-purple-500/10 border border-purple-500/20 flex items-center justify-center flex-shrink-0">
+                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#A78BFA" strokeWidth="2">
+                              <path d="M12 2a10 10 0 110 20A10 10 0 0112 2z" /><path d="M12 8v4l3 3" />
+                            </svg>
+                          </div>
+                          <span className="text-purple-300 text-xs font-semibold uppercase tracking-wider">AI Analysis</span>
+                        </div>
+                        {confidence !== null && (
+                          <span className="flex-shrink-0 px-2 py-0.5 rounded-full text-xs font-semibold bg-purple-500/10 text-purple-300 border border-purple-500/20 whitespace-nowrap">
+                            {`${confidence}% confidence`}
+                          </span>
+                        )}
+                      </div>
+                      {analysis && (
+                        <div>
+                          <div className="text-[#4A6280] text-xs font-semibold uppercase tracking-wider mb-1">Analysis</div>
+                          <div className="text-[#8BA4C8] text-sm">{analysis}</div>
+                        </div>
+                      )}
+                      {rootCause && (
+                        <div>
+                          <div className="text-[#4A6280] text-xs font-semibold uppercase tracking-wider mb-1">Root Cause</div>
+                          <div className="text-[#8BA4C8] text-sm">{rootCause}</div>
+                        </div>
+                      )}
+                      {fix && (
+                        <div>
+                          <div className="text-[#4A6280] text-xs font-semibold uppercase tracking-wider mb-1">Suggested Fix</div>
+                          <div className="text-[#8BA4C8] text-sm">{fix}</div>
+                        </div>
+                      )}
+                      {testingRecommendations && (
+                        <div>
+                          <div className="text-[#4A6280] text-xs font-semibold uppercase tracking-wider mb-1">Verification</div>
+                          <div className="text-[#8BA4C8] text-sm">{testingRecommendations}</div>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })()}
               </div>
             </td>
           </motion.tr>
@@ -762,7 +821,7 @@ function TestRow({ t, idx, indented = false }: { t: NormalisedTest; idx: number;
 
 // ─── Category group (sub-category collapsible tbody section) ─────────────────
 
-function CategoryGroup({ category, tests, indented = false }: { category: string; tests: NormalisedTest[]; indented?: boolean }) {
+function CategoryGroup({ category, tests, indented = false, aiAnalysis = [] }: { category: string; tests: NormalisedTest[]; indented?: boolean; aiAnalysis?: AiAnalysisItem[] }) {
   const [open, setOpen] = useState(true);
   const meta = getCategoryMeta(category);
   const passed = tests.filter(t => ['passed', 'pass'].includes(t.status.toLowerCase())).length;
@@ -788,23 +847,23 @@ function CategoryGroup({ category, tests, indented = false }: { category: string
             <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${meta.dot}`} />
             <span className={`text-[11px] font-semibold uppercase tracking-wider ${meta.color}`}>{meta.label}</span>
             <span className="text-[#4A6280] text-[11px]">{tests.length} test{tests.length !== 1 ? 's' : ''}</span>
-            <div className="flex items-center gap-2 ml-1">
-              {passed > 0 && <span className="text-emerald-400 text-[11px]">{passed}✓</span>}
-              {failed > 0 && <span className="text-red-400 text-[11px]">{failed}✗</span>}
-              {skipped > 0 && <span className="text-amber-400 text-[11px]">{skipped}–</span>}
+            <div className="flex items-center gap-2">
+              {passed > 0 && <span className="text-[#8BA4C8] text-[11px]">{passed} passed</span>}
+              {failed > 0 && <span className="text-[#8BA4C8] text-[11px]">{failed} failed</span>}
+              {skipped > 0 && <span className="text-[#8BA4C8] text-[11px]">{skipped} skipped</span>}
             </div>
           </div>
         </td>
       </tr>
       {/* Test rows */}
-      {open && tests.map((t, i) => <TestRow key={i} t={t} idx={i} indented={indented} />)}
+      {open && tests.map((t, i) => <TestRow key={i} t={t} idx={i} indented={indented} aiAnalysis={aiAnalysis} />)}
     </tbody>
   );
 }
 
 // ─── Main type group (top-level collapsible section) ─────────────────────────
 
-function MainTypeGroup({ mainType, subGroups }: { mainType: string; subGroups: [string, NormalisedTest[]][] }) {
+function MainTypeGroup({ mainType, subGroups, aiAnalysis = [] }: { mainType: string; subGroups: [string, NormalisedTest[]][]; aiAnalysis?: AiAnalysisItem[] }) {
   const [open, setOpen] = useState(true);
   const meta = getMainTypeMeta(mainType);
   const allTests = subGroups.flatMap(([, tests]) => tests);
@@ -832,10 +891,10 @@ function MainTypeGroup({ mainType, subGroups }: { mainType: string; subGroups: [
               <span className={`w-2.5 h-2.5 rounded-full flex-shrink-0 ${meta.dot}`} />
               <span className={`text-sm font-bold ${meta.color}`}>{meta.label}</span>
               <span className="text-[#4A6280] text-xs">{allTests.length} test{allTests.length !== 1 ? 's' : ''}</span>
-              <div className="flex items-center gap-3 ml-1">
-                {passed > 0 && <span className="text-emerald-400 text-xs font-medium">{passed} passed</span>}
-                {failed > 0 && <span className="text-red-400 text-xs font-medium">{failed} failed</span>}
-                {skipped > 0 && <span className="text-amber-400 text-xs font-medium">{skipped} skipped</span>}
+              <div className="flex items-center gap-3">
+                {passed > 0 && <span className="text-[#8BA4C8] text-xs font-medium">{passed} passed</span>}
+                {failed > 0 && <span className="text-[#8BA4C8] text-xs font-medium">{failed} failed</span>}
+                {skipped > 0 && <span className="text-[#8BA4C8] text-xs font-medium">{skipped} skipped</span>}
               </div>
               {!isSingleUncategorised && (
                 <span className="ml-auto text-[#4A6280] text-[11px]">{subGroups.length} sub-categor{subGroups.length === 1 ? 'y' : 'ies'}</span>
@@ -848,11 +907,11 @@ function MainTypeGroup({ mainType, subGroups }: { mainType: string; subGroups: [
       {open && (isSingleUncategorised
         ? (
           <tbody>
-            {subGroups[0][1].map((t, i) => <TestRow key={i} t={t} idx={i} />)}
+            {subGroups[0][1].map((t, i) => <TestRow key={i} t={t} idx={i} aiAnalysis={aiAnalysis} />)}
           </tbody>
         )
         : subGroups.map(([subCat, tests]) => (
-          <CategoryGroup key={subCat} category={subCat} tests={tests} indented />
+          <CategoryGroup key={subCat} category={subCat} tests={tests} indented aiAnalysis={aiAnalysis} />
         ))
       )}
     </>
@@ -1075,11 +1134,9 @@ export default function TestRunDetailPage() {
   const [pipelineOpen, setPipelineOpen] = useState(true);
   const [pipelineEnded, setPipelineEnded] = useState(false);
   const [testResultsOpen, setTestResultsOpen] = useState(true);
-  const [aiAnalysisOpen, setAiAnalysisOpen] = useState(true);
   const [overviewOpen, setOverviewOpen] = useState(false);
 
   const testResultsHeaderRef = useRef<HTMLDivElement>(null);
-  const aiAnalysisHeaderRef = useRef<HTMLButtonElement>(null);
   const evtSourceRef = useRef<EventSource | null>(null);
 
   const isLiveOrRunning = useCallback((run: TestRun | null) => {
@@ -1793,12 +1850,12 @@ export default function TestRunDetailPage() {
                     </thead>
                     {groupByCategory ? (
                       hierarchicalTests.map(([mainType, subGroups]) => (
-                        <MainTypeGroup key={mainType} mainType={mainType} subGroups={subGroups} />
+                        <MainTypeGroup key={mainType} mainType={mainType} subGroups={subGroups} aiAnalysis={aiAnalysis} />
                       ))
                     ) : (
                       <tbody>
                         {filteredTests.map((t, i) => (
-                          <TestRow key={i} t={t} idx={i} />
+                          <TestRow key={i} t={t} idx={i} aiAnalysis={aiAnalysis} />
                         ))}
                       </tbody>
                     )}
@@ -1828,121 +1885,6 @@ export default function TestRunDetailPage() {
           </AnimatePresence>
         </motion.div>
       ) : null}
-
-      {/* AI Analysis */}
-      <AnimatePresence>
-        {aiAnalysis.length > 0 && (
-          <motion.div initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.5 }} className="glass-card rounded-2xl overflow-hidden">
-            {/* Header with collapse toggle */}
-            <button
-              ref={aiAnalysisHeaderRef}
-              onClick={() => setAiAnalysisOpen(o => !o)}
-              className="w-full px-6 py-4 border-b border-white/8 flex items-center gap-3 text-left hover:bg-white/[0.02] transition-colors"
-            >
-              <svg
-                width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"
-                className={`text-[#4A6280] transition-transform duration-200 flex-shrink-0 ${aiAnalysisOpen ? 'rotate-180' : ''}`}
-              >
-                <polyline points="6 9 12 15 18 9" />
-              </svg>
-              <div className="w-8 h-8 rounded-lg bg-purple-500/10 border border-purple-500/20 flex items-center justify-center">
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#A78BFA" strokeWidth="2">
-                  <path d="M12 2a10 10 0 110 20A10 10 0 0112 2z" /><path d="M12 8v4l3 3" />
-                </svg>
-              </div>
-              <div>
-                <h2 className="text-[#F0F6FF] font-semibold text-base">AI Analysis</h2>
-                <p className="text-[#4A6280] text-xs">{aiAnalysis.length} issue{aiAnalysis.length !== 1 ? 's' : ''} analysed</p>
-              </div>
-            </button>
-
-            <AnimatePresence initial={false}>
-              {aiAnalysisOpen && (
-                <motion.div
-                  key="ai-analysis-body"
-                  initial={{ height: 0, opacity: 0 }}
-                  animate={{ height: 'auto', opacity: 1 }}
-                  exit={{ height: 0, opacity: 0 }}
-                  transition={{ duration: 0.25 }}
-                  style={{ overflow: 'hidden' }}
-                >
-                  <div className="p-5 flex flex-col gap-4">
-                    {aiAnalysis.map((item, i) => {
-                      const testName = safeString(item.testName ?? item.test ?? item.test_name) ?? `Issue ${i + 1}`;
-                      const analysis = safeString(item.analysis);
-                      const rootCause = safeString(item.root_cause ?? item.rootCause);
-                      const fix = safeString(item.suggested_fix ?? item.suggestedFix ?? item.fix);
-                      const testingRecommendations = safeString(item.testingRecommendations ?? item.testing_recommendations);
-                      const confidence = getConfidencePercent(item.confidence);
-                      return (
-                        <motion.div
-                          key={i}
-                          initial={{ opacity: 0, x: -8 }}
-                          animate={{ opacity: 1, x: 0 }}
-                          transition={{ delay: 0.55 + i * 0.08 }}
-                          className="rounded-xl bg-purple-500/5 border border-purple-500/10 p-4 flex flex-col gap-3"
-                        >
-                          <div className="flex items-start justify-between gap-3">
-                            <div className="text-[#F0F6FF] font-semibold text-sm">{testName}</div>
-                            {confidence !== null && (
-                              <span className="flex-shrink-0 px-2 py-0.5 rounded-full text-xs font-semibold bg-purple-500/10 text-purple-300 border border-purple-500/20 whitespace-nowrap">
-                                {`${confidence}% confidence`}
-                              </span>
-                            )}
-                          </div>
-                          {analysis && (
-                            <div>
-                              <div className="text-[#4A6280] text-xs font-semibold uppercase tracking-wider mb-1">Analysis</div>
-                              <div className="text-[#8BA4C8] text-sm">{analysis}</div>
-                            </div>
-                          )}
-                          {rootCause && (
-                            <div>
-                              <div className="text-[#4A6280] text-xs font-semibold uppercase tracking-wider mb-1">Root Cause</div>
-                              <div className="text-[#8BA4C8] text-sm">{rootCause}</div>
-                            </div>
-                          )}
-                          {fix && (
-                            <div>
-                              <div className="text-[#4A6280] text-xs font-semibold uppercase tracking-wider mb-1">Suggested Fix</div>
-                              <div className="text-[#8BA4C8] text-sm">{fix}</div>
-                            </div>
-                          )}
-                          {testingRecommendations && (
-                            <div>
-                              <div className="text-[#4A6280] text-xs font-semibold uppercase tracking-wider mb-1">Verification</div>
-                              <div className="text-[#8BA4C8] text-sm">{testingRecommendations}</div>
-                            </div>
-                          )}
-                          {!analysis && !rootCause && !fix && (
-                            <div className="text-[#8BA4C8] text-sm">No structured AI details were provided for this issue.</div>
-                          )}
-                        </motion.div>
-                      );
-                    })}
-                  </div>
-
-                  {/* Footer collapse toggle */}
-                  <button
-                    onClick={() => {
-                      setAiAnalysisOpen(false);
-                      setTimeout(() => {
-                        aiAnalysisHeaderRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-                      }, 100);
-                    }}
-                    className="w-full px-6 py-3 border-t border-white/8 flex items-center justify-center gap-2 text-[#4A6280] hover:text-[#F0F6FF] hover:bg-white/[0.02] transition-colors text-xs font-medium"
-                  >
-                    <span>Collapse AI Analysis</span>
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                      <polyline points="18 15 12 9 6 15" />
-                    </svg>
-                  </button>
-                </motion.div>
-              )}
-            </AnimatePresence>
-          </motion.div>
-        )}
-      </AnimatePresence>
 
       {/* Duration footer */}
       {testRun.duration_ms && (
