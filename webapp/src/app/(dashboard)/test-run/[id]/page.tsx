@@ -604,8 +604,8 @@ function TestRow({ t, idx, indented = false, aiAnalysis = [] }: { t: NormalisedT
     if (!aiName) return false;
     return aiName.toLowerCase().trim() === t.name.toLowerCase().trim();
   }) ?? null;
-  const hasDetails = !!(t.error || t.screenshots.length || t.videos.length || t.traces.length || t.errorObj || matchedAi);
   const isFailed = ['failed', 'fail'].includes(t.status.toLowerCase());
+  const hasDetails = !!(t.error || t.screenshots.length || t.videos.length || t.traces.length || t.errorObj || (matchedAi && isFailed));
   const failureInsight = t.error ? buildFailureInsight(t.error) : null;
 
   return (
@@ -760,7 +760,7 @@ function TestRow({ t, idx, indented = false, aiAnalysis = [] }: { t: NormalisedT
                 )}
 
                 {/* Inline AI Analysis */}
-                {matchedAi && (() => {
+                {matchedAi && isFailed && (() => {
                   const analysis = safeString(matchedAi.analysis);
                   const rootCause = safeString(matchedAi.root_cause ?? matchedAi.rootCause);
                   const fix = safeString(matchedAi.suggested_fix ?? matchedAi.suggestedFix ?? matchedAi.fix);
@@ -921,6 +921,7 @@ function MainTypeGroup({ mainType, subGroups, aiAnalysis = [] }: { mainType: str
 // ─── Phase display helpers ───────────────────────────────────────────────────
 
 const PHASE_LABELS: Record<string, string> = {
+  starting_pipeline: 'Starting Healix',
   started: 'Healix Started',
   port_conflict: 'Port Conflict',
   jira: 'Fetching Jira Stories',
