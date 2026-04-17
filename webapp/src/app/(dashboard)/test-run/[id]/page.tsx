@@ -217,8 +217,8 @@ function useCountUp(target: number, duration = 1200, delay = 0) {
 
 // ─── Sub-components ──────────────────────────────────────────────────────────
 
-function KpiCard({ label, value, sub, color, delay }: {
-  label: string; value: number; sub?: string; color: string; delay: number;
+function KpiCard({ label, value, sub, color, delay, loading }: {
+  label: string; value: number; sub?: string; color: string; delay: number; loading?: boolean;
 }) {
   const displayed = useCountUp(value, 1000, delay);
   return (
@@ -229,7 +229,18 @@ function KpiCard({ label, value, sub, color, delay }: {
       className="glass-card rounded-2xl p-5 flex flex-col gap-1"
     >
       <span className="text-[#4A6280] text-xs font-semibold uppercase tracking-wider">{label}</span>
-      <span className={`text-3xl font-bold ${color}`}>{displayed}{sub}</span>
+      {loading ? (
+        <div className="relative mt-1 h-9 w-14 rounded-lg bg-white/5 overflow-hidden">
+          <motion.div
+            className="absolute inset-y-0 w-1/2 rounded-lg"
+            style={{ background: 'linear-gradient(90deg, transparent, rgba(255,255,255,0.07), transparent)' }}
+            animate={{ left: ['-50%', '150%'] }}
+            transition={{ duration: 1.4, repeat: Infinity, ease: 'linear', repeatDelay: 0.4 }}
+          />
+        </div>
+      ) : (
+        <span className={`text-3xl font-bold ${color}`}>{displayed}{sub}</span>
+      )}
     </motion.div>
   );
 }
@@ -245,26 +256,6 @@ function StatusBadge({ status }: { status: string }) {
   return <span className="px-2 py-0.5 rounded-full text-xs font-semibold bg-blue-500/10 text-blue-400">{s}</span>;
 }
 
-function StatusBar({ passed, failed, skipped, total }: { passed: number; failed: number; skipped: number; total: number }) {
-  if (total === 0) return null;
-  const pPct = (passed / total) * 100;
-  const fPct = (failed / total) * 100;
-  const sPct = (skipped / total) * 100;
-  return (
-    <div className="flex flex-col gap-2">
-      <div className="flex h-3 rounded-full overflow-hidden bg-white/5">
-        <motion.div initial={{ width: 0 }} animate={{ width: `${pPct}%` }} transition={{ duration: 0.8, delay: 0.3 }} className="h-full bg-emerald-500" />
-        <motion.div initial={{ width: 0 }} animate={{ width: `${fPct}%` }} transition={{ duration: 0.8, delay: 0.5 }} className="h-full bg-red-500" />
-        <motion.div initial={{ width: 0 }} animate={{ width: `${sPct}%` }} transition={{ duration: 0.8, delay: 0.7 }} className="h-full bg-amber-500" />
-      </div>
-      <div className="flex items-center gap-4 text-xs text-[#4A6280]">
-        <span className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-full bg-emerald-500 inline-block" />{passed} passed</span>
-        <span className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-full bg-red-500 inline-block" />{failed} failed</span>
-        {skipped > 0 && <span className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-full bg-amber-500 inline-block" />{skipped} skipped</span>}
-      </div>
-    </div>
-  );
-}
 
 // ─── Artifact viewer components ──────────────────────────────────────────────
 
@@ -399,11 +390,221 @@ function normaliseTest(t: ReportTest, idx: number, testRunId: string): Normalise
   };
 }
 
+// ─── Category helpers ─────────────────────────────────────────────────────────
+
+function extractCategory(name: string): string {
+  const match = name.match(/\[CAT:([^\]]+)\]/i);
+  if (!match) return 'uncategorized';
+  return match[1].trim().toLowerCase().replace(/[\s-]+/g, '_').replace(/[^a-z0-9_]/g, '');
+}
+
+const CATEGORY_META: Record<string, { label: string; color: string; border: string; dot: string }> = {
+  form_validation:   { label: 'Form Validation',    color: 'text-[#8BA4C8]', border: 'border-[#8BA4C8]/30', dot: 'bg-[#8BA4C8]' },
+  ui_flow:           { label: 'UI Flow',             color: 'text-[#8BA4C8]', border: 'border-[#8BA4C8]/30', dot: 'bg-[#8BA4C8]' },
+  workflow_journey:  { label: 'Workflow / Journey',  color: 'text-[#8BA4C8]', border: 'border-[#8BA4C8]/30', dot: 'bg-[#8BA4C8]' },
+  api_contract:      { label: 'API Contract',        color: 'text-[#8BA4C8]', border: 'border-[#8BA4C8]/30', dot: 'bg-[#8BA4C8]' },
+  api_auth:          { label: 'API Auth',            color: 'text-[#8BA4C8]', border: 'border-[#8BA4C8]/30', dot: 'bg-[#8BA4C8]' },
+  api_negative:      { label: 'API Negative',        color: 'text-[#8BA4C8]', border: 'border-[#8BA4C8]/30', dot: 'bg-[#8BA4C8]' },
+  api_stress:        { label: 'API Stress',          color: 'text-[#8BA4C8]', border: 'border-[#8BA4C8]/30', dot: 'bg-[#8BA4C8]' },
+  uncategorized:     { label: 'Uncategorized',       color: 'text-[#8BA4C8]', border: 'border-[#8BA4C8]/30', dot: 'bg-[#8BA4C8]' },
+};
+
+function getCategoryMeta(cat: string) {
+  if (CATEGORY_META[cat]) return CATEGORY_META[cat];
+  const label = cat.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+  return { label, color: 'text-[#8BA4C8]', border: 'border-[#8BA4C8]/30', dot: 'bg-[#8BA4C8]' };
+}
+
+const API_CATS = new Set(['api_contract', 'api_auth', 'api_negative', 'api_stress']);
+const FRONTEND_CATS = new Set(['ui_flow', 'form_validation', 'workflow_journey']);
+
+// Words that, when found as a filename segment, unambiguously denote a test type.
+// Add any new type here and it will automatically get its own main-type group.
+const TYPE_KEYWORD_MAP: Record<string, string> = {
+  smoke:         'smoke',
+  sanity:        'smoke',
+  e2e:           'e2e',
+  integration:   'integration',
+  regression:    'regression',
+  workflow:      'workflow',
+  journey:       'workflow',
+  performance:   'performance',
+  perf:          'performance',
+  load:          'load',
+  stress:        'stress',
+  burst:         'stress',
+  accessibility: 'accessibility',
+  a11y:          'accessibility',
+  visual:        'visual',
+  snapshot:      'visual',
+  contract:      'api',
+  api:           'api',
+  expansion:     'expansion',
+  error:         'error',
+  frontend:      'frontend',
+  ui:            'frontend',
+};
+
+// Feature-name prefixes common in filenames that are NOT test types — ignore these
+// when deciding type from a segment (e.g. auth-forms.spec.ts → 'auth' is a feature).
+const FEATURE_SEGMENTS = new Set([
+  'auth', 'user', 'users', 'home', 'page', 'pages', 'test', 'spec',
+  'main', 'index', 'app', 'dashboard', 'settings', 'profile', 'login',
+  'signup', 'register', 'admin', 'public', 'private', 'shared',
+]);
+
+function extractMainType(name: string, suite: string): string {
+  const fileBase = (suite || '')
+    .toLowerCase()
+    .replace(/\.spec\.(ts|js)$/i, '')
+    .replace(/^(fallback|healix)[-_]/, '');
+
+  // 1. Scan every segment of the filename for a type keyword
+  const segments = fileBase.split(/[-_./\\]/);
+  for (const seg of segments) {
+    if (TYPE_KEYWORD_MAP[seg]) return TYPE_KEYWORD_MAP[seg];
+  }
+
+  // 2. CAT tag inference (most explicit per-test signal)
+  const cat = extractCategory(name);
+  if (API_CATS.has(cat)) return 'api';
+  if (FRONTEND_CATS.has(cat)) return 'frontend';
+
+  // 3. No keyword match and no CAT tag — use first non-feature segment of the
+  //    filename as the type so new/unknown file conventions still surface correctly.
+  const firstMeaningful = segments.find(s => s.length > 1 && !FEATURE_SEGMENTS.has(s));
+  if (firstMeaningful) return firstMeaningful;
+
+  // 4. Absolute fallback (generic file with no usable signal)
+  return 'other';
+}
+
+const MAIN_TYPE_META: Record<string, { label: string; color: string; bg: string; dot: string; order: number }> = {
+  smoke:     { label: 'Smoke',            color: 'text-[#C8DEFF]', bg: 'bg-white/[0.04]', dot: 'bg-[#C8DEFF]', order: 0 },
+  frontend:  { label: 'Frontend',         color: 'text-[#C8DEFF]', bg: 'bg-white/[0.04]', dot: 'bg-[#C8DEFF]', order: 1 },
+  api:       { label: 'API',              color: 'text-[#C8DEFF]', bg: 'bg-white/[0.04]', dot: 'bg-[#C8DEFF]', order: 2 },
+  workflow:  { label: 'Workflow',         color: 'text-[#C8DEFF]', bg: 'bg-white/[0.04]', dot: 'bg-[#C8DEFF]', order: 3 },
+  expansion: { label: 'Enhanced Coverage', color: 'text-[#C8DEFF]', bg: 'bg-white/[0.04]', dot: 'bg-[#C8DEFF]', order: 4 },
+};
+
+function getMainTypeMeta(type: string) {
+  if (MAIN_TYPE_META[type]) return MAIN_TYPE_META[type];
+  const label = type.charAt(0).toUpperCase() + type.slice(1);
+  return { label, color: 'text-[#C8DEFF]', bg: 'bg-white/[0.04]', dot: 'bg-[#C8DEFF]', order: 99 };
+}
+
+const SECTION_BORDER: Record<string, string> = {
+  smoke:     'border-[#C8DEFF]/40',
+  frontend:  'border-[#C8DEFF]/40',
+  api:       'border-[#C8DEFF]/40',
+  workflow:  'border-[#C8DEFF]/40',
+  expansion: 'border-[#C8DEFF]/40',
+};
+
+type SectionCounts = { passed: number; failed: number; skipped: number };
+interface SectionDatum {
+  key: string;
+  totals: SectionCounts;
+  subs: { key: string; counts: SectionCounts }[];
+}
+
+function SectionOverview({ sections }: { sections: SectionDatum[] }) {
+  const R = 24;
+  const CIRC = 2 * Math.PI * R;
+  const count = sections.length;
+  const cols = count <= 1 ? 1 : count <= 2 ? 2 : count <= 6 ? 3 : 4;
+  const remainder = count % cols;
+  const leadingSpacers = remainder === 0 ? 0 : Math.floor((cols - remainder) / 2);
+  const colsClass = cols === 1 ? 'grid-cols-1' : cols === 2 ? 'grid-cols-2' : cols === 3 ? 'grid-cols-3' : 'grid-cols-4';
+  const lastRowStart = remainder === 0 ? count : count - remainder;
+  const firstRows = sections.slice(0, lastRowStart);
+  const lastRow = sections.slice(lastRowStart);
+
+  const renderSection = ({ key, totals, subs }: SectionDatum) => {
+        const meta = getMainTypeMeta(key);
+        const border = SECTION_BORDER[key] ?? 'border-white/20';
+        const total = totals.passed + totals.failed + totals.skipped;
+        const rate = total > 0 ? Math.round((totals.passed / total) * 100) : 0;
+        const rateColor = rate >= 70 ? 'text-emerald-400' : rate >= 40 ? 'text-amber-400' : 'text-red-400';
+        const subParts = [
+          totals.failed > 0 ? `${totals.failed} failed` : null,
+          totals.skipped > 0 ? `${totals.skipped} skipped` : null,
+          totals.passed > 0 ? `${totals.passed} passed` : null,
+        ].filter(Boolean).join(' · ');
+        return (
+          <div key={key} className={`border-l-2 ${border} pl-3 flex flex-col gap-2`}>
+            {/* Section header: name + overall inline */}
+            <div className="flex items-center gap-2">
+              <span className={`text-xs font-semibold ${meta.color}`}>{meta.label}</span>
+              <span className={`text-xs font-bold tabular-nums ${rateColor}`}>{rate}%</span>
+              <span className="text-[#4A6280] text-[11px]">{subParts}</span>
+            </div>
+            {/* Subcategory arc-progress circles */}
+            {subs.length > 0 && (
+              <div className="flex flex-wrap gap-3">
+                {subs.map(({ key: subKey, counts }) => {
+                  const subMeta = getCategoryMeta(subKey);
+                  const subTotal = counts.passed + counts.failed + counts.skipped;
+                  const subRate = subTotal > 0 ? Math.round((counts.passed / subTotal) * 100) : 0;
+                  const stroke = subRate >= 70 ? '#34d399' : subRate >= 40 ? '#fbbf24' : '#f87171';
+                  const offset = CIRC * (1 - subRate / 100);
+                  return (
+                    <div key={subKey} className="flex flex-col items-center gap-1">
+                      <div className="relative w-14 h-14">
+                        <svg width="56" height="56" viewBox="0 0 56 56">
+                          <circle cx="28" cy="28" r={R} fill="none" stroke="rgba(255,255,255,0.06)" strokeWidth="3.5" />
+                          <circle
+                            cx="28" cy="28" r={R}
+                            fill="none"
+                            stroke={stroke}
+                            strokeWidth="3.5"
+                            strokeLinecap="round"
+                            strokeDasharray={CIRC}
+                            strokeDashoffset={offset}
+                            transform="rotate(-90 28 28)"
+                          />
+                        </svg>
+                        <div className="absolute inset-0 flex items-center justify-center">
+                          <span className="text-[11px] font-bold tabular-nums" style={{ color: stroke }}>{subRate}%</span>
+                        </div>
+                      </div>
+                      <span className="text-[#8BA4C8] text-[10px] text-center leading-tight max-w-[56px]">{subMeta.label}</span>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        );
+  };
+
+  return (
+    <div className="flex flex-col gap-4">
+      {firstRows.length > 0 && (
+        <div className={`grid ${colsClass} gap-x-6 gap-y-4`}>
+          {firstRows.map(s => renderSection(s))}
+        </div>
+      )}
+      {lastRow.length > 0 && (
+        <div className={`grid ${colsClass} gap-x-6 gap-y-4`}>
+          {Array.from({ length: leadingSpacers }).map((_, i) => <div key={`sp-${i}`} />)}
+          {lastRow.map(s => renderSection(s))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ─── Expandable test row ─────────────────────────────────────────────────────
 
-function TestRow({ t, idx }: { t: NormalisedTest; idx: number }) {
+function TestRow({ t, idx, indented = false, aiAnalysis = [] }: { t: NormalisedTest; idx: number; indented?: boolean; aiAnalysis?: AiAnalysisItem[] }) {
   const [expanded, setExpanded] = useState(false);
-  const hasDetails = !!(t.error || t.screenshots.length || t.videos.length || t.traces.length || t.errorObj);
+  const matchedAi = aiAnalysis.find(item => {
+    const aiName = safeString(item.testName ?? item.test ?? item.test_name);
+    if (!aiName) return false;
+    return aiName.toLowerCase().trim() === t.name.toLowerCase().trim();
+  }) ?? null;
+  const hasDetails = !!(t.error || t.screenshots.length || t.videos.length || t.traces.length || t.errorObj || matchedAi);
   const isFailed = ['failed', 'fail'].includes(t.status.toLowerCase());
   const failureInsight = t.error ? buildFailureInsight(t.error) : null;
 
@@ -416,15 +617,17 @@ function TestRow({ t, idx }: { t: NormalisedTest; idx: number }) {
         className={`border-b border-white/5 last:border-0 transition-all ${hasDetails ? 'cursor-pointer hover:bg-white/[0.03]' : 'hover:bg-white/[0.02]'}`}
         onClick={() => hasDetails && setExpanded(!expanded)}
       >
-        <td className="px-6 py-3">
+        <td className={`${indented ? 'pl-14 pr-6' : 'px-6'} py-3`}>
           <div className="flex items-center gap-2">
-            {hasDetails && (
+            {hasDetails ? (
               <svg
                 width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"
                 className={`flex-shrink-0 text-[#4A6280] transition-transform ${expanded ? 'rotate-90' : ''}`}
               >
                 <polyline points="9 18 15 12 9 6" />
               </svg>
+            ) : (
+              <span className="w-[14px] h-[14px] flex-shrink-0 inline-block" />
             )}
             <div>
               <div className="text-[#F0F6FF] text-sm font-medium">{t.name}</div>
@@ -555,6 +758,58 @@ function TestRow({ t, idx }: { t: NormalisedTest; idx: number }) {
                     </div>
                   </div>
                 )}
+
+                {/* Inline AI Analysis */}
+                {matchedAi && (() => {
+                  const analysis = safeString(matchedAi.analysis);
+                  const rootCause = safeString(matchedAi.root_cause ?? matchedAi.rootCause);
+                  const fix = safeString(matchedAi.suggested_fix ?? matchedAi.suggestedFix ?? matchedAi.fix);
+                  const testingRecommendations = safeString(matchedAi.testingRecommendations ?? matchedAi.testing_recommendations);
+                  const confidence = getConfidencePercent(matchedAi.confidence);
+                  return (
+                    <div className="rounded-xl bg-purple-500/5 border border-purple-500/10 p-4 flex flex-col gap-3">
+                      <div className="flex items-center justify-between gap-3">
+                        <div className="flex items-center gap-2">
+                          <div className="w-6 h-6 rounded-md bg-purple-500/10 border border-purple-500/20 flex items-center justify-center flex-shrink-0">
+                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#A78BFA" strokeWidth="2">
+                              <path d="M12 2a10 10 0 110 20A10 10 0 0112 2z" /><path d="M12 8v4l3 3" />
+                            </svg>
+                          </div>
+                          <span className="text-purple-300 text-xs font-semibold uppercase tracking-wider">AI Analysis</span>
+                        </div>
+                        {confidence !== null && (
+                          <span className="flex-shrink-0 px-2 py-0.5 rounded-full text-xs font-semibold bg-purple-500/10 text-purple-300 border border-purple-500/20 whitespace-nowrap">
+                            {`${confidence}% confidence`}
+                          </span>
+                        )}
+                      </div>
+                      {analysis && (
+                        <div>
+                          <div className="text-[#4A6280] text-xs font-semibold uppercase tracking-wider mb-1">Analysis</div>
+                          <div className="text-[#8BA4C8] text-sm">{analysis}</div>
+                        </div>
+                      )}
+                      {rootCause && (
+                        <div>
+                          <div className="text-[#4A6280] text-xs font-semibold uppercase tracking-wider mb-1">Root Cause</div>
+                          <div className="text-[#8BA4C8] text-sm">{rootCause}</div>
+                        </div>
+                      )}
+                      {fix && (
+                        <div>
+                          <div className="text-[#4A6280] text-xs font-semibold uppercase tracking-wider mb-1">Suggested Fix</div>
+                          <div className="text-[#8BA4C8] text-sm">{fix}</div>
+                        </div>
+                      )}
+                      {testingRecommendations && (
+                        <div>
+                          <div className="text-[#4A6280] text-xs font-semibold uppercase tracking-wider mb-1">Verification</div>
+                          <div className="text-[#8BA4C8] text-sm">{testingRecommendations}</div>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })()}
               </div>
             </td>
           </motion.tr>
@@ -564,16 +819,115 @@ function TestRow({ t, idx }: { t: NormalisedTest; idx: number }) {
   );
 }
 
+// ─── Category group (sub-category collapsible tbody section) ─────────────────
+
+function CategoryGroup({ category, tests, indented = false, aiAnalysis = [] }: { category: string; tests: NormalisedTest[]; indented?: boolean; aiAnalysis?: AiAnalysisItem[] }) {
+  const [open, setOpen] = useState(true);
+  const meta = getCategoryMeta(category);
+  const passed = tests.filter(t => ['passed', 'pass'].includes(t.status.toLowerCase())).length;
+  const failed = tests.filter(t => ['failed', 'fail'].includes(t.status.toLowerCase())).length;
+  const skipped = tests.filter(t => ['skipped', 'skip', 'pending'].includes(t.status.toLowerCase())).length;
+  const px = indented ? 'pl-10 pr-5' : 'px-5';
+
+  return (
+    <tbody>
+      {/* Sub-category header row */}
+      <tr
+        className="cursor-pointer select-none border-b border-white/5 bg-white/[0.015] hover:bg-white/[0.03] transition-colors"
+        onClick={() => setOpen(o => !o)}
+      >
+        <td colSpan={5} className={`${px} py-2`}>
+          <div className="flex items-center gap-2.5">
+            <svg
+              width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"
+              className={`flex-shrink-0 text-[#4A6280] transition-transform duration-150 ${open ? 'rotate-90' : ''}`}
+            >
+              <polyline points="9 18 15 12 9 6" />
+            </svg>
+            <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${meta.dot}`} />
+            <span className={`text-[11px] font-semibold uppercase tracking-wider ${meta.color}`}>{meta.label}</span>
+            <span className="text-[#4A6280] text-[11px]">{tests.length} test{tests.length !== 1 ? 's' : ''}</span>
+            <div className="flex items-center gap-2">
+              {passed > 0 && <span className="text-[#8BA4C8] text-[11px]">{passed} passed</span>}
+              {failed > 0 && <span className="text-[#8BA4C8] text-[11px]">{failed} failed</span>}
+              {skipped > 0 && <span className="text-[#8BA4C8] text-[11px]">{skipped} skipped</span>}
+            </div>
+          </div>
+        </td>
+      </tr>
+      {/* Test rows */}
+      {open && tests.map((t, i) => <TestRow key={i} t={t} idx={i} indented={indented} aiAnalysis={aiAnalysis} />)}
+    </tbody>
+  );
+}
+
+// ─── Main type group (top-level collapsible section) ─────────────────────────
+
+function MainTypeGroup({ mainType, subGroups, aiAnalysis = [] }: { mainType: string; subGroups: [string, NormalisedTest[]][]; aiAnalysis?: AiAnalysisItem[] }) {
+  const [open, setOpen] = useState(true);
+  const meta = getMainTypeMeta(mainType);
+  const allTests = subGroups.flatMap(([, tests]) => tests);
+  const passed = allTests.filter(t => ['passed', 'pass'].includes(t.status.toLowerCase())).length;
+  const failed = allTests.filter(t => ['failed', 'fail'].includes(t.status.toLowerCase())).length;
+  const skipped = allTests.filter(t => ['skipped', 'skip', 'pending'].includes(t.status.toLowerCase())).length;
+  const isSingleUncategorised = subGroups.length === 1 && subGroups[0][0] === 'uncategorized';
+
+  return (
+    <>
+      <tbody>
+        {/* Main type header row */}
+        <tr
+          className={`cursor-pointer select-none border-b border-white/10 ${meta.bg} hover:brightness-110 transition-all`}
+          onClick={() => setOpen(o => !o)}
+        >
+          <td colSpan={5} className="px-4 py-3">
+            <div className="flex items-center gap-3">
+              <svg
+                width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"
+                className={`flex-shrink-0 text-[#4A6280] transition-transform duration-150 ${open ? 'rotate-90' : ''}`}
+              >
+                <polyline points="9 18 15 12 9 6" />
+              </svg>
+              <span className={`w-2.5 h-2.5 rounded-full flex-shrink-0 ${meta.dot}`} />
+              <span className={`text-sm font-bold ${meta.color}`}>{meta.label}</span>
+              <span className="text-[#4A6280] text-xs">{allTests.length} test{allTests.length !== 1 ? 's' : ''}</span>
+              <div className="flex items-center gap-3">
+                {passed > 0 && <span className="text-[#8BA4C8] text-xs font-medium">{passed} passed</span>}
+                {failed > 0 && <span className="text-[#8BA4C8] text-xs font-medium">{failed} failed</span>}
+                {skipped > 0 && <span className="text-[#8BA4C8] text-xs font-medium">{skipped} skipped</span>}
+              </div>
+              {!isSingleUncategorised && (
+                <span className="ml-auto text-[#4A6280] text-[11px]">{subGroups.length} sub-categor{subGroups.length === 1 ? 'y' : 'ies'}</span>
+              )}
+            </div>
+          </td>
+        </tr>
+      </tbody>
+      {/* Sub-category groups rendered as sibling tbodies */}
+      {open && (isSingleUncategorised
+        ? (
+          <tbody>
+            {subGroups[0][1].map((t, i) => <TestRow key={i} t={t} idx={i} aiAnalysis={aiAnalysis} />)}
+          </tbody>
+        )
+        : subGroups.map(([subCat, tests]) => (
+          <CategoryGroup key={subCat} category={subCat} tests={tests} indented aiAnalysis={aiAnalysis} />
+        ))
+      )}
+    </>
+  );
+}
+
 // ─── Phase display helpers ───────────────────────────────────────────────────
 
 const PHASE_LABELS: Record<string, string> = {
-  started: 'Pipeline Started',
+  started: 'Healix Started',
   port_conflict: 'Port Conflict',
   jira: 'Fetching Jira Stories',
   context: 'Gathering Context',
   context_enrichment: 'Enriching Context',
   generating: 'Generating Tests',
-  running: 'Running Playwright Tests',
+  running: 'Running Tests',
   tests_complete: 'Tests Complete',
   analyzing: 'Analyzing Failures',
   reporting: 'Generating Report',
@@ -582,8 +936,8 @@ const PHASE_LABELS: Record<string, string> = {
   artifacts_upload_failed: 'Artifact Upload Failed',
   artifacts_upload_error: 'Artifact Upload Error',
   dashboard: 'Opening Dashboard',
-  completed: 'Pipeline Complete',
-  error: 'Pipeline Error',
+  completed: 'Healix run Complete',
+  error: 'Healix Error',
   error_reported: 'Error Reported',
 };
 
@@ -637,11 +991,26 @@ function LiveTimeline({ events, liveFiles, pipelineEnded }: {
   liveFiles: string[];
   pipelineEnded: boolean;
 }) {
-  const displayEvents = events.filter(e =>
+  const [now, setNow] = useState(() => Date.now());
+
+  // Tick every second while the pipeline is still running so the elapsed timer updates
+  useEffect(() => {
+    if (pipelineEnded) return;
+    const interval = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(interval);
+  }, [pipelineEnded]);
+
+  const filteredEvents = events.filter(e =>
     e.eventType !== 'test_results' &&
     e.eventType !== 'test_file_generated' &&
     e.eventType !== 'test_result'
   );
+  // Deduplicate: keep only the last event per phase (multiple events per phase are repetitive)
+  const phaseMap = new Map<string, LiveEvent>();
+  for (const e of filteredEvents) {
+    phaseMap.set(e.phase ?? '__unknown__', e);
+  }
+  const displayEvents = Array.from(phaseMap.values());
   if (displayEvents.length === 0) return null;
   // Decide which single event owns files to avoid duplicates
   const hasTestsGenEvent = displayEvents.some(e => e.eventType === 'tests_generated');
@@ -656,13 +1025,35 @@ function LiveTimeline({ events, liveFiles, pipelineEnded }: {
         const showFiles = liveFiles.length > 0 && (hasTestsGenEvent ? isTestsGen : isGeneratingPhase);
         const effectiveIsLast = isLast && !isTerminal && !pipelineEnded;
         const time = ev.occurredAt ? new Date(ev.occurredAt).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true }) : '';
+
+        // Live elapsed timer for the currently active step
+        let elapsedLabel = '';
+        if (effectiveIsLast && ev.occurredAt) {
+          const elapsedSec = Math.max(0, Math.floor((now - new Date(ev.occurredAt).getTime()) / 1000));
+          if (elapsedSec >= 2) {
+            elapsedLabel = elapsedSec < 60
+              ? `${elapsedSec}s`
+              : `${Math.floor(elapsedSec / 60)}m ${elapsedSec % 60}s`;
+          }
+        }
+
         return (
           <div key={ev.id} className="flex gap-3 group">
             <div className="flex flex-col items-center">
               <PhaseIcon phase={isTerminal ? ev.phase : (effectiveIsLast ? ev.phase : 'done')} isLast={effectiveIsLast} />
-              {i < displayEvents.length - 1 && (
+              {i < displayEvents.length - 1 ? (
                 <div className="w-px h-full min-h-[16px] bg-white/10 mt-0.5" />
-              )}
+              ) : effectiveIsLast ? (
+                // Animated flowing connector below the active step to signal work in progress
+                <div className="w-px flex-1 min-h-[12px] mt-0.5 relative overflow-hidden bg-blue-400/10">
+                  <motion.div
+                    className="absolute left-0 right-0 h-8"
+                    style={{ background: 'linear-gradient(to bottom, rgba(96,165,250,0.35), transparent)' }}
+                    animate={{ y: ['-100%', '200%'] }}
+                    transition={{ duration: 1.4, repeat: Infinity, ease: 'linear' }}
+                  />
+                </div>
+              ) : null}
             </div>
             <div className="pb-3 flex-1 min-w-0">
               <div className="flex items-center gap-2 flex-wrap">
@@ -670,6 +1061,12 @@ function LiveTimeline({ events, liveFiles, pipelineEnded }: {
                 {time && <span className="text-[#4A6280] text-[10px] font-mono">{time}</span>}
                 {ev.durationMs != null && ev.durationMs > 0 && (
                   <span className="text-[#4A6280] text-[10px] font-mono">{(ev.durationMs / 1000).toFixed(1)}s</span>
+                )}
+                {effectiveIsLast && (
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" className="text-blue-400/70 flex-shrink-0 animate-spin" style={{animationDuration: '2s'}}>
+                    <circle cx="12" cy="12" r="10"/>
+                    <polyline points="12 6 12 12 16 14"/>
+                  </svg>
                 )}
               </div>
               {ev.message && (
@@ -696,6 +1093,17 @@ function LiveTimeline({ events, liveFiles, pipelineEnded }: {
                 </div>
               )}
 
+              {/* Indeterminate shimmer progress bar — only on the active (last, non-terminal) step */}
+              {effectiveIsLast && (
+                <div className="relative mt-2 h-0.5 rounded-full overflow-hidden bg-blue-500/10">
+                  <motion.div
+                    className="absolute inset-y-0 rounded-full"
+                    style={{ width: '45%', background: 'linear-gradient(90deg, transparent, rgba(96,165,250,0.55), transparent)' }}
+                    animate={{ left: ['-45%', '100%'] }}
+                    transition={{ duration: 1.6, repeat: Infinity, ease: 'linear', repeatDelay: 0.15 }}
+                  />
+                </div>
+              )}
             </div>
           </div>
         );
@@ -715,6 +1123,7 @@ export default function TestRunDetailPage() {
   const [loading, setLoading] = useState(true);
   const [notFound, setNotFound] = useState(false);
   const [filterStatus, setFilterStatus] = useState<string>('all');
+  const [groupByCategory, setGroupByCategory] = useState(true);
   const [activePolling, setActivePolling] = useState(true);
   const lastRunSignatureRef = useRef<string | null>(null);
   const pollFailCountRef = useRef(0);
@@ -725,14 +1134,15 @@ export default function TestRunDetailPage() {
   const [pipelineOpen, setPipelineOpen] = useState(true);
   const [pipelineEnded, setPipelineEnded] = useState(false);
   const [testResultsOpen, setTestResultsOpen] = useState(true);
-  const [aiAnalysisOpen, setAiAnalysisOpen] = useState(true);
-  
+  const [overviewOpen, setOverviewOpen] = useState(false);
+
   const testResultsHeaderRef = useRef<HTMLDivElement>(null);
-  const aiAnalysisHeaderRef = useRef<HTMLButtonElement>(null);
+  const evtSourceRef = useRef<EventSource | null>(null);
 
   const isLiveOrRunning = useCallback((run: TestRun | null) => {
     if (!run) return false;
-    if (isLiveDetailId) return true;
+    // For real ingested runs trust their status directly.
+    // For synthetic live runs (is_live=true) keep polling until the real run appears.
     const status = String(run.status || '').toLowerCase();
     const phase = String(run.current_phase || '').toLowerCase();
     if (run.is_live) return true;
@@ -751,12 +1161,16 @@ export default function TestRunDetailPage() {
       'reporting',
       'tests_complete',
     ].includes(phase);
-  }, [isLiveDetailId]);
+  }, []);
 
   useEffect(() => {
     if (!id || !isLiveDetailId) return;
     const evtSource = new EventSource(`/api/test-runs/${id}/stream`);
+    evtSourceRef.current = evtSource;
+    let retryCount = 0;
+
     evtSource.onmessage = (e: MessageEvent) => {
+      retryCount = 0;
       try {
         const data = JSON.parse(e.data) as LiveEvent & { type: string };
         if (data.type === 'event') {
@@ -778,9 +1192,10 @@ export default function TestRunDetailPage() {
           }
         } else if (data.type === 'done') {
           evtSource.close();
+          evtSourceRef.current = null;
           setActivePolling(false);
           setPipelineEnded(true);
-          // Final fetch to pick up completed state & report
+          // Final fetch to pick up completed state & report (Fix 1 returns real ingested run)
           fetch(`/api/test-runs/${id}`, { cache: 'no-store' })
             .then(res => res.ok ? res.json() : null)
             .then(json => { if (json?.data) setTestRun(json.data); })
@@ -788,8 +1203,19 @@ export default function TestRunDetailPage() {
         }
       } catch { /* ignore malformed events */ }
     };
-    evtSource.onerror = () => { evtSource.close(); };
-    return () => { evtSource.close(); };
+    evtSource.onerror = () => {
+      retryCount++;
+      if (retryCount > 10) {
+        evtSource.close();
+        evtSourceRef.current = null;
+        setActivePolling(false);
+      }
+      // else: let EventSource auto-reconnect (native browser behavior)
+    };
+    return () => {
+      evtSource.close();
+      evtSourceRef.current = null;
+    };
   }, [id, isLiveDetailId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
@@ -825,6 +1251,16 @@ export default function TestRunDetailPage() {
         if (signature !== lastRunSignatureRef.current) {
           lastRunSignatureRef.current = signature;
           setTestRun(nextRun);
+        }
+
+        // When the real ingested run is returned for a live-prefixed URL,
+        // mark the pipeline as ended and close the SSE connection.
+        if (isLiveDetailId && nextRun && !nextRun.is_live) {
+          setPipelineEnded(true);
+          if (evtSourceRef.current) {
+            evtSourceRef.current.close();
+            evtSourceRef.current = null;
+          }
         }
 
         setNotFound(false);
@@ -885,6 +1321,15 @@ export default function TestRunDetailPage() {
             lastRunSignatureRef.current = signature;
             setTestRun(nextRun);
           }
+          // When the real ingested run is returned for a live-prefixed URL,
+          // mark the pipeline as ended and close the SSE connection.
+          if (isLiveDetailId && nextRun && !nextRun.is_live) {
+            setPipelineEnded(true);
+            if (evtSourceRef.current) {
+              evtSourceRef.current.close();
+              evtSourceRef.current = null;
+            }
+          }
           setActivePolling(isLiveOrRunning(nextRun));
         })
         .catch(() => {
@@ -941,11 +1386,11 @@ export default function TestRunDetailPage() {
   const liveMeta = report?.metadata?.live || null;
   const liveRunId = report?.metadata?.runId || report?.metadata?.run_id || testRun.run_id || null;
   const rawTests: ReportTest[] = report?.tests ?? report?.results ?? [];
-  const normalisedTests = rawTests.map((t, i) => normaliseTest(t, i, id));
+  const normalisedTests = rawTests.map((t, i) => normaliseTest(t, i, testRun.id));
 
   // Filter tests — strip synthetic pipeline rows when we have real test data
   const isPipelineSynthetic = (t: NormalisedTest) =>
-    t.suite === 'pipeline' && (t.name.startsWith('[PIPELINE') || t.name.startsWith('[PIPELINE_ERROR'));
+    (t.suite === 'pipeline' || t.suite === 'Healix') && (t.name.startsWith('[PIPELINE') || t.name.startsWith('[HEALIX'));
   const hasRealTests = liveTestResults.length > 0 || normalisedTests.some(t => !isPipelineSynthetic(t));
   const displayTests = hasRealTests ? normalisedTests.filter(t => !isPipelineSynthetic(t)) : normalisedTests;
   
@@ -978,6 +1423,8 @@ export default function TestRunDetailPage() {
   const failedTests = hasLiveStats ? liveFailed : (testRun.failed_tests || report?.summary?.failed || report?.stats?.failed || displayTests.filter(t => ['failed', 'fail'].includes(t.status.toLowerCase())).length);
   const skippedTests = hasLiveStats ? liveSkipped : (testRun.skipped_tests || report?.summary?.skipped || report?.stats?.skipped || displayTests.filter(t => ['skipped', 'skip', 'pending'].includes(t.status.toLowerCase())).length);
   const passRate = totalTests > 0 ? Math.round((passedTests / totalTests) * 100) : 0;
+  // True while Playwright is executing but no individual results have streamed in yet
+  const isRunningPhase = !pipelineEnded && liveEvents.some(e => (e.phase || '').toLowerCase() === 'running');
   const filteredTests = filterStatus === 'all'
     ? displayTests
     : displayTests.filter(t => {
@@ -987,6 +1434,30 @@ export default function TestRunDetailPage() {
         if (filterStatus === 'skipped') return s === 'skipped' || s === 'skip' || s === 'pending';
         return true;
       });
+
+  // Two-level grouping: mainType → subCat → tests
+  const hierarchicalTests: [string, [string, NormalisedTest[]][]][] = (() => {
+    if (!groupByCategory) return [];
+    const typeMap = new Map<string, Map<string, NormalisedTest[]>>();
+    for (const t of filteredTests) {
+      const mainType = extractMainType(t.name, t.suite);
+      const subCat = extractCategory(t.name);
+      if (!typeMap.has(mainType)) typeMap.set(mainType, new Map());
+      const subMap = typeMap.get(mainType)!;
+      if (!subMap.has(subCat)) subMap.set(subCat, []);
+      subMap.get(subCat)!.push(t);
+    }
+    return [...typeMap.entries()]
+      .sort(([a], [b]) => getMainTypeMeta(a).order - getMainTypeMeta(b).order)
+      .map(([mainType, subMap]) => [
+        mainType,
+        [...subMap.entries()].sort(([a], [b]) => {
+          if (a === 'uncategorized') return 1;
+          if (b === 'uncategorized') return -1;
+          return getCategoryMeta(a).label.localeCompare(getCategoryMeta(b).label);
+        }),
+      ]);
+  })();
 
   // Count artifacts across all tests
   const totalScreenshots = normalisedTests.reduce((sum, t) => sum + t.screenshots.length, 0);
@@ -1067,7 +1538,7 @@ export default function TestRunDetailPage() {
                 )}
               </div>
               <div>
-                <div className="text-[#D8E8FF] font-semibold text-sm">Pipeline Activity</div>
+                <div className="text-[#D8E8FF] font-semibold text-sm">Healix Activity</div>
                 <div className="text-[#4A6280] text-[11px] font-mono">
                   {pipelineEnded ? 'completed' : (testRun.current_phase || liveMeta?.phase || testRun.status)}
                   {testRun.error_code || liveMeta?.errorCode ? ` · error: ${testRun.error_code || liveMeta?.errorCode}` : ''}
@@ -1077,11 +1548,15 @@ export default function TestRunDetailPage() {
             </div>
             <div className="flex items-center gap-2">
               {liveEvents.length > 0 && (() => {
-                const pipelineCount = liveEvents.filter(e =>
-                  e.eventType !== 'test_results' &&
-                  e.eventType !== 'test_file_generated' &&
-                  e.eventType !== 'test_result'
-                ).length;
+                const pipelineCount = (() => {
+                  const seen = new Set<string>();
+                  for (const e of liveEvents) {
+                    if (e.eventType !== 'test_results' && e.eventType !== 'test_file_generated' && e.eventType !== 'test_result') {
+                      seen.add(e.phase ?? '__unknown__');
+                    }
+                  }
+                  return seen.size;
+                })();
                 return (
                   <div className="flex items-center gap-1.5">
                     <span className="px-2 py-0.5 rounded-full bg-blue-500/10 border border-blue-500/20 text-blue-300 text-[10px] font-semibold">
@@ -1153,7 +1628,7 @@ export default function TestRunDetailPage() {
                 {pipelineEnded && (
                   <div className="border-t border-white/8 px-5 py-3 flex items-center gap-2">
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#34D399" strokeWidth="3"><polyline points="20 6 9 17 4 12" /></svg>
-                    <span className="text-emerald-400 text-xs font-semibold">Pipeline complete</span>
+                    <span className="text-emerald-400 text-xs font-semibold">Healix run complete</span>
                     {liveTotal > 0 && (
                       <span className="text-[#4A6280] text-xs">— {livePassed}/{liveTotal} tests passed ({Math.round((livePassed / liveTotal) * 100)}%)</span>
                     )}
@@ -1166,26 +1641,100 @@ export default function TestRunDetailPage() {
       )}
 
       {/* KPI cards */}
-      <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-5 gap-4">
-        <KpiCard label="Total Tests" value={totalTests} color="text-[#F0F6FF]" delay={0} />
-        <KpiCard label="Passed" value={passedTests} color="text-emerald-400" delay={80} />
-        <KpiCard label="Failed" value={failedTests} color="text-red-400" delay={160} />
-        <KpiCard label="Skipped" value={skippedTests} color="text-amber-400" delay={240} />
-        <KpiCard label="Pass Rate" value={passRate} sub="%" color={passRate >= 80 ? 'text-emerald-400' : 'text-red-400'} delay={320} />
-      </div>
-
-      {/* Status distribution bar */}
-      {totalTests > 0 && (
-        <motion.div initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.3 }} className="glass-card rounded-2xl p-5">
-          <h2 className="text-[#F0F6FF] font-semibold text-sm mb-4">Status Distribution</h2>
-          <StatusBar passed={passedTests} failed={failedTests} skipped={skippedTests} total={totalTests} />
+      {isRunningPhase && !hasLiveStats && (
+        <motion.div
+          initial={{ opacity: 0, y: 6 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="flex items-center gap-2 px-3 py-2 rounded-xl bg-blue-500/5 border border-blue-500/15 w-fit"
+        >
+          <span className="w-1.5 h-1.5 rounded-full bg-blue-400 animate-pulse flex-shrink-0" />
+          <span className="text-blue-300/70 text-xs font-medium">Tests executing — results will stream in as they complete</span>
         </motion.div>
       )}
+      <div className="grid grid-cols-2 sm:grid-cols-5 gap-4">
+        <KpiCard label="Total Tests" value={totalTests} color="text-[#F0F6FF]" delay={0} />
+        <KpiCard label="Passed" value={passedTests} color="text-emerald-400" delay={80} loading={isRunningPhase && !hasLiveStats} />
+        <KpiCard label="Failed" value={failedTests} color="text-red-400" delay={160} loading={isRunningPhase && !hasLiveStats} />
+        <KpiCard label="Skipped" value={skippedTests} color="text-amber-400" delay={240} loading={isRunningPhase && !hasLiveStats} />
+        <KpiCard label="Pass Rate" value={passRate} sub="%" color={passRate >= 70 ? 'text-emerald-400' : passRate >= 40 ? 'text-amber-400' : 'text-red-400'} delay={320} loading={isRunningPhase && !hasLiveStats} />
+      </div>
+
+      {/* Results by Section */}
+      {totalTests > 0 && (() => {
+        const sourceTests = hasLiveStats
+          ? liveTestResults.map(t => ({ name: t.n, suite: t.su, status: t.s }))
+          : displayTests.map(t => ({ name: t.name, suite: t.suite, status: t.status }));
+
+        type Counts = { passed: number; failed: number; skipped: number };
+        const sectionMap = new Map<string, { totals: Counts; subs: Map<string, Counts> }>();
+        for (const t of sourceTests) {
+          const mainKey = extractMainType(t.name, t.suite);
+          const subKey = extractCategory(t.name);
+          if (!sectionMap.has(mainKey)) sectionMap.set(mainKey, { totals: { passed: 0, failed: 0, skipped: 0 }, subs: new Map() });
+          const section = sectionMap.get(mainKey)!;
+          if (!section.subs.has(subKey)) section.subs.set(subKey, { passed: 0, failed: 0, skipped: 0 });
+          const s = t.status.toLowerCase();
+          const increment = (c: Counts) => { if (s === 'passed' || s === 'pass') c.passed++; else if (s === 'failed' || s === 'fail') c.failed++; else c.skipped++; };
+          increment(section.totals);
+          increment(section.subs.get(subKey)!);
+        }
+
+        const sections = [...sectionMap.entries()]
+          .sort(([a], [b]) => getMainTypeMeta(a).order - getMainTypeMeta(b).order);
+
+        if (sections.length === 0) return null;
+
+        const sectionData: SectionDatum[] = sections.map(([mainKey, { totals, subs }]) => ({
+          key: mainKey,
+          totals,
+          subs: [...subs.entries()]
+            .filter(([k]) => k !== 'uncategorized')
+            .sort(([a], [b]) => getCategoryMeta(a).label.localeCompare(getCategoryMeta(b).label))
+            .map(([k, counts]) => ({ key: k, counts })),
+        }));
+
+        return (
+          <motion.div initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.3 }} className="glass-card rounded-2xl p-5">
+            <button
+              onClick={() => setOverviewOpen(o => !o)}
+              className="w-full flex items-center justify-between mb-0 group"
+            >
+              <h2 className="text-[#F0F6FF] font-semibold text-sm">Overview</h2>
+              <div className="flex items-center gap-2">
+                <span className="text-[#4A6280] text-xs">{overviewOpen ? 'Click to collapse' : 'Click to expand'}</span>
+                <motion.svg
+                  animate={{ rotate: overviewOpen ? 0 : -90 }}
+                  transition={{ duration: 0.2 }}
+                  width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"
+                  className="text-[#4A6280] flex-shrink-0"
+                >
+                  <polyline points="6 9 12 15 18 9" />
+                </motion.svg>
+              </div>
+            </button>
+            <AnimatePresence initial={false}>
+              {overviewOpen && (
+                <motion.div
+                  initial={{ opacity: 0, height: 0 }}
+                  animate={{ opacity: 1, height: 'auto' }}
+                  exit={{ opacity: 0, height: 0 }}
+                  transition={{ duration: 0.2 }}
+                  className="overflow-hidden"
+                >
+                  <div className="mt-3">
+                    <SectionOverview sections={sectionData} />
+                  </div>
+                </motion.div>
+              )}
+            </AnimatePresence>
+          </motion.div>
+        );
+      })()}
 
       {/* Artifacts summary */}
       {(totalScreenshots + totalVideos + totalTraces) > 0 && (
         <motion.div initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.32 }} className="glass-card rounded-2xl p-5">
-          <h2 className="text-[#F0F6FF] font-semibold text-sm mb-3">Playwright Artifacts</h2>
+          <h2 className="text-[#F0F6FF] font-semibold text-sm mb-3">Test Artifacts</h2>
           <div className="flex items-center gap-4">
             {totalScreenshots > 0 && (
               <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-blue-500/5 border border-blue-500/15">
@@ -1241,8 +1790,8 @@ export default function TestRunDetailPage() {
                 <p className="text-[#4A6280] text-xs mt-0.5">{totalTests} individual tests — click a row to expand details</p>
               </div>
             </button>
-            {/* Filter buttons */}
-            <div className="flex items-center gap-1.5">
+            {/* Filter + Group buttons */}
+            <div className="flex items-center gap-1.5 flex-wrap">
               {(['all', 'passed', 'failed', 'skipped'] as const).map(f => (
                 <button
                   key={f}
@@ -1259,6 +1808,22 @@ export default function TestRunDetailPage() {
                   {f === 'all' ? `All (${displayTests.length})` : f === 'passed' ? `Passed (${passedTests})` : f === 'failed' ? `Failed (${failedTests})` : `Skipped (${skippedTests})`}
                 </button>
               ))}
+              <div className="w-px h-4 bg-white/10 mx-1" />
+              <button
+                onClick={() => setGroupByCategory(g => !g)}
+                title="Group tests by category"
+                className={`flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold transition-all border ${
+                  groupByCategory
+                    ? 'bg-violet-500/15 text-violet-300 border-violet-500/30'
+                    : 'bg-white/5 text-[#4A6280] border-transparent hover:border-white/10'
+                }`}
+              >
+                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+                  <rect x="3" y="3" width="7" height="7" rx="1" /><rect x="14" y="3" width="7" height="7" rx="1" />
+                  <rect x="3" y="14" width="7" height="7" rx="1" /><rect x="14" y="14" width="7" height="7" rx="1" />
+                </svg>
+                Group
+              </button>
             </div>
           </div>
 
@@ -1283,11 +1848,17 @@ export default function TestRunDetailPage() {
                         <th className="text-left px-4 py-3 text-[#4A6280] text-xs font-semibold uppercase tracking-wider">Artifacts</th>
                       </tr>
                     </thead>
-                    <tbody>
-                      {filteredTests.map((t, i) => (
-                        <TestRow key={i} t={t} idx={i} />
-                      ))}
-                    </tbody>
+                    {groupByCategory ? (
+                      hierarchicalTests.map(([mainType, subGroups]) => (
+                        <MainTypeGroup key={mainType} mainType={mainType} subGroups={subGroups} aiAnalysis={aiAnalysis} />
+                      ))
+                    ) : (
+                      <tbody>
+                        {filteredTests.map((t, i) => (
+                          <TestRow key={i} t={t} idx={i} aiAnalysis={aiAnalysis} />
+                        ))}
+                      </tbody>
+                    )}
                   </table>
                 </div>
                 {filteredTests.length === 0 && (
@@ -1314,121 +1885,6 @@ export default function TestRunDetailPage() {
           </AnimatePresence>
         </motion.div>
       ) : null}
-
-      {/* AI Analysis */}
-      <AnimatePresence>
-        {aiAnalysis.length > 0 && (
-          <motion.div initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.5 }} className="glass-card rounded-2xl overflow-hidden">
-            {/* Header with collapse toggle */}
-            <button
-              ref={aiAnalysisHeaderRef}
-              onClick={() => setAiAnalysisOpen(o => !o)}
-              className="w-full px-6 py-4 border-b border-white/8 flex items-center gap-3 text-left hover:bg-white/[0.02] transition-colors"
-            >
-              <svg
-                width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"
-                className={`text-[#4A6280] transition-transform duration-200 flex-shrink-0 ${aiAnalysisOpen ? 'rotate-180' : ''}`}
-              >
-                <polyline points="6 9 12 15 18 9" />
-              </svg>
-              <div className="w-8 h-8 rounded-lg bg-purple-500/10 border border-purple-500/20 flex items-center justify-center">
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#A78BFA" strokeWidth="2">
-                  <path d="M12 2a10 10 0 110 20A10 10 0 0112 2z" /><path d="M12 8v4l3 3" />
-                </svg>
-              </div>
-              <div>
-                <h2 className="text-[#F0F6FF] font-semibold text-base">AI Analysis</h2>
-                <p className="text-[#4A6280] text-xs">{aiAnalysis.length} issue{aiAnalysis.length !== 1 ? 's' : ''} analysed</p>
-              </div>
-            </button>
-
-            <AnimatePresence initial={false}>
-              {aiAnalysisOpen && (
-                <motion.div
-                  key="ai-analysis-body"
-                  initial={{ height: 0, opacity: 0 }}
-                  animate={{ height: 'auto', opacity: 1 }}
-                  exit={{ height: 0, opacity: 0 }}
-                  transition={{ duration: 0.25 }}
-                  style={{ overflow: 'hidden' }}
-                >
-                  <div className="p-5 flex flex-col gap-4">
-                    {aiAnalysis.map((item, i) => {
-                      const testName = safeString(item.testName ?? item.test ?? item.test_name) ?? `Issue ${i + 1}`;
-                      const analysis = safeString(item.analysis);
-                      const rootCause = safeString(item.root_cause ?? item.rootCause);
-                      const fix = safeString(item.suggested_fix ?? item.suggestedFix ?? item.fix);
-                      const testingRecommendations = safeString(item.testingRecommendations ?? item.testing_recommendations);
-                      const confidence = getConfidencePercent(item.confidence);
-                      return (
-                        <motion.div
-                          key={i}
-                          initial={{ opacity: 0, x: -8 }}
-                          animate={{ opacity: 1, x: 0 }}
-                          transition={{ delay: 0.55 + i * 0.08 }}
-                          className="rounded-xl bg-purple-500/5 border border-purple-500/10 p-4 flex flex-col gap-3"
-                        >
-                          <div className="flex items-start justify-between gap-3">
-                            <div className="text-[#F0F6FF] font-semibold text-sm">{testName}</div>
-                            {confidence !== null && (
-                              <span className="flex-shrink-0 px-2 py-0.5 rounded-full text-xs font-semibold bg-purple-500/10 text-purple-300 border border-purple-500/20 whitespace-nowrap">
-                                {`${confidence}% confidence`}
-                              </span>
-                            )}
-                          </div>
-                          {analysis && (
-                            <div>
-                              <div className="text-[#4A6280] text-xs font-semibold uppercase tracking-wider mb-1">Analysis</div>
-                              <div className="text-[#8BA4C8] text-sm">{analysis}</div>
-                            </div>
-                          )}
-                          {rootCause && (
-                            <div>
-                              <div className="text-[#4A6280] text-xs font-semibold uppercase tracking-wider mb-1">Root Cause</div>
-                              <div className="text-[#8BA4C8] text-sm">{rootCause}</div>
-                            </div>
-                          )}
-                          {fix && (
-                            <div>
-                              <div className="text-[#4A6280] text-xs font-semibold uppercase tracking-wider mb-1">Suggested Fix</div>
-                              <div className="text-[#8BA4C8] text-sm">{fix}</div>
-                            </div>
-                          )}
-                          {testingRecommendations && (
-                            <div>
-                              <div className="text-[#4A6280] text-xs font-semibold uppercase tracking-wider mb-1">Verification</div>
-                              <div className="text-[#8BA4C8] text-sm">{testingRecommendations}</div>
-                            </div>
-                          )}
-                          {!analysis && !rootCause && !fix && (
-                            <div className="text-[#8BA4C8] text-sm">No structured AI details were provided for this issue.</div>
-                          )}
-                        </motion.div>
-                      );
-                    })}
-                  </div>
-
-                  {/* Footer collapse toggle */}
-                  <button
-                    onClick={() => {
-                      setAiAnalysisOpen(false);
-                      setTimeout(() => {
-                        aiAnalysisHeaderRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-                      }, 100);
-                    }}
-                    className="w-full px-6 py-3 border-t border-white/8 flex items-center justify-center gap-2 text-[#4A6280] hover:text-[#F0F6FF] hover:bg-white/[0.02] transition-colors text-xs font-medium"
-                  >
-                    <span>Collapse AI Analysis</span>
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                      <polyline points="18 15 12 9 6 15" />
-                    </svg>
-                  </button>
-                </motion.div>
-              )}
-            </AnimatePresence>
-          </motion.div>
-        )}
-      </AnimatePresence>
 
       {/* Duration footer */}
       {testRun.duration_ms && (

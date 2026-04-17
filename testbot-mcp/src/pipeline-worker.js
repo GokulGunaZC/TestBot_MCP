@@ -733,7 +733,7 @@ function summarizeGenerationAttemptError(error) {
 }
 
 function buildUserFacingPipelineError(errorCode, error) {
-  const normalizedMessage = normalizeErrorText(error?.message) || 'Pipeline execution failed';
+  const normalizedMessage = normalizeErrorText(error?.message) || 'Healix run failed';
 
   if (errorCode === 'EXPO_DEPENDENCY_VALIDATION_FAILED') {
     return 'Expo blocked server startup due to dependency version validation. Set compatible dependency versions (for example via `npx expo install --check`) or rerun with dependency validation disabled for CI automation.';
@@ -744,18 +744,18 @@ function buildUserFacingPipelineError(errorCode, error) {
   }
 
   if (errorCode === 'PLAYWRIGHT_DEPENDENCY_MISSING') {
-    return 'Playwright test runtime could not be resolved while validating generated tests. Healix attempted to auto-link @playwright/test; install it in the target project if this persists.';
+    return 'Test runtime could not be resolved while validating generated tests. Healix attempted to auto-link the test runner; install @playwright/test in the target project if this persists.';
   }
 
   if (errorCode === 'GENERATION_VALIDATION_FAILED') {
     if (/playwright_list_failed/i.test(normalizedMessage)) {
-      return 'Generated tests failed pre-run validation (`playwright test --list`). This is usually caused by missing Playwright runtime dependencies or invalid generated imports.';
+      return 'Generated tests failed pre-run validation. This is usually caused by missing test runner dependencies or invalid generated imports.';
     }
     return `Generated tests did not pass validation gates. ${normalizedMessage}`;
   }
 
   if (errorCode === 'TIME_BUDGET_EXCEEDED') {
-    return 'Pipeline exceeded the configured time budget before tests could complete. Increase time budget or reduce generation/execution scope.';
+    return 'Healix exceeded the configured time budget before tests could complete. Increase time budget or reduce generation/execution scope.';
   }
 
   if (errorCode === 'SERVER_START_TIMEOUT') {
@@ -1000,8 +1000,8 @@ export default defineConfig({
   workers: process.env.CI ? 1 : 2,
   reporter: [
     ['list'],
-    ['json', { outputFile: 'test-results/results.json' }],
-    ['html', { open: 'never' }],
+    ['json', { outputFile: 'healix-reports/results/results.json' }],
+    ['html', { open: 'never', outputFolder: 'healix-reports/html-report' }],
   ],
   use: {
     baseURL: '${baseURL}',
@@ -1760,7 +1760,7 @@ async function runPipeline(config, runId) {
 
   updateStatus(statusDir, 'started', {
     runId,
-    message: 'Pipeline started',
+    message: 'Healix started',
     project: config.projectName,
     budgetMs: runBudget.totalMs,
     aiOnlyEnforced,
@@ -2047,7 +2047,7 @@ async function runPipeline(config, runId) {
     // -------------------------------------------------------
     updateStatus(statusDir, 'running', {
       runId,
-      message: 'Running Playwright tests...',
+      message: 'Running tests...',
       generationMeta,
       fallbackUsed,
       aiOnlyEnforced,
@@ -2056,10 +2056,40 @@ async function runPipeline(config, runId) {
     }, telemetryReporter);
 
     const executionTimeout = Math.max(1000, Math.min(getBudgetRemainingMs(runBudget), runBudget.stageCaps.execution));
+
+    // Throttled real-time test progress: buffer results and flush every 1.5s
+    // so each completed test emits a telemetry event without flooding the API.
+    const pendingProgress = [];
+    let progressFlushTimer = null;
+    const flushProgress = () => {
+      progressFlushTimer = null;
+      const batch = pendingProgress.splice(0);
+      if (!batch.length || !telemetryReporter || !telemetryReporter.isEnabled()) return;
+      for (const t of batch) {
+        telemetryReporter.emitBackground({
+          toolName: 'healix_test_my_app',
+          eventType: 'test_result',
+          runId,
+          phase: 'running',
+          status: t.status === 'failed' ? 'error' : 'info',
+          success: t.status !== 'failed',
+          message: t.name,
+          metadata: { test: { n: t.name, su: '', f: '', s: t.status, d: t.durationMs } },
+        });
+      }
+    };
+    const onTestProgress = (t) => {
+      pendingProgress.push(t);
+      if (!progressFlushTimer) {
+        progressFlushTimer = setTimeout(flushProgress, 1500);
+      }
+    };
+
     playwright = new PlaywrightIntegration({
       ...config,
       timeout: executionTimeout,
       serverPidFile,
+      onTestProgress: telemetryReporter && telemetryReporter.isEnabled() ? onTestProgress : undefined,
     });
 
     const mcpParallelEnabled =
@@ -2433,7 +2463,7 @@ async function runPipeline(config, runId) {
     try {
       const reportGen = new ReportGenerator();
       const syntheticFailure = {
-        testName: `[PIPELINE_ERROR:${errorCode}] Healix pipeline failed before/while execution`,
+        testName: `[HEALIX_ERROR:${errorCode}] Healix run failed before/while execution`,
         file: 'pipeline-worker.js',
         status: 'failed',
         duration: 0,
