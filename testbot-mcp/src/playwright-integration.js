@@ -472,6 +472,7 @@ class PlaywrightIntegration {
       .map((relativePath) => path.resolve(projectPath, relativePath));
 
     const defaults = [
+      path.join(projectPath, 'healix-reports', 'results', 'results.json'),
       path.join(projectPath, 'test-results', 'results.json'),
       path.join(projectPath, 'test-results.json'),
     ];
@@ -559,11 +560,19 @@ class PlaywrightIntegration {
       let stderr = '';
 
       proc.stdout.on('data', (data) => {
-        stdout += data.toString();
+        const chunk = data.toString();
+        stdout += chunk;
+        if (typeof this.config.onTestProgress === 'function') {
+          this._parseProgressChunk(chunk, this.config.onTestProgress);
+        }
       });
 
       proc.stderr.on('data', (data) => {
-        stderr += data.toString();
+        const chunk = data.toString();
+        stderr += chunk;
+        if (typeof this.config.onTestProgress === 'function') {
+          this._parseProgressChunk(chunk, this.config.onTestProgress);
+        }
       });
 
       const timer = setTimeout(() => {
@@ -586,6 +595,42 @@ class PlaywrightIntegration {
         reject(new Error(`Playwright execution failed: ${error.message}`));
       });
     });
+  }
+
+  _parseProgressChunk(chunk, onProgress) {
+    const lines = chunk.split('\n');
+    for (const line of lines) {
+      const stripped = this.stripAnsi(line);
+      // Playwright list reporter completion lines contain Unicode status icons:
+      //   ✓ / ✔  = passed    ✗ / × / ✕ / ✘ = failed    ○ (with skip) = skipped
+      const hasPassed = /[\u2713\u2714]/.test(stripped);
+      const hasFailed = /[\u2717\u00d7\u2715\u2718]/.test(stripped);
+      const hasSkipped = /[\u25cb]/.test(stripped);
+
+      let status = null;
+      if (hasPassed) status = 'passed';
+      else if (hasFailed) status = 'failed';
+      else if (hasSkipped) status = 'skipped';
+      else continue;
+
+      // Duration: "(1.2s)" or "(500ms)"
+      let durationMs = 0;
+      const durMatch = stripped.match(/\((\d+(?:\.\d+)?)\s*(ms|s)\)/);
+      if (durMatch) {
+        durationMs = durMatch[2] === 's'
+          ? Math.round(parseFloat(durMatch[1]) * 1000)
+          : parseInt(durMatch[1], 10);
+      }
+
+      // Test name: everything after the status icon (and optional test-number)
+      // Typical: "  ✓  1 login.spec.ts › should log in (234ms)"
+      const nameMatch = stripped.match(/[\u2713\u2714\u2717\u00d7\u2715\u2718\u25cb]\s+(?:\d+\s+)?(.+?)(?:\s+\(\d+(?:\.\d+)?(?:ms|s)\))?\s*$/);
+      const name = nameMatch ? nameMatch[1].trim() : '';
+
+      if (name) {
+        onProgress({ status, name, durationMs });
+      }
+    }
   }
 
   async executePlaywright({ project, lastFailed = false, grep, grepInvert, outputDir } = {}) {
@@ -751,8 +796,8 @@ class PlaywrightIntegration {
     const gatePattern = '@phase2|@deep|@stress|@matrix|@load|@api-stress|@api-negative|@api-auth|@api-contract';
     
     // Use separate output directories to prevent artifact overwriting
-    const phase1OutputDir = path.join(this.config.projectPath, 'test-results', 'phase1');
-    const phase2OutputDir = path.join(this.config.projectPath, 'test-results', 'phase2');
+    const phase1OutputDir = path.join(this.config.projectPath, 'healix-reports', 'results', 'phase1');
+    const phase2OutputDir = path.join(this.config.projectPath, 'healix-reports', 'results', 'phase2');
     
     const phaseOne = await this.executePlaywright({ 
       grepInvert: gatePattern,
@@ -760,9 +805,6 @@ class PlaywrightIntegration {
     });
 
     if (!this.hasPhaseTwoTaggedTests()) {
-      // Move phase1 artifacts to main test-results directory
-      this.mergePhaseArtifacts([phase1OutputDir]);
-      
       return {
         ...phaseOne,
         phaseResults: {
@@ -792,64 +834,7 @@ class PlaywrightIntegration {
       outputDir: phase2OutputDir
     });
     
-    // Merge artifacts from both phases into main test-results directory
-    this.mergePhaseArtifacts([phase1OutputDir, phase2OutputDir]);
-    
     return this.combinePhaseResults(phaseOne, phaseTwo);
-  }
-
-  mergePhaseArtifacts(phaseDirs) {
-    const mainResultsDir = path.join(this.config.projectPath, 'test-results');
-    
-    for (const phaseDir of phaseDirs) {
-      if (!fs.existsSync(phaseDir)) {
-        continue;
-      }
-      
-      try {
-        // Copy all artifacts from phase directory to main test-results
-        const items = fs.readdirSync(phaseDir);
-        
-        for (const item of items) {
-          const srcPath = path.join(phaseDir, item);
-          const destPath = path.join(mainResultsDir, item);
-          
-          const stat = fs.statSync(srcPath);
-          
-          if (stat.isDirectory()) {
-            // Copy directory recursively
-            this.copyDirRecursive(srcPath, destPath);
-          } else {
-            // Copy file
-            fs.copyFileSync(srcPath, destPath);
-          }
-        }
-        
-        Logger.info('PlaywrightIntegration', `Merged artifacts from ${path.basename(phaseDir)}`);
-      } catch (error) {
-        Logger.warn('PlaywrightIntegration', `Failed to merge artifacts from ${path.basename(phaseDir)}:`, error.message);
-      }
-    }
-  }
-
-  copyDirRecursive(src, dest) {
-    if (!fs.existsSync(dest)) {
-      fs.mkdirSync(dest, { recursive: true });
-    }
-    
-    const items = fs.readdirSync(src);
-    
-    for (const item of items) {
-      const srcPath = path.join(src, item);
-      const destPath = path.join(dest, item);
-      const stat = fs.statSync(srcPath);
-      
-      if (stat.isDirectory()) {
-        this.copyDirRecursive(srcPath, destPath);
-      } else {
-        fs.copyFileSync(srcPath, destPath);
-      }
-    }
   }
 
   /**

@@ -5,6 +5,10 @@ import { mcpTelemetryEvents } from '@/lib/db/schema'
 const DEFAULT_WINDOW_HOURS = 24
 const DEFAULT_EVENT_LIMIT = 1200
 
+const TERMINAL_PHASES = new Set(['completed', 'error', 'error_reported', 'failed'])
+const ORPHAN_TIMEOUT_MS = 30 * 60 * 1000 // 30 minutes for pipeline phases
+const CONFIG_UI_ORPHAN_TIMEOUT_MS = 4 * 60 * 60 * 1000 // 4 hours for awaiting_config_ui
+
 type TelemetryRow = {
   runId: string | null
   phase: string | null
@@ -59,6 +63,25 @@ function toMetadata(value: unknown): Record<string, unknown> {
   return value as Record<string, unknown>
 }
 
+function resolveOrphanedSnapshot(snapshot: LiveRunSnapshot): LiveRunSnapshot {
+  if (TERMINAL_PHASES.has(snapshot.phase)) return snapshot
+  if (snapshot.runStatus !== 'running') return snapshot
+
+  const ageMs = Date.now() - snapshot.lastSeenAt.getTime()
+  const timeoutMs = snapshot.phase === 'awaiting_config_ui'
+    ? CONFIG_UI_ORPHAN_TIMEOUT_MS
+    : ORPHAN_TIMEOUT_MS
+
+  if (ageMs < timeoutMs) return snapshot
+
+  return {
+    ...snapshot,
+    runStatus: 'failed',
+    errorCode: snapshot.errorCode || 'ORPHANED_RUN',
+    message: `Run stopped responding in phase: ${snapshot.phase}`,
+  }
+}
+
 function mapPhaseToRunStatus(phase: string, status: string): 'running' | 'passed' | 'failed' | 'error' {
   const normalizedPhase = phase.toLowerCase()
   const normalizedStatus = status.toLowerCase()
@@ -88,7 +111,7 @@ function buildSyntheticLiveReport(snapshot: LiveRunSnapshot) {
   const skipped = clampNumber(snapshot.metadata.skipped, 0)
   const duration = snapshot.durationMs
   const projectName = getProjectName(snapshot)
-  const baseMessage = snapshot.message || `Pipeline phase: ${snapshot.phase}`
+  const baseMessage = snapshot.message || `Healix phase: ${snapshot.phase}`
 
   let tests
   if (snapshot.liveTests && snapshot.liveTests.length > 0) {
@@ -105,10 +128,10 @@ function buildSyntheticLiveReport(snapshot: LiveRunSnapshot) {
     }))
   } else if (snapshot.runStatus === 'failed') {
     tests = [{
-      id: `live-${snapshot.runId}-pipeline-error`,
-      title: `[PIPELINE_ERROR:${snapshot.errorCode || 'PIPELINE_FAILED'}] ${baseMessage}`,
-      suite: 'pipeline',
-      file: 'pipeline',
+      id: `live-${snapshot.runId}-healix-error`,
+      title: `[HEALIX_ERROR:${snapshot.errorCode || 'HEALIX_FAILED'}] ${baseMessage}`,
+      suite: 'Healix',
+      file: 'healix',
       status: 'failed',
       duration,
       retries: 0,
@@ -121,9 +144,9 @@ function buildSyntheticLiveReport(snapshot: LiveRunSnapshot) {
   } else {
     tests = [{
       id: `live-${snapshot.runId}-phase-${snapshot.phase}`,
-      title: `[PIPELINE:${snapshot.phase}] ${baseMessage}`,
-      suite: 'pipeline',
-      file: 'pipeline',
+      title: `[HEALIX:${snapshot.phase}] ${baseMessage}`,
+      suite: 'Healix',
+      file: 'healix',
       status: snapshot.runStatus === 'passed' ? 'passed' : 'running',
       duration,
       retries: 0,
@@ -329,7 +352,7 @@ export async function getLiveRunSnapshotsForUser(userId: string, options?: {
     }
   }
 
-  return [...byRunId.values()]
+  return [...byRunId.values()].map(resolveOrphanedSnapshot)
 }
 
 export async function getLiveRunsForUser(userId: string, options?: {

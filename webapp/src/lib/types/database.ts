@@ -49,6 +49,8 @@ export interface TestRun {
   report_json: any
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   ai_analysis: any
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  coverage_metrics: any | null
   framework: string | null
   source: 'mcp' | 'api' | 'dashboard'
   created_at: string

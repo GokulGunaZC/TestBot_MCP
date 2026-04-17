@@ -10,6 +10,7 @@ import { validateTestRunIngest } from '@/lib/validation'
 import { runAbuseDetection } from '@/lib/abuse-detector'
 import { trackProjectUsage } from '@/lib/project-hash'
 import { logBlockedRequest } from '@/lib/security-logger'
+import { computeCoverageMetrics } from '@/lib/coverage'
 
 const ENDPOINT = '/api/test-runs/ingest'
 
@@ -298,6 +299,16 @@ export async function POST(request: NextRequest) {
       ? Math.round((frontendPassed / frontendTests.length) * 100).toString()
       : null
 
+    // Coverage Intelligence — computed at ingest time
+    const overallPassRate = total_tests > 0 ? Math.round((passed_tests / total_tests) * 100) : 0
+    const rawTests: ReportTestWithAI[] = report.tests || []
+    const coverageMetricsPayload = rawTests.length > 0
+      ? computeCoverageMetrics(
+          rawTests.map(t => ({ name: t.title ?? t.name ?? '', suite: t.suite ?? t.file ?? '', status: t.status ?? 'unknown' })),
+          overallPassRate,
+        )
+      : null
+
     const projectName = creation_name || report.metadata?.projectName || 'Untitled Test Run'
     const normalizedRunId = typeof run_id === 'string' && run_id.trim().length > 0
       ? run_id.trim().slice(0, 180)
@@ -327,6 +338,7 @@ export async function POST(request: NextRequest) {
         frontendPassRate: frontend_pass_rate,
         reportJson: reportWithRunId,
         aiAnalysis: aiAnalysisPayload,
+        coverageMetrics: coverageMetricsPayload,
         source: 'mcp',
         projectPath: project_path || null,
       })

@@ -379,8 +379,8 @@ export default defineConfig({
   },
   reporter: [
     ['list'],
-    ['json', { outputFile: 'test-results/results.json' }],
-    ['html', { open: 'never' }],
+    ['json', { outputFile: 'healix-reports/results/results.json' }],
+    ['html', { open: 'never', outputFolder: 'healix-reports/html-report' }],
   ],
   use: {
     baseURL: '${projectInfo.baseURL || 'http://localhost:3000'}',
