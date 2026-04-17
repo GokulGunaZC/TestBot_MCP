@@ -30,18 +30,18 @@ const NAV_SECTIONS: NavSection[] = [
           </svg>
         ),
       },
-      {
-        href: '/mcp-tests',
-        label: 'MCP Tests',
-        icon: (
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <rect x="2" y="2" width="20" height="8" rx="0" ry="0" />
-            <rect x="2" y="14" width="20" height="8" rx="0" ry="0" />
-            <line x1="6" y1="6" x2="6.01" y2="6" />
-            <line x1="6" y1="18" x2="6.01" y2="18" />
-          </svg>
-        ),
-      },
+      // {
+      //   href: '/mcp-tests',
+      //   label: 'MCP Tests',
+      //   icon: (
+      //     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      //       <rect x="2" y="2" width="20" height="8" rx="0" ry="0" />
+      //       <rect x="2" y="14" width="20" height="8" rx="0" ry="0" />
+      //       <line x1="6" y1="6" x2="6.01" y2="6" />
+      //       <line x1="6" y1="18" x2="6.01" y2="18" />
+      //     </svg>
+      //   ),
+      // },
     ],
   },
   {

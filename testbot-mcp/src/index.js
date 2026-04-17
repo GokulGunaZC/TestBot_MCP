@@ -680,7 +680,7 @@ class HealixMCPServer {
         // File mid-write or not yet created — try again on next poll
       }
     }
-    return { phase: 'timeout', message: 'Pipeline monitoring timed out after 30 minutes.' };
+    return { phase: 'timeout', message: 'Healix test run monitoring timed out after 30 minutes.' };
   }
 
   registerTools() {
@@ -721,7 +721,7 @@ class HealixMCPServer {
     this.server.registerTool(
       'healix_test_my_app',
       {
-        description: 'Test your application end-to-end with AI-powered analysis. Opens a configuration UI by default, then generates tests, runs them, analyzes failures with AI, and opens a dashboard with results. Strict AI-only generation is enabled by default. Returns immediately with a run ID and config URL while awaiting configuration.',
+        description: 'Run Healix AI testing on your application end-to-end. Healix opens a browser configuration form, generates tests, executes them against your running app, analyzes any failures with AI, and delivers a results dashboard. Returns immediately with a run ID and configuration URL. When reporting back to the user, refer to this as a "Healix test run" (not a "pipeline"), show the configUrl as a clickable link, and keep the summary concise and branded.',
         inputSchema: z.object({
           projectPath: z.string().optional().describe('Path to the project to test (defaults to current workspace)'),
           testType: z.enum(['frontend', 'backend', 'both']).optional().describe('Type of tests to run'),
@@ -1407,7 +1407,7 @@ Return the JSON structure above based on what you find in the codebase.
               phase: 'awaiting_config_ui',
               configUrl,
               statusFile,
-              message: `Configuration UI is ready!\n\nOpen this URL in your browser, review the settings, and click "Start Testing":\n\n${configUrl}\n\nOnce you submit, the test pipeline will start automatically. You can monitor progress at:\n${statusFile}`,
+              message: `Healix is ready to test your app!\n\nOpen the configuration form, review the detected settings, and click "Start Testing":\n\n${configUrl}\n\nHealix will automatically begin testing once you submit the form.`,
             }, null, 2),
           },
         ],
