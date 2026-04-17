@@ -138,12 +138,12 @@ const NAV_SECTIONS: NavSection[] = [
 ];
 
 interface SidebarProps {
-  creditsRemaining?: number;
-  creditsTotal?: number;
+  tokensRemaining?: number;
+  tokensTotal?: number;
   plan?: string;
 }
 
-export default function Sidebar({ creditsRemaining = 130, creditsTotal = 500, plan = 'Free' }: SidebarProps) {
+export default function Sidebar({ tokensRemaining = 50, tokensTotal = 50, plan = 'free' }: SidebarProps) {
   const pathname = usePathname();
   const [mobileOpen, setMobileOpen] = useState(false);
 
@@ -212,21 +212,26 @@ export default function Sidebar({ creditsRemaining = 130, creditsTotal = 500, pl
       <div className="px-3 py-4 border-t-2 border-[#333]">
         <div className="bg-[#0a0a0a] border-2 border-[#333] p-3">
           <div className="flex items-center justify-between mb-2">
-            <span className="text-[#a0a0a0] text-xs font-mono uppercase tracking-wider">Credits</span>
+            <span className="text-[#a0a0a0] text-xs font-mono uppercase tracking-wider">Tokens</span>
             <span className="y2k-badge">{plan}</span>
           </div>
-          <div className="text-white font-black text-lg font-mono mb-2">{creditsRemaining}</div>
+          <div className={`font-black text-lg font-mono mb-2 ${tokensRemaining === 0 ? 'text-red-400' : 'text-white'}`}>{tokensRemaining}</div>
           <div className="h-1.5 bg-[#222] overflow-hidden mb-3 border border-[#333]">
             <div
-              className="h-full bg-white transition-all duration-1000"
-              style={{ width: `${creditsTotal > 0 ? (creditsRemaining / creditsTotal) * 100 : 0}%` }}
+              className={`h-full transition-all duration-1000 ${tokensRemaining === 0 ? 'bg-red-500' : 'bg-white'}`}
+              style={{ width: `${tokensTotal > 0 ? (tokensRemaining / tokensTotal) * 100 : 0}%` }}
             />
           </div>
+          {tokensRemaining === 0 && (
+            <div className="text-[10px] text-red-400 font-mono mb-2 uppercase tracking-wider">
+              ⚠ Out of tokens
+            </div>
+          )}
           <Link
             href="/plan-billing"
-            className="block text-center text-xs text-white hover:text-[#a0a0a0] font-mono font-bold uppercase tracking-widest transition-colors"
+            className={`block text-center text-xs font-mono font-bold uppercase tracking-widest transition-colors ${tokensRemaining === 0 ? 'text-red-400 hover:text-red-300' : 'text-white hover:text-[#a0a0a0]'}`}
           >
-            Manage Plan →
+            {tokensRemaining === 0 ? 'Upgrade Plan →' : 'Manage Plan →'}
           </Link>
         </div>
       </div>

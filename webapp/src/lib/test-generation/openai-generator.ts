@@ -69,6 +69,10 @@ export class OpenAITestGenerator {
   private openaiClient: OpenAIClient | null = null
   generatedFiles: GeneratedTestFile[]
   generationMeta: GenerationMeta | null
+  totalPromptTokens: number
+  totalCompletionTokens: number
+  totalTokensUsed: number
+  lastModelUsed: string | null
 
   constructor(config: OpenAITestGeneratorConfig = {}) {
     const envMaxTokens = Number.parseInt(process.env.OPENAI_MAX_TOKENS || '', 10)
@@ -82,7 +86,7 @@ export class OpenAITestGenerator {
         config.model ||
         process.env.OPENAI_MODEL ||
         process.env.OPENAI_CODEX_MODEL ||
-        'gpt-4o',
+        'gpt-5.4',
       maxTokens: config.maxTokens || (Number.isFinite(envMaxTokens) ? envMaxTokens : 4000),
       temperature:
         config.temperature !== undefined
@@ -115,6 +119,10 @@ export class OpenAITestGenerator {
 
     this.generatedFiles = []
     this.generationMeta = null
+    this.totalPromptTokens = 0
+    this.totalCompletionTokens = 0
+    this.totalTokensUsed = 0
+    this.lastModelUsed = null
   }
 
   initialize(): boolean {
@@ -152,6 +160,10 @@ export class OpenAITestGenerator {
     const isOpenAIReady = this.openaiClient !== null || this.initialize()
 
     this.generatedFiles = []
+    this.totalPromptTokens = 0
+    this.totalCompletionTokens = 0
+    this.totalTokensUsed = 0
+    this.lastModelUsed = null
     this.generationMeta = {
       provider: isOpenAIReady ? 'openai' : 'fallback',
       testType,
@@ -895,8 +907,12 @@ Return only the JSON array of generated files.`
             messages.push({ role: 'user', content: correctionPrompt })
           }
 
-          const response = await this.openaiClient.callOpenAI(messages)
-          const parsed = this.parseTestResponse(response, prefix, generationContext)
+          const callResult = await this.openaiClient.callOpenAI(messages)
+          this.totalPromptTokens += callResult.usage.promptTokens
+          this.totalCompletionTokens += callResult.usage.completionTokens
+          this.totalTokensUsed += callResult.usage.totalTokens
+          this.lastModelUsed = callResult.modelUsed
+          const parsed = this.parseTestResponse(callResult.text, prefix, generationContext)
           const parsedFiles = parsed.files
 
           if (parsedFiles.length > 0) {
@@ -2145,6 +2161,12 @@ test.describe('Fallback error handling checks', () => {
       files: this.generatedFiles,
       generationMeta: this.generationMeta,
       generationQuality: this.generationMeta?.generationQuality || null,
+      tokenUsage: {
+        promptTokens: this.totalPromptTokens,
+        completionTokens: this.totalCompletionTokens,
+        totalTokens: this.totalTokensUsed,
+        modelUsed: this.lastModelUsed,
+      },
       byType: {
         smoke: this.generatedFiles.filter((f) => f.type === 'smoke').length,
         frontend: this.generatedFiles.filter((f) => f.type === 'frontend').length,

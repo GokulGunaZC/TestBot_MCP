@@ -9,33 +9,44 @@ import Badge from '@/components/ui/Badge'
 
 const PLANS = [
   {
-    id: 'starter',
-    name: 'Starter',
+    id: 'free',
+    name: 'Free',
     price: 'Free',
     priceNote: 'forever',
-    description: 'Perfect for individuals and small projects.',
-    credits: 500,
-    features: ['500 test credits/month', 'MCP integration', 'Basic analytics', 'Community support'],
+    description: 'Start free. No credit card required.',
+    tokens: 240_000,
+    tokenLabel: '50 tokens / month',
+    features: ['1 user · 1 project', 'Basic AI models', 'Basic test types', 'Community support'],
     cta: 'Current Plan',
-    ctaHref: '#',
     highlighted: false,
   },
   {
-    id: 'pro',
-    name: 'Pro',
-    price: '$29',
+    id: 'starter',
+    name: 'Starter',
+    price: '$15',
     priceNote: '/month',
-    description: 'For professional teams who need more power.',
-    credits: 5000,
+    description: 'Advanced AI for growing teams.',
+    tokens: 2_400_000,
+    tokenLabel: '500 tokens / month',
+    features: ['Advanced AI models', 'All test types · self healing', 'Jira / ADO integration', 'Priority support'],
+    cta: 'Upgrade to Starter',
+    highlighted: false,
+  },
+  {
+    id: 'team',
+    name: 'Team',
+    price: '$30',
+    priceNote: '/month',
+    description: 'Scalable testing for engineering teams.',
+    tokens: 4_800_000,
+    tokenLabel: '1,000 tokens / month',
     features: [
-      '5,000 test credits/month',
-      'Priority MCP processing',
-      'Advanced AI analysis',
-      'API access',
-      'Email support',
+      'Advanced models + priority queue',
+      'Custom integrations (10 hrs onboarding)',
+      'CI/CD pipeline integration',
+      'Priority support (< 4hr SLA)',
     ],
-    cta: 'Upgrade to Pro',
-    ctaHref: 'mailto:Swathi.Dharshna@zapcg.com',
+    cta: 'Upgrade to Team',
     highlighted: true,
   },
   {
@@ -43,14 +54,14 @@ const PLANS = [
     name: 'Enterprise',
     price: 'Custom',
     priceNote: '',
-    description: 'Tailored solutions for large organizations.',
-    credits: Infinity,
+    description: 'Custom AI, dedicated infrastructure, and SLA.',
+    tokens: Infinity,
+    tokenLabel: 'Unlimited tokens',
     features: [
-      'Unlimited test credits',
-      'Dedicated infrastructure',
-      'Custom integrations',
-      'SLA guarantee',
-      '24/7 priority support',
+      'Custom AI model selection',
+      'API access + custom agents',
+      'Dedicated CSM + 99.9% SLA',
+      'SSO/SAML + compliance',
     ],
     cta: 'Contact Sales',
     ctaHref: 'mailto:Swathi.Dharshna@zapcg.com',
@@ -58,17 +69,23 @@ const PLANS = [
   },
 ] as const
 
-function CreditsMeter({ remaining, total }: { remaining: number; total: number }) {
+// 1 displayed unit = 4,800 real OpenAI tokens → Starter (2.4M) shows 500, Team (4.8M) shows 1,000
+const REAL_TOKENS_PER_UNIT = 4_800
+
+function toDisplayUnits(realTokens: number): number {
+  return Math.floor(realTokens / REAL_TOKENS_PER_UNIT)
+}
+
+function TokenMeter({ remaining, total }: { remaining: number; total: number }) {
   const pct = total > 0 ? Math.min(100, (remaining / total) * 100) : 0
   const color = pct > 50 ? '#3B82F6' : pct > 20 ? '#F59E0B' : '#EF4444'
 
   return (
     <div>
       <div className="flex justify-between text-sm mb-2">
-        <span className="text-text-secondary">Credits remaining</span>
+        <span className="text-text-secondary">Tokens remaining</span>
         <span className="text-text-primary font-semibold">
-          {remaining.toLocaleString()} / {total.toLocaleString()}
-          <span className="text-text-muted text-xs mt-1.5"> credits left</span>
+          {toDisplayUnits(remaining).toLocaleString()} / {toDisplayUnits(total).toLocaleString()}
         </span>
       </div>
       <div className="h-2.5 rounded-full bg-white/8 overflow-hidden">
@@ -104,7 +121,7 @@ export default function PlanBillingPage() {
     load()
   }, [])
 
-  const currentPlan = profile?.plan ?? 'starter'
+  const currentPlan = profile?.plan ?? 'free'
 
   return (
     <div className="min-h-screen bg-bg-darkest p-6">
@@ -115,7 +132,7 @@ export default function PlanBillingPage() {
           transition={{ duration: 0.4 }}
         >
           <h1 className="text-2xl font-bold text-text-primary mb-1">Plan & Billing</h1>
-          <p className="text-text-muted text-sm mb-8">Manage your subscription and credits</p>
+          <p className="text-text-muted text-sm mb-8">Manage your subscription and token usage</p>
         </motion.div>
 
         {/* Current plan summary */}
@@ -133,7 +150,7 @@ export default function PlanBillingPage() {
                   <p className="text-text-muted text-sm mb-1">Current plan</p>
                   <div className="flex items-center gap-2">
                     <h2 className="text-xl font-bold text-text-primary capitalize">{currentPlan}</h2>
-                    <Badge variant={currentPlan === 'enterprise' ? 'info' : currentPlan === 'pro' ? 'success' : 'neutral'}>
+                    <Badge variant={currentPlan === 'enterprise' ? 'info' : currentPlan === 'team' || currentPlan === 'starter' ? 'success' : 'neutral'}>
                       Active
                     </Badge>
                   </div>
@@ -144,9 +161,9 @@ export default function PlanBillingPage() {
                   </Button>
                 )} */}
               </div>
-              <CreditsMeter
-                remaining={profile?.credits_remaining ?? 0}
-                total={profile?.credits_total ?? 500}
+              <TokenMeter
+                remaining={profile?.tokens_remaining ?? 0}
+                total={profile?.tokens_total ?? 1_000_000}
               />
             </div>
           )}
@@ -154,7 +171,7 @@ export default function PlanBillingPage() {
 
         {/* Plan comparison */}
         <h2 className="text-lg font-semibold text-text-primary mb-4">Available Plans</h2>
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
           {PLANS.map((plan, i) => {
             const isCurrent = plan.id === currentPlan
             return (
@@ -180,7 +197,8 @@ export default function PlanBillingPage() {
                       <span className="text-text-muted text-sm">{plan.priceNote}</span>
                     )}
                   </div>
-                  <p className="text-text-muted text-xs">{plan.description}</p>
+                  <p className="text-text-muted text-xs mb-1.5">{plan.description}</p>
+                  <span className="inline-block text-xs font-medium text-blue-400 bg-blue-400/10 px-2 py-0.5 rounded-full">{plan.tokenLabel}</span>
                 </div>
 
                 <ul className="flex flex-col gap-2.5 flex-1 mb-6">

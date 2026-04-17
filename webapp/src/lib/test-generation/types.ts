@@ -208,3 +208,15 @@ export interface OpenAIMessage {
   role: 'system' | 'user' | 'assistant'
   content: string
 }
+
+export interface OpenAIUsage {
+  promptTokens: number
+  completionTokens: number
+  totalTokens: number
+}
+
+export interface OpenAICallResult {
+  text: string
+  usage: OpenAIUsage
+  modelUsed: string
+}

@@ -4,7 +4,7 @@ import { apiKeys } from '@/lib/db/schema'
 import { eq, and } from 'drizzle-orm'
 import { hashApiKey } from '@/lib/utils/api-keys'
 import { checkRateLimit } from '@/lib/rate-limit'
-import { deductCredit } from '@/lib/credits'
+import { checkTokenBalance, deductTokens } from '@/lib/tokens'
 import { checkIdempotency, storeIdempotencyResult } from '@/lib/idempotency'
 import { validateAnalyzeFailures } from '@/lib/validation'
 import { checkAiGuard, recordAiCall } from '@/lib/ai-guard'
@@ -14,7 +14,7 @@ import { logBlockedRequest } from '@/lib/security-logger'
 const ENDPOINT = '/api/analyze-failures'
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY
-const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o'
+const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-5.4'
 const FALLBACK_MODEL = 'gpt-4o'
 const OPENAI_MAX_TOKENS = 4000
 const OPENAI_TEMPERATURE = 0.2
@@ -23,10 +23,18 @@ const OPENAI_TIMEOUT = 180_000 // 3 minutes
 const MAX_FAILURES = 8
 
 // ── OpenAI Chat Completions call (with model fallback) ───────────────
+interface OpenAICallResult {
+  text: string
+  promptTokens: number
+  completionTokens: number
+  totalTokens: number
+  modelUsed: string
+}
+
 async function callOpenAIWithModel(
   messages: Array<{ role: string; content: string }>,
   model: string,
-) {
+): Promise<OpenAICallResult> {
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), OPENAI_TIMEOUT)
 
@@ -41,7 +49,7 @@ async function callOpenAIWithModel(
         model,
         messages,
         temperature: OPENAI_TEMPERATURE,
-        max_completion_tokens: OPENAI_MAX_TOKENS, // Use max_completion_tokens instead of max_tokens for newer models
+        max_completion_tokens: OPENAI_MAX_TOKENS,
       }),
       signal: controller.signal,
     })
@@ -54,7 +62,15 @@ async function callOpenAIWithModel(
     }
 
     const data = await res.json()
-    return data.choices?.[0]?.message?.content ?? ''
+    const text = data.choices?.[0]?.message?.content ?? ''
+    const usage = data.usage ?? {}
+    return {
+      text,
+      promptTokens: usage.prompt_tokens ?? 0,
+      completionTokens: usage.completion_tokens ?? 0,
+      totalTokens: usage.total_tokens ?? ((usage.prompt_tokens ?? 0) + (usage.completion_tokens ?? 0)),
+      modelUsed: model,
+    }
   } catch (error: unknown) {
     clearTimeout(timeout)
     if (error instanceof Error && error.name === 'AbortError')
@@ -63,7 +79,7 @@ async function callOpenAIWithModel(
   }
 }
 
-async function callOpenAI(messages: Array<{ role: string; content: string }>) {
+async function callOpenAI(messages: Array<{ role: string; content: string }>): Promise<OpenAICallResult> {
   try {
     return await callOpenAIWithModel(messages, OPENAI_MODEL)
   } catch (error) {
@@ -265,24 +281,27 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'RATE_LIMIT_EXCEEDED' }, { status: 429 })
     }
 
-    // 8. Credit gate — atomic decrement, fail-closed (throws on DB error)
-    const creditResult = await deductCredit({ userId, endpoint: ENDPOINT })
-    if (!creditResult.allowed) {
-      return NextResponse.json({ error: 'No credits remaining' }, { status: 402 })
+    // 8. Token balance gate — check before making AI calls
+    const tokenCheck = await checkTokenBalance({ userId, endpoint: ENDPOINT })
+    if (!tokenCheck.allowed) {
+      return NextResponse.json({ error: 'No tokens remaining. Please renew your plan.' }, { status: 402 })
     }
 
-    // Update last_used_at and record AI call
+    // Update last_used_at
     await db
       .update(apiKeys)
       .set({ lastUsedAt: new Date() })
       .where(eq(apiKeys.id, apiKeyRecord.id))
 
-    await recordAiCall({ userId, apiKeyId: apiKeyRecord.id, endpoint: ENDPOINT })
-
     // Cap failures to max limit
     const cappedFailures = failures.slice(0, MAX_FAILURES)
 
-    // 6. Analyze each failure
+    // 6. Analyze each failure — accumulate token usage across all parallel calls
+    let totalPromptTokens = 0
+    let totalCompletionTokens = 0
+    let totalTokensConsumed = 0
+    let lastModelUsed = OPENAI_MODEL
+
     const analyses = await Promise.all(
       cappedFailures.map(async (failure: {
         testName?: string
@@ -292,12 +311,17 @@ export async function POST(request: NextRequest) {
         error?: { message?: string; stack?: string }
       }) => {
         try {
-          const raw = await callOpenAI([
+          const result = await callOpenAI([
             { role: 'system', content: SYSTEM_PROMPT },
             { role: 'user', content: buildUserPrompt(failure) },
           ])
 
-          const parsed = parseAnalysis(raw)
+          totalPromptTokens += result.promptTokens
+          totalCompletionTokens += result.completionTokens
+          totalTokensConsumed += result.totalTokens
+          lastModelUsed = result.modelUsed
+
+          const parsed = parseAnalysis(result.text)
 
           return {
             failure: {
@@ -328,6 +352,20 @@ export async function POST(request: NextRequest) {
         }
       }),
     )
+
+    // Deduct actual tokens consumed and record AI call
+    if (totalTokensConsumed > 0) {
+      await deductTokens({ userId, tokensUsed: totalTokensConsumed })
+      await recordAiCall({
+        userId,
+        apiKeyId: apiKeyRecord.id,
+        endpoint: ENDPOINT,
+        modelUsed: lastModelUsed,
+        tokensPrompt: totalPromptTokens,
+        tokensCompletion: totalCompletionTokens,
+        tokensTotal: totalTokensConsumed,
+      })
+    }
 
     const responseBody = { success: true, analyses }
 
