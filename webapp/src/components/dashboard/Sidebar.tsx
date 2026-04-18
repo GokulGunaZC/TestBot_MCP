@@ -143,7 +143,7 @@ interface SidebarProps {
   plan?: string;
 }
 
-export default function Sidebar({ tokensRemaining = 50, tokensTotal = 50, plan = 'free' }: SidebarProps) {
+export default function Sidebar({ tokensRemaining = 0, tokensTotal = 0, plan = 'free' }: SidebarProps) {
   const pathname = usePathname();
   const [mobileOpen, setMobileOpen] = useState(false);
 

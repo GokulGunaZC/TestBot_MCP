@@ -1,4 +1,4 @@
-# Request Gates — TestBot Webapp
+# Request Gates — Healix Webapp
 
 Every inbound request to a protected endpoint passes through a sequential chain of gates.
 A request is rejected as soon as the **first** gate it fails is reached; later gates are never evaluated.

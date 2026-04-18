@@ -169,6 +169,34 @@ class HealixMCPServer {
     });
   }
 
+  // Return the most-recently-updated run for this project (or null). Used by
+  // handleTestMyApp to short-circuit agent retry loops on transient pipeline
+  // failure — so the user isn't forced to re-enter the same config each time.
+  findRecentRunForProject(projectPath) {
+    try {
+      const runsDir = path.join(projectPath, 'healix-reports', '.runs');
+      if (!fs.existsSync(runsDir)) return null;
+      const entries = fs.readdirSync(runsDir, { withFileTypes: true })
+        .filter(e => e.isDirectory())
+        .map(e => {
+          const statusFile = path.join(runsDir, e.name, 'status.json');
+          try {
+            const stat = fs.statSync(statusFile);
+            const data = JSON.parse(fs.readFileSync(statusFile, 'utf-8'));
+            return { runId: e.name, mtimeMs: stat.mtimeMs, data };
+          } catch {
+            return null;
+          }
+        })
+        .filter(Boolean)
+        .sort((a, b) => b.mtimeMs - a.mtimeMs);
+      return entries[0] || null;
+    } catch (err) {
+      Logger.warn('Index', 'findRecentRunForProject failed', { reason: err.message });
+      return null;
+    }
+  }
+
   emitRunStatusTelemetry(statusPayload) {
     const runId = statusPayload?.runId;
     if (!runId) {
@@ -365,18 +393,30 @@ class HealixMCPServer {
     const headless = this.resolveHeadlessPreference(params);
     const autoOpenBrowser = this.resolveAutoOpenBrowserPreference(params, headless);
 
+    // Prefer explicit user override; otherwise fall back to detection. Monorepo repos
+    // that split frontend + backend surface `context.services` with two entries, and
+    // api-only repos flag `context.apiOnly`. These propagate to the pipeline worker so
+    // server startup can launch both services and the generator can branch into
+    // multi-step API flow mode when only a backend is present.
+    const detectedApiOnly = !!context.apiOnly;
+    const defaultTestType = detectedApiOnly ? 'backend' : 'both';
+
     return {
       projectPath: context.projectPath,
       projectName: context.projectName,
       language: context.language,
       ecosystem: context.ecosystem,
-      testType: params.testType || 'both',
+      testType: params.testType || defaultTestType,
       generateTests: params.generateTests !== false,
       prdFile: params.prdFile,
       codebaseContext: this.normalizeCodebaseContext(params.codebaseContext),
       baseURL: params.baseURL || context.baseURL,
       port: params.port || context.port,
       startCommand: params.startCommand || context.startCommand,
+      services: Array.isArray(params.services) && params.services.length > 0
+        ? params.services
+        : (Array.isArray(context.services) ? context.services : undefined),
+      apiOnly: typeof params.apiOnly === 'boolean' ? params.apiOnly : detectedApiOnly,
       jira: params.jira,
       openDashboard: params.openDashboard !== false,
       generationMode: resolvedGenerationMode,
@@ -756,6 +796,7 @@ class HealixMCPServer {
           playwrightMcp: PLAYWRIGHT_MCP_OPTIONS_SCHEMA.describe('Playwright MCP execution options'),
           resultMerge: RESULT_MERGE_OPTIONS_SCHEMA.describe('Result merge options'),
           logRedaction: LOG_REDACTION_OPTIONS_SCHEMA.describe('Log redaction controls'),
+          force: z.boolean().optional().describe('Start a fresh run even if a very recent run for this project is still in-flight or just failed. Default false — without this flag, a repeat invocation within 10 minutes returns the prior run\'s status/error instead of re-opening the configurator, so an agent retry loop does not force the user to re-enter the same settings.'),
         }),
       },
       async (args, extra) => {
@@ -787,13 +828,46 @@ class HealixMCPServer {
     );
 
     this.server.registerTool(
+      'healix_check_run_status',
+      {
+        description: 'Poll the status of a Healix test run started by healix_test_my_app. You MUST call this repeatedly (every ~15 seconds) until the returned isTerminal flag is true. Do not conclude the user\'s task, do not summarize results, and do not hand control back to the user while isTerminal is false — the pipeline is still running in the background and has not yet produced verdicts. When isTerminal is true, the response contains the final phase, dashboardUrl, and (for runs with failures) a structured actionPlan telling you exactly which patches to auto-apply, which to surface for user approval, which are app regressions you must NOT auto-edit, and any pipeline_error banner details.',
+        inputSchema: z.object({
+          runId: z.string().describe('The runId returned by healix_test_my_app'),
+          projectPath: z.string().optional().describe('Path to the project (defaults to current workspace)'),
+        }),
+      },
+      async (args, extra) => {
+        const telemetryStartedAt = this.trackToolInvocation('healix_check_run_status', args);
+        Logger.mcp('Index', `Tool called: healix_check_run_status`, { runId: args?.runId });
+        try {
+          await this.validateApiKey();
+          const result = await this.handleCheckRunStatus(args);
+          this.trackToolResult('healix_check_run_status', telemetryStartedAt);
+          return result;
+        } catch (error) {
+          this.trackToolResult('healix_check_run_status', telemetryStartedAt, error);
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `Error: ${error.message}\n${error.stack}`,
+              },
+            ],
+            isError: true,
+          };
+        }
+      }
+    );
+
+    this.server.registerTool(
       'healix_analyze_failures',
       {
         description: 'Analyze existing test failures with AI without running new tests',
         inputSchema: z.object({
           projectPath: z.string().describe('Path to the project'),
           testResultsPath: z.string().optional().describe('Path to test-results.json file'),
-          aiProvider: z.enum(['openai', 'cascade', 'windsurf']).optional().describe('AI provider for failure analysis'),
+          // aiProvider is deprecated — all AI calls now proxy through the Healix webapp using HEALIX_API_KEY.
+          aiProvider: z.enum(['saas']).optional().describe('Deprecated. Only "saas" is supported; all AI proxies through the Healix webapp.'),
         }),
       },
       async (args, extra) => {
@@ -903,8 +977,16 @@ class HealixMCPServer {
       });
       clearTimeout(timeout);
     } catch (networkErr) {
-      Logger.warn('Index', 'API key validation request failed (network/timeout) — proceeding anyway', { error: networkErr.message });
-      return;
+      Logger.error('Index', 'API key validation request failed (network/timeout)', { error: networkErr.message });
+      const err = new Error(
+        '❌ Cannot reach the Healix dashboard to validate your API key.\n\n' +
+        `Tried: ${dashboardUrl}/api/mcp-auth/validate\n` +
+        `Error: ${networkErr.message}\n\n` +
+        'Check your internet connection, the HEALIX_DASHBOARD_URL value in your MCP config,\n' +
+        'and that the Healix webapp is reachable. We won\'t run tests against an un-validated key.'
+      );
+      err.code = 'KEY_VALIDATION_NETWORK_ERROR';
+      throw err;
     }
 
     if (response.ok) {
@@ -994,6 +1076,13 @@ class HealixMCPServer {
           existingTestFiles: existingTests.files.slice(0, 10),
           totalTestFiles: existingTests.count,
           testDirectories: context.testDirs,
+          // Monorepo / multi-service detection. `services` always has at least one entry.
+          // When the repo splits frontend + backend, there will be two entries with
+          // distinct roles, ports, baseURLs, and startCommands. `apiOnly` is true when
+          // every detected service is a backend — downstream generator branches into
+          // deep multi-step API flow mode.
+          services: context.services,
+          apiOnly: !!context.apiOnly,
         },
         prdFiles: prdFiles,
         jiraAvailable: hasJiraConfig,
@@ -1027,7 +1116,9 @@ class HealixMCPServer {
         // Recommended configuration based on detection
         recommendedConfig: {
           projectPath: context.projectPath,
-          testType: 'both',
+          services: context.services,
+          apiOnly: !!context.apiOnly,
+          testType: context.apiOnly ? 'backend' : 'both',
           baseURL: context.baseURL,
           port: context.port,
           startCommand: context.startCommand,
@@ -1295,6 +1386,49 @@ Return the JSON structure above based on what you find in the codebase.
     // 2. Merge params with detected context
     const baseConfig = this.createBasePipelineConfig(context, params);
 
+    // Short-circuit: if the previous run for this project is very recent, surface it
+    // instead of launching a new config UI. This prevents agent retry loops where
+    // Cursor re-invokes the tool after a failure and the user is forced to re-enter
+    // the same settings instead of fixing the underlying error in code.
+    const recent = this.findRecentRunForProject(baseConfig.projectPath);
+    if (recent && !params.force) {
+      const ageMs = Date.now() - recent.mtimeMs;
+      const ageSec = Math.round(ageMs / 1000);
+      if (recent.data.phase === 'error' && ageMs < 10 * 60 * 1000) {
+        const errMsg = recent.data.error || recent.data.message || 'Pipeline failed';
+        const errCode = recent.data.errorCode || 'PIPELINE_FAILED';
+        return {
+          isError: true,
+          content: [
+            {
+              type: 'text',
+              text: `Your previous Healix run (${recent.runId}) failed ${ageSec}s ago:\n\n  ${errCode}: ${errMsg}\n\nDO NOT retry this tool blindly — investigate and fix the root cause in the codebase (e.g. failing dependency, misconfigured dev server, broken selector). Once fixed, re-run with { force: true } to start a fresh Healix run.\n\nPrevious run status: ${path.join(baseConfig.projectPath, 'healix-reports', '.runs', recent.runId, 'status.json')}`,
+            },
+          ],
+        };
+      }
+      if (recent.data.phase === 'awaiting_config_ui' && recent.data.configUrl && ageMs < 10 * 60 * 1000) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `A Healix configuration form is already open for run ${recent.runId} (${ageSec}s ago):\n\n  ${recent.data.configUrl}\n\nOpen and submit it to start testing. Pass { force: true } to discard and start a fresh run.`,
+            },
+          ],
+        };
+      }
+      if (['queued','detecting','exploring','auth_injecting','generating','running_tests','tests_complete','reporting','uploading_artifacts'].includes(recent.data.phase) && ageMs < 10 * 60 * 1000) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `A Healix run (${recent.runId}) is already in progress for this project — phase: ${recent.data.phase} (${ageSec}s ago).\n\nWait for it to finish, or pass { force: true } to start a fresh run.`,
+            },
+          ],
+        };
+      }
+    }
+
     // 3. Generate a unique run ID
     const runId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const statusDir = path.join(baseConfig.projectPath, 'healix-reports', '.runs', runId);
@@ -1392,7 +1526,22 @@ Return the JSON structure above based on what you find in the codebase.
       // in chat and can open it even if the browser didn't auto-launch.
       this.continuePipelineAfterConfig({ waitForConfig, runId, statusFile, statusDir, baseConfig })
         .finally(() => { this._activeConfigUILauncher = null; })
-        .catch(() => {}); // errors are already written to statusFile inside continuePipelineAfterConfig
+        .catch((err) => {
+          // continuePipelineAfterConfig already writes errors to statusFile;
+          // but surface them on stderr so IDEs (Cursor/Windsurf) show them in chat.
+          Logger.error('Index', `Pipeline failure for run ${runId}`, { error: err?.message, code: err?.code });
+          try {
+            this.writeRunStatus(statusFile, {
+              runId,
+              phase: 'error',
+              message: err?.message || 'Pipeline failed',
+              error: err?.message || String(err),
+              errorCode: err?.code || 'PIPELINE_FAILED',
+              project: baseConfig.projectName,
+            });
+          } catch (_) {}
+          process.stderr.write(`[HEALIX] Pipeline failed for run ${runId}: ${err?.message || err}\n`);
+        });
 
       // Return immediately — the tool description says "Returns immediately with a
       // run ID and config URL while awaiting configuration."
@@ -1407,12 +1556,143 @@ Return the JSON structure above based on what you find in the codebase.
               phase: 'awaiting_config_ui',
               configUrl,
               statusFile,
-              message: `Healix is ready to test your app!\n\nOpen the configuration form, review the detected settings, and click "Start Testing":\n\n${configUrl}\n\nHealix will automatically begin testing once you submit the form.`,
+              message: `Healix is ready to test your app!\n\nOpen the configuration form, review the detected settings, and click "Start Testing":\n\n${configUrl}\n\nHealix will automatically begin testing once the form is submitted.`,
+              agentInstructions: [
+                `The test pipeline is running in the BACKGROUND. This tool returned immediately; no tests have completed yet.`,
+                `You MUST now call healix_check_run_status with { runId: "${runId}" } every ~15 seconds until the response has isTerminal:true.`,
+                `Do NOT hand control back to the user, summarize, or declare the task done while isTerminal is false.`,
+                `When isTerminal is true, the poll response carries an actionPlan telling you which patches are safe to auto-apply (high-confidence test bugs), which to surface for user approval, and which are app regressions you must NOT auto-edit.`,
+                `If the run ends with a pipeline_error, the poll response carries the stderr + stage + reason — relay them to the user with the dashboard link.`,
+              ].join(' '),
             }, null, 2),
           },
         ],
       };
     }
+  }
+
+  /**
+   * Read the current status of a background pipeline run and return a
+   * structured response the Cursor agent can act on.
+   *
+   * Non-terminal phases return `isTerminal: false` and explicit instructions
+   * to poll again. Terminal phases (`completed`, `error`, `error_reported`,
+   * `failed`) return the full T7 action plan when a report is on disk, or a
+   * compact summary otherwise.
+   */
+  async handleCheckRunStatus(params) {
+    Logger.mcp('Index', 'handleCheckRunStatus called', { runId: params?.runId });
+
+    const runId = params?.runId;
+    if (!runId || typeof runId !== 'string') {
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ success: false, error: 'runId is required (a string returned by healix_test_my_app).' }, null, 2) }],
+        isError: true,
+      };
+    }
+    const projectPath = params.projectPath || process.cwd();
+    const statusFile = path.join(projectPath, 'healix-reports', '.runs', runId, 'status.json');
+
+    if (!fs.existsSync(statusFile)) {
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            success: false,
+            runId,
+            isTerminal: false,
+            error: 'RUN_NOT_FOUND',
+            message: `No status file at ${statusFile}. Double-check the runId and projectPath you passed to healix_test_my_app.`,
+          }, null, 2),
+        }],
+        isError: true,
+      };
+    }
+
+    let status;
+    try {
+      status = JSON.parse(fs.readFileSync(statusFile, 'utf-8'));
+    } catch (err) {
+      // Mid-write — tell the agent to try again shortly rather than failing.
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            success: true,
+            runId,
+            isTerminal: false,
+            phase: 'transient_read_error',
+            agentInstructions: 'Status file was mid-write. Wait ~5 seconds and call healix_check_run_status again.',
+          }, null, 2),
+        }],
+      };
+    }
+
+    const TERMINAL_PHASES = new Set(['completed', 'error', 'error_reported', 'failed']);
+    const isTerminal = TERMINAL_PHASES.has(status.phase);
+
+    const base = {
+      success: true,
+      runId,
+      phase: status.phase || 'unknown',
+      isTerminal,
+      message: status.message || null,
+      errorCode: status.errorCode || null,
+      project: status.project || null,
+      configUrl: status.configUrl || null,
+      dashboardUrl: status.dashboardUrl || process.env.HEALIX_DASHBOARD_URL || null,
+      reportPath: status.reportPath || null,
+      timestamp: status.timestamp || null,
+    };
+
+    if (!isTerminal) {
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            ...base,
+            agentInstructions: `The pipeline is still at phase='${status.phase || 'unknown'}'. Call healix_check_run_status again in ~15 seconds with the same runId. Do not conclude the task until isTerminal is true.`,
+          }, null, 2),
+        }],
+      };
+    }
+
+    // Terminal — try to build the T7 action plan from the latest report.
+    const report = this.loadLatestHealixReport(projectPath);
+    if (report) {
+      try {
+        const { buildAgentResponse } = require('./failure-triage/agent-response');
+        const agentResponse = buildAgentResponse({
+          report,
+          projectPath,
+          dashboardUrl: base.dashboardUrl,
+          testRunId: runId,
+        });
+        return {
+          content: [{
+            type: 'text',
+            text: `${agentResponse.actionPlan}\n\n---\n\n${JSON.stringify({
+              ...base,
+              summary: agentResponse.summary,
+              verdicts: agentResponse.verdicts,
+            }, null, 2)}`,
+          }],
+        };
+      } catch (err) {
+        Logger.warn('Index', 'buildAgentResponse failed in check_run_status', { error: err.message });
+      }
+    }
+
+    const agentInstructions = status.phase === 'completed'
+      ? 'Run completed. Share the dashboardUrl with the user.'
+      : 'Run ended in error. Relay the message + errorCode + dashboardUrl to the user; the dashboard shows the pipeline_error banner with stderr + first-spec preview.';
+
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({ ...base, agentInstructions }, null, 2),
+      }],
+    };
   }
 
   /**
@@ -1442,6 +1722,35 @@ Return the JSON structure above based on what you find in the codebase.
     const analyzer = AIAnalyzer.create('saas', process.env.HEALIX_API_KEY);
     const analysis = await analyzer.analyzeFailures(testResults.failures);
 
+    // T7 — try to load the latest Healix report and produce the structured
+    // Cursor-agent handoff. Falls back to the legacy analyses[] payload when
+    // no report is on disk (e.g. user ran analyze-failures standalone).
+    const report = this.loadLatestHealixReport(projectPath);
+    if (report) {
+      const { buildAgentResponse } = require('./failure-triage/agent-response');
+      const agentResponse = buildAgentResponse({
+        report,
+        projectPath,
+        dashboardUrl: process.env.HEALIX_DASHBOARD_URL || null,
+        testRunId: report.metadata?.testRunId ?? report.metadata?.runId ?? null,
+        aiAnalysis: analysis,
+      });
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `${agentResponse.actionPlan}\n\n---\n\n${JSON.stringify({
+              success: true,
+              summary: agentResponse.summary,
+              verdicts: agentResponse.verdicts,
+              dashboardUrl: agentResponse.dashboardUrl,
+              analyses: analysis,
+            }, null, 2)}`,
+          },
+        ],
+      };
+    }
+
     return {
       content: [
         {
@@ -1454,6 +1763,31 @@ Return the JSON structure above based on what you find in the codebase.
         },
       ],
     };
+  }
+
+  /**
+   * Find and parse the most recent Healix report JSON for a project, if any.
+   * Returns null when the project has never been reported on.
+   */
+  loadLatestHealixReport(projectPath) {
+    try {
+      const fs_ = require('node:fs');
+      const path_ = require('node:path');
+      const reportsDir = path_.join(projectPath, 'healix-reports');
+      const latestPath = path_.join(reportsDir, 'latest.json');
+      if (fs_.existsSync(latestPath)) {
+        return JSON.parse(fs_.readFileSync(latestPath, 'utf-8'));
+      }
+      if (!fs_.existsSync(reportsDir)) return null;
+      const files = fs_.readdirSync(reportsDir)
+        .filter((f) => f.startsWith('report-') && f.endsWith('.json'))
+        .sort()
+        .reverse();
+      if (files.length === 0) return null;
+      return JSON.parse(fs_.readFileSync(path_.join(reportsDir, files[0]), 'utf-8'));
+    } catch {
+      return null;
+    }
   }
 
   /**

@@ -2,5 +2,5 @@ test/
 .env
 .env.*
 *.test.js
-testbot-reports/
+healix-reports/
 node_modules/

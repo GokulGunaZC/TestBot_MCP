@@ -1,0 +1,171 @@
+import { NextRequest, NextResponse } from 'next/server'
+import { db } from '@/lib/db'
+import { apiKeys } from '@/lib/db/schema'
+import { eq, and } from 'drizzle-orm'
+import { hashApiKey } from '@/lib/utils/api-keys'
+import { parsePRD, hashPRD } from '@/lib/prd-parser'
+import { checkRateLimit } from '@/lib/rate-limit'
+import { checkTokenBalance, deductTokens } from '@/lib/tokens'
+import { checkConcurrencyLimit } from '@/lib/concurrency-limit'
+import { checkAiGuard, recordAiCall } from '@/lib/ai-guard'
+import { logBlockedRequest } from '@/lib/security-logger'
+import type { ParsedPRD } from '@/lib/test-generation/types'
+
+const ENDPOINT = '/api/parse-prd'
+const MAX_PRD_CHARS = 40_000
+
+// In-process cache keyed by `userId:prdHash` → parsed PRD.
+// TTL keeps memory bounded on long-running serverless instances; exact-match
+// repeat calls within the TTL skip the OpenAI bill entirely.
+const CACHE_TTL_MS = 15 * 60 * 1000
+const parseCache = new Map<string, { parsedPRD: ParsedPRD; cachedAt: number }>()
+
+function cacheKey(userId: string, prdHash: string): string {
+  return `${userId}:${prdHash}`
+}
+
+function getCached(userId: string, prdHash: string): ParsedPRD | null {
+  const hit = parseCache.get(cacheKey(userId, prdHash))
+  if (!hit) return null
+  if (Date.now() - hit.cachedAt > CACHE_TTL_MS) {
+    parseCache.delete(cacheKey(userId, prdHash))
+    return null
+  }
+  return hit.parsedPRD
+}
+
+function setCached(userId: string, prdHash: string, parsedPRD: ParsedPRD): void {
+  parseCache.set(cacheKey(userId, prdHash), { parsedPRD, cachedAt: Date.now() })
+}
+
+export async function POST(request: NextRequest) {
+  try {
+    if (!process.env.OPENAI_API_KEY) {
+      return NextResponse.json({ error: 'Server OpenAI key not configured' }, { status: 503 })
+    }
+
+    const rawKey = request.headers.get('x-api-key') ?? null
+    const body = await request.json()
+    const api_key: string = rawKey ?? body?.api_key ?? ''
+    const prdText: string = typeof body?.prd === 'string' ? body.prd : ''
+
+    if (!api_key) {
+      logBlockedRequest({ type: 'MISSING_API_KEY', reason: 'No x-api-key header or api_key body field', endpoint: ENDPOINT })
+      return NextResponse.json({ error: 'Missing api_key' }, { status: 401 })
+    }
+
+    if (!prdText.trim()) {
+      return NextResponse.json({ error: 'Missing prd content' }, { status: 422 })
+    }
+
+    if (prdText.length > MAX_PRD_CHARS) {
+      return NextResponse.json(
+        { error: 'INVALID_INPUT_LIMIT', field: 'prd', limit: MAX_PRD_CHARS, received: prdText.length },
+        { status: 422 },
+      )
+    }
+
+    const keyHash = hashApiKey(api_key)
+    const [apiKeyRecord] = await db
+      .select({
+        id: apiKeys.id,
+        userId: apiKeys.userId,
+        isActive: apiKeys.isActive,
+        revoked: apiKeys.revoked,
+        expiresAt: apiKeys.expiresAt,
+      })
+      .from(apiKeys)
+      .where(and(eq(apiKeys.keyHash, keyHash), eq(apiKeys.isActive, true)))
+      .limit(1)
+
+    if (!apiKeyRecord) {
+      logBlockedRequest({ type: 'INVALID_API_KEY', reason: 'Key not found or inactive', endpoint: ENDPOINT })
+      return NextResponse.json({ error: 'Invalid or inactive API key' }, { status: 401 })
+    }
+
+    if (apiKeyRecord.revoked) {
+      logBlockedRequest({ type: 'REVOKED_API_KEY', user_id: apiKeyRecord.userId, reason: 'API key has been revoked', endpoint: ENDPOINT })
+      return NextResponse.json({ error: 'API key has been revoked' }, { status: 401 })
+    }
+
+    if (apiKeyRecord.expiresAt && apiKeyRecord.expiresAt < new Date()) {
+      logBlockedRequest({ type: 'EXPIRED_API_KEY', user_id: apiKeyRecord.userId, reason: 'API key has expired', endpoint: ENDPOINT })
+      return NextResponse.json({ error: 'API key has expired' }, { status: 401 })
+    }
+
+    const userId = apiKeyRecord.userId
+
+    const rateResult = await checkRateLimit({ keyHash, userId, endpoint: ENDPOINT })
+    if (!rateResult.allowed) {
+      return NextResponse.json(
+        { error: 'RATE_LIMIT_EXCEEDED' },
+        { status: 429, headers: { 'Retry-After': String(rateResult.retryAfter ?? 1) } },
+      )
+    }
+
+    const concurrencyResult = await checkConcurrencyLimit({ userId, endpoint: ENDPOINT })
+    if (!concurrencyResult.allowed) {
+      return NextResponse.json({ error: 'CONCURRENT_LIMIT_EXCEEDED' }, { status: 429 })
+    }
+
+    // Cache hit → short-circuit before any billable call.
+    const prdHash = hashPRD(prdText)
+    const cached = getCached(userId, prdHash)
+    if (cached) {
+      return NextResponse.json({
+        success: true,
+        parsedPRD: cached,
+        cached: true,
+      })
+    }
+
+    const aiGuardResult = await checkAiGuard({ userId, endpoint: ENDPOINT })
+    if (!aiGuardResult.allowed) {
+      return NextResponse.json({ error: 'RATE_LIMIT_EXCEEDED' }, { status: 429 })
+    }
+
+    const tokenCheck = await checkTokenBalance({ userId, endpoint: ENDPOINT })
+    if (!tokenCheck.allowed) {
+      return NextResponse.json({ error: 'No tokens remaining. Please renew your plan.' }, { status: 402 })
+    }
+
+    await db
+      .update(apiKeys)
+      .set({ lastUsedAt: new Date() })
+      .where(eq(apiKeys.id, apiKeyRecord.id))
+
+    const { parsedPRD, tokenUsage } = await parsePRD(prdText, {
+      openaiApiKey: process.env.OPENAI_API_KEY,
+      // gpt-5.4 only — env override intentionally ignored.
+      model: 'gpt-5.4',
+    })
+
+    if (tokenUsage.totalTokens > 0) {
+      await deductTokens({ userId, tokensUsed: tokenUsage.totalTokens })
+      await recordAiCall({
+        userId,
+        apiKeyId: apiKeyRecord.id,
+        endpoint: ENDPOINT,
+        modelUsed: tokenUsage.modelUsed,
+        tokensPrompt: tokenUsage.promptTokens,
+        tokensCompletion: tokenUsage.completionTokens,
+        tokensTotal: tokenUsage.totalTokens,
+      })
+    }
+
+    setCached(userId, prdHash, parsedPRD)
+
+    return NextResponse.json({
+      success: true,
+      parsedPRD,
+      cached: false,
+      tokenUsage,
+    })
+  } catch (error) {
+    console.error('[parse-prd] error:', error)
+    return NextResponse.json(
+      { error: error instanceof Error ? error.message : 'Internal server error' },
+      { status: 500 },
+    )
+  }
+}

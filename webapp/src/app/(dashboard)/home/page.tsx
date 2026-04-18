@@ -5,6 +5,7 @@ import { useRouter } from 'next/navigation';
 import Link from 'next/link';
 import { motion } from 'framer-motion';
 import type { TestRun, TestList, Profile } from '@/lib/types/database';
+import { toDisplayUnits } from '@/lib/token-units';
 
 
 function formatDate(iso: string) {
@@ -104,8 +105,14 @@ export default function HomePage() {
     fetchData();
   }, []);
 
-  const credits = profile?.credits_remaining ?? 130;
-  const creditsTotal = profile?.credits_total ?? 500;
+  // Plan card reads the SAME token fields the sidebar does — both surfaces
+  // derive from profile.tokens_remaining / tokens_total through toDisplayUnits.
+  // No `credits_*` fallbacks: that legacy column is never decremented by the
+  // runtime, so rendering it would drift from actual billing.
+  const tokensRemaining = toDisplayUnits(profile?.tokens_remaining);
+  const tokensTotal = toDisplayUnits(profile?.tokens_total);
+  const tokensUsed = Math.max(0, tokensTotal - tokensRemaining);
+  const tokensUsedPct = tokensTotal > 0 ? Math.min(100, (tokensUsed / tokensTotal) * 100) : 0;
   const plan = profile?.plan ?? 'Free';
 
   const containerVariants = {
@@ -357,18 +364,18 @@ export default function HomePage() {
                     <span className="px-3 py-1 rounded-full bg-blue-500/10 border border-blue-500/20 text-[#60A5FA] text-sm font-bold capitalize">
                       {plan}
                     </span>
-                    <span className="text-[#4A6280] text-xs">{credits} credits left</span>
+                    <span className="text-[#4A6280] text-xs">{tokensRemaining.toLocaleString()} tokens left</span>
                   </div>
 
                   <div className="mb-2">
                     <div className="flex items-center justify-between mb-1.5">
-                      <span className="text-[#8BA4C8] text-xs">Credits used</span>
-                      <span className="text-[#F0F6FF] text-xs font-semibold">{creditsTotal - credits}/{creditsTotal}</span>
+                      <span className="text-[#8BA4C8] text-xs">Tokens used</span>
+                      <span className="text-[#F0F6FF] text-xs font-semibold">{tokensUsed.toLocaleString()}/{tokensTotal.toLocaleString()}</span>
                     </div>
                     <div className="h-2 bg-white/5 rounded-full overflow-hidden">
                       <motion.div
                         initial={{ width: 0 }}
-                        animate={{ width: `${(((creditsTotal - credits) / creditsTotal) * 100).toFixed(1)}%` }}
+                        animate={{ width: `${tokensUsedPct.toFixed(1)}%` }}
                         transition={{ duration: 1, delay: 0.5 }}
                         className="h-full rounded-full bg-gradient-to-r from-blue-500 to-cyan-500"
                       />
@@ -376,7 +383,7 @@ export default function HomePage() {
                   </div>
 
                   <p className="text-[#4A6280] text-xs mt-3">
-                    Upgrade to Pro for unlimited credits + Jira integration + all AI providers.
+                    Upgrade to Pro for more tokens + Jira integration + all AI providers.
                   </p>
 
                   <Link

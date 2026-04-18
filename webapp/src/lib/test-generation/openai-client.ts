@@ -17,27 +17,17 @@ export class OpenAIClient {
         ? Number(config.timeout)
         : Number.isFinite(envTimeout) && envTimeout > 0
           ? envTimeout
-          : 90000
+          : 540_000 // 9 min — gpt-5.4 reasoning:high can take minutes per call
 
+    // gpt-5.4 only. No chat-fallback, no model alternates.
+    // gpt-5.4 runs on the Responses API (/v1/responses) with `input` +
+    // `reasoning`, per https://developers.openai.com/api/docs/quickstart.
     this.config = {
       apiKey: config.apiKey,
-      model:
-        config.model ||
-        process.env.OPENAI_MODEL ||
-        process.env.OPENAI_CODEX_MODEL ||
-        'gpt-5.4',
-      chatFallbackModel:
-        config.chatFallbackModel ||
-        process.env.OPENAI_CHAT_FALLBACK_MODEL ||
-        'gpt-4o',
-      latestGPTModel:
-        config.latestGPTModel || process.env.OPENAI_LATEST_GPT_MODEL || 'gpt-5.4',
-      modelFallbacks: Array.isArray(config.modelFallbacks)
-        ? config.modelFallbacks
-        : String(process.env.OPENAI_MODEL_FALLBACKS || '')
-            .split(',')
-            .map((item) => item.trim())
-            .filter(Boolean),
+      model: 'gpt-5.4',
+      chatFallbackModel: 'gpt-5.4',
+      latestGPTModel: 'gpt-5.4',
+      modelFallbacks: [],
       maxTokens:
         config.maxTokens || parseInt(process.env.OPENAI_MAX_TOKENS || '4000') || 4000,
       temperature: config.temperature ?? 0.2,
@@ -45,57 +35,19 @@ export class OpenAIClient {
     }
   }
 
-  async callOpenAI(messages: OpenAIMessage[], options: { model?: string } = {}): Promise<OpenAICallResult> {
-    const requestedModel = options.model || this.config.model
-    const modelCandidates = this.buildPreferredModelList(requestedModel)
-    let lastError: Error | null = null
-
-    for (const model of modelCandidates) {
-      const tryResponsesFirst = this.isLikelyCodexModel(model)
-      const endpointOrder = tryResponsesFirst ? ['responses', 'chat'] : ['chat', 'responses']
-
-      for (const endpoint of endpointOrder) {
-        try {
-          const result =
-            endpoint === 'responses'
-              ? await this.callResponsesAPI(messages, model)
-              : await this.callChatCompletionsAPI(messages, model)
-
-          if (model !== this.config.model) {
-            this.config.model = model
-          }
-
-          return { text: result.text, usage: result.usage, modelUsed: model }
-        } catch (error) {
-          lastError = error instanceof Error ? error : new Error(String(error))
-        }
-      }
-    }
-
-    throw lastError || new Error('OpenAI API call failed for all candidate models/endpoints')
+  async callOpenAI(messages: OpenAIMessage[], _options: { model?: string } = {}): Promise<OpenAICallResult> {
+    // Single model, single endpoint. No silent failover.
+    const result = await this.callResponsesAPI(messages, 'gpt-5.4')
+    return { text: result.text, usage: result.usage, modelUsed: 'gpt-5.4' }
   }
 
-  buildPreferredModelList(requestedModel: string): string[] {
-    const primary = String(requestedModel || this.config.model || 'gpt-4o').trim()
-    const configuredFallbacks = (this.config.modelFallbacks || [])
-      .map((item) => String(item).trim())
-      .filter(Boolean)
-    const codexCandidate = process.env.OPENAI_CODEX_MODEL || ''
-
-    const list = [
-      primary,
-      ...(codexCandidate ? [codexCandidate] : []),
-      this.config.latestGPTModel,
-      ...configuredFallbacks,
-      this.config.chatFallbackModel,
-      'gpt-5.4',
-    ].filter(Boolean) as string[]
-
-    return [...new Set(list)]
+  buildPreferredModelList(_requestedModel: string): string[] {
+    return ['gpt-5.4']
   }
 
-  isLikelyCodexModel(model: string): boolean {
-    return /codex/i.test(String(model || ''))
+  isLikelyCodexModel(_model: string): boolean {
+    // All our calls go through gpt-5.4 on the Responses API.
+    return true
   }
 
   buildResponsesInput(messages: OpenAIMessage[]): string {
@@ -165,6 +117,7 @@ export class OpenAIClient {
         body: JSON.stringify({
           model,
           input: this.buildResponsesInput(messages),
+          reasoning: { effort: 'high' },
         }),
         signal: controller.signal,
       })

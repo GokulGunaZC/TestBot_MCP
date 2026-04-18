@@ -74,6 +74,22 @@ class AutoDetector {
     const startCommand = this.detectStartCommand(packageJson, langInfo, resolvedPath, port);
     const testDirs = this.scanTestDirs(resolvedPath);
 
+    // Detect whether the repo contains both a frontend and a backend (monorepo split, or
+    // Next.js/Rails-style fullstack in one process). Returns an array of services with
+    // `{ role, port, baseURL, startCommand, path, framework }`. For a single-service repo
+    // we still return one element so downstream code has a uniform shape.
+    const services = this.detectServices(resolvedPath, {
+      packageJson,
+      playwrightConfig,
+      envFile,
+      langInfo,
+      topLevelPort: port,
+      topLevelBaseURL: baseURL,
+      topLevelStartCommand: startCommand,
+    });
+
+    const apiOnly = services.length > 0 && services.every((s) => s.role === 'backend');
+
     const settings = {
       projectPath: resolvedPath,
       projectName,
@@ -87,10 +103,169 @@ class AutoDetector {
       testDirs,
       packageJson,
       playwrightConfig,
+      services,
+      apiOnly,
     };
 
-    Logger.debug('AutoDetector', 'Finished detection', { projectName, language: langInfo.language, hasPlaywright: settings.hasPlaywright });
+    Logger.debug('AutoDetector', 'Finished detection', {
+      projectName,
+      language: langInfo.language,
+      hasPlaywright: settings.hasPlaywright,
+      serviceCount: services.length,
+      services: services.map((s) => ({ role: s.role, port: s.port })),
+      apiOnly,
+    });
     return settings;
+  }
+
+  /**
+   * Detect frontend and backend services inside a single repo.
+   *
+   * Heuristics:
+   *  - Monorepo workspace dirs: apps/web + apps/api, packages/web + packages/api,
+   *    frontend/ + backend/, client/ + server/, web/ + api/.
+   *  - Each candidate sub-dir is inspected for its own package.json / pyproject / etc.,
+   *    and the same port-detection heuristics are applied scoped to that dir.
+   *  - Backend-only is detected when NO page/route component files are found anywhere
+   *    and a server-side framework is present (express, fastapi, gin, spring, etc.).
+   *  - Next.js / Remix / NestJS-with-client are treated as ONE service (shared port).
+   *
+   * Returns an array of `{ role, path, port, baseURL, startCommand, framework }`.
+   * When the repo is a single service the array has one entry whose values mirror
+   * the top-level detection so callers can always iterate.
+   */
+  detectServices(projectPath, opts) {
+    const { packageJson, playwrightConfig, envFile, langInfo, topLevelPort, topLevelBaseURL, topLevelStartCommand } = opts;
+    const services = [];
+
+    // 1. Workspace-style monorepo
+    const monorepoPairs = [
+      { fe: 'apps/web', be: 'apps/api' },
+      { fe: 'apps/web', be: 'apps/server' },
+      { fe: 'apps/client', be: 'apps/server' },
+      { fe: 'packages/web', be: 'packages/api' },
+      { fe: 'frontend', be: 'backend' },
+      { fe: 'client', be: 'server' },
+      { fe: 'web', be: 'api' },
+      { fe: 'webapp', be: 'server' },
+    ];
+
+    for (const pair of monorepoPairs) {
+      const fePath = path.join(projectPath, pair.fe);
+      const bePath = path.join(projectPath, pair.be);
+      if (fs.existsSync(fePath) && fs.existsSync(bePath) && fs.statSync(fePath).isDirectory() && fs.statSync(bePath).isDirectory()) {
+        const feSvc = this.inspectServiceDir(fePath, projectPath, 'frontend');
+        const beSvc = this.inspectServiceDir(bePath, projectPath, 'backend');
+        if (feSvc) services.push(feSvc);
+        if (beSvc) services.push(beSvc);
+        if (services.length > 0) break;
+      }
+    }
+
+    // 2. Single-service (the common case): mirror top-level detection.
+    if (services.length === 0) {
+      const role = this.inferRoleFromTopLevel(packageJson, langInfo, projectPath);
+      services.push({
+        role,                       // 'frontend' | 'backend' | 'fullstack'
+        path: '.',
+        port: topLevelPort,
+        baseURL: topLevelBaseURL,
+        startCommand: topLevelStartCommand,
+        framework: this.inferFrameworkLabel(packageJson, langInfo),
+      });
+    }
+
+    // 3. Enforce port uniqueness. If both services autodetected to the same default
+    // (e.g. frontend Next=3000 and backend Express=3000), bump the backend by 1000.
+    const portsSeen = new Set();
+    for (const svc of services) {
+      if (!svc || !svc.port) continue;
+      if (portsSeen.has(svc.port) && svc.role === 'backend') {
+        const newPort = svc.port >= 4000 ? svc.port + 1 : 4000;
+        svc.port = newPort;
+        svc.baseURL = svc.baseURL ? svc.baseURL.replace(/:\d+/, `:${newPort}`) : `http://localhost:${newPort}`;
+        svc.portConflictResolved = true;
+      }
+      portsSeen.add(svc.port);
+    }
+
+    return services;
+  }
+
+  /**
+   * Inspect a sub-directory for its own package.json / pyproject, detect port,
+   * framework, and build a service descriptor. Returns null if nothing detectable.
+   */
+  inspectServiceDir(absDir, repoRoot, expectedRole) {
+    const relPath = path.relative(repoRoot, absDir) || '.';
+    let subPackageJson = null;
+    try {
+      const p = path.join(absDir, 'package.json');
+      if (fs.existsSync(p)) subPackageJson = JSON.parse(fs.readFileSync(p, 'utf-8'));
+    } catch { /* ignore */ }
+
+    const subLangInfo = this.detectLanguageAndEcosystem(absDir);
+    const subEnvFile = this.readEnvFile(absDir);
+    const subPlaywrightConfig = this.readPlaywrightConfig(absDir);
+
+    const port = this.detectPort(subPackageJson, subEnvFile, subPlaywrightConfig, subLangInfo);
+    const baseURL = this.detectBaseURL(subPackageJson, subEnvFile, subPlaywrightConfig, port);
+    const startCommand = this.detectStartCommand(subPackageJson, subLangInfo, absDir, port);
+
+    return {
+      role: expectedRole,
+      path: relPath,
+      port,
+      baseURL,
+      startCommand,
+      framework: this.inferFrameworkLabel(subPackageJson, subLangInfo),
+    };
+  }
+
+  /**
+   * Decide whether a single-root project is frontend, backend, or fullstack. Used when
+   * no monorepo split is detected.
+   */
+  inferRoleFromTopLevel(packageJson, langInfo, projectPath) {
+    const deps = {
+      ...(packageJson?.dependencies || {}),
+      ...(packageJson?.devDependencies || {}),
+    };
+
+    const hasFrontend = !!(deps.next || deps.react || deps['react-dom'] || deps.vue || deps.svelte || deps.vite || deps['@remix-run/react'] || deps.expo);
+    const hasBackend = !!(deps.express || deps.fastify || deps.koa || deps['@nestjs/core'] || deps['@nestjs/common'] || deps.hapi);
+
+    // Next.js is fullstack by design (pages + API routes).
+    if (deps.next) return 'fullstack';
+    if (hasFrontend && hasBackend) return 'fullstack';
+    if (hasFrontend) return 'frontend';
+    if (hasBackend) return 'backend';
+
+    // Non-JS backends
+    if (['python', 'java', 'kotlin', 'go', 'rust', 'ruby', 'php', 'csharp', 'elixir'].includes(langInfo.language)) {
+      // Check for page-producing frameworks vs API frameworks. We scan for tell-tale files.
+      const hasAppRoutes = fs.existsSync(path.join(projectPath, 'src/app')) || fs.existsSync(path.join(projectPath, 'app'));
+      return hasAppRoutes ? 'fullstack' : 'backend';
+    }
+
+    return 'fullstack';
+  }
+
+  inferFrameworkLabel(packageJson, langInfo) {
+    const deps = {
+      ...(packageJson?.dependencies || {}),
+      ...(packageJson?.devDependencies || {}),
+    };
+    if (deps.next) return 'next';
+    if (deps['@remix-run/react']) return 'remix';
+    if (deps.vite && deps.react) return 'vite-react';
+    if (deps.vite && deps.vue) return 'vite-vue';
+    if (deps['@nestjs/core']) return 'nest';
+    if (deps.express) return 'express';
+    if (deps.fastify) return 'fastify';
+    if (deps.expo) return 'expo';
+    if (langInfo?.ecosystem) return langInfo.ecosystem;
+    return langInfo?.language || 'unknown';
   }
 
   /**

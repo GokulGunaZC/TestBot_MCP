@@ -69,12 +69,48 @@ export const testRuns = pgTable(
     framework: text('framework'),
     source: text('source').default('mcp'),
     projectPath: text('project_path'), // Local project path for artifact fallback
+    currentPhase: text('current_phase'),
+    currentPhaseAt: timestamp('current_phase_at', { withTimezone: true }),
+    tierResults: jsonb('tier_results'),
+    pipelineError: jsonb('pipeline_error'),
     createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow(),
   },
   (table) => [
     index('test_runs_user_id_idx').on(table.userId),
     index('test_runs_created_at_idx').on(table.createdAt),
+  ]
+)
+
+export const testFailures = pgTable(
+  'test_failures',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    testRunId: uuid('test_run_id')
+      .notNull()
+      .references(() => testRuns.id, { onDelete: 'cascade' }),
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => profiles.id, { onDelete: 'cascade' }),
+    testName: text('test_name').notNull(),
+    testFile: text('test_file'),
+    tier: text('tier'),
+    verdict: text('verdict').notNull(),
+    verdictSource: text('verdict_source').notNull(),
+    verdictConfidence: numeric('verdict_confidence', { precision: 3, scale: 2 }),
+    fixTarget: text('fix_target'),
+    reason: text('reason'),
+    suggestedPatch: jsonb('suggested_patch'),
+    evidence: jsonb('evidence'),
+    clusterId: text('cluster_id'),
+    userOverride: text('user_override'),
+    userOverrideAt: timestamp('user_override_at', { withTimezone: true }),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    index('test_failures_run_idx').on(table.testRunId),
+    index('test_failures_user_verdict_idx').on(table.userId, table.verdict),
+    index('test_failures_cluster_idx').on(table.testRunId, table.clusterId),
   ]
 )
 
@@ -103,6 +139,8 @@ export const mcpTelemetryEvents = pgTable(
     tokensCompletion: integer('tokens_completion'),
     tokensTotal: integer('tokens_total'),
     costUsd: numeric('cost_usd', { precision: 12, scale: 8 }),
+    agent: text('agent'),
+    latencyMs: integer('latency_ms'),
     occurredAt: timestamp('occurred_at', { withTimezone: true }).defaultNow(),
     createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
   },
@@ -113,6 +151,7 @@ export const mcpTelemetryEvents = pgTable(
     index('mcp_telemetry_run_id_idx').on(table.runId),
     index('mcp_telemetry_event_type_idx').on(table.eventType),
     index('mcp_telemetry_status_idx').on(table.status),
+    index('mcp_telemetry_agent_idx').on(table.agent),
   ]
 )
 

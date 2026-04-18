@@ -1,47 +1,21 @@
 'use strict';
 
-const Logger = require('../logger');
+/**
+ * Thin wrapper that exposes a failure-analysis surface to
+ * `pipeline-worker.js` (via `AIAnalyzer.create('saas')`).
+ * All network logic lives in `../webapp-client.js`.
+ */
+
+const WebappClient = require('../webapp-client');
 
 class SaaSClient {
   constructor({ apiKey, dashboardUrl } = {}) {
-    this.apiKey = apiKey || process.env.HEALIX_API_KEY;
-    this.dashboardUrl = (dashboardUrl || process.env.HEALIX_DASHBOARD_URL || 'http://localhost:3000').replace(/\/+$/, '');
-    this.timeout = 120_000; // 2 min timeout
+    this._client = new WebappClient({ apiKey, dashboardUrl });
   }
 
   async analyzeFailures(failures) {
-    if (!this.apiKey) throw new Error('HEALIX_API_KEY is required for SaaS failure analysis');
-    if (!Array.isArray(failures) || failures.length === 0) return [];
-
-    const fetchFn = global.fetch || require('node-fetch');
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.timeout);
-
-    try {
-      const response = await fetchFn(`${this.dashboardUrl}/api/analyze-failures`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          api_key: this.apiKey,
-          failures: failures.slice(0, 8),
-        }),
-        signal: controller.signal,
-      });
-
-      clearTimeout(timer);
-
-      if (!response.ok) {
-        const text = await response.text();
-        throw new Error(`SaaS failure analysis failed (${response.status}): ${text.slice(0, 300)}`);
-      }
-
-      const payload = await response.json();
-      return Array.isArray(payload.analyses) ? payload.analyses : [];
-    } catch (error) {
-      clearTimeout(timer);
-      if (error.name === 'AbortError') throw new Error('SaaS failure analysis timed out');
-      throw error;
-    }
+    const payload = await this._client.analyzeFailures(failures);
+    return Array.isArray(payload?.analyses) ? payload.analyses : [];
   }
 
   async analyzeFailure(failure) {
@@ -50,7 +24,7 @@ class SaaSClient {
       failure,
       testName: failure.testName,
       file: failure.file,
-      analysis: 'SaaS analysis returned no results',
+      analysis: 'Healix returned no analysis for this failure',
       rootCause: 'Unknown',
       suggestedFix: { description: 'Manual review required', changes: [] },
       confidence: 0,

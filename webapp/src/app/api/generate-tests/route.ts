@@ -3,8 +3,16 @@ import { db } from '@/lib/db'
 import { apiKeys } from '@/lib/db/schema'
 import { eq, and } from 'drizzle-orm'
 import { hashApiKey } from '@/lib/utils/api-keys'
-import { OpenAITestGenerator } from '@/lib/test-generation/openai-generator'
-import type { CapturedContext, GenerationOptions, ProjectInfo } from '@/lib/test-generation/types'
+import { dispatchAgents } from '@/lib/test-generation/agent-dispatcher'
+import type {
+  CapturedContext,
+  GenerationOptions,
+  ProjectInfo,
+  ParsedPRD,
+  ExplorationArtifact,
+  Role,
+  AgentRunRecord,
+} from '@/lib/test-generation/types'
 import { checkRateLimit } from '@/lib/rate-limit'
 import { checkTokenBalance, deductTokens } from '@/lib/tokens'
 import { checkConcurrencyLimit } from '@/lib/concurrency-limit'
@@ -108,46 +116,64 @@ export async function POST(request: NextRequest) {
       .where(eq(apiKeys.id, apiKeyRecord.id))
 
     // Business logic
-    const { context, testType, prd, projectInfo, options } = body
+    const { context, testType, prd, parsedPRD, explorationArtifact, roles, projectInfo, options } = body
 
     const ctx = (context || {}) as CapturedContext
     const info = (projectInfo || {}) as ProjectInfo
     const type = (testType || 'both') as 'frontend' | 'backend' | 'both'
     const prdContent = (prd || '') as string
     const genOptions = (options || {}) as GenerationOptions
+    const parsedPRDInput = (parsedPRD || null) as ParsedPRD | null
+    const explorationInput = (explorationArtifact || null) as ExplorationArtifact | null
+    const rolesInput = Array.isArray(roles) ? (roles as Role[]) : []
 
-    const generator = new OpenAITestGenerator({
-      apiKey: process.env.OPENAI_API_KEY,
-      model: process.env.OPENAI_MODEL,
-      fallbackOnFailure: genOptions.strictAIGeneration !== true,
-      enforceValidation: true,
-      syntaxValidationMode: 'fail-open',
-      strictAIGeneration: genOptions.strictAIGeneration === true,
-    })
-
-    const generatedFiles = await generator.generateTests({
+    // Per-agent telemetry. Each generator agent (smoke/frontend/api/workflow/
+    // error/expansion) emits one `recordAiCall` row tagged with the agent name,
+    // latency, and its own token usage — the rows drive the per-agent dashboard
+    // (SELECT agent, AVG(latency_ms), SUM(tokens_total) FROM ... GROUP BY agent).
+    const agentTelemetry: AgentRunRecord[] = []
+    const runId = request.headers.get('x-healix-run-id') || null
+    const { files: generatedFiles, summary, plan } = await dispatchAgents({
       context: ctx,
       prd: prdContent,
+      parsedPRD: parsedPRDInput,
+      explorationArtifact: explorationInput,
+      roles: rolesInput,
       testType: type,
       projectInfo: info,
       options: genOptions,
+      generatorConfig: {
+        apiKey: process.env.OPENAI_API_KEY,
+        // gpt-5.4 only. The generator hardcodes this too, but we pass it
+        // explicitly so env drift is impossible.
+        model: 'gpt-5.4',
+        fallbackOnFailure: genOptions.strictAIGeneration !== true,
+        enforceValidation: true,
+        syntaxValidationMode: 'fail-open',
+        strictAIGeneration: genOptions.strictAIGeneration === true,
+      },
+      onAgentComplete: async (record) => {
+        agentTelemetry.push(record)
+        await recordAiCall({
+          userId,
+          apiKeyId: apiKeyRecord.id,
+          endpoint: ENDPOINT,
+          agent: record.agent,
+          latencyMs: record.latencyMs,
+          modelUsed: record.modelUsed ?? undefined,
+          tokensPrompt: record.tokensPrompt,
+          tokensCompletion: record.tokensCompletion,
+          tokensTotal: record.tokensTotal,
+          success: record.success,
+          errorCode: record.errorCode ?? null,
+          runId,
+        })
+      },
     })
 
-    const summary = generator.getSummary()
-
-    // Deduct actual tokens consumed and record AI call
     const tokensConsumed = summary.tokenUsage.totalTokens
     if (tokensConsumed > 0) {
       await deductTokens({ userId, tokensUsed: tokensConsumed })
-      await recordAiCall({
-        userId,
-        apiKeyId: apiKeyRecord.id,
-        endpoint: ENDPOINT,
-        modelUsed: summary.tokenUsage.modelUsed ?? undefined,
-        tokensPrompt: summary.tokenUsage.promptTokens,
-        tokensCompletion: summary.tokenUsage.completionTokens,
-        tokensTotal: tokensConsumed,
-      })
     }
 
     const responseBody = {
@@ -156,6 +182,8 @@ export async function POST(request: NextRequest) {
       count: generatedFiles.length,
       generationMeta: summary.generationMeta,
       byType: summary.byType,
+      agentPlan: plan,
+      agentRuns: agentTelemetry,
     }
 
     // 9. Store idempotency result
@@ -164,7 +192,9 @@ export async function POST(request: NextRequest) {
     }
 
     // 10. Async abuse detection (non-blocking)
-    runAbuseDetection({ userId, apiKeyId: apiKeyRecord.id }).catch(() => undefined)
+    runAbuseDetection({ userId, apiKeyId: apiKeyRecord.id }).catch((err: unknown) => {
+      console.error('[generate-tests] abuse detection failed', err)
+    })
 
     return NextResponse.json(responseBody)
   } catch (error) {

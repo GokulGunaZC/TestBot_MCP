@@ -618,7 +618,7 @@ function escapeRegExp(value) {
 function normalizePathname(value) {
   const normalized = String(value || '').trim() || '/';
   try {
-    const pathname = new URL(normalized, 'http://testbot.local').pathname || '/';
+    const pathname = new URL(normalized, 'http://healix.local').pathname || '/';
     if (pathname !== '/' && pathname.endsWith('/')) {
       return pathname.replace(/\/+$/, '');
     }
@@ -1080,7 +1080,7 @@ function escapeRegExp(value) {
 function normalizePathname(value) {
   const normalized = String(value || '').trim() || '/';
   try {
-    const pathname = new URL(normalized, 'http://testbot.local').pathname || '/';
+    const pathname = new URL(normalized, 'http://healix.local').pathname || '/';
     if (pathname !== '/' && pathname.endsWith('/')) {
       return pathname.replace(/\/+$/, '');
     }

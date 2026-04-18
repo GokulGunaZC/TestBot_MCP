@@ -2,11 +2,30 @@
  * Shared TypeScript types for test generation
  */
 
+export interface ServiceInfo {
+  role: 'frontend' | 'backend' | 'fullstack'
+  path?: string
+  port?: number
+  baseURL?: string
+  startCommand?: string | null
+  framework?: string
+  portConflictResolved?: boolean
+}
+
 export interface ProjectInfo {
   name?: string
   baseURL?: string
   framework?: string
   startCommand?: string
+  // When the repo splits frontend + backend (monorepo) these describe each service
+  // individually so generated tests can target the right port and generated
+  // Playwright projects can launch each with its own `startCommand` / `baseURL`.
+  services?: ServiceInfo[]
+  // True when every detected service is a backend. Generator switches into
+  // multi-step API-flow mode (chained calls: api1 → api2 → api3) with no
+  // frontend/UI test output.
+  apiOnly?: boolean
+  testCredentials?: Array<{ role?: string; username?: string; password?: string }>
 }
 
 export interface PageInfo {
@@ -185,12 +204,115 @@ export interface GenerationMeta {
   generationQuality?: GenerationQuality
 }
 
+export type AcceptanceCriterionKind = 'positive' | 'negative' | 'boundary'
+
+export interface AcceptanceCriterion {
+  id: string                  // e.g. "F1.S1.AC1"
+  kind: AcceptanceCriterionKind
+  authRequired: boolean
+  roleHint?: string           // e.g. "admin" if the AC is admin-only
+  text: string                // original AC language, preserved verbatim
+}
+
+export interface UserStory {
+  id: string                  // e.g. "F1.S1"
+  persona: string
+  goal: string
+  acceptanceCriteria: AcceptanceCriterion[]
+}
+
+export interface PRDFeature {
+  id: string                  // e.g. "F1"
+  name: string
+  userStories: UserStory[]
+}
+
+export interface PRDPersona {
+  name: string
+  description: string
+}
+
+export interface NonFunctionalRequirement {
+  kind: 'perf' | 'a11y' | 'i18n' | 'security'
+  text: string
+}
+
+export interface ParsedPRD {
+  features: PRDFeature[]
+  personas: PRDPersona[]
+  nonFunctional: NonFunctionalRequirement[]
+  sourceHash?: string          // SHA-256 of the raw PRD text; used as cache key
+  parsedAt?: string            // ISO timestamp
+}
+
+export interface Role {
+  name: string                 // e.g. "admin", "user"
+  storageStatePath?: string    // path to Playwright storageState JSON for this role
+  loginVerified?: boolean
+}
+
+export interface ObservedRoute {
+  path: string
+  requiresAuth: boolean
+  elements: Array<{ role: string; name: string; selector: string }>
+}
+
+export interface ObservedForm {
+  route: string
+  fields: Array<{ name: string; type: string; required: boolean }>
+  submitLabel: string
+}
+
+export interface ObservedAuthFlow {
+  loginUrl: string
+  credentialFields: { username: string; password: string }
+  successIndicator: string
+  failureIndicator: string
+}
+
+export interface ObservedKeyFlow {
+  name: string
+  steps: Array<{ action: string; target: string; value?: string }>
+  endCondition: string
+}
+
+export interface ExplorationArtifact {
+  routes: ObservedRoute[]
+  forms: ObservedForm[]
+  authFlow: ObservedAuthFlow | null
+  keyFlows: ObservedKeyFlow[]
+  observedErrors: string[]
+}
+
+export type AgentName = 'smoke' | 'frontend' | 'api' | 'workflow' | 'error' | 'expansion'
+
+export interface AgentRunRecord {
+  agent: AgentName
+  startedAt: string
+  finishedAt: string
+  latencyMs: number
+  success: boolean
+  testsProduced: number
+  modelUsed: string | null
+  tokensPrompt: number
+  tokensCompletion: number
+  tokensTotal: number
+  errorCode?: string | null
+  errorMessage?: string | null
+}
+
+export type AgentCompleteHook = (record: AgentRunRecord) => void | Promise<void>
+
 export interface GenerateTestsParams {
   context?: CapturedContext
   prd?: string
+  parsedPRD?: ParsedPRD | null
+  explorationArtifact?: ExplorationArtifact | null
+  roles?: Role[]
   testType?: 'frontend' | 'backend' | 'both'
   projectInfo?: ProjectInfo
   options?: GenerationOptions
+  onAgentComplete?: AgentCompleteHook
 }
 
 export interface OpenAIClientConfig {

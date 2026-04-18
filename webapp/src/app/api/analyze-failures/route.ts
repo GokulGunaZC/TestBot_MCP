@@ -10,19 +10,28 @@ import { validateAnalyzeFailures } from '@/lib/validation'
 import { checkAiGuard, recordAiCall } from '@/lib/ai-guard'
 import { runAbuseDetection } from '@/lib/abuse-detector'
 import { logBlockedRequest } from '@/lib/security-logger'
+import {
+  TEST_TRIAGE_SYSTEM_PROMPT,
+  buildTestTriagePrompt,
+  isEvidenceBundle,
+  validatePatchGuardrail,
+  type EvidenceBundle,
+  type SuggestedPatch,
+} from '@/lib/triage/prompt'
 
 const ENDPOINT = '/api/analyze-failures'
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY
-const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-5.4'
-const FALLBACK_MODEL = 'gpt-4o'
-const OPENAI_MAX_TOKENS = 4000
-const OPENAI_TEMPERATURE = 0.2
-const OPENAI_TIMEOUT = 180_000 // 3 minutes
+// gpt-5.4 is the only model we run. It uses the Responses API (not
+// chat/completions) — see https://developers.openai.com/api/docs/quickstart.
+// No silent fallback: if gpt-5.4 fails, surface the error.
+const OPENAI_MODEL = 'gpt-5.4'
+// gpt-5.4 with reasoning:high can run 5+ minutes on evidence-heavy triage.
+const OPENAI_TIMEOUT = 540_000 // 9 minutes
 
 const MAX_FAILURES = 8
 
-// ── OpenAI Chat Completions call (with model fallback) ───────────────
+// ── OpenAI Responses API call ────────────────────────────────────────
 interface OpenAICallResult {
   text: string
   promptTokens: number
@@ -31,25 +40,47 @@ interface OpenAICallResult {
   modelUsed: string
 }
 
-async function callOpenAIWithModel(
-  messages: Array<{ role: string; content: string }>,
-  model: string,
-): Promise<OpenAICallResult> {
+function messagesToResponsesInput(messages: Array<{ role: string; content: string }>): string {
+  return messages
+    .map((m) => `${String(m.role || 'user').toUpperCase()}:\n${String(m.content || '').trim()}`)
+    .join('\n\n')
+}
+
+function extractResponsesText(data: unknown): string {
+  if (!data || typeof data !== 'object') return ''
+  const p = data as Record<string, unknown>
+  if (typeof p.output_text === 'string' && p.output_text.trim()) return p.output_text.trim()
+  if (Array.isArray(p.output)) {
+    const chunks: string[] = []
+    for (const item of p.output) {
+      const content = Array.isArray((item as Record<string, unknown>)?.content)
+        ? ((item as Record<string, unknown>).content as unknown[])
+        : []
+      for (const part of content) {
+        const partObj = part as Record<string, unknown>
+        if (typeof partObj?.text === 'string' && partObj.text.trim()) chunks.push(partObj.text.trim())
+      }
+    }
+    if (chunks.length) return chunks.join('\n').trim()
+  }
+  return ''
+}
+
+async function callOpenAI(messages: Array<{ role: string; content: string }>): Promise<OpenAICallResult> {
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), OPENAI_TIMEOUT)
 
   try {
-    const res = await fetch('https://api.openai.com/v1/chat/completions', {
+    const res = await fetch('https://api.openai.com/v1/responses', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${OPENAI_API_KEY}`,
       },
       body: JSON.stringify({
-        model,
-        messages,
-        temperature: OPENAI_TEMPERATURE,
-        max_completion_tokens: OPENAI_MAX_TOKENS,
+        model: OPENAI_MODEL,
+        input: messagesToResponsesInput(messages),
+        reasoning: { effort: 'high' },
       }),
       signal: controller.signal,
     })
@@ -62,35 +93,21 @@ async function callOpenAIWithModel(
     }
 
     const data = await res.json()
-    const text = data.choices?.[0]?.message?.content ?? ''
-    const usage = data.usage ?? {}
+    const text = extractResponsesText(data)
+    const usage = (data.usage ?? {}) as Record<string, number>
+    const promptTokens = usage.input_tokens ?? 0
+    const completionTokens = usage.output_tokens ?? 0
     return {
       text,
-      promptTokens: usage.prompt_tokens ?? 0,
-      completionTokens: usage.completion_tokens ?? 0,
-      totalTokens: usage.total_tokens ?? ((usage.prompt_tokens ?? 0) + (usage.completion_tokens ?? 0)),
-      modelUsed: model,
+      promptTokens,
+      completionTokens,
+      totalTokens: usage.total_tokens ?? promptTokens + completionTokens,
+      modelUsed: OPENAI_MODEL,
     }
   } catch (error: unknown) {
     clearTimeout(timeout)
     if (error instanceof Error && error.name === 'AbortError')
       throw new Error('OpenAI request timed out (3 min)')
-    throw error
-  }
-}
-
-async function callOpenAI(messages: Array<{ role: string; content: string }>): Promise<OpenAICallResult> {
-  try {
-    return await callOpenAIWithModel(messages, OPENAI_MODEL)
-  } catch (error) {
-    if (
-      OPENAI_MODEL !== FALLBACK_MODEL &&
-      error instanceof Error &&
-      (error.message.includes('does not exist') || error.message.includes('model_not_found'))
-    ) {
-      console.warn(`[analyze-failures] Model "${OPENAI_MODEL}" failed, falling back to "${FALLBACK_MODEL}"`)
-      return await callOpenAIWithModel(messages, FALLBACK_MODEL)
-    }
     throw error
   }
 }
@@ -202,6 +219,83 @@ Analyze this test failure and provide a fix. Focus on:
 Return your analysis as a JSON object.`
 }
 
+// ── Pipeline-error prompt — whole run never executed because generation broke ───
+interface PipelineFailureInput {
+  kind: 'pipeline'
+  stage?: string
+  reason?: string | null
+  stderr?: string | null
+  stdout?: string | null
+  firstSpecPreview?: { file?: string; lines?: string } | null
+  generatedSpecCount?: number
+  qualityAuditErrors?: string[] | null
+  errorCode?: string | null
+  userFacingMessage?: string | null
+}
+
+function isPipelineFailure(failure: unknown): failure is PipelineFailureInput {
+  return !!failure && typeof failure === 'object' && (failure as { kind?: string }).kind === 'pipeline'
+}
+
+function truncate(value: unknown, max = 3000): string {
+  if (typeof value !== 'string') return ''
+  return value.length > max ? value.slice(0, max) + `\n… (${value.length - max} more chars truncated)` : value
+}
+
+const PIPELINE_SYSTEM_PROMPT = `You are an expert CI/CD and test-runner debugging assistant. The Healix pipeline failed BEFORE any test could run — there is no per-test failure, only a pipeline-level diagnostic. Your job is to classify which layer is at fault and emit a concrete remediation.
+
+Return a single JSON object with this exact shape:
+{
+  "verdict": "pipeline_error",
+  "fixTarget": "test_generation" | "test_runner_config" | "dependencies" | "env" | "app" | "unknown",
+  "rootCause": "One-sentence plain-English root cause, grounded in the stderr or spec preview provided.",
+  "analysis": "2-4 sentence explanation. Quote the specific stderr line or spec snippet that justifies your call.",
+  "fix": {
+    "description": "Exact remediation a developer can execute.",
+    "changes": [
+      { "file": "path/or/command", "action": "run" | "edit" | "install", "command": "npm install …" | null, "oldCode": null, "newCode": null }
+    ]
+  },
+  "confidence": 0.0,
+  "affectedFiles": [],
+  "testingRecommendations": "How to verify the pipeline now runs."
+}
+
+Classification rules:
+- "cannot find module" / "Cannot find package '@playwright/test'" → fixTarget: "dependencies", suggest install.
+- "SyntaxError" / "Unexpected token" inside a generated spec → fixTarget: "test_generation", propose regenerating or patching the specific spec.
+- "testDir" / "no tests found" / config-parsing errors → fixTarget: "test_runner_config".
+- "ECONNREFUSED" / "server didn't respond" on startup → fixTarget: "env".
+- If the stderr is inconclusive, confidence ≤ 0.5 and ask for a re-run with --debug.
+
+Ground EVERY claim in the stderr or spec text provided. Never invent error messages. Return ONLY the JSON object.`
+
+function buildPipelinePrompt(failure: PipelineFailureInput) {
+  const stderr = truncate(failure.stderr, 3500)
+  const spec = failure.firstSpecPreview?.lines ? truncate(failure.firstSpecPreview.lines, 2500) : ''
+  const qa = (failure.qualityAuditErrors || []).slice(0, 8).map((s, i) => `  ${i + 1}. ${s}`).join('\n')
+
+  return `# Healix Pipeline Failure
+
+## Context
+- **Stage**: ${failure.stage || 'unknown'}
+- **Reason code**: ${failure.reason || 'unknown'}
+- **Error code**: ${failure.errorCode || 'none'}
+- **Generated spec count**: ${failure.generatedSpecCount ?? 'unknown'}
+${failure.userFacingMessage ? `- **User-facing summary**: ${failure.userFacingMessage}` : ''}
+
+## Playwright stderr
+\`\`\`
+${stderr || '(no stderr captured)'}
+\`\`\`
+
+${qa ? `## Quality audit errors\n${qa}\n` : ''}
+${spec ? `## First generated spec preview (${failure.firstSpecPreview?.file || 'unknown'})\n\`\`\`ts\n${spec}\n\`\`\`\n` : ''}
+
+## Task
+Classify which layer broke (test generation / runner config / dependencies / env / app) and emit a concrete fix. Return the JSON object specified in the system prompt.`
+}
+
 // ── Main POST handler ─────────────────────────────────────────────────
 export async function POST(request: NextRequest) {
   try {
@@ -303,18 +397,58 @@ export async function POST(request: NextRequest) {
     let lastModelUsed = OPENAI_MODEL
 
     const analyses = await Promise.all(
-      cappedFailures.map(async (failure: {
-        testName?: string
-        file?: string
-        status?: string
-        duration?: number
-        error?: { message?: string; stack?: string }
-      }) => {
-        try {
-          const result = await callOpenAI([
+      cappedFailures.map(async (failure: unknown) => {
+        const isPipeline = isPipelineFailure(failure)
+        const isEvidence = !isPipeline && isEvidenceBundle(failure)
+
+        let messages: Array<{ role: string; content: string }>
+        if (isPipeline) {
+          messages = [
+            { role: 'system', content: PIPELINE_SYSTEM_PROMPT },
+            { role: 'user', content: buildPipelinePrompt(failure as PipelineFailureInput) },
+          ]
+        } else if (isEvidence) {
+          messages = [
+            { role: 'system', content: TEST_TRIAGE_SYSTEM_PROMPT },
+            { role: 'user', content: buildTestTriagePrompt(failure as EvidenceBundle) },
+          ]
+        } else {
+          messages = [
             { role: 'system', content: SYSTEM_PROMPT },
-            { role: 'user', content: buildUserPrompt(failure) },
-          ])
+            { role: 'user', content: buildUserPrompt(failure as {
+              testName?: string; file?: string; status?: string; duration?: number; error?: { message?: string; stack?: string }
+            }) },
+          ]
+        }
+
+        const failureMeta = isPipeline
+          ? {
+              kind: 'pipeline' as const,
+              testName: `[PIPELINE] ${(failure as PipelineFailureInput).stage || 'unknown'}`,
+              file: (failure as PipelineFailureInput).firstSpecPreview?.file || null,
+              status: 'pipeline_error',
+              duration: 0,
+            }
+          : isEvidence
+          ? {
+              kind: 'test' as const,
+              testName: (failure as EvidenceBundle).testName,
+              file: (failure as EvidenceBundle).file ?? null,
+              status: (failure as EvidenceBundle).status,
+              duration: (failure as EvidenceBundle).duration,
+              tier: (failure as EvidenceBundle).tier ?? null,
+              role: (failure as EvidenceBundle).role ?? null,
+            }
+          : {
+              kind: 'test' as const,
+              testName: (failure as { testName?: string }).testName,
+              file: (failure as { file?: string }).file,
+              status: (failure as { status?: string }).status,
+              duration: (failure as { duration?: number }).duration,
+            }
+
+        try {
+          const result = await callOpenAI(messages)
 
           totalPromptTokens += result.promptTokens
           totalCompletionTokens += result.completionTokens
@@ -323,25 +457,28 @@ export async function POST(request: NextRequest) {
 
           const parsed = parseAnalysis(result.text)
 
-          return {
-            failure: {
-              testName: failure.testName,
-              file: failure.file,
-              status: failure.status,
-              duration: failure.duration,
-            },
-            ...parsed,
+          // For evidence bundles, server-side re-verify the patch guardrail so
+          // the downstream agent can trust `auto_apply_eligible`. Model flags
+          // are advisory, never load-bearing.
+          if (isEvidence && parsed && typeof parsed === 'object') {
+            const bundle = failure as EvidenceBundle
+            const patch = (parsed as { suggestedPatch?: SuggestedPatch | null }).suggestedPatch ?? null
+            const guard = validatePatchGuardrail(patch, bundle.testSource || null)
+            ;(parsed as { auto_apply_eligible?: boolean }).auto_apply_eligible =
+              guard.ok && (parsed as { verdictConfidence?: number }).verdictConfidence != null
+                ? Number((parsed as { verdictConfidence?: number }).verdictConfidence) >= 0.85
+                : false
+            ;(parsed as { guardrail?: { ok: boolean; reason?: string } }).guardrail = guard
           }
+
+          return { failure: failureMeta, ...parsed }
         } catch (err) {
-          console.error(`[analyze-failures] Failed to analyze ${failure.testName}:`, err)
+          console.error(`[analyze-failures] Failed to analyze ${failureMeta.testName}:`, err)
           return {
-            failure: {
-              testName: failure.testName,
-              file: failure.file,
-              status: failure.status,
-              duration: failure.duration,
-            },
-            analysis: 'Failed to analyze this failure',
+            failure: failureMeta,
+            analysis: isPipeline
+              ? 'Failed to analyze pipeline error — check server logs.'
+              : 'Failed to analyze this failure',
             rootCause: 'Analysis error',
             fix: { description: 'Unable to generate fix', changes: [] },
             confidence: 0,
@@ -375,7 +512,9 @@ export async function POST(request: NextRequest) {
     }
 
     // 10. Async abuse detection (non-blocking)
-    runAbuseDetection({ userId, apiKeyId: apiKeyRecord.id }).catch(() => undefined)
+    runAbuseDetection({ userId, apiKeyId: apiKeyRecord.id }).catch((err: unknown) => {
+      console.error('[analyze-failures] abuse detection failed', err)
+    })
 
     return NextResponse.json(responseBody)
   } catch (error) {

@@ -1,9 +1,34 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getCurrentUser } from '@/lib/auth/session'
 import { db } from '@/lib/db'
-import { testRuns } from '@/lib/db/schema'
+import { testRuns, testFailures } from '@/lib/db/schema'
 import { eq, and, sql } from 'drizzle-orm'
 import { extractRunIdFromReport, getLiveRunsForUser } from '@/lib/mcp-live-runs'
+
+async function loadFailuresForRun(runId: string, userId: string) {
+  const rows = await db
+    .select()
+    .from(testFailures)
+    .where(and(eq(testFailures.testRunId, runId), eq(testFailures.userId, userId)))
+    .orderBy(testFailures.createdAt)
+  return rows.map((r) => ({
+    id: r.id,
+    test_name: r.testName,
+    test_file: r.testFile,
+    tier: r.tier,
+    verdict: r.verdict,
+    verdict_source: r.verdictSource,
+    verdict_confidence: r.verdictConfidence != null ? Number(r.verdictConfidence) : null,
+    fix_target: r.fixTarget,
+    reason: r.reason,
+    suggested_patch: r.suggestedPatch ?? null,
+    evidence: r.evidence ?? null,
+    cluster_id: r.clusterId,
+    user_override: r.userOverride,
+    user_override_at: r.userOverrideAt?.toISOString() ?? null,
+    created_at: r.createdAt?.toISOString() ?? null,
+  }))
+}
 
 export async function GET(
   _request: NextRequest,
@@ -37,6 +62,7 @@ export async function GET(
         .limit(1)
 
       if (ingestedRow) {
+        const test_failures = await loadFailuresForRun(ingestedRow.id, user.id)
         const data = {
           id: ingestedRow.id,
           user_id: ingestedRow.userId,
@@ -52,6 +78,9 @@ export async function GET(
           report_json: ingestedRow.reportJson,
           ai_analysis: ingestedRow.aiAnalysis,
           coverage_metrics: ingestedRow.coverageMetrics ?? null,
+          tier_results: ingestedRow.tierResults ?? null,
+          pipeline_error: ingestedRow.pipelineError ?? null,
+          test_failures,
           framework: ingestedRow.framework,
           source: ingestedRow.source,
           created_at: ingestedRow.createdAt?.toISOString() ?? null,
@@ -83,6 +112,7 @@ export async function GET(
       return NextResponse.json({ error: 'Test run not found' }, { status: 404 })
     }
 
+    const test_failures = await loadFailuresForRun(row.id, user.id)
     const data = {
       id: row.id,
       user_id: row.userId,
@@ -98,6 +128,9 @@ export async function GET(
       report_json: row.reportJson,
       ai_analysis: row.aiAnalysis,
       coverage_metrics: row.coverageMetrics ?? null,
+      tier_results: row.tierResults ?? null,
+      pipeline_error: row.pipelineError ?? null,
+      test_failures,
       framework: row.framework,
       source: row.source,
       created_at: row.createdAt?.toISOString() ?? null,

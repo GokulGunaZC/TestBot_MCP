@@ -31,6 +31,10 @@ const ReportGenerator = require('./report-generator');
 const ArtifactUploader = require('./artifact-uploader');
 const DashboardLauncher = require('./dashboard-launcher');
 const AIAnalyzer = require('./ai-providers/index');
+const WebappClient = require('./webapp-client');
+const { startSecondaryServices, stopSecondaryServices } = require('./multi-service-starter');
+const { runExplorationPhase, EMPTY_ARTIFACT } = require('./exploration-phase');
+const { injectCredentials } = require('./credentials-injector');
 const Logger = require('./logger');
 const MCPTelemetryReporter = require('./mcp-telemetry');
 
@@ -41,6 +45,7 @@ const DEFAULT_TOTAL_BUDGET_MS = 3600000; // 60 minutes
 const DEFAULT_STAGE_CAPS_MS = {
   jira: 45000,
   context: 90000,
+  prdParse: 90000,
   generation: 360000,  // 6 minutes
   validation: 90000,
   execution: 2400000,  // 40 minutes
@@ -546,6 +551,15 @@ function evaluateGenerationQualityGates({ config, context, quality }) {
   };
 }
 
+// Optional reporter — installed by runPipeline when a HEALIX_API_KEY is present.
+// Every stage emits a `stage_budget_consumed` telemetry event through this so
+// dashboards can see "parsing took 62s of a 90s cap" without the run ingesting
+// first.
+let __stageBudgetReporter = null;
+function setStageBudgetReporter(fn) {
+  __stageBudgetReporter = typeof fn === 'function' ? fn : null;
+}
+
 async function withStageBudget(budget, stage, workFn) {
   const remainingMs = getBudgetRemainingMs(budget);
   if (remainingMs <= 0) {
@@ -554,10 +568,12 @@ async function withStageBudget(budget, stage, workFn) {
 
   const capMs = budget.stageCaps[stage] || remainingMs;
   const timeoutMs = Math.max(1000, Math.min(capMs, remainingMs));
+  const startedAt = Date.now();
 
   let timeoutRef;
+  let success = false;
   try {
-    return await Promise.race([
+    const result = await Promise.race([
       Promise.resolve().then(workFn),
       new Promise((_, reject) => {
         timeoutRef = setTimeout(() => {
@@ -565,9 +581,21 @@ async function withStageBudget(budget, stage, workFn) {
         }, timeoutMs);
       }),
     ]);
+    success = true;
+    return result;
   } finally {
     if (timeoutRef) {
       clearTimeout(timeoutRef);
+    }
+    if (__stageBudgetReporter) {
+      try {
+        __stageBudgetReporter({
+          stage,
+          consumedMs: Date.now() - startedAt,
+          capMs: timeoutMs,
+          success,
+        });
+      } catch { /* non-blocking */ }
     }
   }
 }
@@ -614,6 +642,14 @@ function emitPipelineTelemetry(reporter, payload) {
   });
 }
 
+// Optional fire-and-forget durable phase reporter. Populates
+// `test_runs.current_phase + current_phase_at` so a crashed run's dashboard can
+// show "last seen at tier-B auth probe 3 minutes ago".
+let __durablePhaseReporter = null;
+function setDurablePhaseReporter(fn) {
+  __durablePhaseReporter = typeof fn === 'function' ? fn : null;
+}
+
 /**
  * Write status update to disk so the caller can track progress.
  */
@@ -629,6 +665,9 @@ function updateStatus(statusDir, phase, data, telemetryReporter = null) {
       JSON.stringify(payload, null, 2)
     );
     emitPipelineTelemetry(telemetryReporter, payload);
+    if (__durablePhaseReporter) {
+      try { __durablePhaseReporter(payload); } catch { /* non-blocking */ }
+    }
   } catch (e) {
     Logger.error('PipelineWorker', 'Failed to write status', e);
   }
@@ -675,8 +714,8 @@ function classifyErrorCode(error) {
   if (message.includes('validation')) {
     return 'GENERATION_VALIDATION_FAILED';
   }
-  if (message.includes('openai')) {
-    return 'OPENAI_GENERATION_FAILED';
+  if (message.includes('openai') || message.includes('ai generation')) {
+    return 'AI_GENERATION_FAILED';
   }
   if (message.includes('minimum') && message.includes('generated')) {
     return 'MIN_TEST_COUNT_NOT_MET';
@@ -763,7 +802,7 @@ function buildUserFacingPipelineError(errorCode, error) {
     return `App server did not become reachable before timeout. Verify start command, base URL, and port settings in the config form.${detail}`;
   }
 
-  if (errorCode === 'OPENAI_KEY_MISSING' || errorCode === 'MISSING_HEALIX_API_KEY') {
+  if (errorCode === 'MISSING_HEALIX_API_KEY') {
     return 'HEALIX_API_KEY is required for AI test generation. Set it in your MCP config: "HEALIX_API_KEY": "tb_your_key_here".';
   }
 
@@ -795,7 +834,27 @@ function toImportPath(relativePath) {
   return normalized.startsWith('.') ? normalized : `./${normalized}`;
 }
 
-function getCursorFixtureContent(serializedInitScript) {
+/**
+ * Read the target project's package.json to decide whether Node will treat
+ * sibling `.js` files as ESM. An ambiguous `.js` fixture using `module.exports`
+ * inside a `"type": "module"` project fails at load with
+ *   "The requested module './__healix-fixture' does not provide an export named 'expect'"
+ * because Node parses it as ESM and synthesized named exports aren't available.
+ * This helper is the source of truth we use to emit the right body.
+ */
+function detectProjectModuleType(projectPath) {
+  if (!projectPath) return 'commonjs';
+  try {
+    const pkgPath = path.join(projectPath, 'package.json');
+    if (!fs.existsSync(pkgPath)) return 'commonjs';
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8'));
+    return pkg?.type === 'module' ? 'module' : 'commonjs';
+  } catch {
+    return 'commonjs';
+  }
+}
+
+function getCursorFixtureContent(serializedInitScript, moduleType = 'commonjs') {
   const ts = `import { test as base, expect, request } from '@playwright/test';
 
 const test = base.extend({
@@ -808,7 +867,22 @@ const test = base.extend({
 export { test, expect, request };
 `;
 
-  const js = `const { test: base, expect, request } = require('@playwright/test');
+  // Body must match the container's module system or Node will blow up at load.
+  // ESM projects ("type":"module"): named exports via `export { ... }`.
+  // CJS projects: `module.exports = { ... }`, our historical default.
+  const jsEsm = `import { test as base, expect, request } from '@playwright/test';
+
+const test = base.extend({
+  page: async ({ page }, use) => {
+    await page.addInitScript(${serializedInitScript});
+    await use(page);
+  },
+});
+
+export { test, expect, request };
+`;
+
+  const jsCjs = `const { test: base, expect, request } = require('@playwright/test');
 
 const test = base.extend({
   page: async ({ page }, use) => {
@@ -820,12 +894,17 @@ const test = base.extend({
 module.exports = { test, expect, request };
 `;
 
-  return { ts, js };
+  const js = moduleType === 'module' ? jsEsm : jsCjs;
+  return { ts, js, moduleType };
 }
 
-function ensureCursorFixtureFiles(generatedDir) {
+function ensureCursorFixtureFiles(generatedDir, projectPath = null) {
   const serializedInitScript = JSON.stringify(CURSOR_OVERLAY_INIT_SCRIPT);
-  const { ts, js } = getCursorFixtureContent(serializedInitScript);
+  // projectPath can be omitted only in tests; in production the caller passes
+  // it so we emit the correct module-system body for this project.
+  const resolvedProject = projectPath || path.resolve(generatedDir, '..', '..');
+  const moduleType = detectProjectModuleType(resolvedProject);
+  const { ts, js } = getCursorFixtureContent(serializedInitScript, moduleType);
 
   const fixtureTs = path.join(generatedDir, `${CURSOR_FIXTURE_BASENAME}.ts`);
   const fixtureJs = path.join(generatedDir, `${CURSOR_FIXTURE_BASENAME}.js`);
@@ -865,7 +944,7 @@ function applyMouseCursorOverlayToGeneratedTests({ projectPath, enabled }) {
     return { enabled: false, reason: 'no_generated_test_files' };
   }
 
-  const fixtureFiles = ensureCursorFixtureFiles(generatedDir);
+  const fixtureFiles = ensureCursorFixtureFiles(generatedDir, projectPath);
   let patchedFiles = 0;
   let skippedFiles = 0;
 
@@ -969,7 +1048,7 @@ function safeWriteGeneratedTest(testsDir, test, index, fallbackPrefix, usedFilen
   };
 }
 
-function ensurePlaywrightConfig(projectPath, projectInfo = {}) {
+function ensurePlaywrightConfig(projectPath, projectInfo = {}, roles = []) {
   const candidates = [
     'playwright.config.ts',
     'playwright.config.js',
@@ -988,8 +1067,46 @@ function ensurePlaywrightConfig(projectPath, projectInfo = {}) {
 
   // Generate playwright.config.ts
   const baseURL = projectInfo.baseURL || 'http://localhost:3000';
-  const startCommand = projectInfo.startCommand || '';
-  
+
+  // Phase D: emit tier-aware projects.
+  //   - tierA-public runs everything not tagged @auth or @api (the legacy default).
+  //   - tierB-auth-<role> runs tests tagged @auth under the role's storageState,
+  //     one project per verified role. Failed logins drop out here — the user
+  //     still gets Tier A + Tier C green.
+  //   - tierC-backend runs tests tagged @api (API-only, no browser session).
+  // Until the generator tags tests, @grepInvert on tierA-public means all
+  // current tests run once under tierA-public — backwards-compatible.
+  const verifiedRoles = (roles || []).filter((r) => r && r.loginVerified && r.storageStatePath);
+
+  // Per-tier retries live on the individual project so UI flakes don't get masked
+  // as hard failures and so tierC (backend) doesn't waste budget on retryable HTTP
+  // assertion bugs that are genuinely deterministic.
+  const tierBProjects = verifiedRoles.map((r) => `    {
+      name: 'tierB-auth-${String(r.role || 'user').replace(/[^a-zA-Z0-9_-]/g, '_')}',
+      grep: /@auth|@tierB/,
+      retries: 2,
+      use: {
+        ...devices['Desktop Chrome'],
+        storageState: ${JSON.stringify(r.storageStatePath)},
+      },
+    }`).join(',\n');
+
+  const projectsBlock = [
+    `    {
+      name: 'tierA-public',
+      grepInvert: /@auth|@tierB|@api|@tierC/,
+      retries: 2,
+      use: { ...devices['Desktop Chrome'] },
+    }`,
+    tierBProjects,
+    `    {
+      name: 'tierC-backend',
+      grep: /@api|@tierC/,
+      retries: 1,
+      use: { ...devices['Desktop Chrome'] },
+    }`,
+  ].filter(Boolean).join(',\n');
+
   const config = `import { defineConfig, devices } from '@playwright/test';
 
 export default defineConfig({
@@ -1010,17 +1127,17 @@ export default defineConfig({
     video: 'retain-on-failure',
   },
   projects: [
-    {
-      name: 'chromium',
-      use: { ...devices['Desktop Chrome'] },
-    },
+${projectsBlock}
   ],
 });
 `;
 
   const configPath = path.join(projectPath, 'playwright.config.ts');
   fs.writeFileSync(configPath, config, 'utf-8');
-  Logger.info('PipelineWorker', 'Created playwright.config.ts', { path: configPath });
+  Logger.info('PipelineWorker', 'Created playwright.config.ts', {
+    path: configPath,
+    tierBRoles: verifiedRoles.map((r) => r.role),
+  });
 }
 
 function resolvePlaywrightConfig(projectPath) {
@@ -1253,6 +1370,59 @@ async function validateGeneratedTestsWithList({ projectPath, validateGeneratedTe
   });
 }
 
+/**
+ * Build a structured diagnostics blob for pipeline-level failures — the things
+ * that go wrong BEFORE any test actually runs (validation, quality audit,
+ * server-start, etc.). This ends up on `error.diagnostics`, flows through the
+ * run report, and is rendered by the dashboard as a proper failure banner with
+ * the real stderr + a preview of one of the generated specs. Without this, the
+ * user sees only the generic "usually caused by missing test runner
+ * dependencies" message with no way to diagnose further.
+ */
+function buildPipelineDiagnostics({ projectPath, stage, reason, stderr, stdout, qualityAudit } = {}) {
+  const generatedDir = path.join(projectPath, 'tests', 'generated');
+  let firstSpecPreview = null;
+  let generatedSpecCount = 0;
+
+  try {
+    if (fs.existsSync(generatedDir)) {
+      const files = fs.readdirSync(generatedDir).filter((name) => /\.spec\.(ts|js)$/i.test(name));
+      generatedSpecCount = files.length;
+      if (files.length > 0) {
+        const firstPath = path.join(generatedDir, files[0]);
+        const raw = fs.readFileSync(firstPath, 'utf-8');
+        const lines = raw.split(/\r?\n/).slice(0, 80);
+        firstSpecPreview = { file: files[0], lines: lines.join('\n') };
+      }
+    }
+  } catch { /* best effort */ }
+
+  const truncate = (v, n) => (typeof v === 'string' ? v.slice(0, n) : null);
+
+  // Never emit an unknown stage/reason — run it through the stderr classifier
+  // so downstream banners always have structured fields the Cursor agent can
+  // act on.
+  const { classifyPipelineErrorFromStderr } = require('./failure-triage/pipeline-error-classifier');
+  const classified = classifyPipelineErrorFromStderr({
+    stderr: stderr || '',
+    stdout: stdout || '',
+    hintedStage: stage || null,
+  });
+
+  return {
+    kind: 'pipeline',
+    stage: stage && stage !== 'unknown' ? stage : classified.stage,
+    reason: reason || classified.reason,
+    errorCode: classified.errorCode,
+    userFacingMessage: classified.userFacingMessage,
+    stderr: truncate(stderr, 4000),
+    stdout: truncate(stdout, 4000),
+    firstSpecPreview,
+    generatedSpecCount,
+    qualityAuditErrors: qualityAudit?.errors || null,
+  };
+}
+
 function auditGeneratedTestQuality({ projectPath, testType, context }) {
   const generatedDir = path.join(projectPath, 'tests', 'generated');
   const summary = {
@@ -1463,11 +1633,11 @@ function installMissingDependencies(projectPath, testsDir) {
   }
 }
 
-async function maybeGenerateViaSaaS({ config, context, prdContent, testsDir, projectInfo }) {
+async function maybeGenerateViaSaaS({ config, context, prdContent, testsDir, projectInfo, parsedPRD, explorationArtifact, roles }) {
   const healixApiKey = process.env.HEALIX_API_KEY;
   if (!healixApiKey) {
     const err = new Error(
-      'Backend test generation requires HEALIX_API_KEY.\n' +
+      'Healix test generation requires HEALIX_API_KEY.\n' +
       'Please configure it in your MCP settings:\n' +
       '{\n' +
       '  "env": {\n' +
@@ -1484,63 +1654,27 @@ async function maybeGenerateViaSaaS({ config, context, prdContent, testsDir, pro
     return { generated: 0, files: [], skipped: true, reason: 'missing_context' };
   }
 
-  const dashboardUrl = process.env.HEALIX_DASHBOARD_URL || 'http://localhost:3000';
-  const fetchFn = global.fetch || require('node-fetch');
-
   const strictAI = strictAIEnabled(config);
 
-  let response;
-  try {
-    response = await fetchFn(`${dashboardUrl}/api/generate-tests`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        api_key: healixApiKey,
-        context,
-        testType: config.testType,
-        prd: prdContent || '',
-        projectInfo,
-        options: {
-          includeSmoke: true,
-          includeWorkflows: true,
-          includeErrorStates: true,
-          strictAIGeneration: strictAI,
-          coverageProfile: config.coverageProfile || 'qa-max',
-          minGeneratedTests: toFiniteNumber(config.minGeneratedTests, 50),
-        },
-      }),
-    });
-  } catch (networkError) {
-    const err = new Error(
-      `Backend test generation failed: Cannot reach ${dashboardUrl}.\n` +
-      `Please check that HEALIX_DASHBOARD_URL is correct and the server is running.\n` +
-      `Network error: ${networkError.message}`
-    );
-    err.code = 'BACKEND_UNREACHABLE';
-    throw err;
-  }
+  const client = new WebappClient({ apiKey: healixApiKey });
+  const payload = await client.generateTests({
+    context,
+    prd: prdContent || '',
+    parsedPRD: parsedPRD || null,
+    explorationArtifact: explorationArtifact || null,
+    roles: roles || [],
+    testType: config.testType,
+    projectInfo,
+    options: {
+      includeSmoke: true,
+      includeWorkflows: true,
+      includeErrorStates: true,
+      strictAIGeneration: strictAI,
+      coverageProfile: config.coverageProfile || 'qa-max',
+      minGeneratedTests: toFiniteNumber(config.minGeneratedTests, 50),
+    },
+  });
 
-  if (!response.ok) {
-    const text = await response.text().catch(() => '');
-    let errorDetail = text.slice(0, 400);
-    try {
-      const parsed = JSON.parse(text);
-      if (parsed.error) errorDetail = parsed.error;
-    } catch { /* use raw text */ }
-
-    const err = new Error(
-      `Backend test generation failed (HTTP ${response.status}).\n` +
-      `Please check:\n` +
-      `- HEALIX_API_KEY is valid and active\n` +
-      `- HEALIX_DASHBOARD_URL points to the correct server\n` +
-      `- Your account has sufficient credits\n` +
-      `Error: ${errorDetail}`
-    );
-    err.code = response.status === 401 ? 'INVALID_API_KEY' : response.status === 402 ? 'INSUFFICIENT_CREDITS' : 'BACKEND_ERROR';
-    throw err;
-  }
-
-  const payload = await response.json();
   const tests = Array.isArray(payload.tests) ? payload.tests : [];
   const used = new Set();
   const files = [];
@@ -1561,7 +1695,7 @@ async function maybeGenerateViaSaaS({ config, context, prdContent, testsDir, pro
   };
 }
 
-async function generateWithFallbackChain({ config, context, prdContent, runBudget, projectInfo }) {
+async function generateWithFallbackChain({ config, context, prdContent, runBudget, projectInfo, parsedPRD, explorationArtifact, roles }) {
   const generationMeta = {
     provider: null,
     selectedGenerator: null,
@@ -1586,6 +1720,13 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
       const error = new Error(`${generator} generation failed validation: ${validation.reason || 'unknown'}`);
       error.code = 'GENERATION_VALIDATION_FAILED';
       error.validation = validation;
+      error.diagnostics = buildPipelineDiagnostics({
+        projectPath: config.projectPath,
+        stage: 'validation',
+        reason: validation.reason,
+        stderr: validation.stderr,
+        stdout: validation.stdout,
+      });
       throw error;
     }
 
@@ -1602,6 +1743,14 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
         ...validation,
         qualityAudit,
       };
+      error.diagnostics = buildPipelineDiagnostics({
+        projectPath: config.projectPath,
+        stage: 'quality_audit',
+        reason: qualityAudit.errors.join(',') || 'quality_audit_failed',
+        stderr: null,
+        stdout: null,
+        qualityAudit,
+      });
       throw error;
     }
 
@@ -1675,6 +1824,9 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
       prdContent,
       testsDir,
       projectInfo,
+      parsedPRD: parsedPRD || null,
+      explorationArtifact: explorationArtifact || null,
+      roles: roles || [],
     });
 
     if (!saasResult.generated) {
@@ -1707,14 +1859,56 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
   };
 }
 
-async function maybeRunFailureTriage({ config, testResults, runBudget }) {
+async function maybeRunFailureTriage({ config, testResults, runBudget, runId }) {
   if (config.aiFailureAnalysis === false) {
-    return null;
+    return { analysis: null, evidenceBundles: [], verdicts: [], clusters: [] };
   }
 
   if (!testResults?.failures?.length) {
-    return null;
+    return { analysis: null, evidenceBundles: [], verdicts: [], clusters: [] };
   }
+
+  const limit = toFiniteNumber(config.aiFailureLimit || process.env.HEALIX_AI_TRIAGE_LIMIT, 8);
+  const cappedFailures = testResults.failures.slice(0, limit);
+
+  // Build evidence bundles before handing off to classifier + AI.
+  let bundleResult = { bundles: [], skipped: 0 };
+  try {
+    const { bundleFailures } = require('./failure-triage/evidence-bundler');
+    bundleResult = await bundleFailures({
+      failures: cappedFailures,
+      tests: testResults.tests || [],
+      projectPath: config.projectPath,
+      runId,
+    });
+  } catch (err) {
+    Logger.warn('PipelineWorker', 'Evidence bundler failed — falling back to raw failures', { error: err?.message });
+  }
+
+  // Run deterministic classifier first — high-confidence verdicts skip AI
+  // entirely, saving tokens and reducing the "blame the test" bias.
+  let classifierResult = { verdicts: [], clusters: [], aiEligibleIndexes: [] };
+  try {
+    const { classifyFailures } = require('./failure-triage/classifier');
+    classifierResult = classifyFailures(bundleResult.bundles);
+    Logger.info('PipelineWorker', 'Classifier completed', {
+      totalFailures: bundleResult.bundles.length,
+      aiEligible: classifierResult.aiEligibleIndexes.length,
+      clusters: classifierResult.clusters.length,
+    });
+  } catch (err) {
+    Logger.warn('PipelineWorker', 'Classifier failed — all failures will go to AI', { error: err?.message });
+    classifierResult.aiEligibleIndexes = bundleResult.bundles.map((_, i) => i);
+  }
+
+  // Annotate bundles with verdicts in-place so downstream consumers (report,
+  // ingest, dashboard) have them.
+  bundleResult.bundles.forEach((bundle, idx) => {
+    const verdict = classifierResult.verdicts[idx];
+    if (verdict) {
+      bundle.classifierVerdict = verdict;
+    }
+  });
 
   const providerConfig = resolveFailureAnalysisProvider(config);
   if (providerConfig.reason) {
@@ -1722,16 +1916,41 @@ async function maybeRunFailureTriage({ config, testResults, runBudget }) {
       reason: providerConfig.reason,
       provider: providerConfig.provider,
     });
-    return null;
+    return {
+      analysis: null,
+      evidenceBundles: bundleResult.bundles,
+      verdicts: classifierResult.verdicts,
+      clusters: classifierResult.clusters,
+    };
   }
 
-  const limit = toFiniteNumber(config.aiFailureLimit || process.env.HEALIX_AI_TRIAGE_LIMIT, 8);
-  const failures = testResults.failures.slice(0, limit);
+  // Only send ambiguous / low-confidence failures to AI. If none remain, skip.
+  const aiPayload = classifierResult.aiEligibleIndexes.length > 0
+    ? classifierResult.aiEligibleIndexes.map((i) => bundleResult.bundles[i])
+    : [];
+
+  if (aiPayload.length === 0) {
+    Logger.info('PipelineWorker', 'All failures resolved deterministically — skipping AI call');
+    return {
+      analysis: null,
+      evidenceBundles: bundleResult.bundles,
+      verdicts: classifierResult.verdicts,
+      clusters: classifierResult.clusters,
+    };
+  }
+
+  // Fallback: if bundler failed, ship raw failures so the old v1 path keeps working.
+  const payload = bundleResult.bundles.length > 0 ? aiPayload : cappedFailures;
 
   return withStageBudget(runBudget, 'aiTriage', async () => {
     const analyzer = AIAnalyzer.create(providerConfig.provider, providerConfig.apiKey);
-    const analysis = await analyzer.analyzeFailures(failures);
-    return Array.isArray(analysis) ? analysis : null;
+    const analysis = await analyzer.analyzeFailures(payload);
+    return {
+      analysis: Array.isArray(analysis) ? analysis : null,
+      evidenceBundles: bundleResult.bundles,
+      verdicts: classifierResult.verdicts,
+      clusters: classifierResult.clusters,
+    };
   });
 }
 
@@ -1742,6 +1961,32 @@ async function runPipeline(config, runId) {
   const statusDir = path.join(config.projectPath, 'healix-reports', '.runs', runId);
   ensureDir(statusDir);
   const telemetryReporter = new MCPTelemetryReporter();
+
+  // Install durable-state + stage-budget reporters (fire-and-forget). Both are
+  // best-effort: if the webapp is unreachable the pipeline keeps running.
+  const durableClient = process.env.HEALIX_API_KEY
+    ? new WebappClient({ apiKey: process.env.HEALIX_API_KEY })
+    : null;
+  if (durableClient) {
+    setDurablePhaseReporter((payload) => {
+      durableClient.reportPhase({
+        runId,
+        phase: payload.phase,
+        metadata: { message: payload.message, errorCode: payload.errorCode || null },
+      }).catch(() => undefined);
+    });
+    setStageBudgetReporter(({ stage, consumedMs, capMs, success }) => {
+      durableClient.reportPhase({
+        runId,
+        phase: `stage:${stage}`,
+        stageBudget: { stage, consumedMs, capMs },
+        metadata: { success },
+      }).catch(() => undefined);
+    });
+  } else {
+    setDurablePhaseReporter(null);
+    setStageBudgetReporter(null);
+  }
 
   // Kill any leftover Healix-started dev server from a previous run.
   // We only kill what Healix wrote into this PID file — nothing else.
@@ -1901,6 +2146,7 @@ async function runPipeline(config, runId) {
     // -------------------------------------------------------
     let prdContent = null;
     const prdContents = [];
+    const prdErrors = [];
 
     if (config.prdFile) {
       try {
@@ -1908,7 +2154,8 @@ async function runPipeline(config, runId) {
         prdContents.push(prdContent);
         Logger.info('PipelineWorker', 'Read PRD file', { path: config.prdFile, length: prdContent.length });
       } catch (error) {
-        Logger.warn('PipelineWorker', 'Could not read PRD file', { path: config.prdFile, reason: error.message });
+        Logger.error('PipelineWorker', 'Could not read PRD file', { path: config.prdFile, reason: error.message });
+        prdErrors.push({ path: config.prdFile, reason: error.message });
       }
     }
 
@@ -1920,12 +2167,87 @@ async function runPipeline(config, runId) {
           prdContents.push(content);
           Logger.info('PipelineWorker', 'Read additional PRD file', { path: prdFilePath, length: content.length });
         } catch (error) {
-          Logger.warn('PipelineWorker', 'Could not read PRD file', { path: prdFilePath, reason: error.message });
+          Logger.error('PipelineWorker', 'Could not read PRD file', { path: prdFilePath, reason: error.message });
+          prdErrors.push({ path: prdFilePath, reason: error.message });
         }
       }
     }
 
+    if (prdErrors.length > 0) {
+      // Surface PRD-read failures as a run-level warning event instead of silently dropping them.
+      updateStatus(statusDir, 'warning', {
+        runId,
+        message: `Some PRD file(s) could not be read and were skipped (${prdErrors.length}).`,
+        prdErrors,
+      }, telemetryReporter);
+      process.stderr.write(`[HEALIX] PRD read failures for run ${runId}: ${JSON.stringify(prdErrors)}\n`);
+    }
+
     const combinedPrdContent = prdContents.length > 0 ? prdContents.join('\n\n---\n\n') : null;
+
+    // -------------------------------------------------------
+    // 3a. Parse PRD into structured acceptance criteria (Phase B).
+    //
+    // Three paths converge here:
+    //   (1) User uploaded a PRD file      → config.prdFile / config.prdFiles → combinedPrdContent
+    //   (2) Cursor agent synthesised a PRD → submitted as prd text → persisted to disk upstream → same
+    //   (3) No PRD at all                  → combinedPrdContent === null → skip entirely, generator
+    //                                        falls back to context + exploration artifacts alone.
+    //
+    // If the /api/parse-prd call fails we don't kill the run — the raw PRD string is still
+    // passed down and the generator degrades to free-form PRD mode.
+    // -------------------------------------------------------
+    let parsedPRD = null;
+    if (combinedPrdContent && config.generateTests) {
+      updateStatus(statusDir, 'parsing_prd', {
+        runId,
+        message: 'Parsing PRD into structured acceptance criteria...',
+      }, telemetryReporter);
+      try {
+        const client = new WebappClient({ apiKey: process.env.HEALIX_API_KEY });
+        const parseResponse = await withStageBudget(runBudget, 'prdParse', () =>
+          client.parsePRD({ prdContent: combinedPrdContent })
+        );
+        parsedPRD = parseResponse?.parsedPRD || null;
+        if (parsedPRD) {
+          try {
+            fs.writeFileSync(
+              path.join(statusDir, 'parsed-prd.json'),
+              JSON.stringify(parsedPRD, null, 2),
+              'utf-8'
+            );
+          } catch (writeErr) {
+            Logger.warn('PipelineWorker', 'Failed to cache parsed-prd.json', { reason: writeErr.message });
+          }
+          const featureCount = Array.isArray(parsedPRD.features) ? parsedPRD.features.length : 0;
+          const acCount = Array.isArray(parsedPRD.features)
+            ? parsedPRD.features.reduce((sum, f) =>
+                sum + (Array.isArray(f.userStories)
+                  ? f.userStories.reduce((s, st) =>
+                      s + (Array.isArray(st.acceptanceCriteria) ? st.acceptanceCriteria.length : 0), 0)
+                  : 0), 0)
+            : 0;
+          Logger.info('PipelineWorker', 'PRD parsed', { featureCount, acCount, cached: !!parseResponse?.cached });
+          updateStatus(statusDir, 'prd_parsed', {
+            runId,
+            message: `Parsed PRD: ${featureCount} feature(s), ${acCount} acceptance criteria`,
+            featureCount,
+            acCount,
+            cached: !!parseResponse?.cached,
+          }, telemetryReporter);
+        }
+      } catch (parseErr) {
+        Logger.warn('PipelineWorker', 'PRD parse failed — falling back to raw PRD text', {
+          reason: parseErr.message,
+          code: parseErr.code,
+        });
+        updateStatus(statusDir, 'warning', {
+          runId,
+          message: `PRD parsing failed — continuing with raw PRD text. (${parseErr.message})`,
+        }, telemetryReporter);
+        // parsedPRD stays null; generator will fall back to raw prd.
+      }
+    }
 
     const projectInfo = {
       name: config.projectName,
@@ -1933,7 +2255,81 @@ async function runPipeline(config, runId) {
       baseURL: config.baseURL,
       startCommand: config.startCommand,
       testCredentials: config.testCredentials,
+      services: Array.isArray(config.services) ? config.services : undefined,
+      apiOnly: !!config.apiOnly,
     };
+
+    // -------------------------------------------------------
+    // 3b. Browser-use exploration (Phase C). Opt-in via config.enableExploration
+    // or HEALIX_ENABLE_EXPLORATION=1. Degrades gracefully: if browser-use isn't
+    // installed, or exploration fails, we continue with an empty artifact and
+    // the generator falls back to PRD + static context alone.
+    // -------------------------------------------------------
+    let explorationArtifact = { ...EMPTY_ARTIFACT };
+    // Exploration is ON by default now that we have a Playwright heuristic
+    // fallback — the user can still opt out via config.skipExploration or
+    // HEALIX_SKIP_EXPLORATION=1 if, e.g., the dev server doesn't come up.
+    const explorationSkipped =
+      config.skipExploration === true
+      || process.env.HEALIX_SKIP_EXPLORATION === '1';
+    if (!explorationSkipped) {
+      updateStatus(statusDir, 'exploring', {
+        runId,
+        message: 'Exploring app with browser-use...',
+      }, telemetryReporter);
+      try {
+        const result = await runExplorationPhase({
+          statusDir,
+          baseURL: config.baseURL,
+          credentials: config.testCredentials,
+          skipExploration: explorationSkipped,
+          totalTimeoutMs: 120_000,
+        });
+        explorationArtifact = result.artifact;
+        updateStatus(statusDir, 'explored', {
+          runId,
+          message: `Exploration ${result.source}${result.reason ? ` (${result.reason})` : ''}`,
+          source: result.source,
+          reason: result.reason || null,
+          routeCount: (result.artifact?.routes || []).length,
+          keyFlowCount: (result.artifact?.keyFlows || []).length,
+        }, telemetryReporter);
+      } catch (explErr) {
+        Logger.warn('PipelineWorker', 'Exploration phase failed (best-effort)', { reason: explErr.message });
+      }
+    }
+
+    // -------------------------------------------------------
+    // 3c. Credential injection (Phase D). For each testCredentials entry,
+    // drive a headless login, persist storageState to .healix/auth-state-<role>.json,
+    // and expose the role list to the generator so Tier B tests can run under
+    // the right role. Graceful degradation: if login fails for a role, that
+    // role is excluded from Tier B (but Tier A + Tier C continue).
+    // -------------------------------------------------------
+    let roles = [];
+    if (Array.isArray(config.testCredentials) && config.testCredentials.length > 0) {
+      updateStatus(statusDir, 'auth_injecting', {
+        runId,
+        message: `Verifying credentials for ${config.testCredentials.length} role(s)...`,
+      }, telemetryReporter);
+      try {
+        roles = await injectCredentials({
+          projectPath: config.projectPath,
+          baseURL: config.baseURL,
+          credentials: config.testCredentials,
+          authFlow: explorationArtifact?.authFlow || null,
+        });
+        const verifiedCount = roles.filter((r) => r.loginVerified).length;
+        updateStatus(statusDir, 'auth_injected', {
+          runId,
+          message: `${verifiedCount}/${roles.length} role login(s) verified`,
+          roles: roles.map((r) => ({ role: r.role, loginVerified: !!r.loginVerified, reason: r.reason || null })),
+        }, telemetryReporter);
+      } catch (credErr) {
+        Logger.warn('PipelineWorker', 'Credential injection failed (best-effort)', { reason: credErr.message });
+        roles = [];
+      }
+    }
 
     // -------------------------------------------------------
     // 4. Generate tests
@@ -1949,6 +2345,9 @@ async function runPipeline(config, runId) {
         config,
         context: codebaseContext,
         prdContent: combinedPrdContent,
+        parsedPRD,
+        explorationArtifact,
+        roles,
         runBudget,
         projectInfo,
       });
@@ -1957,7 +2356,7 @@ async function runPipeline(config, runId) {
       fallbackUsed = !!generationMeta?.fallbackUsed;
 
       // Ensure playwright.config.ts exists after test generation
-      ensurePlaywrightConfig(config.projectPath, projectInfo);
+      ensurePlaywrightConfig(config.projectPath, projectInfo, roles);
 
       const qualityScan = collectGenerationQuality(config.projectPath);
       const qualityGate = evaluateGenerationQualityGates({
@@ -2085,6 +2484,34 @@ async function runPipeline(config, runId) {
       }
     };
 
+    // Monorepo multi-service startup: if the detector found both a frontend and
+    // a backend, start the backend here BEFORE Playwright launches the primary
+    // (frontend) server. Secondary service PIDs are tracked in
+    // healix-reports/.healix-services.pids and cleaned up on error or on the
+    // next pipeline run's boot.
+    if (Array.isArray(config.services) && config.services.length > 1) {
+      try {
+        const started = await startSecondaryServices({
+          projectPath: config.projectPath,
+          services: config.services,
+          waitMs: toFiniteNumber(config.serverStartTimeoutMs, 60_000),
+        });
+        if (started.length > 0) {
+          updateStatus(statusDir, 'secondary_services_started', {
+            runId,
+            message: `Started ${started.length} secondary service(s)`,
+            services: started.map((s) => ({
+              role: s.service.role,
+              port: s.service.port,
+              ready: s.ready,
+            })),
+          }, telemetryReporter);
+        }
+      } catch (err) {
+        Logger.warn('PipelineWorker', 'Failed to start secondary services — continuing with primary only', { reason: err.message });
+      }
+    }
+
     playwright = new PlaywrightIntegration({
       ...config,
       timeout: executionTimeout,
@@ -2148,6 +2575,15 @@ async function runPipeline(config, runId) {
       failed: testResults.failed,
     });
     phaseResults = testResults.phaseResults || null;
+
+    let tierResults = null;
+    try {
+      const tierMerger = new ResultsMerger({ projectPath: config.projectPath });
+      tierResults = tierMerger.computeTierResults(testResults.tests || []);
+      testResults.tierResults = tierResults;
+    } catch (tierErr) {
+      Logger.warn('PipelineWorker', 'Failed to compute tier results', { reason: tierErr.message });
+    }
 
     updateStatus(statusDir, 'tests_complete', {
       runId,
@@ -2219,15 +2655,26 @@ async function runPipeline(config, runId) {
     // 6. Optional AI failure triage
     // -------------------------------------------------------
     let aiAnalysis = null;
+    let evidenceBundles = [];
+    let classifierVerdicts = [];
+    let failureClusters = [];
     try {
-      aiAnalysis = await maybeRunFailureTriage({
+      const triage = await maybeRunFailureTriage({
         config,
         testResults,
         runBudget,
+        runId,
       });
+      aiAnalysis = triage?.analysis ?? null;
+      evidenceBundles = triage?.evidenceBundles ?? [];
+      classifierVerdicts = triage?.verdicts ?? [];
+      failureClusters = triage?.clusters ?? [];
     } catch (triageError) {
       Logger.warn('PipelineWorker', 'AI failure triage failed', { reason: triageError.message });
       aiAnalysis = null;
+      evidenceBundles = [];
+      classifierVerdicts = [];
+      failureClusters = [];
     }
 
     // -------------------------------------------------------
@@ -2260,7 +2707,12 @@ async function runPipeline(config, runId) {
         generationQuality,
         requirementsCoverage,
         phaseResults,
+        tierResults,
         fallbackUsed,
+        failures: evidenceBundles,
+        flakyCount: testResults.flaky || 0,
+        classifierVerdicts,
+        failureClusters,
         api_key: healixApiKey,
         dashboard_url: healixDashboardUrl,
       });
@@ -2417,12 +2869,17 @@ async function runPipeline(config, runId) {
       dashboard: dashboardUrl || report.url,
       runId,
     });
+
+    // Stop any secondary (monorepo) services we started — primary server is
+    // handled by playwright.runTests()'s own teardown.
+    try { stopSecondaryServices(config.projectPath); } catch { /* ignore */ }
   } catch (error) {
     // Ensure the dev server is killed immediately even when the budget timeout
     // races ahead of playwright.runTests()'s own finally{stopServer()} block.
     if (playwright) {
       try { playwright.stopServer(); } catch { /* ignore */ }
     }
+    try { stopSecondaryServices(config.projectPath); } catch { /* ignore */ }
 
     const errorCode = classifyErrorCode(error);
     const userFacingError = buildUserFacingPipelineError(errorCode, error);
@@ -2503,6 +2960,41 @@ async function runPipeline(config, runId) {
 
       const healixApiKey = process.env.HEALIX_API_KEY;
       const healixDashboardUrl = process.env.HEALIX_DASHBOARD_URL || 'http://localhost:3000';
+
+      // Fall back to stderr-pattern classification when the upstream thrower
+      // didn't attach diagnostics (e.g. PlaywrightIntegration.runTests throws
+      // a plain Error on exit-code !=0 with no diagnostics). Without this the
+      // banner used to render `stage: unknown / reason: unknown_reason` — see
+      // pm-app regression 2026-04-18.
+      const { classifyPipelineErrorFromStderr } = require('./failure-triage/pipeline-error-classifier');
+      const stderrForClassifier = error.diagnostics?.stderr || error.message || '';
+      const classification = classifyPipelineErrorFromStderr({
+        stderr: stderrForClassifier,
+        stdout: error.diagnostics?.stdout || '',
+        hintedStage: error.diagnostics?.stage
+          || (errorCode === 'GENERATION_VALIDATION_FAILED' ? 'validation' : null),
+      });
+
+      const pipelineError = {
+        errorCode,
+        stage: error.diagnostics?.stage && error.diagnostics.stage !== 'unknown'
+          ? error.diagnostics.stage
+          : classification.stage,
+        reason: error.diagnostics?.reason || classification.reason,
+        userFacingMessage: userFacingError || classification.userFacingMessage,
+        technicalMessage: technicalError,
+        stderr: error.diagnostics?.stderr || (typeof error.message === 'string' ? error.message.slice(0, 4000) : null),
+        stdout: error.diagnostics?.stdout || null,
+        firstSpecPreview: error.diagnostics?.firstSpecPreview || null,
+        generatedSpecCount: error.diagnostics?.generatedSpecCount || 0,
+        qualityAuditErrors: error.diagnostics?.qualityAuditErrors || null,
+      };
+      // Mark the synthetic row so the dashboard can hide it when the banner
+      // carries full diagnostics — otherwise stats strip double-counts it as
+      // a failed test (Total 1 / Failed 1 with zero real runs).
+      syntheticFailure.isPipelineSynthetic = true;
+      syntheticTestResults.tests[0].isPipelineSynthetic = true;
+
       const errorReport = await reportGen.generate({
         projectPath: config.projectPath,
         projectName: config.projectName,
@@ -2515,6 +3007,7 @@ async function runPipeline(config, runId) {
         requirementsCoverage,
         phaseResults,
         fallbackUsed,
+        pipelineError,
         api_key: healixApiKey,
         dashboard_url: healixDashboardUrl,
       });
@@ -2591,4 +3084,7 @@ module.exports = {
   strictAIEnabled,
   classifyErrorCode,
   buildUserFacingPipelineError,
+  detectProjectModuleType,
+  getCursorFixtureContent,
+  ensureCursorFixtureFiles,
 };

@@ -51,25 +51,38 @@ export async function recordAiCall(params: {
   tokensPrompt?: number
   tokensCompletion?: number
   tokensTotal?: number
+  // NEW: per-agent attribution. When present, this row becomes queryable as
+  //   SELECT agent, SUM(tokens_total), AVG(latency_ms) FROM mcp_telemetry_events GROUP BY agent
+  // which drives the per-agent dashboards and prompt-tuning workflow.
+  agent?: string
+  latencyMs?: number
+  success?: boolean
+  errorCode?: string | null
+  runId?: string | null
 }): Promise<void> {
   try {
     const costUsd =
       params.tokensPrompt !== undefined && params.tokensCompletion !== undefined
         ? computeInternalCost(params.tokensPrompt, params.tokensCompletion).toFixed(8)
         : null
+    const success = params.success ?? true
     await db.insert(mcpTelemetryEvents).values({
       userId: params.userId,
       apiKeyId: params.apiKeyId,
       source: 'healix-webapp',
       toolName: params.endpoint,
       eventType: 'ai_call',
-      status: 'info',
-      success: true,
+      status: success ? 'info' : 'error',
+      success,
+      errorCode: params.errorCode ?? null,
+      runId: params.runId ?? null,
       modelUsed: params.modelUsed ?? null,
       tokensPrompt: params.tokensPrompt ?? null,
       tokensCompletion: params.tokensCompletion ?? null,
       tokensTotal: params.tokensTotal ?? null,
       costUsd: costUsd,
+      agent: params.agent ?? null,
+      latencyMs: Number.isFinite(params.latencyMs) ? params.latencyMs! : null,
     })
   } catch {
     // Non-blocking — don't fail the request if this insert fails

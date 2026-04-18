@@ -6,6 +6,7 @@ import { Profile } from '@/lib/types/database'
 import Card from '@/components/ui/Card'
 import Button from '@/components/ui/Button'
 import Badge from '@/components/ui/Badge'
+import { toDisplayUnits } from '@/lib/token-units'
 
 const PLANS = [
   {
@@ -69,12 +70,8 @@ const PLANS = [
   },
 ] as const
 
-// 1 displayed unit = 4,800 real OpenAI tokens → Starter (2.4M) shows 500, Team (4.8M) shows 1,000
-const REAL_TOKENS_PER_UNIT = 4_800
-
-function toDisplayUnits(realTokens: number): number {
-  return Math.floor(realTokens / REAL_TOKENS_PER_UNIT)
-}
+// Display ratio + toDisplayUnits imported from @/lib/tokens so the billing
+// page, the sidebar, and the home plan card all derive from the same source.
 
 function TokenMeter({ remaining, total }: { remaining: number; total: number }) {
   const pct = total > 0 ? Math.min(100, (remaining / total) * 100) : 0

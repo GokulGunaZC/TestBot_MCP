@@ -1,4 +1,4 @@
-import { test, expect } from '../__testbot-fixture';
+import { test, expect } from '../__healix-fixture';
 import { execSync } from 'child_process';
 import path from 'path';
 

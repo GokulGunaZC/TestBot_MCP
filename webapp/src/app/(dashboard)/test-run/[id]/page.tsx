@@ -4,7 +4,7 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import { useParams } from 'next/navigation';
 import Link from 'next/link';
 import { motion, AnimatePresence } from 'framer-motion';
-import type { TestRun } from '@/lib/types/database';
+import type { TestRun, TestFailure, FailureVerdict } from '@/lib/types/database';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -595,9 +595,303 @@ function SectionOverview({ sections }: { sections: SectionDatum[] }) {
   );
 }
 
+// ─── Failure verdict chip / evidence panel / override bar ──────────────────
+
+const VERDICT_META: Record<FailureVerdict, { label: string; cls: string; dot: string }> = {
+  test_is_wrong: { label: 'Test is wrong',  cls: 'bg-amber-500/15 text-amber-300 border-amber-500/30', dot: 'bg-amber-400' },
+  app_is_wrong:  { label: 'App regression', cls: 'bg-red-500/15 text-red-300 border-red-500/30',       dot: 'bg-red-400' },
+  environment:   { label: 'Environment',    cls: 'bg-zinc-500/20 text-zinc-300 border-zinc-400/30',    dot: 'bg-zinc-400' },
+  ambiguous:     { label: 'Ambiguous',      cls: 'bg-blue-500/15 text-blue-300 border-blue-500/30',    dot: 'bg-blue-400' },
+  flake:         { label: 'Flake',          cls: 'bg-yellow-500/15 text-yellow-300 border-yellow-500/30', dot: 'bg-yellow-400' },
+};
+
+function VerdictChip({ verdict, confidence, source, overridden }: { verdict: FailureVerdict; confidence?: number | null; source?: string; overridden?: boolean }) {
+  const meta = VERDICT_META[verdict] ?? VERDICT_META.ambiguous;
+  const conf = typeof confidence === 'number' ? Math.round(confidence * 100) : null;
+  return (
+    <span className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[11px] font-semibold border ${meta.cls}`}>
+      <span className={`w-1.5 h-1.5 rounded-full ${meta.dot}`} />
+      {meta.label}
+      {conf !== null && !overridden && <span className="text-white/60 tabular-nums">· {conf}%</span>}
+      {overridden && <span className="text-white/60 uppercase tracking-wider">· your call</span>}
+      {!overridden && source === 'classifier' && <span className="text-white/40 text-[10px] uppercase tracking-wider">· rule</span>}
+      {!overridden && source === 'ai' && <span className="text-white/40 text-[10px] uppercase tracking-wider">· ai</span>}
+    </span>
+  );
+}
+
+function OverrideBar({ runId, failureId, current, aiVerdict, onOverride }: {
+  runId: string;
+  failureId: string;
+  current: FailureVerdict | null;
+  aiVerdict: FailureVerdict;
+  onOverride: (v: FailureVerdict) => void;
+}) {
+  const [submitting, setSubmitting] = useState<FailureVerdict | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  const submit = async (verdict: FailureVerdict) => {
+    setSubmitting(verdict);
+    setErr(null);
+    try {
+      const res = await fetch(`/api/test-runs/${runId}/failure-verdict`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ failureId, override: verdict }),
+      });
+      if (!res.ok) {
+        const j = await res.json().catch(() => ({}));
+        throw new Error(j?.error || `HTTP ${res.status}`);
+      }
+      onOverride(verdict);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : 'failed');
+    } finally {
+      setSubmitting(null);
+    }
+  };
+
+  const btn = (verdict: FailureVerdict, label: string, cls: string) => {
+    const active = current === verdict;
+    const busy = submitting === verdict;
+    return (
+      <button
+        onClick={(e) => { e.stopPropagation(); submit(verdict); }}
+        disabled={!!submitting}
+        className={`px-2.5 py-1 rounded-md text-[11px] font-semibold transition-all border ${active ? cls : 'bg-white/5 text-[#8BA4C8] border-white/10 hover:border-white/25'} ${busy ? 'opacity-60' : ''}`}
+      >
+        {busy ? '…' : label}
+      </button>
+    );
+  };
+
+  return (
+    <div className="flex flex-wrap items-center gap-2">
+      <span className="text-[10px] uppercase tracking-wider text-[#4A6280] font-semibold">Your verdict:</span>
+      {btn('test_is_wrong', '🔧 Test wrong', VERDICT_META.test_is_wrong.cls)}
+      {btn('app_is_wrong',  '🐛 App wrong',  VERDICT_META.app_is_wrong.cls)}
+      {btn('flake',         '💨 Flake',      VERDICT_META.flake.cls)}
+      {current && current !== aiVerdict && (
+        <span className="text-[10px] text-[#8BA4C8] italic">
+          You overrode the AI ({VERDICT_META[aiVerdict]?.label ?? aiVerdict}).
+        </span>
+      )}
+      {err && <span className="text-[10px] text-red-400">{err}</span>}
+    </div>
+  );
+}
+
+interface EvidenceShape {
+  trace?: {
+    failedAction?: { name?: string; selector?: string | null; url?: string | null; errorText?: string };
+    domAtFailure?: { bodyTextSample?: string; visibleButtons?: string[]; visibleInputs?: string[] };
+    networkAtFailure?: Array<{ url: string; method?: string; status: number; duration?: number }>;
+    consoleAtFailure?: string[];
+    preFailureScreenshot?: { path?: string } | null;
+  };
+  testSource?: string;
+  acceptanceCriterion?: { tag?: string; text?: string } | null;
+  explorationRoute?: { url?: string; title?: string | null; elements?: Array<{ selector?: string; label?: string; type?: string }> } | null;
+  tier?: string | null;
+  role?: string | null;
+}
+
+function EvidencePanel({ failure }: { failure: TestFailure }) {
+  const [tab, setTab] = useState<'test' | 'app' | 'ac' | 'patch'>('test');
+  const evidence: EvidenceShape = (failure.evidence ?? {}) as EvidenceShape;
+  const patch = failure.suggested_patch as null | {
+    file?: string; lineStart?: number; lineEnd?: number;
+    oldCode?: string; newCode?: string; preservesRequirementTag?: boolean;
+  };
+
+  const Tab = ({ k, label }: { k: typeof tab; label: string }) => (
+    <button
+      onClick={(e) => { e.stopPropagation(); setTab(k); }}
+      className={`px-3 py-1.5 text-[11px] font-semibold uppercase tracking-wider rounded-t-md transition-colors ${
+        tab === k
+          ? 'bg-white/10 text-[#F0F6FF] border-b-2 border-[#60A5FA]'
+          : 'text-[#4A6280] hover:text-[#8BA4C8]'
+      }`}
+    >{label}</button>
+  );
+
+  const failedAction = evidence.trace?.failedAction;
+  const dom = evidence.trace?.domAtFailure;
+  const net = evidence.trace?.networkAtFailure ?? [];
+  const ac = evidence.acceptanceCriterion;
+
+  return (
+    <div className="rounded-xl bg-white/[0.02] border border-white/10 overflow-hidden">
+      <div className="flex items-center gap-1 px-3 pt-2 border-b border-white/5">
+        <Tab k="test"  label="Test asked for" />
+        <Tab k="app"   label="App rendered" />
+        <Tab k="ac"    label="AC says" />
+        <Tab k="patch" label={patch ? 'Suggested patch' : 'No patch'} />
+      </div>
+      <div className="p-3">
+        {tab === 'test' && (
+          <div className="flex flex-col gap-2">
+            {failedAction?.selector && (
+              <div>
+                <div className="text-[10px] uppercase tracking-wider text-[#4A6280] font-semibold mb-1">Failed action</div>
+                <code className="text-[12px] font-mono text-[#F0F6FF] block break-all">
+                  {failedAction.name ?? 'action'}({failedAction.selector})
+                </code>
+                {failedAction.errorText && (
+                  <pre className="mt-1 text-red-300/80 text-[11px] font-mono whitespace-pre-wrap">{failedAction.errorText}</pre>
+                )}
+              </div>
+            )}
+            {evidence.testSource ? (
+              <div>
+                <div className="text-[10px] uppercase tracking-wider text-[#4A6280] font-semibold mb-1">Test source</div>
+                <pre className="text-[11.5px] font-mono text-[#D8E8FF]/85 whitespace-pre-wrap bg-black/25 rounded p-2 max-h-72 overflow-auto">{evidence.testSource}</pre>
+              </div>
+            ) : (
+              <div className="text-[#4A6280] text-xs italic">No test source captured.</div>
+            )}
+          </div>
+        )}
+        {tab === 'app' && (
+          <div className="flex flex-col gap-2">
+            {dom?.bodyTextSample ? (
+              <div>
+                <div className="text-[10px] uppercase tracking-wider text-[#4A6280] font-semibold mb-1">DOM at failure</div>
+                <pre className="text-[11.5px] font-mono text-[#D8E8FF]/85 whitespace-pre-wrap bg-black/25 rounded p-2 max-h-48 overflow-auto">{dom.bodyTextSample}</pre>
+              </div>
+            ) : (
+              <div className="text-[#4A6280] text-xs italic">No DOM snapshot captured.</div>
+            )}
+            {(dom?.visibleButtons?.length ?? 0) > 0 && (
+              <div>
+                <div className="text-[10px] uppercase tracking-wider text-[#4A6280] font-semibold mb-1">Visible buttons</div>
+                <div className="flex flex-wrap gap-1">
+                  {dom!.visibleButtons!.slice(0, 30).map((b, i) => (
+                    <span key={i} className="px-1.5 py-0.5 rounded bg-white/5 text-[#D8E8FF]/80 text-[10px] font-mono">{b}</span>
+                  ))}
+                </div>
+              </div>
+            )}
+            {net.length > 0 && (
+              <div>
+                <div className="text-[10px] uppercase tracking-wider text-[#4A6280] font-semibold mb-1">Recent network</div>
+                <div className="flex flex-col gap-0.5">
+                  {net.slice(-10).map((r, i) => (
+                    <div key={i} className={`text-[11px] font-mono ${r.status >= 500 ? 'text-red-400' : r.status >= 400 ? 'text-amber-400' : 'text-[#8BA4C8]'}`}>
+                      {r.status} {r.method ?? 'GET'} {r.url}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+        {tab === 'ac' && (
+          ac?.text ? (
+            <div>
+              {ac.tag && (
+                <div className="text-[10px] uppercase tracking-wider text-[#4A6280] font-semibold mb-1 font-mono">{ac.tag}</div>
+              )}
+              <div className="text-[#D8E8FF] text-sm leading-relaxed">{ac.text}</div>
+            </div>
+          ) : (
+            <div className="text-[#4A6280] text-xs italic">No acceptance criterion attached to this test.</div>
+          )
+        )}
+        {tab === 'patch' && (
+          patch && patch.newCode ? (
+            <div className="flex flex-col gap-2">
+              <div className="text-[10px] uppercase tracking-wider text-[#4A6280] font-semibold font-mono">
+                {patch.file}{patch.lineStart ? `:${patch.lineStart}` : ''}{patch.lineEnd ? `-${patch.lineEnd}` : ''}
+                {patch.preservesRequirementTag === false && (
+                  <span className="ml-2 text-amber-400 normal-case"> · ⚠ does not preserve [REQ:]</span>
+                )}
+              </div>
+              {patch.oldCode && (
+                <div>
+                  <div className="text-[10px] uppercase tracking-wider text-red-400/70 font-semibold mb-1">Remove</div>
+                  <pre className="text-[11.5px] font-mono text-red-300 whitespace-pre-wrap bg-red-500/5 rounded p-2">{patch.oldCode}</pre>
+                </div>
+              )}
+              <div>
+                <div className="text-[10px] uppercase tracking-wider text-emerald-400/70 font-semibold mb-1">Replace with</div>
+                <pre className="text-[11.5px] font-mono text-emerald-200 whitespace-pre-wrap bg-emerald-500/5 rounded p-2">{patch.newCode}</pre>
+              </div>
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  const prompt = [
+                    `Apply the following patch to ${patch.file}${patch.lineStart ? `:${patch.lineStart}` : ''}:`,
+                    '',
+                    '--- Replace:',
+                    patch.oldCode ?? '',
+                    '',
+                    '+++ With:',
+                    patch.newCode ?? '',
+                  ].join('\n');
+                  navigator.clipboard.writeText(prompt).catch(() => {});
+                }}
+                className="self-start px-3 py-1 rounded-md bg-[#60A5FA]/15 text-[#60A5FA] border border-[#60A5FA]/25 text-[11px] font-semibold hover:bg-[#60A5FA]/25 transition-colors"
+              >
+                Copy as Cursor prompt
+              </button>
+            </div>
+          ) : (
+            <div className="text-[#4A6280] text-xs italic">No patch suggested. This verdict is for diagnosis only.</div>
+          )
+        )}
+      </div>
+    </div>
+  );
+}
+
+function FailureClusterBanner({ clusters }: { clusters: Array<{ clusterId: string; members: TestFailure[] }> }) {
+  const [openId, setOpenId] = useState<string | null>(null);
+  if (clusters.length === 0) return null;
+  return (
+    <div className="flex flex-col gap-2">
+      {clusters.map(({ clusterId, members }) => {
+        const sample = members[0];
+        const verdict = sample.verdict;
+        const reason = sample.reason || 'same root cause';
+        const open = openId === clusterId;
+        return (
+          <div key={clusterId} className="rounded-xl border border-amber-500/25 bg-amber-500/[0.04] overflow-hidden">
+            <button
+              onClick={() => setOpenId(open ? null : clusterId)}
+              className="w-full px-4 py-3 flex items-center gap-3 text-left hover:bg-white/[0.02] transition-colors"
+            >
+              <VerdictChip verdict={verdict} />
+              <div className="flex-1 min-w-0">
+                <div className="text-[#F0F6FF] text-sm font-semibold">
+                  {members.length} tests failed with the same root cause
+                </div>
+                <div className="text-[#8BA4C8] text-xs mt-0.5 font-mono truncate">{reason}</div>
+              </div>
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className={`text-[#4A6280] transition-transform ${open ? 'rotate-180' : ''}`}>
+                <polyline points="6 9 12 15 18 9" />
+              </svg>
+            </button>
+            {open && (
+              <ul className="px-4 pb-3 flex flex-col gap-1 border-t border-white/5 pt-2">
+                {members.map((m) => (
+                  <li key={m.id} className="text-[#D8E8FF]/85 text-xs font-mono truncate">
+                    <span className="text-[#4A6280]">•</span> {m.test_name}
+                    {m.tier && <span className="text-[#4A6280] ml-2">[{m.tier}]</span>}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 // ─── Expandable test row ─────────────────────────────────────────────────────
 
-function TestRow({ t, idx, indented = false, aiAnalysis = [] }: { t: NormalisedTest; idx: number; indented?: boolean; aiAnalysis?: AiAnalysisItem[] }) {
+function TestRow({ t, idx, indented = false, aiAnalysis = [], failure, runId, onOverride }: { t: NormalisedTest; idx: number; indented?: boolean; aiAnalysis?: AiAnalysisItem[]; failure?: TestFailure; runId?: string; onOverride?: (failureId: string, verdict: FailureVerdict) => void }) {
   const [expanded, setExpanded] = useState(false);
   const matchedAi = aiAnalysis.find(item => {
     const aiName = safeString(item.testName ?? item.test ?? item.test_name);
@@ -605,8 +899,14 @@ function TestRow({ t, idx, indented = false, aiAnalysis = [] }: { t: NormalisedT
     return aiName.toLowerCase().trim() === t.name.toLowerCase().trim();
   }) ?? null;
   const isFailed = ['failed', 'fail'].includes(t.status.toLowerCase());
-  const hasDetails = !!(t.error || t.screenshots.length || t.videos.length || t.traces.length || t.errorObj || (matchedAi && isFailed));
+  const hasDetails = !!(t.error || t.screenshots.length || t.videos.length || t.traces.length || t.errorObj || (matchedAi && isFailed) || failure);
   const failureInsight = t.error ? buildFailureInsight(t.error) : null;
+
+  const displayVerdict: FailureVerdict | null = failure
+    ? (failure.user_override ?? failure.verdict)
+    : null;
+  const aiVerdict: FailureVerdict | null = failure?.verdict ?? null;
+  const overridden = !!failure?.user_override;
 
   return (
     <>
@@ -630,11 +930,24 @@ function TestRow({ t, idx, indented = false, aiAnalysis = [] }: { t: NormalisedT
               <span className="w-[14px] h-[14px] flex-shrink-0 inline-block" />
             )}
             <div>
-              <div className="text-[#F0F6FF] text-sm font-medium">{t.name}</div>
+              <div className="text-[#F0F6FF] text-sm font-medium flex items-center gap-2 flex-wrap">
+                <span>{t.name}</span>
+                {displayVerdict && (
+                  <VerdictChip
+                    verdict={displayVerdict}
+                    confidence={failure?.verdict_confidence ?? null}
+                    source={failure?.verdict_source}
+                    overridden={overridden}
+                  />
+                )}
+              </div>
               {isFailed && t.error && !expanded && (
                 <div className="text-red-400/70 text-xs mt-0.5 font-mono truncate max-w-xs">
                   {t.error.length > 100 ? t.error.slice(0, 100) + '...' : t.error}
                 </div>
+              )}
+              {isFailed && failure?.reason && !expanded && (
+                <div className="text-[#8BA4C8] text-[11px] mt-0.5 font-mono truncate max-w-xs">{failure.reason}</div>
               )}
             </div>
           </div>
@@ -759,6 +1072,28 @@ function TestRow({ t, idx, indented = false, aiAnalysis = [] }: { t: NormalisedT
                   </div>
                 )}
 
+                {/* Triage verdict + evidence + override */}
+                {failure && isFailed && (
+                  <div className="flex flex-col gap-3">
+                    {failure.reason && (
+                      <div className="text-[#8BA4C8] text-xs">
+                        <span className="text-[#4A6280] text-[10px] uppercase tracking-wider mr-2 font-semibold">Reason</span>
+                        {failure.reason}
+                      </div>
+                    )}
+                    <EvidencePanel failure={failure} />
+                    {runId && onOverride && (
+                      <OverrideBar
+                        runId={runId}
+                        failureId={failure.id}
+                        current={failure.user_override ?? null}
+                        aiVerdict={aiVerdict ?? 'ambiguous'}
+                        onOverride={(v) => onOverride(failure.id, v)}
+                      />
+                    )}
+                  </div>
+                )}
+
                 {/* Inline AI Analysis */}
                 {matchedAi && isFailed && (() => {
                   const analysis = safeString(matchedAi.analysis);
@@ -821,7 +1156,7 @@ function TestRow({ t, idx, indented = false, aiAnalysis = [] }: { t: NormalisedT
 
 // ─── Category group (sub-category collapsible tbody section) ─────────────────
 
-function CategoryGroup({ category, tests, indented = false, aiAnalysis = [] }: { category: string; tests: NormalisedTest[]; indented?: boolean; aiAnalysis?: AiAnalysisItem[] }) {
+function CategoryGroup({ category, tests, indented = false, aiAnalysis = [], failuresByName, runId, onOverride }: { category: string; tests: NormalisedTest[]; indented?: boolean; aiAnalysis?: AiAnalysisItem[]; failuresByName?: Map<string, TestFailure>; runId?: string; onOverride?: (failureId: string, verdict: FailureVerdict) => void }) {
   const [open, setOpen] = useState(true);
   const meta = getCategoryMeta(category);
   const passed = tests.filter(t => ['passed', 'pass'].includes(t.status.toLowerCase())).length;
@@ -856,14 +1191,25 @@ function CategoryGroup({ category, tests, indented = false, aiAnalysis = [] }: {
         </td>
       </tr>
       {/* Test rows */}
-      {open && tests.map((t, i) => <TestRow key={i} t={t} idx={i} indented={indented} aiAnalysis={aiAnalysis} />)}
+      {open && tests.map((t, i) => (
+        <TestRow
+          key={i}
+          t={t}
+          idx={i}
+          indented={indented}
+          aiAnalysis={aiAnalysis}
+          failure={failuresByName?.get(t.name) ?? undefined}
+          runId={runId}
+          onOverride={onOverride}
+        />
+      ))}
     </tbody>
   );
 }
 
 // ─── Main type group (top-level collapsible section) ─────────────────────────
 
-function MainTypeGroup({ mainType, subGroups, aiAnalysis = [] }: { mainType: string; subGroups: [string, NormalisedTest[]][]; aiAnalysis?: AiAnalysisItem[] }) {
+function MainTypeGroup({ mainType, subGroups, aiAnalysis = [], failuresByName, runId, onOverride }: { mainType: string; subGroups: [string, NormalisedTest[]][]; aiAnalysis?: AiAnalysisItem[]; failuresByName?: Map<string, TestFailure>; runId?: string; onOverride?: (failureId: string, verdict: FailureVerdict) => void }) {
   const [open, setOpen] = useState(true);
   const meta = getMainTypeMeta(mainType);
   const allTests = subGroups.flatMap(([, tests]) => tests);
@@ -907,11 +1253,30 @@ function MainTypeGroup({ mainType, subGroups, aiAnalysis = [] }: { mainType: str
       {open && (isSingleUncategorised
         ? (
           <tbody>
-            {subGroups[0][1].map((t, i) => <TestRow key={i} t={t} idx={i} aiAnalysis={aiAnalysis} />)}
+            {subGroups[0][1].map((t, i) => (
+              <TestRow
+                key={i}
+                t={t}
+                idx={i}
+                aiAnalysis={aiAnalysis}
+                failure={failuresByName?.get(t.name) ?? undefined}
+                runId={runId}
+                onOverride={onOverride}
+              />
+            ))}
           </tbody>
         )
         : subGroups.map(([subCat, tests]) => (
-          <CategoryGroup key={subCat} category={subCat} tests={tests} indented aiAnalysis={aiAnalysis} />
+          <CategoryGroup
+            key={subCat}
+            category={subCat}
+            tests={tests}
+            indented
+            aiAnalysis={aiAnalysis}
+            failuresByName={failuresByName}
+            runId={runId}
+            onOverride={onOverride}
+          />
         ))
       )}
     </>
@@ -1113,6 +1478,160 @@ function LiveTimeline({ events, liveFiles, pipelineEnded }: {
   );
 }
 
+// ─── Pipeline error banner ──────────────────────────────────────────────────
+
+interface PipelineErrorShape {
+  stage?: string;
+  reason?: string | null;
+  stderr?: string | null;
+  stdout?: string | null;
+  firstSpecPreview?: { file?: string; lines?: string } | null;
+  generatedSpecCount?: number;
+  qualityAuditErrors?: string[] | null;
+  errorCode?: string | null;
+  userFacingMessage?: string | null;
+}
+
+function PipelineErrorBanner({ error, runId }: { error: PipelineErrorShape; runId: string }) {
+  const [stderrOpen, setStderrOpen] = useState(true);
+  const [specOpen, setSpecOpen] = useState(false);
+  const [copied, setCopied] = useState(false);
+
+  const stage = error.stage || 'unknown';
+  const reason = error.reason || 'unknown_reason';
+  const code = error.errorCode || null;
+
+  const stageLabel =
+    stage === 'validation' ? 'Generated tests failed Playwright validation' :
+    stage === 'generation' ? 'Test generation failed' :
+    stage === 'server_start' ? 'Dev server failed to start' :
+    stage === 'execution' ? 'Playwright run crashed before completion' :
+    `Pipeline stage \`${stage}\` failed`;
+
+  const promptForAgent = [
+    `Healix pipeline failed at stage: ${stage} (${reason}${code ? ' · ' + code : ''}).`,
+    error.userFacingMessage ? `Summary: ${error.userFacingMessage}` : '',
+    '',
+    'Playwright stderr:',
+    '```',
+    (error.stderr || '(none)').slice(0, 3000),
+    '```',
+    error.firstSpecPreview?.lines ? [
+      '',
+      `First generated spec (${error.firstSpecPreview.file}):`,
+      '```ts',
+      error.firstSpecPreview.lines,
+      '```',
+    ].join('\n') : '',
+    '',
+    'Please diagnose the root cause (dependency, generated-code bug, config) and fix it.',
+  ].filter(Boolean).join('\n');
+
+  const onCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(promptForAgent);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1800);
+    } catch { /* ignore */ }
+  };
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: -6 }}
+      animate={{ opacity: 1, y: 0 }}
+      className="glass-card rounded-2xl overflow-hidden border border-red-500/25 bg-red-500/[0.04]"
+      id={`pipeline-error-${runId}`}
+    >
+      <div className="px-5 py-4 border-b border-red-500/15 flex items-start justify-between gap-3">
+        <div className="flex items-start gap-3">
+          <div className="w-9 h-9 rounded-lg bg-red-500/15 border border-red-500/30 flex items-center justify-center flex-shrink-0 mt-0.5">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#F87171" strokeWidth="2.2">
+              <circle cx="12" cy="12" r="10" /><line x1="12" y1="8" x2="12" y2="13" /><line x1="12" y1="16" x2="12.01" y2="16" />
+            </svg>
+          </div>
+          <div className="min-w-0">
+            <div className="text-[#FECACA] font-semibold text-[15px]">Healix couldn&apos;t run your tests</div>
+            <div className="text-[#F0F6FF]/85 text-sm mt-0.5">{stageLabel}</div>
+            <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+              <span className="px-2 py-0.5 rounded-md bg-red-500/10 border border-red-500/25 text-[#FCA5A5] text-[11px] font-mono">
+                stage: {stage}
+              </span>
+              <span className="px-2 py-0.5 rounded-md bg-red-500/10 border border-red-500/25 text-[#FCA5A5] text-[11px] font-mono">
+                reason: {reason}
+              </span>
+              {code && (
+                <span className="px-2 py-0.5 rounded-md bg-red-500/10 border border-red-500/25 text-[#FCA5A5] text-[11px] font-mono">
+                  {code}
+                </span>
+              )}
+              {typeof error.generatedSpecCount === 'number' && (
+                <span className="px-2 py-0.5 rounded-md bg-white/5 border border-white/10 text-[#D8E8FF]/70 text-[11px] font-mono">
+                  generated: {error.generatedSpecCount} spec{error.generatedSpecCount === 1 ? '' : 's'}
+                </span>
+              )}
+            </div>
+          </div>
+        </div>
+        <button
+          onClick={onCopy}
+          className="px-3 py-1.5 rounded-lg bg-red-500/15 hover:bg-red-500/25 border border-red-500/30 text-[#FCA5A5] text-xs font-semibold transition-colors flex-shrink-0"
+        >
+          {copied ? 'Copied ✓' : 'Ask Cursor agent to fix'}
+        </button>
+      </div>
+
+      {error.userFacingMessage && (
+        <div className="px-5 py-3 text-[13px] text-[#D8E8FF]/85 border-b border-red-500/10 leading-relaxed">
+          {error.userFacingMessage}
+        </div>
+      )}
+
+      {error.qualityAuditErrors && error.qualityAuditErrors.length > 0 && (
+        <div className="px-5 py-3 border-b border-red-500/10">
+          <div className="text-[11px] uppercase tracking-wider text-[#FCA5A5] font-semibold mb-1.5">Quality audit errors</div>
+          <ul className="text-[12.5px] text-[#D8E8FF]/90 space-y-1 list-disc list-inside">
+            {error.qualityAuditErrors.slice(0, 6).map((e, i) => (<li key={i}>{e}</li>))}
+          </ul>
+        </div>
+      )}
+
+      {error.stderr && (
+        <div className="border-b border-red-500/10">
+          <button
+            onClick={() => setStderrOpen(o => !o)}
+            className="w-full px-5 py-2.5 text-left text-[11px] uppercase tracking-wider text-[#FCA5A5] font-semibold flex items-center justify-between hover:bg-white/[0.02] transition-colors"
+          >
+            <span>Playwright stderr</span>
+            <span className="text-[#FCA5A5]/70">{stderrOpen ? '▾' : '▸'}</span>
+          </button>
+          {stderrOpen && (
+            <pre className="px-5 pb-4 text-[11.5px] text-[#FECACA]/90 font-mono whitespace-pre-wrap max-h-80 overflow-auto">
+{error.stderr}
+            </pre>
+          )}
+        </div>
+      )}
+
+      {error.firstSpecPreview?.lines && (
+        <div>
+          <button
+            onClick={() => setSpecOpen(o => !o)}
+            className="w-full px-5 py-2.5 text-left text-[11px] uppercase tracking-wider text-[#FCA5A5] font-semibold flex items-center justify-between hover:bg-white/[0.02] transition-colors"
+          >
+            <span>First generated spec{error.firstSpecPreview.file ? ` — ${error.firstSpecPreview.file}` : ''}</span>
+            <span className="text-[#FCA5A5]/70">{specOpen ? '▾' : '▸'}</span>
+          </button>
+          {specOpen && (
+            <pre className="px-5 pb-4 text-[11.5px] text-[#D8E8FF]/90 font-mono whitespace-pre-wrap max-h-80 overflow-auto">
+{error.firstSpecPreview.lines}
+            </pre>
+          )}
+        </div>
+      )}
+    </motion.div>
+  );
+}
+
 // ─── Main page ────────────────────────────────────────────────────────────────
 
 export default function TestRunDetailPage() {
@@ -1121,6 +1640,7 @@ export default function TestRunDetailPage() {
   const isLiveDetailId = String(id || '').startsWith('live-');
 
   const [testRun, setTestRun] = useState<TestRun | null>(null);
+  const [overrides, setOverrides] = useState<Record<string, FailureVerdict>>({});
   const [loading, setLoading] = useState(true);
   const [notFound, setNotFound] = useState(false);
   const [filterStatus, setFilterStatus] = useState<string>('all');
@@ -1392,8 +1912,13 @@ export default function TestRunDetailPage() {
   // Filter tests — strip synthetic pipeline rows when we have real test data
   const isPipelineSynthetic = (t: NormalisedTest) =>
     (t.suite === 'pipeline' || t.suite === 'Healix') && (t.name.startsWith('[PIPELINE') || t.name.startsWith('[HEALIX'));
+  const pipelineError = testRun.pipeline_error ?? null;
   const hasRealTests = liveTestResults.length > 0 || normalisedTests.some(t => !isPipelineSynthetic(t));
-  const displayTests = hasRealTests ? normalisedTests.filter(t => !isPipelineSynthetic(t)) : normalisedTests;
+  // When pipeline_error is structured on the run, always hide the synthetic fake-test row
+  // in favour of the dedicated banner. Otherwise fall back to legacy behaviour.
+  const displayTests = pipelineError
+    ? normalisedTests.filter(t => !isPipelineSynthetic(t))
+    : (hasRealTests ? normalisedTests.filter(t => !isPipelineSynthetic(t)) : normalisedTests);
   
   // Count of real (non-synthetic) tests for accurate stats
   const realTestsCount = normalisedTests.filter(t => !isPipelineSynthetic(t)).length;
@@ -1416,13 +1941,21 @@ export default function TestRunDetailPage() {
   const liveTotal = liveTestResults.length;
   const hasLiveStats = liveTotal > 0;
 
-  // Priority: live results > database stats > generated count > real test count
-  const totalTests = hasLiveStats 
-    ? liveTotal 
-    : (testRun.total_tests || report?.summary?.total || report?.stats?.total || generatedTestCount || realTestsCount);
-  const passedTests = hasLiveStats ? livePassed : (testRun.passed_tests || report?.summary?.passed || report?.stats?.passed || displayTests.filter(t => ['passed', 'pass'].includes(t.status.toLowerCase())).length);
-  const failedTests = hasLiveStats ? liveFailed : (testRun.failed_tests || report?.summary?.failed || report?.stats?.failed || displayTests.filter(t => ['failed', 'fail'].includes(t.status.toLowerCase())).length);
-  const skippedTests = hasLiveStats ? liveSkipped : (testRun.skipped_tests || report?.summary?.skipped || report?.stats?.skipped || displayTests.filter(t => ['skipped', 'skip', 'pending'].includes(t.status.toLowerCase())).length);
+  // Priority: pipeline_error (zero real tests ran) > live > DB stats > generated > real
+  //
+  // When the pipeline errored before any test reported, the ingest payload
+  // still carries the fake synthetic row in testRun.total_tests / failed_tests.
+  // That used to surface as "Total 1 / Failed 1" — misleading because nothing
+  // actually ran. With pipeline_error set we zero the counters and let the
+  // banner carry the explanation.
+  const totalTests = pipelineError
+    ? 0
+    : (hasLiveStats
+        ? liveTotal
+        : (testRun.total_tests || report?.summary?.total || report?.stats?.total || generatedTestCount || realTestsCount));
+  const passedTests = pipelineError ? 0 : (hasLiveStats ? livePassed : (testRun.passed_tests || report?.summary?.passed || report?.stats?.passed || displayTests.filter(t => ['passed', 'pass'].includes(t.status.toLowerCase())).length));
+  const failedTests = pipelineError ? 0 : (hasLiveStats ? liveFailed : (testRun.failed_tests || report?.summary?.failed || report?.stats?.failed || displayTests.filter(t => ['failed', 'fail'].includes(t.status.toLowerCase())).length));
+  const skippedTests = pipelineError ? 0 : (hasLiveStats ? liveSkipped : (testRun.skipped_tests || report?.summary?.skipped || report?.stats?.skipped || displayTests.filter(t => ['skipped', 'skip', 'pending'].includes(t.status.toLowerCase())).length));
   const passRate = totalTests > 0 ? Math.round((passedTests / totalTests) * 100) : 0;
   // True while Playwright is executing but no individual results have streamed in yet
   const isRunningPhase = !pipelineEnded && liveEvents.some(e => (e.phase || '').toLowerCase() === 'running');
@@ -1478,6 +2011,30 @@ export default function TestRunDetailPage() {
     || !!safeString(item?.suggestedFix ?? item?.suggested_fix ?? item?.fix)
   ));
 
+  // Failure triage state — merge server rows with optimistic overrides
+  const rawFailures: TestFailure[] = Array.isArray(testRun.test_failures) ? testRun.test_failures : [];
+  const testFailures: TestFailure[] = rawFailures.map((f) => (
+    overrides[f.id] ? { ...f, user_override: overrides[f.id] } : f
+  ));
+  const failuresByName = new Map<string, TestFailure>();
+  for (const f of testFailures) failuresByName.set(f.test_name, f);
+
+  const failureClusters = (() => {
+    const byCluster = new Map<string, TestFailure[]>();
+    for (const f of testFailures) {
+      if (!f.cluster_id) continue;
+      if (!byCluster.has(f.cluster_id)) byCluster.set(f.cluster_id, []);
+      byCluster.get(f.cluster_id)!.push(f);
+    }
+    return Array.from(byCluster.entries())
+      .filter(([, members]) => members.length >= 3)
+      .map(([clusterId, members]) => ({ clusterId, members }));
+  })();
+
+  const handleOverride = (failureId: string, verdict: FailureVerdict) => {
+    setOverrides((prev) => ({ ...prev, [failureId]: verdict }));
+  };
+
   const formattedDate = new Date(testRun.created_at).toLocaleDateString('en-US', {
     month: 'long', day: 'numeric', year: 'numeric',
   }) + ' at ' + new Date(testRun.created_at).toLocaleTimeString('en-US', {
@@ -1514,6 +2071,10 @@ export default function TestRunDetailPage() {
           </div>
         </div>
       </motion.div>
+
+      {pipelineError && (
+        <PipelineErrorBanner error={pipelineError as PipelineErrorShape} runId={testRun.id} />
+      )}
 
       {(testRun.is_live || !!liveMeta || !!testRun.current_phase || !!testRun.error_code || liveEvents.length > 0) && (
         <motion.div
@@ -1660,6 +2221,40 @@ export default function TestRunDetailPage() {
         <KpiCard label="Pass Rate" value={passRate} sub="%" color={passRate >= 70 ? 'text-emerald-400' : passRate >= 40 ? 'text-amber-400' : 'text-red-400'} delay={320} loading={isRunningPhase && !hasLiveStats} />
       </div>
 
+      {/* Tier pills (Phase D) — Tier A/B/C segmentation from MCP. Only shown
+          when the run reported a tier breakdown. */}
+      {testRun.tier_results && Object.keys(testRun.tier_results).length > 0 && (
+        <div className="space-y-2">
+          <div className="text-xs uppercase tracking-wider text-[#8DA0BC]/70 font-medium">Tiered execution</div>
+          <div className="flex flex-wrap gap-2">
+            {Object.entries(testRun.tier_results).map(([tier, counts]) => {
+              const label =
+                tier === 'A-public' ? 'Tier A · public'
+                : tier.startsWith('B-auth-') ? `Tier B · ${tier.replace('B-auth-', '')}`
+                : tier === 'C-backend' ? 'Tier C · backend'
+                : tier === 'untiered' ? 'Untiered'
+                : tier;
+              const tone =
+                counts.failed > 0 ? 'border-red-500/40 bg-red-500/10 text-red-200'
+                : counts.blocked > 0 ? 'border-amber-500/40 bg-amber-500/10 text-amber-200'
+                : counts.passed > 0 ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-200'
+                : 'border-white/10 bg-white/5 text-[#8DA0BC]';
+              const parts: string[] = [];
+              if (counts.passed) parts.push(`${counts.passed} passed`);
+              if (counts.failed) parts.push(`${counts.failed} failed`);
+              if (counts.blocked) parts.push(`${counts.blocked} blocked`);
+              if (counts.skipped) parts.push(`${counts.skipped} skipped`);
+              return (
+                <div key={tier} className={`px-3 py-1.5 rounded-full text-xs font-medium border ${tone}`}>
+                  <span className="opacity-80 mr-2">{label}</span>
+                  <span>{parts.length > 0 ? parts.join(' · ') : `${counts.total} tests`}</span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
       {/* Results by Section */}
       {totalTests > 0 && (() => {
         const sourceTests = hasLiveStats
@@ -1773,6 +2368,12 @@ export default function TestRunDetailPage() {
           </div>
         </motion.div>
       ) : displayTests.length > 0 ? (
+        <>
+        {failureClusters.length > 0 && (
+          <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.3 }}>
+            <FailureClusterBanner clusters={failureClusters} />
+          </motion.div>
+        )}
         <motion.div initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.35 }} className="glass-card rounded-2xl overflow-hidden">
           {/* Header with collapse toggle */}
           <div ref={testResultsHeaderRef} className="px-6 py-4 border-b border-white/8 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
@@ -1851,12 +2452,28 @@ export default function TestRunDetailPage() {
                     </thead>
                     {groupByCategory ? (
                       hierarchicalTests.map(([mainType, subGroups]) => (
-                        <MainTypeGroup key={mainType} mainType={mainType} subGroups={subGroups} aiAnalysis={aiAnalysis} />
+                        <MainTypeGroup
+                          key={mainType}
+                          mainType={mainType}
+                          subGroups={subGroups}
+                          aiAnalysis={aiAnalysis}
+                          failuresByName={failuresByName}
+                          runId={testRun.id}
+                          onOverride={handleOverride}
+                        />
                       ))
                     ) : (
                       <tbody>
                         {filteredTests.map((t, i) => (
-                          <TestRow key={i} t={t} idx={i} aiAnalysis={aiAnalysis} />
+                          <TestRow
+                            key={i}
+                            t={t}
+                            idx={i}
+                            aiAnalysis={aiAnalysis}
+                            failure={failuresByName.get(t.name) ?? undefined}
+                            runId={testRun.id}
+                            onOverride={handleOverride}
+                          />
                         ))}
                       </tbody>
                     )}
@@ -1885,10 +2502,13 @@ export default function TestRunDetailPage() {
             )}
           </AnimatePresence>
         </motion.div>
+        </>
       ) : null}
 
-      {/* Duration footer */}
-      {testRun.duration_ms && (
+      {/* Duration footer — `duration_ms && (...)` would render a literal "0"
+          when a pipeline_error run ends with duration_ms === 0, so we coerce
+          to boolean explicitly. */}
+      {typeof testRun.duration_ms === 'number' && testRun.duration_ms > 0 && (
         <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 0.6 }} className="text-center text-[#4A6280] text-xs pb-4">
           Total run duration: {(testRun.duration_ms / 1000).toFixed(2)}s
         </motion.div>

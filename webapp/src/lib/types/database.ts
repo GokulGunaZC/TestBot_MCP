@@ -33,6 +33,42 @@ export interface ApiKey {
   created_at: string
 }
 
+export interface PipelineError {
+  kind?: 'pipeline'
+  stage?: string
+  reason?: string | null
+  stderr?: string | null
+  stdout?: string | null
+  firstSpecPreview?: { file: string; lines: string } | null
+  generatedSpecCount?: number
+  qualityAuditErrors?: string[] | null
+  errorCode?: string | null
+  userFacingMessage?: string | null
+}
+
+export type FailureVerdict = 'test_is_wrong' | 'app_is_wrong' | 'environment' | 'ambiguous' | 'flake'
+export type FailureVerdictSource = 'classifier' | 'ai' | 'user_override'
+
+export interface TestFailure {
+  id: string
+  test_name: string
+  test_file: string | null
+  tier: string | null
+  verdict: FailureVerdict
+  verdict_source: FailureVerdictSource
+  verdict_confidence: number | null
+  fix_target: string | null
+  reason: string | null
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  suggested_patch: any | null
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  evidence: any | null
+  cluster_id: string | null
+  user_override: FailureVerdict | null
+  user_override_at: string | null
+  created_at: string | null
+}
+
 export interface TestRun {
   id: string
   user_id: string
@@ -51,6 +87,9 @@ export interface TestRun {
   ai_analysis: any
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   coverage_metrics: any | null
+  tier_results?: Record<string, { passed: number; failed: number; blocked: number; skipped: number; total: number }> | null
+  pipeline_error?: PipelineError | null
+  test_failures?: TestFailure[] | null
   framework: string | null
   source: 'mcp' | 'api' | 'dashboard'
   created_at: string

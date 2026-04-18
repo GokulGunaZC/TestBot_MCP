@@ -26,21 +26,21 @@ class PlaywrightIntegration {
       timeout: config.timeout || 300000,
       playwrightRetries: Number.isFinite(Number(config.playwrightRetries))
         ? Math.max(0, Math.floor(Number(config.playwrightRetries)))
-        : Number.isFinite(Number(process.env.TESTBOT_PLAYWRIGHT_RETRIES))
-          ? Math.max(0, Math.floor(Number(process.env.TESTBOT_PLAYWRIGHT_RETRIES)))
+        : Number.isFinite(Number(process.env.HEALIX_PLAYWRIGHT_RETRIES))
+          ? Math.max(0, Math.floor(Number(process.env.HEALIX_PLAYWRIGHT_RETRIES)))
           : 1,
       testTimeoutMs: Number.isFinite(Number(config.testTimeoutMs))
         ? Math.max(1000, Number(config.testTimeoutMs))
-        : Number(process.env.TESTBOT_PLAYWRIGHT_TEST_TIMEOUT_MS || 60000),
+        : Number(process.env.HEALIX_PLAYWRIGHT_TEST_TIMEOUT_MS || 60000),
       expectTimeoutMs: Number.isFinite(Number(config.expectTimeoutMs))
         ? Math.max(1000, Number(config.expectTimeoutMs))
-        : Number(process.env.TESTBOT_PLAYWRIGHT_EXPECT_TIMEOUT_MS || 10000),
+        : Number(process.env.HEALIX_PLAYWRIGHT_EXPECT_TIMEOUT_MS || 10000),
       actionTimeoutMs: Number.isFinite(Number(config.actionTimeoutMs))
         ? Math.max(1000, Number(config.actionTimeoutMs))
-        : Number(process.env.TESTBOT_PLAYWRIGHT_ACTION_TIMEOUT_MS || 15000),
+        : Number(process.env.HEALIX_PLAYWRIGHT_ACTION_TIMEOUT_MS || 15000),
       navigationTimeoutMs: Number.isFinite(Number(config.navigationTimeoutMs))
         ? Math.max(1000, Number(config.navigationTimeoutMs))
-        : Number(process.env.TESTBOT_PLAYWRIGHT_NAVIGATION_TIMEOUT_MS || 30000),
+        : Number(process.env.HEALIX_PLAYWRIGHT_NAVIGATION_TIMEOUT_MS || 30000),
       browserMode: config.browserMode || 'chromium',
       artifactMode: config.artifactMode || 'hybrid',
       phaseMode: config.phaseMode || 'two-phase',
@@ -660,11 +660,27 @@ class PlaywrightIntegration {
     });
 
     if (commandResult.code !== 0 && testResults.total === 0) {
-      const stderrPreview = this.stripAnsi(commandResult.stderr || commandResult.stdout || '')
-        .replace(/\s+/g, ' ')
-        .trim()
-        .slice(0, 500);
-      const errorSuffix = stderrPreview ? `: ${stderrPreview}` : '';
+      // Prefer real error lines (Error:, SyntaxError:, at …) over the noisy
+      // first-line of stderr — dev-server warnings often dominate the top of
+      // the output and drown out the actual failure line.
+      const fullStderr = this.stripAnsi(commandResult.stderr || commandResult.stdout || '');
+      const lines = fullStderr.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+      const errorLines = lines.filter((l) =>
+        /^(Error|TypeError|SyntaxError|ReferenceError|AssertionError|FATAL)[:\s]/i.test(l) ||
+        /failed to (start|load|compile|launch)/i.test(l) ||
+        /exit(ed|s) (with )?code/i.test(l)
+      );
+      const tailContext = lines.slice(-8).join(' | ');
+      const chosen = errorLines.length > 0 ? errorLines.slice(-3).join(' | ') : tailContext;
+      const errorSuffix = chosen ? `: ${chosen.slice(0, 800)}` : '';
+
+      try {
+        const logPath = path.join(this.config.projectPath, 'healix-reports', 'playwright-stderr.log');
+        fs.mkdirSync(path.dirname(logPath), { recursive: true });
+        fs.writeFileSync(logPath, fullStderr, 'utf-8');
+        Logger.info('PlaywrightIntegration', `Full Playwright stderr written to ${logPath}`);
+      } catch (_) {}
+
       throw new Error(`Playwright execution failed with exit code ${commandResult.code}${errorSuffix}`);
     }
 
@@ -1028,6 +1044,7 @@ test.describe('${this.sanitizeString(scenario.name)}', () => {
       passed: 0,
       failed: 0,
       skipped: 0,
+      flaky: 0,
       duration: 0,
       tests: [],
       failures: [],
@@ -1096,6 +1113,7 @@ test.describe('${this.sanitizeString(scenario.name)}', () => {
       passed: 0,
       failed: 0,
       skipped: 0,
+      flaky: 0,
       duration: 0,
       tests: [],
       failures: [],
@@ -1151,8 +1169,8 @@ test.describe('${this.sanitizeString(scenario.name)}', () => {
 
       for (const test of spec.tests) {
         const lastResult = test.results?.[test.results.length - 1] || null;
-        const status = lastResult?.status || test.status || 'unknown';
-        const normalizedStatus = this.normalizeStatus(status);
+        const rawStatus = lastResult?.status || test.status || 'unknown';
+        let normalizedStatus = this.normalizeStatus(rawStatus);
         const artifacts = this.extractArtifacts(lastResult?.attachments || []);
         const normalizedError = normalizeError(
           lastResult?.error
@@ -1160,6 +1178,20 @@ test.describe('${this.sanitizeString(scenario.name)}', () => {
           || (Array.isArray(test.errors) ? test.errors.find(Boolean) : null)
           || null
         );
+
+        // Playwright reports `flaky` on the test-level `status` field whenever a
+        // retry eventually passed. We also detect it defensively by inspecting
+        // the result array: if any result passed and any other failed, treat as
+        // flaky so downstream triage doesn't mistake a retry-recovered test for
+        // a hard failure.
+        const resultStatuses = (test.results || []).map((r) => String(r?.status || '').toLowerCase());
+        const hasPassingRetry = resultStatuses.some((s) => s === 'passed' || s === 'expected');
+        const hasFailingAttempt = resultStatuses.some((s) => s === 'failed' || s === 'unexpected' || s === 'timedout');
+        const testLevelStatus = String(test.status || '').toLowerCase();
+        const isFlaky = testLevelStatus === 'flaky' || (hasPassingRetry && hasFailingAttempt);
+        if (isFlaky) {
+          normalizedStatus = 'flaky';
+        }
 
         const testObj = {
           id: `${suiteName}-${spec.title}-${test.projectName || 'default'}`.replace(/\s+/g, '-'),
@@ -1179,6 +1211,11 @@ test.describe('${this.sanitizeString(scenario.name)}', () => {
         results.duration += testObj.duration;
 
         if (normalizedStatus === 'passed') {
+          results.passed += 1;
+        } else if (normalizedStatus === 'flaky') {
+          results.flaky = (results.flaky || 0) + 1;
+          // Count as passed for the headline pass-rate — triage system tracks
+          // flakiness separately so the dashboard can surface a yellow badge.
           results.passed += 1;
         } else if (normalizedStatus === 'failed') {
           results.failed += 1;

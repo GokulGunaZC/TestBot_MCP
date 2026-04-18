@@ -1,82 +1,57 @@
-# Testbot MCP
+# Healix
 
-**One-command testing with AI-powered analysis for any project.**
+**End-to-end QA automation in one command, from your IDE.**
 
-Testbot MCP is a Model Context Protocol (MCP) server that enables seamless end-to-end testing with AI-powered failure analysis. Just say "test my app using testbot mcp" in Cursor or Windsurf, and Testbot handles everything automatically.
-
-## Features
-
-- **One Command Testing**: Simply ask your AI assistant to test your app
-- **Playwright Integration**: Uses the official Playwright MCP for test generation and execution
-- **AI-Powered Analysis**: Automatically analyzes test failures using Sarvam, Cascade, or Windsurf AI
-- **Beautiful Dashboard**: Auto-opens a dashboard with screenshots, videos, traces, and AI analysis
-- **Zero Config**: Auto-detects project settings (port, base URL, start command)
-- **Optional Jira Integration**: Fetch stories, generate tests from acceptance criteria
+Healix is a Model Context Protocol (MCP) server that generates acceptance-criteria-traced Playwright tests, runs them in tiers, and opens a dashboard — all from a single prompt in Cursor, Claude Code, or Windsurf. All AI calls are proxied through the Healix webapp, so users only need a `HEALIX_API_KEY`.
 
 ## Quick Start
 
 ### 1. Install
 
 ```bash
-npm install -g @testbot/mcp
+npm install -g @healix/mcp
 ```
 
 ### 2. Configure MCP
 
-Add to your MCP settings (`~/.cursor/mcp.json` or similar):
+Add to your MCP settings (`~/.cursor/mcp.json`, Claude Code, or Windsurf):
 
 ```json
 {
   "mcpServers": {
-    "testbot": {
+    "healix": {
       "command": "npx",
-      "args": ["@testbot/mcp"],
+      "args": ["@healix/mcp"],
       "env": {
-        "SARVAM_API_KEY": "your-api-key"
+        "HEALIX_API_KEY": "your-healix-api-key"
       }
     }
   }
 }
 ```
 
+Get your API key at your Healix dashboard.
+
 ### 3. Test Your App
 
-In Cursor or Windsurf:
+In your IDE:
 
-> "Test my app using testbot mcp"
+> "Test my app using the healix mcp"
 
-That's it! Testbot will:
-1. Auto-detect your project settings
-2. Generate tests (from PRD or Jira stories if provided)
-3. Run the tests
-4. Analyze failures with AI
-5. Open a dashboard with results
+Healix will:
 
-## Usage
+1. Open a local configuration UI (test type, optional PRD, role credentials)
+2. Auto-detect project settings (port, base URL, start command)
+3. Explore your app with browser-use to discover real flows
+4. Generate AC-traced tests (each test tagged `[REQ:F1.S1.AC1]`)
+5. Run Playwright tests in tiers:
+   - **Tier A** — public flows (no auth required)
+   - **Tier B** — authenticated flows per role
+   - **Tier C** — backend / API contract
+6. Analyze failures with AI
+7. Open a dashboard with tier pills, screenshots, traces, and AI analysis
 
-### Basic Usage
-
-```
-User: "test my app using testbot mcp"
-```
-
-### With Options
-
-```
-User: "test my frontend using testbot mcp with sarvam AI analysis"
-```
-
-### With PRD File
-
-```
-User: "test my app using testbot mcp with the PRD at ./docs/requirements.md"
-```
-
-### With Jira Integration
-
-```
-User: "test my app using testbot mcp and fetch stories from Jira project MYAPP"
-```
+If login fails, Healix re-prompts for credentials; if login still fails, Tier B is marked `blocked` and Tiers A and C still run — you always get a partial green.
 
 ## Configuration
 
@@ -84,85 +59,88 @@ User: "test my app using testbot mcp and fetch stories from Jira project MYAPP"
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `SARVAM_API_KEY` | Sarvam AI API key for failure analysis | - |
-| `AI_PROVIDER` | AI provider: `sarvam`, `cascade`, `windsurf`, or `none` | `sarvam` |
-| `JIRA_BASE_URL` | Jira instance URL | - |
-| `JIRA_EMAIL` | Jira account email | - |
-| `JIRA_API_TOKEN` | Jira API token | - |
-| `JIRA_PROJECT_KEY` | Jira project key | - |
+| `HEALIX_API_KEY` | Required. Your Healix API key (authenticates and meters token usage). | - |
+| `HEALIX_DASHBOARD_URL` | Optional. Dashboard base URL. | Production Vercel URL |
+
+No other keys are required. OpenAI calls are proxied server-side through the Healix webapp.
 
 ### Tool Parameters
 
-The `testbot_test_my_app` tool accepts:
+The `healix_test_my_app` tool accepts:
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `projectPath` | string | Path to project (default: workspace root) |
 | `testType` | string | `frontend`, `backend`, or `both` |
-| `prdFile` | string | Path to PRD file for test generation |
+| `prdFile` | string | Path to PRD file for AC extraction |
 | `baseURL` | string | Application base URL |
 | `port` | number | Application port |
 | `startCommand` | string | Command to start the app |
-| `aiProvider` | string | AI provider for analysis |
-| `jira.enabled` | boolean | Enable Jira integration |
 
 ## Dashboard
 
 The dashboard displays:
 
-- **KPI Cards**: Total tests, passed, failed, skipped, pass rate, duration
-- **AI Analysis Summary**: Carousel of AI-powered failure analyses
-- **Suite Breakdown**: Results by test suite
-- **Charts**: Status distribution and suite results
-- **Test Table**: Filterable, sortable list of all tests
-- **Regression Comparison**: Compare with baseline results
+- **Tier pills**: passed / failed / blocked per tier (public, auth-{role}, backend)
+- **KPI cards**: total tests, pass rate, duration
+- **AI failure analysis**: root cause + suggested fix per failure
+- **Artifacts**: screenshots, videos, Playwright traces (hosted on Supabase Storage)
+- **Regression comparison**: compare against baseline runs
 
-### Screenshots and Artifacts
+## Architecture
 
-Click any failed test to see:
-- Error details and stack trace
-- AI analysis with root cause and suggested fix
-- Screenshots at time of failure
-- Video recording of the test
-- Playwright trace files
+```
+User IDE (Cursor / Claude Code / Windsurf)
+        │  stdio MCP
+        ▼
+@healix/mcp  ──── thin client (HEALIX_API_KEY only) ────┐
+        │                                               │
+        │ 1. Config UI (local http)                     │
+        │ 2. Auto-detect project                        │
+        │ 3. Browser-use exploration (auto-install)     │
+        │ 4. Credentials injector (per role)            │
+        │ 5. Playwright tiered execution                │
+        │ 6. Dashboard deep-link                        │
+        │                                               │
+        │ All AI prompts ─► HTTPS ──────────────────────┤
+        ▼                                               ▼
+Healix webapp (Vercel)                        OpenAI (server-side key only)
+```
 
 ## Project Structure
 
 ```
-testbot-mcp/
-├── src/
-│   ├── index.js              # MCP server entry
-│   ├── auto-detector.js      # Project settings detection
-│   ├── playwright-integration.js
-│   ├── report-generator.js
-│   ├── dashboard-launcher.js
-│   ├── ai-providers/
-│   │   ├── sarvam.js
-│   │   ├── cascade.js
-│   │   └── windsurf.js
-│   └── jira/
-│       └── client.js
-├── package.json
-└── .env.example
-
-dashboard/
-├── public/
-│   └── index.html
-└── src/
-    ├── data-parser.js
-    ├── reporter.js
-    └── styles/
-        └── dashboard.css
+TestBot_MCP/
+├── testbot-mcp/            # @healix/mcp — the MCP server (publishes to npm)
+│   ├── src/
+│   │   ├── index.js                   # MCP tool registration
+│   │   ├── auto-detector.js           # Project settings detection
+│   │   ├── pipeline-worker.js         # End-to-end orchestration
+│   │   ├── webapp-client.js           # All AI proxied through webapp
+│   │   ├── browser-use-driver.js      # Browser-use subprocess bridge
+│   │   ├── exploration-phase.js       # Browser-use exploration + auth probe
+│   │   ├── credentials-injector.js    # Per-role Playwright storageState
+│   │   ├── playwright-integration.js  # Tier A / B / C Playwright projects
+│   │   ├── results-merger.js
+│   │   └── ai-providers/
+│   │       └── saas-client.js         # Proxy to Healix webapp
+│   └── scripts/
+│       └── browser_use_runner.py      # Pinned browser-use driver
+└── webapp/                 # Next.js webapp on Vercel
+    ├── src/app/api/
+    │   ├── generate-tests/            # AC-traced test generation
+    │   ├── parse-prd/                 # Structured AC extraction
+    │   ├── exploration/plan/          # Prioritize observed flows
+    │   ├── analyze-failures/
+    │   ├── artifacts/                 # Supabase Storage
+    │   └── test-runs/ingest/
+    └── drizzle/                       # Postgres migrations
 ```
 
-## Documentation
+## Live Customers
 
-- [Quick Start Guide](docs/QUICKSTART.md)
-- [User Guide](docs/USER_GUIDE.md)
-- [API Reference](docs/API_REFERENCE.md)
+Three customer deployments are using Healix in production. See `MIGRATION.md` for upgrading from older `@testbot/mcp` installs.
 
 ## License
 
 MIT
-# TestBot_MCP
-# TestBot_MCP

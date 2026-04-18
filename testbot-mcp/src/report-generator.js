@@ -354,7 +354,7 @@ class ReportGenerator {
             affectedFiles: this.stripAnsiAndNormalize(analysis.affectedFiles),
             testingRecommendations: this.stripAnsiAndNormalize(analysis.testingRecommendations),
             aiProvider: 'healix',
-            model: analysis.model || 'sarvam-m',
+            model: analysis.model || 'healix-ai',
           };
         }
       }
@@ -434,7 +434,13 @@ class ReportGenerator {
     generationQuality,
     requirementsCoverage,
     phaseResults,
+    tierResults,
+    pipelineError,
     fallbackUsed,
+    failures,
+    flakyCount,
+    classifierVerdicts,
+    failureClusters,
     api_key,
     dashboard_url,
   }) {
@@ -480,6 +486,7 @@ class ReportGenerator {
         passed: Number(testResults.passed || 0),
         failed: Number(testResults.failed || 0),
         skipped: Number(testResults.skipped || 0),
+        flaky: Number(flakyCount ?? testResults.flaky ?? 0),
         duration: Number(testResults.duration || 0),
         passRate: testResults.total > 0
           ? Math.round((testResults.passed / testResults.total) * 100)
@@ -491,6 +498,11 @@ class ReportGenerator {
       generationQuality: this.stripAnsiAndNormalize(generationQuality || null),
       requirementsCoverage: this.stripAnsiAndNormalize(requirementsCoverage || null),
       phaseResults: this.stripAnsiAndNormalize(phaseResults || testResults.phaseResults || null),
+      tierResults: tierResults || testResults.tierResults || null,
+      pipelineError: pipelineError ? this.stripAnsiAndNormalize(pipelineError) : null,
+      failures: Array.isArray(failures) ? failures : [],
+      classifierVerdicts: Array.isArray(classifierVerdicts) ? classifierVerdicts : [],
+      failureClusters: Array.isArray(failureClusters) ? failureClusters : [],
     };
 
     const reportFilename = `report-${timestamp.replace(/[:.]/g, '-')}.json`;
@@ -515,6 +527,12 @@ class ReportGenerator {
             run_id: runId || null,
             report,
             project_path: projectPath,
+            tier_results: report.tierResults || null,
+            pipeline_error: report.pipelineError || null,
+            failures: report.failures || [],
+            flaky_count: report.stats.flaky || 0,
+            classifier_verdicts: report.classifierVerdicts || [],
+            failure_clusters: report.failureClusters || [],
           }),
         });
 

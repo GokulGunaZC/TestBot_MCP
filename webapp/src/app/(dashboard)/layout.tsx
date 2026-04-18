@@ -1,5 +1,6 @@
 import { redirect } from 'next/navigation';
 import { getCurrentProfile } from '@/lib/auth/session';
+import { toDisplayUnits } from '@/lib/token-units';
 import Sidebar from '@/components/dashboard/Sidebar';
 import TopBar from '@/components/dashboard/TopBar';
 
@@ -24,9 +25,11 @@ export default async function DashboardLayout({
     .join('')
     .toUpperCase()
     .slice(0, 2) || userEmail[0].toUpperCase();
-  const REAL_TOKENS_PER_UNIT = 4_800
-  const tokensRemaining = Math.floor((profile?.tokensRemaining ?? 240000) / REAL_TOKENS_PER_UNIT)
-  const tokensTotal = Math.floor((profile?.tokensTotal ?? 240000) / REAL_TOKENS_PER_UNIT)
+  // Numbers shown in the sidebar are driven ONLY by what's on the profile row;
+  // no fake defaults. If the DB has 0/null, we render 0/0 — a visible
+  // "out of tokens" state beats a made-up "50/50" that doesn't reflect reality.
+  const tokensRemaining = toDisplayUnits(profile?.tokensRemaining)
+  const tokensTotal = toDisplayUnits(profile?.tokensTotal)
   const plan = profile?.plan ?? 'free'
 
   return (

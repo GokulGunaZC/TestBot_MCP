@@ -10,6 +10,27 @@ const { spawn } = require('child_process');
 const FormData = require('form-data');
 const Logger = require('./logger');
 
+// Phase D: anything matching these patterns MUST NEVER upload. Credentials
+// stay on the user's machine.
+//
+//   auth-state-*.json  — storageState files written by credentials-injector
+//   credentials.json   — raw creds blob (status-dir historical)
+//   credentials-*      — any derivative naming
+//
+// Applied by fileName + fullPath so a state file copied anywhere still gets
+// blocked.
+const CREDENTIAL_DENY_PATTERNS = [
+  /(?:^|[\\/])\.healix[\\/]auth-state-.*\.json$/,
+  /(?:^|[\\/])auth-state-.*\.json$/,
+  /(?:^|[\\/])credentials\.json$/,
+  /(?:^|[\\/])credentials-.*$/,
+];
+
+function isCredentialFile(filePath, fileName) {
+  const candidates = [filePath, fileName].filter(Boolean);
+  return candidates.some((s) => CREDENTIAL_DENY_PATTERNS.some((rx) => rx.test(s)));
+}
+
 let sharp;
 try {
   sharp = require('sharp');
@@ -128,6 +149,20 @@ class ArtifactUploader {
           Logger.warn('ArtifactUploader', `Trace not found: ${tracePath}`);
         }
       }
+    }
+
+    // Phase D: strip any credential file that snuck into test.artifacts.
+    const beforeDeny = artifacts.length;
+    for (let i = artifacts.length - 1; i >= 0; i -= 1) {
+      if (isCredentialFile(artifacts[i].fullPath, artifacts[i].fileName)) {
+        Logger.warn('ArtifactUploader', 'Deny-listed credential file excluded from artifacts', {
+          fileName: artifacts[i].fileName,
+        });
+        artifacts.splice(i, 1);
+      }
+    }
+    if (artifacts.length !== beforeDeny) {
+      Logger.info('ArtifactUploader', `Deny-list removed ${beforeDeny - artifacts.length} credential file(s)`);
     }
 
     Logger.info('ArtifactUploader', `Collected ${artifacts.length} artifacts from ${failedTests.length} failed tests via test.artifacts`);
@@ -395,7 +430,17 @@ class ArtifactUploader {
       // Add each artifact as a file with metadata
       for (let i = 0; i < artifacts.length; i++) {
         const artifact = artifacts[i];
-        
+
+        // Phase D deny-list: never upload credential files. Belt-and-braces
+        // check here in addition to collect-time filtering — if someone hands
+        // this function a credentials file directly, we still refuse.
+        if (isCredentialFile(artifact.fullPath, artifact.fileName)) {
+          Logger.warn('ArtifactUploader', 'Refusing to upload credential file', {
+            fileName: artifact.fileName,
+          });
+          continue;
+        }
+
         // Compress based on type
         let fileBuffer;
         if (artifact.type === 'screenshot') {
@@ -484,3 +529,5 @@ class ArtifactUploader {
 }
 
 module.exports = ArtifactUploader;
+module.exports.isCredentialFile = isCredentialFile;
+module.exports.CREDENTIAL_DENY_PATTERNS = CREDENTIAL_DENY_PATTERNS;

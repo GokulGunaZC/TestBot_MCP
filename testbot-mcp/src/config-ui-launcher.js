@@ -390,8 +390,19 @@ class ConfigUILauncher {
           // never-bound server may never fire it in some Node.js versions.
           // Skip close() and go straight to the next port.
           this.server = null;
+          this._portRetries = (this._portRetries || 0) + 1;
+          const MAX_PORT_RETRIES = 10;
+          if (this._portRetries > MAX_PORT_RETRIES) {
+            safeReject(new Error(
+              `Config UI could not find a free port after ${MAX_PORT_RETRIES} attempts ` +
+              `(tried ${this._startingPort || this.config.port - MAX_PORT_RETRIES}–${this.config.port}). ` +
+              `Free a port in that range or set a custom port in the MCP config.`
+            ));
+            return;
+          }
+          if (!this._startingPort) this._startingPort = this.config.port;
           this.config.port++;
-          Logger.debug('ConfigUILauncher', `Port in use, trying next port`, { port: this.config.port });
+          Logger.debug('ConfigUILauncher', `Port in use, trying next port`, { port: this.config.port, attempt: this._portRetries });
           setImmediate(() => {
             this.startServer(projectInfo).then(safeResolve).catch(safeReject);
           });

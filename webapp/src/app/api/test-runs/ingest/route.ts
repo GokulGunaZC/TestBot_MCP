@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
-import { apiKeys, testRuns } from '@/lib/db/schema'
+import { apiKeys, testRuns, testFailures } from '@/lib/db/schema'
 import { eq, and } from 'drizzle-orm'
 import { hashApiKey } from '@/lib/utils/api-keys'
 import { checkRateLimit } from '@/lib/rate-limit'
@@ -47,6 +47,16 @@ type ReportTestWithAI = {
   }
 }
 
+type TierCounts = {
+  passed?: number
+  failed?: number
+  blocked?: number
+  skipped?: number
+  total?: number
+}
+
+type TierResults = Record<string, TierCounts>
+
 type ReportPayload = {
   metadata?: {
     projectName?: string
@@ -63,6 +73,25 @@ type ReportPayload = {
     analyses?: AiLikeItem[]
   } | null
   aiAnalysis?: AiLikeItem[]
+  tierResults?: TierResults
+}
+
+function normalizeTierResults(input: unknown): TierResults | null {
+  if (!input || typeof input !== 'object') return null
+  const out: TierResults = {}
+  for (const [key, raw] of Object.entries(input as Record<string, unknown>)) {
+    if (!raw || typeof raw !== 'object') continue
+    const bucket = raw as Record<string, unknown>
+    const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : 0)
+    out[String(key).slice(0, 64)] = {
+      passed: num(bucket.passed),
+      failed: num(bucket.failed),
+      blocked: num(bucket.blocked),
+      skipped: num(bucket.skipped),
+      total: num(bucket.total),
+    }
+  }
+  return Object.keys(out).length > 0 ? out : null
 }
 
 function toStringOrNull(value: unknown): string | null {
@@ -187,12 +216,28 @@ export async function POST(request: NextRequest) {
     // 1. API key presence check (header or body)
     const rawKey = request.headers.get('x-api-key') ?? null
     const body = await request.json()
-    const { api_key, creation_name, run_id, report, project_path } = body as {
+    const {
+      api_key,
+      creation_name,
+      run_id,
+      report,
+      project_path,
+      tier_results,
+      pipeline_error,
+      failures,
+      classifier_verdicts,
+      failure_clusters,
+    } = body as {
       api_key?: string
       creation_name?: string
       run_id?: string
       report?: ReportPayload
       project_path?: string
+      tier_results?: unknown
+      pipeline_error?: unknown
+      failures?: unknown[]
+      classifier_verdicts?: unknown[]
+      failure_clusters?: unknown[]
     }
     const finalApiKey: string = rawKey ?? api_key ?? ''
 
@@ -321,6 +366,17 @@ export async function POST(request: NextRequest) {
       },
     }
     const aiAnalysisPayload = buildAiAnalysisPayload(report)
+    // Accept tierResults at top-level (preferred) or nested inside report for
+    // MCP clients that roll it into the report blob.
+    const tierResultsPayload =
+      normalizeTierResults(tier_results) ?? normalizeTierResults(report.tierResults)
+
+    const pipelineErrorPayload =
+      pipeline_error && typeof pipeline_error === 'object'
+        ? (pipeline_error as Record<string, unknown>)
+        : (report as unknown as { pipelineError?: Record<string, unknown> })?.pipelineError ?? null
+
+    const runStatus = pipelineErrorPayload ? 'error' : status
 
     // Insert test run
     const [testRun] = await db
@@ -328,7 +384,7 @@ export async function POST(request: NextRequest) {
       .values({
         userId,
         creationName: projectName,
-        status,
+        status: runStatus,
         totalTests: total_tests,
         passedTests: passed_tests,
         failedTests: failed_tests,
@@ -339,10 +395,69 @@ export async function POST(request: NextRequest) {
         reportJson: reportWithRunId,
         aiAnalysis: aiAnalysisPayload,
         coverageMetrics: coverageMetricsPayload,
+        tierResults: tierResultsPayload,
+        pipelineError: pipelineErrorPayload,
         source: 'mcp',
         projectPath: project_path || null,
       })
       .returning({ id: testRuns.id })
+
+    // Persist test_failures rows — one per evidence bundle. Classifier
+    // verdicts arrive in the same order as `failures` (pipeline-worker
+    // annotates `classifierVerdict` on each bundle), but we also accept a
+    // top-level `classifier_verdicts` array and fall back to the bundle-
+    // level annotation. Failing to insert failures MUST NOT block the ingest
+    // — best-effort only.
+    try {
+      const bundles = Array.isArray(failures) ? failures : []
+      const topLevelVerdicts = Array.isArray(classifier_verdicts) ? classifier_verdicts : []
+      if (bundles.length > 0) {
+        const rows = bundles.flatMap((raw, idx) => {
+          if (!raw || typeof raw !== 'object') return []
+          const bundle = raw as Record<string, unknown>
+          if (bundle.kind !== 'test') return []
+
+          const classifierVerdict = (bundle.classifierVerdict as Record<string, unknown> | undefined)
+            ?? (topLevelVerdicts[idx] as Record<string, unknown> | undefined)
+            ?? null
+
+          const aiAnalysis = null // T4 AI result is merged into report.aiAnalysis; we record the deterministic verdict here.
+          const verdict = (classifierVerdict?.verdict as string | undefined)
+            ?? (aiAnalysis as { verdict?: string } | null)?.verdict
+            ?? 'ambiguous'
+          const verdictSource: string = classifierVerdict ? 'classifier' : 'ai'
+          const confidence = (classifierVerdict?.confidence as number | undefined)
+            ?? (aiAnalysis as { confidence?: number } | null)?.confidence
+            ?? null
+          const reason = toStringOrNull(classifierVerdict?.reason)
+          const clusterId = toStringOrNull(classifierVerdict?.clusterId)
+
+          return [{
+            testRunId: testRun.id,
+            userId,
+            testName: toStringOrNull(bundle.testName) ?? 'unknown',
+            testFile: toStringOrNull(bundle.file),
+            tier: toStringOrNull(bundle.tier),
+            verdict: String(verdict),
+            verdictSource,
+            verdictConfidence: confidence != null ? String(Math.max(0, Math.min(1, Number(confidence) || 0)).toFixed(2)) : null,
+            fixTarget: null as string | null,
+            reason,
+            suggestedPatch: null,
+            evidence: bundle as unknown,
+            clusterId,
+          }]
+        })
+
+        if (rows.length > 0) {
+          await db.insert(testFailures).values(rows)
+        }
+      }
+    } catch (err) {
+      console.error('[Ingest] Failed to persist test_failures rows (non-fatal)', err)
+    }
+
+    void failure_clusters // reserved for T6 banner rendering; we read them back from report_json for now.
 
     // Update last_used_at on the API key
     await db
@@ -370,7 +485,9 @@ export async function POST(request: NextRequest) {
     }
 
     // Async abuse detection (non-blocking)
-    runAbuseDetection({ userId, apiKeyId: apiKeyRecord.id }).catch(() => undefined)
+    runAbuseDetection({ userId, apiKeyId: apiKeyRecord.id }).catch((err: unknown) => {
+      console.error('[ingest] abuse detection failed', err)
+    })
 
     return NextResponse.json(responseBody)
   } catch (error) {

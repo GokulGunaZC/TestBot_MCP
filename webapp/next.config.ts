@@ -10,12 +10,14 @@ const nextConfig: NextConfig = {
     'http://localhost',
   ],
   experimental: {
-    // Increase body size limit for Server Actions
+    // Vercel Hobby hard-caps API request bodies at 4.5 MB, Pro is
+    // configurable but 25 MB is a safer ceiling than 300 MB. Large artifacts
+    // (videos, traces) should go direct to Supabase Storage via signed URLs,
+    // NOT through the Next.js handler.
     serverActions: {
-      bodySizeLimit: '300mb',
+      bodySizeLimit: '25mb',
     },
-    // Increase request body size limit for API routes (fixes truncation)
-    proxyClientMaxBodySize: '300mb',
+    proxyClientMaxBodySize: '25mb',
   },
 };
 
