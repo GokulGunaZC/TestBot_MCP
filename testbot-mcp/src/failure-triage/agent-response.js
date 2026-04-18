@@ -29,6 +29,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
+const { buildRemediationBlock, formatRemediationBlock } = require('./error-remediations');
 
 const AUTO_APPLY_CONFIDENCE_FLOOR = 0.85;
 const REQUIREMENT_TAG_REGEX = /\[REQ:[^\]]+\]/;
@@ -230,12 +231,18 @@ function buildAgentResponse({ report, projectPath = null, dashboardUrl = null, t
 
   if (report?.pipelineError) {
     const pe = report.pipelineError;
+    const remediation = buildRemediationBlock({
+      errorCode: pe.errorCode,
+      fallbackMessage: pe.userFacingMessage,
+    });
     response.verdicts.pipeline_error = {
       stage: pe.stage ?? null,
       reason: pe.reason ?? null,
+      errorCode: pe.errorCode ?? null,
       stderrPreview: typeof pe.stderr === 'string' ? pe.stderr.slice(0, 2000) : null,
       generatedSpecCount: pe.generatedSpecCount ?? null,
-      remediation: pe.userFacingMessage ?? null,
+      userFacingMessage: pe.userFacingMessage ?? null,
+      remediation,
       dashboardUrl: response.dashboardUrl,
     };
   }
@@ -286,9 +293,13 @@ function formatActionPlan(resp) {
   if (resp.verdicts.pipeline_error) {
     const pe = resp.verdicts.pipeline_error;
     lines.push('', '### Pipeline error:');
-    lines.push(`- stage: ${pe.stage}, reason: ${pe.reason}`);
-    if (pe.remediation) lines.push(`  ${pe.remediation}`);
+    lines.push(`- stage: ${pe.stage}, reason: ${pe.reason}, errorCode: ${pe.errorCode || 'UNCLASSIFIED'}`);
+    if (pe.userFacingMessage) lines.push(`  ${pe.userFacingMessage}`);
     if (pe.dashboardUrl) lines.push(`  Dashboard: ${pe.dashboardUrl}`);
+    if (pe.remediation) {
+      lines.push('');
+      lines.push(formatRemediationBlock(pe.remediation));
+    }
   }
 
   if (resp.dashboardUrl) {

@@ -58,6 +58,29 @@ test('ECONNREFUSED → server_start', () => {
   assert.equal(c.stage, 'server_start');
 });
 
+test('webapp unreachable (pm-app 2026-04-19) → webapp_unreachable + WEBAPP_UNREACHABLE', () => {
+  // Verbatim from the dashboard screenshot where the Healix webapp at
+  // localhost:3000 wasn't running when the MCP worker tried /api/generate-tests.
+  const stderr = 'Backend test generation failed: Cannot reach Healix webapp at '
+    + 'http://localhost:3000/api/generate-tests: fetch failed';
+  const c = classifyPipelineErrorFromStderr({ stderr });
+  assert.equal(c.id, 'webapp_unreachable');
+  assert.equal(c.stage, 'execution');
+  assert.equal(c.errorCode, 'WEBAPP_UNREACHABLE');
+  assert.match(c.userFacingMessage, /npm run dev|HEALIX_DASHBOARD_URL/);
+  assert.notEqual(c.reason, 'unknown_reason');
+});
+
+test('webapp_unreachable must beat server_unreachable when both could match', () => {
+  // A failed fetch to /api/generate-tests could theoretically include an
+  // ECONNREFUSED — the webapp rule must win because the remediation differs
+  // (start the webapp vs start the target app's dev server).
+  const stderr = 'Cannot reach Healix webapp at http://localhost:3000/api/generate-tests: '
+    + 'fetch failed (ECONNREFUSED 127.0.0.1:3000)';
+  const c = classifyPipelineErrorFromStderr({ stderr });
+  assert.equal(c.id, 'webapp_unreachable');
+});
+
 test('expo dependency validation signals get their own bucket', () => {
   const c = classifyPipelineErrorFromStderr({ stderr: 'Expo dependency validation failed for react-native@...' });
   assert.equal(c.id, 'expo_dependency_validation');

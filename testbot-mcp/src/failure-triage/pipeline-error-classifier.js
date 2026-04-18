@@ -68,6 +68,17 @@ const CLASSIFIERS = [
     userFacingMessage: 'A module required by a generated test cannot be resolved. Install the missing dependency or adjust the generator config that produced the stale import.',
   },
   {
+    id: 'webapp_unreachable',
+    // MCP worker couldn't reach the Healix webapp itself (not the target
+    // project's dev server). Matches both the explicit WEBAPP_UNREACHABLE
+    // code and the underlying "fetch failed" from Node's fetch/undici.
+    test: (s) => /WEBAPP_UNREACHABLE|Cannot reach Healix webapp|Cannot reach Healix webapp at https?:\/\//i.test(s)
+      || (/fetch failed/i.test(s) && /\/api\/(generate-tests|parse-prd|analyze-failures|exploration\/plan)/i.test(s)),
+    stage: 'execution',
+    errorCode: 'WEBAPP_UNREACHABLE',
+    userFacingMessage: 'Healix could not reach the webapp at the configured HEALIX_DASHBOARD_URL. Start the webapp (`cd webapp && npm run dev` → http://localhost:3000), or point HEALIX_DASHBOARD_URL at your deployed instance, then re-run.',
+  },
+  {
     id: 'server_unreachable',
     test: (s) => /(ECONNREFUSED|net::ERR_CONNECTION_REFUSED|ENOTFOUND)/i.test(s),
     stage: 'server_start',

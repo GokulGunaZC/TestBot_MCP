@@ -133,6 +133,66 @@ test('error phase → isTerminal:true, relay-error instruction with errorCode', 
   assert.match(parsed.agentInstructions, /error|dashboard|pipeline_error/i);
 });
 
+test('error phase attaches structured remediation block for fixable errorCode', async () => {
+  // The Cursor agent reads `remediation.fixable` to decide whether to
+  // auto-remediate or surface to the user. This test pins that contract.
+  const h = newHandler();
+  const projectPath = tempProject();
+  const runId = 'run-fix';
+  writeStatus(projectPath, runId, {
+    runId, phase: 'error',
+    message: 'Cannot reach Healix webapp at http://localhost:3000',
+    errorCode: 'WEBAPP_UNREACHABLE',
+    dashboardUrl: 'http://localhost:3000/test-run/xyz',
+  });
+  const result = await h.handleCheckRunStatus({ projectPath, runId });
+  const parsed = parseResponse(result);
+  assert.equal(parsed.errorCode, 'WEBAPP_UNREACHABLE');
+  assert.ok(parsed.remediation, 'must include a remediation block');
+  assert.equal(parsed.remediation.fixable, true);
+  assert.equal(parsed.remediation.errorCode, 'WEBAPP_UNREACHABLE');
+  assert.ok(Array.isArray(parsed.remediation.remediationSteps) && parsed.remediation.remediationSteps.length > 0);
+  assert.ok(parsed.remediation.retry?.tool);
+  // Agent instructions must tell the agent NOT to hand back to the user.
+  assert.match(parsed.agentInstructions, /auto-fixable|do NOT hand/i);
+  // Raw text content should include the markdown remediation block above the JSON.
+  const raw = result.content[0].text;
+  assert.match(raw, /## AGENT REMEDIATION/);
+  assert.match(raw, /npm run dev/);
+});
+
+test('error phase with non-fixable errorCode still carries remediation, but fixable:false', async () => {
+  const h = newHandler();
+  const projectPath = tempProject();
+  const runId = 'run-nofix';
+  writeStatus(projectPath, runId, {
+    runId, phase: 'error',
+    message: 'Dev server never became reachable',
+    errorCode: 'SERVER_START_TIMEOUT',
+    dashboardUrl: 'http://localhost:3000/test-run/xyz',
+  });
+  const result = await h.handleCheckRunStatus({ projectPath, runId });
+  const parsed = parseResponse(result);
+  assert.equal(parsed.remediation?.fixable, false);
+  assert.match(parsed.agentInstructions, /user input|Surface/i);
+});
+
+test('error phase with unknown errorCode still returns a fallback remediation block', async () => {
+  const h = newHandler();
+  const projectPath = tempProject();
+  const runId = 'run-unknown';
+  writeStatus(projectPath, runId, {
+    runId, phase: 'error',
+    message: 'Something totally new broke',
+    errorCode: 'BRAND_NEW_UNCLASSIFIED_CODE',
+  });
+  const result = await h.handleCheckRunStatus({ projectPath, runId });
+  const parsed = parseResponse(result);
+  assert.ok(parsed.remediation);
+  assert.equal(parsed.remediation.fixable, false);
+  assert.equal(parsed.remediation.errorCode, 'BRAND_NEW_UNCLASSIFIED_CODE');
+});
+
 test('corrupt status.json → isTerminal:false with transient_read_error, never throws', async () => {
   const h = newHandler();
   const projectPath = tempProject();

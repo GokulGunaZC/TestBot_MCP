@@ -806,6 +806,11 @@ function buildUserFacingPipelineError(errorCode, error) {
     return 'HEALIX_API_KEY is required for AI test generation. Set it in your MCP config: "HEALIX_API_KEY": "tb_your_key_here".';
   }
 
+  if (errorCode === 'WEBAPP_UNREACHABLE') {
+    const dashboardUrl = process.env.HEALIX_DASHBOARD_URL || 'http://localhost:3000';
+    return `Healix could not reach the webapp at ${dashboardUrl}. Start it locally with \`cd webapp && npm run dev\` (default http://localhost:3000), or point HEALIX_DASHBOARD_URL at your deployed instance in the MCP config, then re-run.`;
+  }
+
   return normalizedMessage;
 }
 

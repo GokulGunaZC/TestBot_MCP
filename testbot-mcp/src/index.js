@@ -830,7 +830,7 @@ class HealixMCPServer {
     this.server.registerTool(
       'healix_check_run_status',
       {
-        description: 'Poll the status of a Healix test run started by healix_test_my_app. You MUST call this repeatedly (every ~15 seconds) until the returned isTerminal flag is true. Do not conclude the user\'s task, do not summarize results, and do not hand control back to the user while isTerminal is false — the pipeline is still running in the background and has not yet produced verdicts. When isTerminal is true, the response contains the final phase, dashboardUrl, and (for runs with failures) a structured actionPlan telling you exactly which patches to auto-apply, which to surface for user approval, which are app regressions you must NOT auto-edit, and any pipeline_error banner details.',
+        description: 'Poll the status of a Healix test run started by healix_test_my_app. You MUST call this repeatedly (every ~15 seconds) until the returned isTerminal flag is true. Do not conclude the user\'s task, do not summarize results, and do not hand control back to the user while isTerminal is false — the pipeline is still running in the background and has not yet produced verdicts. When isTerminal is true, the response contains the final phase, dashboardUrl, and (for runs with failures) a structured actionPlan telling you exactly which patches to auto-apply, which to surface for user approval, which are app regressions you must NOT auto-edit, and any pipeline_error banner details. If the terminal response includes a `remediation` block with `fixable: true`, you MUST attempt the listed remediationSteps yourself (install deps, start webapp, etc.) and then call this tool (or healix_test_my_app) again per the `retry` hint — do NOT return the error to the user when remediation.fixable is true.',
         inputSchema: z.object({
           runId: z.string().describe('The runId returned by healix_test_my_app'),
           projectPath: z.string().optional().describe('Path to the project (defaults to current workspace)'),
@@ -1435,6 +1435,62 @@ Return the JSON structure above based on what you find in the codebase.
     const statusFile = path.join(statusDir, 'status.json');
     fs.mkdirSync(statusDir, { recursive: true });
 
+    // 3a. Port pre-flight: catch dashboard↔target port collisions BEFORE the
+    // config UI is served, so the form shows the corrected port and the
+    // pipeline doesn't fight the webapp for localhost:3000 later.
+    try {
+      const { checkDashboardPortConflict, describePreflight } = require('./port-preflight');
+      const preflightDashboardUrl = process.env.HEALIX_DASHBOARD_URL || 'http://localhost:3000';
+      const preflight = await checkDashboardPortConflict({
+        dashboardUrl: preflightDashboardUrl,
+        targetBaseUrl: baseConfig.baseURL,
+        targetPort: baseConfig.port,
+      });
+      if (preflight.conflict && preflight.newPort) {
+        Logger.warn('Index', 'Port pre-flight bumped target dev-server port before config UI', {
+          originalPort: preflight.originalPort,
+          newPort: preflight.newPort,
+          detectedAs: preflight.detectedAs,
+        });
+        baseConfig.port = preflight.newPort;
+        baseConfig.baseURL = preflight.newBaseUrl || `http://localhost:${preflight.newPort}`;
+        this.writeRunStatus(statusFile, {
+          runId,
+          phase: 'port_preflight_fixed',
+          message: describePreflight(preflight),
+          project: baseConfig.projectName,
+          originalPort: preflight.originalPort,
+          newPort: preflight.newPort,
+          detectedAs: preflight.detectedAs,
+          newBaseUrl: baseConfig.baseURL,
+        });
+        this.emitTelemetry({
+          toolName: 'healix_test_my_app',
+          eventType: 'port_preflight',
+          runId,
+          status: 'warning',
+          success: true,
+          message: describePreflight(preflight),
+          metadata: {
+            originalPort: preflight.originalPort,
+            newPort: preflight.newPort,
+            detectedAs: preflight.detectedAs,
+          },
+        });
+      } else if (preflight.conflict) {
+        // Couldn't find a free port nearby — don't block the run; the pipeline's
+        // in-flight resolver will take another crack, but at least surface the
+        // issue in status so the dashboard shows it.
+        Logger.warn('Index', 'Port pre-flight detected a conflict but found no free port', {
+          originalPort: preflight.originalPort,
+          detectedAs: preflight.detectedAs,
+        });
+      }
+    } catch (err) {
+      // Pre-flight is best-effort; never block the run on it.
+      Logger.warn('Index', 'Port pre-flight failed (non-fatal)', { error: err?.message });
+    }
+
     // Write initial status
     this.writeRunStatus(statusFile, {
       runId,
@@ -1683,15 +1739,51 @@ Return the JSON structure above based on what you find in the codebase.
       }
     }
 
-    const agentInstructions = status.phase === 'completed'
-      ? 'Run completed. Share the dashboardUrl with the user.'
-      : 'Run ended in error. Relay the message + errorCode + dashboardUrl to the user; the dashboard shows the pipeline_error banner with stderr + first-spec preview.';
+    if (status.phase === 'completed') {
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            ...base,
+            agentInstructions: 'Run completed. Share the dashboardUrl with the user.',
+          }, null, 2),
+        }],
+      };
+    }
+
+    // Terminal error with no T7 report — attach a structured remediation block
+    // so the Cursor agent can auto-fix instead of handing the error to the user.
+    let remediationBlock = null;
+    let remediationMarkdown = '';
+    try {
+      const { buildRemediationBlock, formatRemediationBlock } = require('./failure-triage/error-remediations');
+      remediationBlock = buildRemediationBlock({
+        errorCode: status.errorCode,
+        fallbackMessage: status.message,
+      });
+      remediationMarkdown = formatRemediationBlock(remediationBlock);
+    } catch (err) {
+      Logger.warn('Index', 'buildRemediationBlock failed', { error: err.message });
+    }
+
+    const agentInstructions = remediationBlock
+      ? (remediationBlock.fixable
+        ? `Healix hit an auto-fixable error (${remediationBlock.errorCode}). Follow the remediation steps — do NOT hand this back to the user. After fixing, call ${remediationBlock.retry?.tool || 'healix_test_my_app'} again.`
+        : `Healix hit an error that needs user input (${remediationBlock.errorCode}). Surface the headline + dashboardUrl, ask the user to act, then retry.`)
+      : 'Run ended in error. Relay the message + errorCode + dashboardUrl to the user.';
+
+    const payload = {
+      ...base,
+      agentInstructions,
+      remediation: remediationBlock,
+    };
+
+    const text = remediationMarkdown
+      ? `${remediationMarkdown}\n\n---\n\n${JSON.stringify(payload, null, 2)}`
+      : JSON.stringify(payload, null, 2);
 
     return {
-      content: [{
-        type: 'text',
-        text: JSON.stringify({ ...base, agentInstructions }, null, 2),
-      }],
+      content: [{ type: 'text', text }],
     };
   }
 
