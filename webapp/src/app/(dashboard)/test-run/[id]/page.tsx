@@ -50,11 +50,52 @@ interface ReportTest {
   };
 }
 
+interface AgentFailure {
+  agent: string;
+  code?: string | null;
+  message?: string;
+}
+
+interface PartialGenerationWarning {
+  reason: string;
+  generator?: string;
+  partialsWrittenCount?: number;
+  message?: string;
+}
+
+interface QualityImprovementSuggestion {
+  key: string;
+  potentialImprovement: number;
+  text: string;
+}
+
+interface QualityWarning {
+  qualityScore: number;
+  potentialImprovement: number;
+  suggestions: QualityImprovementSuggestion[];
+  totalTests?: number;
+  selectorQuality?: number;
+  coverageProfile?: string;
+  missingCategories?: string[];
+}
+
+interface GenerationMetaShape {
+  chunkingStrategy?: string;
+  agentsRequested?: string[];
+  agentsCompleted?: string[];
+  agentFailures?: AgentFailure[];
+  partialsWrittenCount?: number;
+  partialGenerationWarning?: PartialGenerationWarning;
+  qualityWarning?: QualityWarning;
+  [key: string]: unknown;
+}
+
 interface ReportJson {
   metadata?: {
     projectPath?: string;
     runId?: string;
     run_id?: string;
+    generationMeta?: GenerationMetaShape | null;
     live?: {
       isLive?: boolean;
       phase?: string;
@@ -99,6 +140,18 @@ interface LiveEvent {
   durationMs: number | null;
   occurredAt: string | null;
   metadata: Record<string, unknown> | null;
+}
+
+// ── Async generation-job progress snapshot (P2-i) ────────────────────────────
+// Fed by /api/test-runs/[id] on initial load + refetch polls, and live-updated
+// by the `generation_job` SSE event emitted from /api/test-runs/[id]/stream.
+// `null` for sync-mode runs that never wrote a generation_jobs row.
+interface GenerationJobSnapshot {
+  jobId: string;
+  status: 'queued' | 'running' | 'succeeded' | 'failed' | 'partial';
+  agentsRequested: string[];
+  agentsCompleted: Array<{ agent: string; ok: boolean; errorCode?: string }>;
+  completedAt: string | null;
 }
 
 interface LiveTestResult {
@@ -1492,6 +1545,444 @@ interface PipelineErrorShape {
   userFacingMessage?: string | null;
 }
 
+// ─── Generation-job progress chip (P2-i) ────────────────────────────────────
+// Single-line pill that surfaces live "X/N agents complete" progress for runs
+// backed by an async generation_jobs row. Collapses silently on full success;
+// the existing PartialGenerationBanner owns the richer partial-state UX once
+// the run lands. Hidden for legacy sync-mode runs (generationJob = null).
+function GenerationJobProgressChip({ job }: { job: GenerationJobSnapshot | null }) {
+  if (!job) return null;
+  if (job.status === 'succeeded') return null;
+
+  const done = job.agentsCompleted.length;
+  const total = job.agentsRequested.length || done;
+  const failed = job.agentsCompleted.filter((a) => !a.ok).length;
+
+  if (job.status === 'queued') {
+    return (
+      <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-blue-500/10 border border-blue-500/25 text-[#60A5FA] text-[11px] font-semibold">
+        <span className="w-1.5 h-1.5 rounded-full bg-blue-400" />
+        Queued · awaiting {total} agent{total === 1 ? '' : 's'}
+      </span>
+    );
+  }
+  if (job.status === 'running') {
+    return (
+      <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-blue-500/10 border border-blue-500/25 text-[#60A5FA] text-[11px] font-semibold">
+        <span className="w-1.5 h-1.5 rounded-full bg-blue-400 animate-pulse" />
+        Generating — {done}/{total} agents complete
+      </span>
+    );
+  }
+  if (job.status === 'partial') {
+    const succeeded = Math.max(0, done - failed);
+    return (
+      <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-amber-500/10 border border-amber-500/25 text-[#FCD34D] text-[11px] font-semibold">
+        <span className="w-1.5 h-1.5 rounded-full bg-amber-400" />
+        Partial — {succeeded}/{total} agents completed · {failed} failed
+      </span>
+    );
+  }
+  if (job.status === 'failed') {
+    return (
+      <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-red-500/10 border border-red-500/25 text-[#F87171] text-[11px] font-semibold">
+        <span className="w-1.5 h-1.5 rounded-full bg-red-400" />
+        Generation failed — 0/{total} agents completed
+      </span>
+    );
+  }
+  return null;
+}
+
+function QualityWarningBanner({ warning }: { warning: QualityWarning }) {
+  const [open, setOpen] = useState(false);
+  const score = Math.max(0, Math.min(100, Math.round(warning.qualityScore)));
+  const potential = Math.max(0, Math.min(100 - score, Math.round(warning.potentialImprovement)));
+  const targetScore = Math.min(100, score + potential);
+  const suggestions = warning.suggestions || [];
+  const topSuggestion = suggestions[0];
+
+  // amber for 60-79, orange/red for below 60
+  const toneClass = score >= 60
+    ? 'border-amber-500/25 bg-amber-500/[0.04]'
+    : 'border-orange-500/30 bg-orange-500/[0.05]';
+  const accentText = score >= 60 ? 'text-[#FDE68A]' : 'text-[#FDBA74]';
+  const chipBg = score >= 60 ? 'bg-amber-500/10 border-amber-500/25 text-[#FCD34D]' : 'bg-orange-500/10 border-orange-500/30 text-[#FDBA74]';
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: -6 }}
+      animate={{ opacity: 1, y: 0 }}
+      className={`glass-card rounded-2xl overflow-hidden border ${toneClass}`}
+    >
+      <div className="px-5 py-4 flex items-start justify-between gap-3">
+        <div className="flex items-start gap-3 min-w-0">
+          <div className={`w-9 h-9 rounded-lg flex items-center justify-center flex-shrink-0 mt-0.5 ${score >= 60 ? 'bg-amber-500/15 border border-amber-500/30' : 'bg-orange-500/15 border border-orange-500/30'}`}>
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke={score >= 60 ? '#FBBF24' : '#FB923C'} strokeWidth="2.2">
+              <circle cx="12" cy="12" r="10" />
+              <line x1="12" y1="8" x2="12" y2="12" />
+              <line x1="12" y1="16" x2="12.01" y2="16" />
+            </svg>
+          </div>
+          <div className="min-w-0">
+            <div className={`font-semibold text-[15px] ${accentText}`}>
+              Test suite quality: {score}%
+            </div>
+            <div className="text-[#F0F6FF]/85 text-sm mt-0.5">
+              {potential > 0 ? (
+                <>
+                  Tests were generated and will run, but quality could improve by{' '}
+                  <span className="font-semibold text-[#FDE68A]">~{potential}%</span>{' '}
+                  (to ~{targetScore}%) with the steps below.
+                </>
+              ) : (
+                <>Tests were generated and will run, but Healix flagged some coverage concerns.</>
+              )}
+              {topSuggestion && (
+                <span className="block mt-1 text-[#D8E8FF]/75 text-[12.5px]">
+                  Biggest lift: {topSuggestion.text}
+                </span>
+              )}
+            </div>
+            <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+              <span className={`px-2 py-0.5 rounded-md border text-[11px] font-mono ${chipBg}`}>
+                quality: {score}%
+              </span>
+              {potential > 0 && (
+                <span className="px-2 py-0.5 rounded-md bg-emerald-500/10 border border-emerald-500/25 text-emerald-300 text-[11px] font-mono">
+                  +{potential}% achievable
+                </span>
+              )}
+              {typeof warning.totalTests === 'number' && (
+                <span className="px-2 py-0.5 rounded-md bg-white/5 border border-white/10 text-[#D8E8FF]/70 text-[11px] font-mono">
+                  {warning.totalTests} tests
+                </span>
+              )}
+              {typeof warning.selectorQuality === 'number' && (
+                <span className="px-2 py-0.5 rounded-md bg-white/5 border border-white/10 text-[#D8E8FF]/70 text-[11px] font-mono">
+                  selectorQuality: {Math.round(warning.selectorQuality * 100)}%
+                </span>
+              )}
+              {warning.coverageProfile && (
+                <span className="px-2 py-0.5 rounded-md bg-white/5 border border-white/10 text-[#D8E8FF]/70 text-[11px] font-mono">
+                  profile: {warning.coverageProfile}
+                </span>
+              )}
+            </div>
+          </div>
+        </div>
+        {suggestions.length > 0 && (
+          <button
+            onClick={() => setOpen((o) => !o)}
+            className={`px-3 py-1.5 rounded-lg border text-xs font-semibold transition-colors flex-shrink-0 ${score >= 60 ? 'bg-amber-500/15 hover:bg-amber-500/25 border-amber-500/30 text-[#FCD34D]' : 'bg-orange-500/15 hover:bg-orange-500/25 border-orange-500/30 text-[#FDBA74]'}`}
+          >
+            {open ? 'Hide suggestions' : `How to improve (${suggestions.length})`}
+          </button>
+        )}
+      </div>
+
+      {open && suggestions.length > 0 && (
+        <div className={`px-5 py-3 border-t ${score >= 60 ? 'border-amber-500/10' : 'border-orange-500/15'}`}>
+          <div className="text-[#D8E8FF]/60 text-[11px] uppercase tracking-wide mb-2">
+            Ways to improve next run
+          </div>
+          <ul className="space-y-2">
+            {suggestions.map((s) => (
+              <li key={s.key} className="flex items-start gap-2">
+                <span className="mt-0.5 px-1.5 py-0.5 rounded bg-emerald-500/10 border border-emerald-500/25 text-emerald-300 text-[10.5px] font-mono flex-shrink-0">
+                  +{s.potentialImprovement}%
+                </span>
+                <span className="text-[13px] text-[#F0F6FF]/90 leading-relaxed">
+                  {s.text}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </motion.div>
+  );
+}
+
+function PartialGenerationBanner({
+  warning,
+  agentFailures,
+  agentsCompleted,
+  agentsRequested,
+}: {
+  warning: PartialGenerationWarning;
+  agentFailures: AgentFailure[];
+  agentsCompleted: string[];
+  agentsRequested: string[];
+}) {
+  const [detailsOpen, setDetailsOpen] = useState(false);
+
+  const completedCount = agentsCompleted.length;
+  const requestedCount = agentsRequested.length || completedCount + agentFailures.length;
+  const failedCount = agentFailures.length;
+  const partials = warning.partialsWrittenCount ?? null;
+
+  const reasonLabel =
+    warning.reason === 'budget_exceeded'
+      ? 'Generation ran out of time'
+      : warning.reason === 'agent_errors'
+      ? 'Some agents failed'
+      : 'Partial generation';
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: -6 }}
+      animate={{ opacity: 1, y: 0 }}
+      className="glass-card rounded-2xl overflow-hidden border border-amber-500/25 bg-amber-500/[0.04]"
+    >
+      <div className="px-5 py-4 border-b border-amber-500/15 flex items-start justify-between gap-3">
+        <div className="flex items-start gap-3 min-w-0">
+          <div className="w-9 h-9 rounded-lg bg-amber-500/15 border border-amber-500/30 flex items-center justify-center flex-shrink-0 mt-0.5">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#FBBF24" strokeWidth="2.2">
+              <path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" />
+              <line x1="12" y1="9" x2="12" y2="13" />
+              <line x1="12" y1="17" x2="12.01" y2="17" />
+            </svg>
+          </div>
+          <div className="min-w-0">
+            <div className="text-[#FDE68A] font-semibold text-[15px]">Partial test generation</div>
+            <div className="text-[#F0F6FF]/85 text-sm mt-0.5">
+              {warning.message ||
+                `${reasonLabel}. Healix continued with the suites that completed in time.`}
+            </div>
+            <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+              <span className="px-2 py-0.5 rounded-md bg-amber-500/10 border border-amber-500/25 text-[#FCD34D] text-[11px] font-mono">
+                agents: {completedCount}/{requestedCount} complete
+              </span>
+              {failedCount > 0 && (
+                <span className="px-2 py-0.5 rounded-md bg-amber-500/10 border border-amber-500/25 text-[#FCD34D] text-[11px] font-mono">
+                  {failedCount} failed
+                </span>
+              )}
+              {partials !== null && (
+                <span className="px-2 py-0.5 rounded-md bg-white/5 border border-white/10 text-[#D8E8FF]/70 text-[11px] font-mono">
+                  {partials} test{partials === 1 ? '' : 's'} generated
+                </span>
+              )}
+              <span className="px-2 py-0.5 rounded-md bg-white/5 border border-white/10 text-[#D8E8FF]/70 text-[11px] font-mono">
+                reason: {warning.reason}
+              </span>
+            </div>
+          </div>
+        </div>
+        {(failedCount > 0 || completedCount > 0) && (
+          <button
+            onClick={() => setDetailsOpen((o) => !o)}
+            className="px-3 py-1.5 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/30 text-[#FCD34D] text-xs font-semibold transition-colors flex-shrink-0"
+          >
+            {detailsOpen ? 'Hide details' : 'Show details'}
+          </button>
+        )}
+      </div>
+
+      {detailsOpen && (
+        <div className="px-5 py-3 text-[12px] text-[#D8E8FF]/85 border-t border-amber-500/10">
+          {completedCount > 0 && (
+            <div className="mb-2">
+              <div className="text-[#D8E8FF]/60 text-[11px] uppercase tracking-wide mb-1">
+                Completed agents
+              </div>
+              <div className="flex flex-wrap gap-1">
+                {agentsCompleted.map((a) => (
+                  <span
+                    key={a}
+                    className="px-2 py-0.5 rounded-md bg-emerald-500/10 border border-emerald-500/25 text-emerald-300 text-[11px] font-mono"
+                  >
+                    {a}
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
+          {failedCount > 0 && (
+            <div>
+              <div className="text-[#D8E8FF]/60 text-[11px] uppercase tracking-wide mb-1">
+                Failed agents
+              </div>
+              <ul className="space-y-1 font-mono text-[11px]">
+                {agentFailures.map((f, i) => (
+                  <li key={`${f.agent}-${i}`} className="flex gap-2">
+                    <span className="text-[#FCD34D]">{f.agent}</span>
+                    {f.code && <span className="text-[#F87171]">{f.code}</span>}
+                    {f.message && (
+                      <span className="text-[#D8E8FF]/70 truncate">
+                        {f.message.length > 160 ? f.message.slice(0, 157) + '…' : f.message}
+                      </span>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </div>
+      )}
+    </motion.div>
+  );
+}
+
+interface SuggestedFixStep {
+  action: string;
+  detail?: string;
+  code?: string;
+}
+interface SuggestedFix {
+  title: string;
+  steps: SuggestedFixStep[];
+  file?: string;
+}
+
+function buildSuggestedFix(error: PipelineErrorShape): SuggestedFix | null {
+  const code = error.errorCode || '';
+  const stderr = error.stderr || '';
+
+  if (code === 'PLAYWRIGHT_WEBSERVER_TIMEOUT' || /Timed out waiting \d+ms from config\.webServer/i.test(stderr)) {
+    // Try to extract the mismatched URL from userFacingMessage so we can show
+    // the exact replacement target.
+    const urlMatch = (error.userFacingMessage || '').match(/baseURL \((https?:\/\/[^)\s]+)\)/);
+    const baseURL = urlMatch?.[1] || 'http://127.0.0.1:<healix-port>/';
+    return {
+      title: 'Suggested fix — playwright.config `webServer` block is racing Healix',
+      file: 'playwright.config.ts',
+      steps: [
+        {
+          action: 'Option A — let Healix own the dev server (recommended)',
+          detail: 'Delete the entire `webServer: { ... }` block from playwright.config. Healix already starts the dev server based on the config form.',
+        },
+        {
+          action: 'Option B — align the port',
+          detail: `Change \`url\` to match the Healix baseURL and set \`reuseExistingServer: true\`:`,
+          code: `webServer: {\n  command: 'npm run dev',\n  url: '${baseURL}',\n  reuseExistingServer: true,\n  timeout: 120000,\n}`,
+        },
+      ],
+    };
+  }
+
+  if (code === 'FIXTURE_MODULE_TYPE_MISMATCH') {
+    return {
+      title: 'Suggested fix — fixture ESM/CJS mismatch',
+      steps: [
+        { action: 'Re-run Healix', detail: 'Healix now matches the generated fixture body to your project\'s `package.json` `"type"`. Just re-run — no manual edit needed.' },
+      ],
+    };
+  }
+
+  if (code === 'NO_TESTS_TO_RUN') {
+    return {
+      title: 'Suggested fix — nothing to execute',
+      steps: [
+        { action: 'Re-run with generation enabled', detail: 'In the Healix config form, toggle "Generate tests" ON, or point Healix at a project that already has `tests/generated/*.spec.ts` files.' },
+      ],
+    };
+  }
+
+  if (code === 'ONLY_FALLBACK_SPECS_EXIST') {
+    return {
+      title: 'Suggested fix — generation was off, only fallback stubs exist',
+      steps: [
+        { action: 'Enable "Generate tests" in the config form', detail: 'The specs on disk are generic Healix fallback probes from a prior failed generation — not AC-traced tests. Toggle generation ON before re-submitting.' },
+        { action: 'Optional — clear the stale fallbacks first', code: 'rm tests/generated/fallback-*.spec.*' },
+      ],
+    };
+  }
+
+  if (code === 'PLAYWRIGHT_DEPENDENCY_MISSING') {
+    return {
+      title: 'Suggested fix — install @playwright/test',
+      steps: [
+        { action: 'Install the dep in the target project', code: 'npm install --save-dev @playwright/test' },
+        { action: 'Re-run Healix', detail: 'Once installed, re-run from Cursor.' },
+      ],
+    };
+  }
+
+  if (code === 'WEBAPP_UNREACHABLE') {
+    return {
+      title: 'Suggested fix — start the Healix webapp',
+      steps: [
+        { action: 'Boot the webapp', code: 'cd webapp && npm run dev' },
+        { action: 'Verify', detail: 'Wait for http://localhost:3000 to serve, then re-run.' },
+      ],
+    };
+  }
+
+  if (code === 'SERVER_START_TIMEOUT') {
+    return {
+      title: 'Suggested fix — dev server didn\'t come up',
+      steps: [
+        { action: 'Check the start command and port', detail: 'Re-open the Healix config form and confirm the `start command`, `baseURL`, and `port` all match your project.' },
+        { action: 'Try running it manually', detail: 'In a terminal, run the same start command yourself and confirm it binds to the expected port before re-running Healix.' },
+      ],
+    };
+  }
+
+  return null;
+}
+
+function SuggestedFixBlock({ error }: { error: PipelineErrorShape }) {
+  const [copiedIdx, setCopiedIdx] = useState<number | null>(null);
+  const fix = buildSuggestedFix(error);
+  if (!fix) return null;
+
+  const onCopy = async (code: string, idx: number) => {
+    try {
+      await navigator.clipboard.writeText(code);
+      setCopiedIdx(idx);
+      setTimeout(() => setCopiedIdx(null), 1500);
+    } catch { /* ignore */ }
+  };
+
+  return (
+    <div className="px-5 py-4 border-b border-red-500/10 bg-emerald-500/[0.04]">
+      <div className="flex items-center gap-2 mb-2.5">
+        <div className="w-6 h-6 rounded-md bg-emerald-500/15 border border-emerald-500/30 flex items-center justify-center flex-shrink-0">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#6EE7B7" strokeWidth="2.6">
+            <polyline points="9 12 12 15 16 10" /><circle cx="12" cy="12" r="10" />
+          </svg>
+        </div>
+        <div className="text-[12.5px] font-semibold text-[#A7F3D0]">{fix.title}</div>
+        {fix.file && (
+          <span className="px-1.5 py-0.5 rounded bg-white/5 border border-white/10 text-[#D8E8FF]/70 text-[10.5px] font-mono">
+            {fix.file}
+          </span>
+        )}
+      </div>
+      <ol className="space-y-2.5 pl-1">
+        {fix.steps.map((step, i) => (
+          <li key={i} className="text-[12.5px] text-[#D8E8FF]/90 leading-relaxed">
+            <div className="flex items-start gap-2">
+              <span className="flex-shrink-0 w-4 h-4 rounded-full bg-emerald-500/15 border border-emerald-500/30 text-[#6EE7B7] text-[10px] font-bold flex items-center justify-center mt-0.5">
+                {i + 1}
+              </span>
+              <div className="flex-1 min-w-0">
+                <div className="font-semibold text-[#ECFDF5]">{step.action}</div>
+                {step.detail && <div className="text-[#D8E8FF]/80 mt-0.5">{step.detail}</div>}
+                {step.code && (
+                  <div className="mt-1.5 relative">
+                    <pre className="text-[11.5px] text-[#A7F3D0] bg-black/30 border border-emerald-500/15 rounded-md px-3 py-2 font-mono whitespace-pre overflow-x-auto">
+{step.code}
+                    </pre>
+                    <button
+                      onClick={() => onCopy(step.code!, i)}
+                      className="absolute top-1.5 right-1.5 px-1.5 py-0.5 rounded bg-emerald-500/15 hover:bg-emerald-500/25 border border-emerald-500/30 text-[#6EE7B7] text-[10px] font-semibold"
+                    >
+                      {copiedIdx === i ? 'Copied ✓' : 'Copy'}
+                    </button>
+                  </div>
+                )}
+              </div>
+            </div>
+          </li>
+        ))}
+      </ol>
+    </div>
+  );
+}
+
 function PipelineErrorBanner({ error, runId }: { error: PipelineErrorShape; runId: string }) {
   const [stderrOpen, setStderrOpen] = useState(true);
   const [specOpen, setSpecOpen] = useState(false);
@@ -1586,6 +2077,8 @@ function PipelineErrorBanner({ error, runId }: { error: PipelineErrorShape; runI
         </div>
       )}
 
+      <SuggestedFixBlock error={error} />
+
       {error.qualityAuditErrors && error.qualityAuditErrors.length > 0 && (
         <div className="px-5 py-3 border-b border-red-500/10">
           <div className="text-[11px] uppercase tracking-wider text-[#FCA5A5] font-semibold mb-1.5">Quality audit errors</div>
@@ -1652,6 +2145,7 @@ export default function TestRunDetailPage() {
   const [liveEvents, setLiveEvents] = useState<LiveEvent[]>([]);
   const [liveFiles, setLiveFiles] = useState<string[]>([]);
   const [liveTestResults, setLiveTestResults] = useState<LiveTestResult[]>([]);
+  const [generationJob, setGenerationJob] = useState<GenerationJobSnapshot | null>(null);
   const [pipelineOpen, setPipelineOpen] = useState(true);
   const [pipelineEnded, setPipelineEnded] = useState(false);
   const [testResultsOpen, setTestResultsOpen] = useState(true);
@@ -1693,7 +2187,19 @@ export default function TestRunDetailPage() {
     evtSource.onmessage = (e: MessageEvent) => {
       retryCount = 0;
       try {
-        const data = JSON.parse(e.data) as LiveEvent & { type: string };
+        const data = JSON.parse(e.data) as LiveEvent & {
+          type: string;
+          generationJob?: GenerationJobSnapshot | null;
+        };
+        // P2-i: absorb generation-job snapshots (sent on `connected` and on
+        // change during poll). Separate from LiveEvent handling — these never
+        // go into the liveEvents timeline.
+        if (data.type === 'connected' || data.type === 'generation_job') {
+          if ('generationJob' in data) {
+            setGenerationJob(data.generationJob ?? null);
+          }
+          return;
+        }
         if (data.type === 'event') {
           setLiveEvents(prev => {
             if (prev.some(ev => ev.id === data.id)) return prev;
@@ -1719,7 +2225,14 @@ export default function TestRunDetailPage() {
           // Final fetch to pick up completed state & report (Fix 1 returns real ingested run)
           fetch(`/api/test-runs/${id}`, { cache: 'no-store' })
             .then(res => res.ok ? res.json() : null)
-            .then(json => { if (json?.data) setTestRun(json.data); })
+            .then(json => {
+              if (json?.data) {
+                setTestRun(json.data);
+                setGenerationJob(
+                  (json.data as { generationJob?: GenerationJobSnapshot | null }).generationJob ?? null
+                );
+              }
+            })
             .catch(() => {});
         }
       } catch { /* ignore malformed events */ }
@@ -1773,6 +2286,14 @@ export default function TestRunDetailPage() {
           lastRunSignatureRef.current = signature;
           setTestRun(nextRun);
         }
+
+        // P2-i: pick up the generation-job snapshot unconditionally so the
+        // progress chip renders on initial load for async-backed runs even
+        // when SSE isn't attached (non-live-prefixed URLs). Cheap `null` fall-
+        // back for sync-mode runs.
+        setGenerationJob(
+          (json.data as { generationJob?: GenerationJobSnapshot | null }).generationJob ?? null
+        );
 
         // When the real ingested run is returned for a live-prefixed URL,
         // mark the pipeline as ended and close the SSE connection.
@@ -1842,6 +2363,12 @@ export default function TestRunDetailPage() {
             lastRunSignatureRef.current = signature;
             setTestRun(nextRun);
           }
+          // P2-i: sync the generation-job snapshot on every poll. SSE pushes
+          // updates faster for live runs, but non-live runs still get current
+          // progress here.
+          setGenerationJob(
+            (json.data as { generationJob?: GenerationJobSnapshot | null }).generationJob ?? null
+          );
           // When the real ingested run is returned for a live-prefixed URL,
           // mark the pipeline as ended and close the SSE connection.
           if (isLiveDetailId && nextRun && !nextRun.is_live) {
@@ -1913,6 +2440,39 @@ export default function TestRunDetailPage() {
   const isPipelineSynthetic = (t: NormalisedTest) =>
     (t.suite === 'pipeline' || t.suite === 'Healix') && (t.name.startsWith('[PIPELINE') || t.name.startsWith('[HEALIX'));
   const pipelineError = testRun.pipeline_error ?? null;
+
+  // Partial-generation banner (P1-f): surface budget-exhaustion + per-agent
+  // failures that survived as a partial suite. Only render when the MCP
+  // actually annotated generationMeta — legacy runs have neither field and
+  // the banner stays hidden.
+  const generationMeta = (report?.metadata?.generationMeta ?? null) as GenerationMetaShape | null;
+  const partialWarning = generationMeta?.partialGenerationWarning ?? null;
+  const qualityWarning = generationMeta?.qualityWarning ?? null;
+  const agentFailuresFromMeta: AgentFailure[] = Array.isArray(generationMeta?.agentFailures)
+    ? (generationMeta!.agentFailures as AgentFailure[])
+    : [];
+  const agentsCompletedFromMeta: string[] = Array.isArray(generationMeta?.agentsCompleted)
+    ? (generationMeta!.agentsCompleted as string[])
+    : [];
+  const agentsRequestedFromMeta: string[] = Array.isArray(generationMeta?.agentsRequested)
+    ? (generationMeta!.agentsRequested as string[])
+    : [];
+  // Banner shows when (a) MCP flagged a budget-exceeded partial, OR
+  // (b) no explicit warning but some agents rejected while others landed tests.
+  // Hide when pipelineError is set — the red banner already tells the full story.
+  const shouldShowPartialBanner =
+    !pipelineError &&
+    !!generationMeta &&
+    (!!partialWarning ||
+      (agentFailuresFromMeta.length > 0 && agentsCompletedFromMeta.length > 0));
+  const effectiveWarning: PartialGenerationWarning | null = partialWarning
+    ? partialWarning
+    : shouldShowPartialBanner
+    ? {
+        reason: 'agent_errors',
+        partialsWrittenCount: generationMeta?.partialsWrittenCount,
+      }
+    : null;
   const hasRealTests = liveTestResults.length > 0 || normalisedTests.some(t => !isPipelineSynthetic(t));
   // When pipeline_error is structured on the run, always hide the synthetic fake-test row
   // in favour of the dedicated banner. Otherwise fall back to legacy behaviour.
@@ -2054,7 +2614,8 @@ export default function TestRunDetailPage() {
             <h1 className="text-[#F0F6FF] font-bold text-2xl">{testRun.creation_name || 'Test Run'}</h1>
             <p className="text-[#4A6280] text-sm mt-0.5">{formattedDate}</p>
           </div>
-          <div className="flex items-center gap-3">
+          <div className="flex items-center gap-3 flex-wrap">
+            <GenerationJobProgressChip job={generationJob} />
             {testRun.source && (
               <span className="px-3 py-1 rounded-full bg-blue-500/10 border border-blue-500/20 text-[#60A5FA] text-xs font-semibold uppercase tracking-wider">
                 {testRun.source}
@@ -2074,6 +2635,19 @@ export default function TestRunDetailPage() {
 
       {pipelineError && (
         <PipelineErrorBanner error={pipelineError as PipelineErrorShape} runId={testRun.id} />
+      )}
+
+      {shouldShowPartialBanner && effectiveWarning && (
+        <PartialGenerationBanner
+          warning={effectiveWarning}
+          agentFailures={agentFailuresFromMeta}
+          agentsCompleted={agentsCompletedFromMeta}
+          agentsRequested={agentsRequestedFromMeta}
+        />
+      )}
+
+      {!pipelineError && qualityWarning && qualityWarning.suggestions?.length > 0 && (
+        <QualityWarningBanner warning={qualityWarning} />
       )}
 
       {(testRun.is_live || !!liveMeta || !!testRun.current_phase || !!testRun.error_code || liveEvents.length > 0) && (

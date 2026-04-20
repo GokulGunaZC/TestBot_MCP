@@ -1,9 +1,85 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getCurrentUser } from '@/lib/auth/session'
 import { db } from '@/lib/db'
-import { testRuns, testFailures } from '@/lib/db/schema'
-import { eq, and, sql } from 'drizzle-orm'
+import { testRuns, testFailures, generationJobs } from '@/lib/db/schema'
+import { eq, and, desc, sql } from 'drizzle-orm'
 import { extractRunIdFromReport, getLiveRunsForUser } from '@/lib/mcp-live-runs'
+
+// ── Generation-job progress projection (P2-i) ────────────────────────────────
+// Normalizes a linked generation_jobs row into the wire shape consumed by the
+// dashboard's GenerationJobProgressChip. Mirrors the per-agent error-code
+// cross-reference logic in /api/generate-tests/jobs/[jobId]/route.ts.
+type AgentErrorEntry = { agent?: unknown; errorCode?: unknown; code?: unknown }
+
+function isAgentErrorList(value: unknown): value is AgentErrorEntry[] {
+  return Array.isArray(value)
+}
+
+function errorCodeForAgent(agent: string, pools: unknown[]): string | null {
+  for (const pool of pools) {
+    if (!isAgentErrorList(pool)) continue
+    for (const entry of pool) {
+      if (entry && typeof entry === 'object' && (entry as AgentErrorEntry).agent === agent) {
+        const code = (entry as AgentErrorEntry).errorCode ?? (entry as AgentErrorEntry).code ?? null
+        return typeof code === 'string' ? code : null
+      }
+    }
+  }
+  return null
+}
+
+type GenerationJobProjection = {
+  jobId: string
+  status: 'queued' | 'running' | 'succeeded' | 'failed' | 'partial'
+  agentsRequested: string[]
+  agentsCompleted: Array<{ agent: string; ok: boolean; errorCode?: string }>
+  completedAt: string | null
+}
+
+async function loadLatestGenerationJob(
+  testRunId: string,
+  userId: string
+): Promise<GenerationJobProjection | null> {
+  // The generation_jobs table may not yet exist in the running DB (migration
+  // 0007 is additive and may land after webapp deploy). Swallow any DB error
+  // and degrade to "no linked job" so the run page keeps rendering.
+  let job: typeof generationJobs.$inferSelect | undefined
+  try {
+    const rows = await db
+      .select()
+      .from(generationJobs)
+      .where(and(eq(generationJobs.testRunId, testRunId), eq(generationJobs.userId, userId)))
+      .orderBy(desc(generationJobs.createdAt))
+      .limit(1)
+    job = rows[0]
+  } catch {
+    return null
+  }
+  if (!job) return null
+
+  const result = (job.result ?? null) as { errors?: AgentErrorEntry[] } | null
+  const error = (job.error ?? null) as { agents?: AgentErrorEntry[] } | AgentErrorEntry[] | null
+  const errorPools: unknown[] = []
+  if (result?.errors) errorPools.push(result.errors)
+  if (Array.isArray(error)) errorPools.push(error)
+  else if (error && typeof error === 'object' && 'agents' in error && error.agents) {
+    errorPools.push((error as { agents?: AgentErrorEntry[] }).agents ?? [])
+  }
+
+  const agentsRequested = job.agentsRequested ?? []
+  const agentsCompleted = (job.agentsCompleted ?? []).map((agent) => {
+    const code = errorCodeForAgent(agent, errorPools)
+    return code ? { agent, ok: false, errorCode: code } : { agent, ok: true }
+  })
+
+  return {
+    jobId: job.id,
+    status: job.status as GenerationJobProjection['status'],
+    agentsRequested,
+    agentsCompleted,
+    completedAt: job.completedAt?.toISOString() ?? null,
+  }
+}
 
 async function loadFailuresForRun(runId: string, userId: string) {
   const rows = await db
@@ -62,7 +138,10 @@ export async function GET(
         .limit(1)
 
       if (ingestedRow) {
-        const test_failures = await loadFailuresForRun(ingestedRow.id, user.id)
+        const [test_failures, generationJob] = await Promise.all([
+          loadFailuresForRun(ingestedRow.id, user.id),
+          loadLatestGenerationJob(ingestedRow.id, user.id),
+        ])
         const data = {
           id: ingestedRow.id,
           user_id: ingestedRow.userId,
@@ -89,17 +168,21 @@ export async function GET(
           current_phase: null,
           error_code: null,
           is_live: false,
+          generationJob,
         }
         return NextResponse.json({ data })
       }
 
-      // Fall back to synthetic live data while the run is still in progress
+      // Fall back to synthetic live data while the run is still in progress.
+      // No ingested test_runs row yet → no FK to join generation_jobs on, so
+      // the chip stays hidden until the real run lands (expected for legacy
+      // sync-mode runs and any live window before ingest).
       const [liveRun] = await getLiveRunsForUser(user.id, { runId, windowHours: 72, limit: 1500 })
       if (!liveRun) {
         return NextResponse.json({ error: 'Test run not found' }, { status: 404 })
       }
 
-      return NextResponse.json({ data: liveRun })
+      return NextResponse.json({ data: { ...liveRun, generationJob: null } })
     }
 
     const [row] = await db
@@ -112,7 +195,10 @@ export async function GET(
       return NextResponse.json({ error: 'Test run not found' }, { status: 404 })
     }
 
-    const test_failures = await loadFailuresForRun(row.id, user.id)
+    const [test_failures, generationJob] = await Promise.all([
+      loadFailuresForRun(row.id, user.id),
+      loadLatestGenerationJob(row.id, user.id),
+    ])
     const data = {
       id: row.id,
       user_id: row.userId,
@@ -139,6 +225,7 @@ export async function GET(
       current_phase: null,
       error_code: null,
       is_live: false,
+      generationJob,
     }
 
     return NextResponse.json({ data })

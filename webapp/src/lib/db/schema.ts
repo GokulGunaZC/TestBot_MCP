@@ -9,7 +9,18 @@ import {
   numeric,
   jsonb,
   index,
+  uniqueIndex,
+  check,
 } from 'drizzle-orm/pg-core'
+import { sql } from 'drizzle-orm'
+import type { GenerationPlan } from '@/lib/test-generation/plan-schema'
+
+// Open-ish shapes for the generation_jobs jsonb columns. The Phase 2 Inngest
+// pipeline writes richer structures here, but at the DB layer we only care
+// that they are JSON objects — callers do their own typed parsing.
+export type GenerationJobPayload = Record<string, unknown>
+export type GenerationJobResult = Record<string, unknown>
+export type GenerationJobError = Record<string, unknown>
 
 export const profiles = pgTable('profiles', {
   id: uuid('id').primaryKey(),
@@ -256,5 +267,77 @@ export const projectUsage = pgTable(
   (table) => [
     index('project_usage_hash_idx').on(table.projectHash),
     index('project_usage_user_id_idx').on(table.userId),
+  ]
+)
+
+/**
+ * P1.5 planner-pass cache. Each user's (prd + parsedPRD + contextDigest +
+ * projectInfoDigest + roles) hash maps to a single cached GenerationPlan
+ * for 24h. Skipping the planner on a cache hit eliminates two gpt-5.4 calls
+ * per pipeline run for repeat generations against the same repo snapshot.
+ */
+export const generationPlans = pgTable(
+  'generation_plans',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => profiles.id, { onDelete: 'cascade' }),
+    planHash: text('plan_hash').notNull(),
+    planJson: jsonb('plan_json').$type<GenerationPlan>().notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
+  },
+  (table) => [
+    uniqueIndex('generation_plans_user_hash_idx').on(table.userId, table.planHash),
+    index('generation_plans_user_recent_idx').on(table.userId, table.createdAt.desc()),
+  ]
+)
+
+/**
+ * Phase 2 async test generation jobs. One row per enqueued Inngest job
+ * tracks the lifecycle (queued → running → succeeded/failed/partial), the
+ * per-agent progress, the request payload, and the terminal result or
+ * error envelope. Partial indexes (status filter, idempotency_key NOT NULL)
+ * are declared in the SQL migration (0007_generation_jobs.sql); the Drizzle
+ * declarations below mirror them without the WHERE clause so the runtime
+ * query builder still knows the indexes exist.
+ */
+export const generationJobs = pgTable(
+  'generation_jobs',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => profiles.id, { onDelete: 'cascade' }),
+    // SET NULL (not cascade) so rotating an api_key doesn't erase audit history.
+    apiKeyId: uuid('api_key_id').references(() => apiKeys.id, { onDelete: 'set null' }),
+    // SET NULL so jobs enqueued before a test_runs row exists stay valid.
+    testRunId: uuid('test_run_id').references(() => testRuns.id, { onDelete: 'set null' }),
+    status: text('status').notNull(),
+    payload: jsonb('payload').$type<GenerationJobPayload>().notNull(),
+    agentsRequested: text('agents_requested').array().notNull(),
+    agentsCompleted: text('agents_completed')
+      .array()
+      .notNull()
+      .default(sql`'{}'`),
+    result: jsonb('result').$type<GenerationJobResult>(),
+    error: jsonb('error').$type<GenerationJobError>(),
+    idempotencyKey: text('idempotency_key'),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
+    startedAt: timestamp('started_at', { withTimezone: true }),
+    completedAt: timestamp('completed_at', { withTimezone: true }),
+  },
+  (table) => [
+    index('generation_jobs_user_idx').on(table.userId, table.createdAt.desc()),
+    index('generation_jobs_status_idx')
+      .on(table.status)
+      .where(sql`status IN ('queued','running')`),
+    uniqueIndex('generation_jobs_idem_idx')
+      .on(table.userId, table.idempotencyKey)
+      .where(sql`idempotency_key IS NOT NULL`),
+    check(
+      'generation_jobs_status_check',
+      sql`status IN ('queued','running','succeeded','failed','partial')`
+    ),
   ]
 )

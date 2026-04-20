@@ -61,8 +61,24 @@ If login fails, Healix re-prompts for credentials; if login still fails, Tier B 
 |----------|-------------|---------|
 | `HEALIX_API_KEY` | Required. Your Healix API key (authenticates and meters token usage). | - |
 | `HEALIX_DASHBOARD_URL` | Optional. Dashboard base URL. | Production Vercel URL |
+| `HEALIX_RUN_BUDGET_MS` | Optional. Overall run budget in milliseconds. | `3600000` (60 min) |
+| `HEALIX_GEN_BUDGET_MS` | Optional. Test-generation stage budget. Raise this for larger codebases. | `900000` (15 min) |
+| `HEALIX_GEN_ASYNC` | Optional. Webapp-side. Set to `true` to route generation through Inngest background jobs. | `false` |
 
 No other keys are required. OpenAI calls are proxied server-side through the Healix webapp.
+
+### Large codebases (async generation)
+
+The default generation mode is per-agent parallel fan-out, executed synchronously within the `/api/generate-tests` request. That fits comfortably inside Vercel Hobby's 60s function ceiling for most repos.
+
+For codebases where even a single per-agent call exceeds 60s, flip the webapp into background-job mode:
+
+1. On the webapp, set `HEALIX_GEN_ASYNC=true` and configure Inngest (`INNGEST_EVENT_KEY`, `INNGEST_SIGNING_KEY`). See `webapp/README.md` for details.
+2. No MCP-side change required. `@healix/mcp` auto-detects the 202 response and switches to polling.
+
+Behavior: the MCP enqueues a job, polls for progress, and writes partials to disk as each agent completes. The dashboard renders a live "X/N agents complete" chip driven by the same `generation_jobs` row.
+
+Rollback: flip `HEALIX_GEN_ASYNC=false`. The next request uses the sync Phase-1 path unchanged. In-flight Inngest jobs keep running and writing to their row — no orphaned users.
 
 ### Tool Parameters
 

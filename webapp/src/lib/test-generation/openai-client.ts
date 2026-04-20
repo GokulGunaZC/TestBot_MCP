@@ -17,7 +17,18 @@ export class OpenAIClient {
         ? Number(config.timeout)
         : Number.isFinite(envTimeout) && envTimeout > 0
           ? envTimeout
-          : 540_000 // 9 min — gpt-5.4 reasoning:high can take minutes per call
+          : 540_000 // 9 min — gpt-5.4 can take minutes per call at reasoning:high
+
+    const envEffort = String(process.env.OPENAI_REASONING_EFFORT || '').toLowerCase()
+    // Default 'medium' for gpt-5.4: 2–3× faster than 'high' and 'high' occasionally
+    // emits only a reasoning block with no message (→ tests:[] → pipeline failure).
+    // Medium returns a message reliably in ~2s. Override via OPENAI_REASONING_EFFORT
+    // or the per-client config option.
+    const resolvedEffort: 'low' | 'medium' | 'high' =
+      config.reasoningEffort ??
+      (envEffort === 'low' || envEffort === 'medium' || envEffort === 'high'
+        ? (envEffort as 'low' | 'medium' | 'high')
+        : 'medium')
 
     // gpt-5.4 only. No chat-fallback, no model alternates.
     // gpt-5.4 runs on the Responses API (/v1/responses) with `input` +
@@ -32,6 +43,7 @@ export class OpenAIClient {
         config.maxTokens || parseInt(process.env.OPENAI_MAX_TOKENS || '4000') || 4000,
       temperature: config.temperature ?? 0.2,
       timeout: timeoutMs,
+      reasoningEffort: resolvedEffort,
     }
   }
 
@@ -117,7 +129,7 @@ export class OpenAIClient {
         body: JSON.stringify({
           model,
           input: this.buildResponsesInput(messages),
-          reasoning: { effort: 'high' },
+          reasoning: { effort: this.config.reasoningEffort || 'high' },
         }),
         signal: controller.signal,
       })

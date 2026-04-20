@@ -320,7 +320,7 @@ export default function TestListsPage() {
                 <div className="text-[#F0F6FF] font-semibold mb-1">No test lists yet</div>
                 <div className="text-[#4A6280] text-sm">Create your first test list to organize your tests</div>
               </div>
-              <button onClick={() => setShowNewForm(true)} className="btn-gradient text-white font-semibold px-5 py-2.5 rounded-xl text-sm">
+              <button onClick={() => setShowNewForm(true)} className="btn-gradient text-black font-semibold px-5 py-2.5 rounded-xl text-sm">
                 Create Test List
               </button>
             </motion.div>

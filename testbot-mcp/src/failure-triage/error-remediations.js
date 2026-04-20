@@ -181,6 +181,54 @@ const REMEDIATIONS = {
     agentInstruction: 'Expo rejected the current dependency versions. Run `npx expo install --fix` in the project root to pin compatible versions, then re-run healix_test_my_app.',
   },
 
+  ONLY_FALLBACK_SPECS_EXIST: {
+    fixable: true,
+    headline: 'Only Healix fallback stubs exist — enable generation and re-run.',
+    diagnosticCommands: [
+      { shell: 'ls tests/generated/ 2>/dev/null | grep -E "^fallback-|^__healix-"',
+        purpose: 'Confirm the only specs are fallback stubs.' },
+    ],
+    remediationSteps: [
+      { kind: 'surface_to_user',
+        description: 'In the Healix config form, toggle "Generate tests" to ON before submitting. Re-running with generation OFF would just execute the same stub smoke tests again.' },
+      { kind: 'shell',
+        command: 'rm tests/generated/fallback-*.spec.* 2>/dev/null; true',
+        description: 'Optional — remove the leftover fallback stubs so a fresh generation has a clean slate.',
+        optional: true },
+    ],
+    retry: { tool: 'healix_test_my_app', reuseRunId: false },
+    agentInstruction: 'Generation was disabled and only fallback stubs exist on disk. Tell the user to re-run with generation enabled (toggle in the config UI). Optionally delete tests/generated/fallback-*.spec.* first.',
+  },
+
+  PLAYWRIGHT_WEBSERVER_TIMEOUT: {
+    fixable: true,
+    headline: 'playwright.config `webServer` block is racing Healix\'s own dev-server manager — disable or align it.',
+    diagnosticCommands: [
+      { shell: 'grep -n "webServer" playwright.config.ts playwright.config.js playwright.config.mjs 2>/dev/null | head -20',
+        purpose: 'Find the webServer block in the user\'s playwright.config.' },
+    ],
+    remediationSteps: [
+      { kind: 'edit_file',
+        description: 'Open the user\'s playwright.config.* and either (a) delete the `webServer: { ... }` block entirely so Healix owns the dev server, or (b) set `reuseExistingServer: true` AND make `webServer.url` match the baseURL/port configured in the Healix config form. The ports must be identical — port 5173 in the config but Healix on 5175 is the common failure mode.' },
+      { kind: 'rerun_tool',
+        description: 'Re-run healix_test_my_app. The dev server Healix starts will be the only one, and Playwright will talk to it directly.' },
+    ],
+    retry: { tool: 'healix_test_my_app', reuseRunId: false },
+    agentInstruction: 'The user\'s playwright.config has a `webServer` block whose port/URL doesn\'t match the Healix-managed dev server. Edit playwright.config to either remove the `webServer` block or align its `url`/port with the baseURL you see in the Healix config UI. Then re-run.',
+  },
+
+  AGENTS_RETURNED_ZERO_TESTS: {
+    fixable: false,
+    headline: 'Every generation agent returned success but produced zero tests.',
+    diagnosticCommands: [],
+    remediationSteps: [
+      { kind: 'surface_to_user',
+        description: 'Root cause is typically OpenAI running past Vercel\'s 60s cap (so the webapp returns an empty tests[] for every agent). Ask the user to re-run — reasoning:"medium" is now the default for scoped agent calls. If it repeats, suggest flipping HEALIX_GEN_ASYNC=true on the webapp to route through Inngest.' },
+    ],
+    retry: { tool: 'healix_test_my_app', reuseRunId: false },
+    agentInstruction: 'All agents returned 200 with an empty tests[] — not a code-level problem on the user\'s side. Surface to the user: re-run once; if it fails again, the webapp operator needs to flip HEALIX_GEN_ASYNC=true (Inngest async path) or shrink the project\'s PRD/exploration input. Do NOT try to patch the user\'s codebase.',
+  },
+
   TIME_BUDGET_EXCEEDED: {
     fixable: false,
     headline: 'Healix hit its configured time budget before tests finished.',

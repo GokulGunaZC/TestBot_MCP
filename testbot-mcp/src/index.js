@@ -255,6 +255,132 @@ class HealixMCPServer {
     }
   }
 
+  /**
+   * Read the project's package.json to classify its web framework. Used by the
+   * port-autocorrection pass so we can inject the right port flag (`--port` vs
+   * `-p` vs `PORT=`) into the user's startCommand. Returns null when unknown.
+   */
+  detectProjectFramework(projectPath) {
+    try {
+      const pkgPath = path.join(projectPath, 'package.json');
+      if (!fs.existsSync(pkgPath)) return null;
+      const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8'));
+      const deps = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) };
+      if (deps.expo || deps['expo-router']) return { kind: 'expo', defaultPort: 8081 };
+      if (deps.next) return { kind: 'next', defaultPort: 3000 };
+      if (deps.vite) return { kind: 'vite', defaultPort: 5173 };
+      if (deps['react-scripts']) return { kind: 'cra', defaultPort: 3000 };
+      if (deps['@remix-run/dev']) return { kind: 'remix', defaultPort: 3000 };
+      if (deps.nuxt || deps.nuxt3) return { kind: 'nuxt', defaultPort: 3000 };
+      if (deps['@sveltejs/kit']) return { kind: 'sveltekit', defaultPort: 5173 };
+      return { kind: 'unknown', defaultPort: null };
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Align the user's startCommand + port + baseURL before the pipeline runs.
+   *
+   * The form lets users override the auto-detected values, which is great in
+   * theory but leads to preventable failures in practice: a Vite project with
+   * port field = 8000 and startCommand = "npm run dev" will have the dev
+   * server bind to 5173 (Vite's default, since `npm run dev` has no `--port`
+   * flag), leaving Playwright testing nothing on 8000.
+   *
+   * This method rewrites startCommand so whatever port the user ended up with
+   * is the port the dev server actually binds to. Framework-aware: Vite uses
+   * `--port N`, Next uses `-p N`, CRA uses `PORT=N`, Expo delegates to the
+   * existing normalizer. Returns `{ startCommand, port, baseURL, appliedFixes }`.
+   */
+  autoCorrectPortConfig({ projectPath, startCommand, port, baseURL }) {
+    const appliedFixes = [];
+    let cmd = String(startCommand || '').trim();
+    let finalPort = Number(port) || 0;
+    let finalBaseURL = String(baseURL || '').trim();
+
+    if (!cmd || !finalPort) return { startCommand: cmd, port: finalPort, baseURL: finalBaseURL, appliedFixes };
+
+    const framework = this.detectProjectFramework(projectPath);
+
+    // Step 1: if baseURL port differs from port field, align them (port field wins —
+    // it's the explicit form input).
+    try {
+      const parsed = new URL(finalBaseURL);
+      if (parsed.port && parseInt(parsed.port, 10) !== finalPort) {
+        parsed.port = String(finalPort);
+        const aligned = parsed.toString();
+        appliedFixes.push({
+          kind: 'baseURL_port_aligned',
+          detail: `baseURL port realigned to match the Port field: ${finalBaseURL} → ${aligned}`,
+        });
+        finalBaseURL = aligned;
+      }
+    } catch { /* malformed baseURL — leave it */ }
+
+    // Step 2: inject the port flag into startCommand so the dev server binds
+    // where Playwright expects. Only act when the command has no explicit
+    // port override already.
+    const hasExplicitPort = /--port[=\s]\d+/i.test(cmd)
+      || /\s-p\s+\d+/i.test(cmd)
+      || /\bPORT\s*=\s*\d+/i.test(cmd);
+
+    if (!hasExplicitPort && framework && framework.kind !== 'unknown') {
+      const usesNpmScript = /^(?:npm|pnpm|yarn|bun)(?:\s+run)?\s+\S+/i.test(cmd);
+      const scriptArgSep = usesNpmScript ? ' -- ' : ' ';
+      const alreadyHasSeparator = usesNpmScript && / -- /.test(cmd);
+
+      let inject = null;
+      switch (framework.kind) {
+        case 'vite':
+        case 'expo':
+        case 'sveltekit':
+        case 'nuxt':
+          inject = `--port ${finalPort}`;
+          break;
+        case 'next':
+        case 'remix':
+          inject = `-p ${finalPort}`;
+          break;
+        case 'cra':
+          cmd = `PORT=${finalPort} ${cmd}`;
+          appliedFixes.push({
+            kind: 'startCommand_port_injected',
+            detail: `Prefixed startCommand with PORT=${finalPort} (CRA reads PORT env var): ${startCommand} → ${cmd}`,
+          });
+          inject = null; // already handled
+          break;
+      }
+
+      if (inject) {
+        const original = cmd;
+        if (alreadyHasSeparator) {
+          cmd += ` ${inject}`;
+        } else if (usesNpmScript) {
+          cmd += `${scriptArgSep}${inject}`;
+        } else {
+          cmd += ` ${inject}`;
+        }
+        appliedFixes.push({
+          kind: 'startCommand_port_injected',
+          detail: `Injected port flag into startCommand so the dev server binds to ${finalPort}: "${original}" → "${cmd}"`,
+        });
+      }
+    }
+
+    // Step 3: if port is the framework's default and the user didn't explicitly
+    // pick something else in the form, log a confirmation (no change). Helps
+    // debug when autodetection was correct all along.
+    if (framework && framework.defaultPort && finalPort === framework.defaultPort && appliedFixes.length === 0) {
+      appliedFixes.push({
+        kind: 'port_matches_framework_default',
+        detail: `Port ${finalPort} matches the ${framework.kind} default — no changes needed.`,
+      });
+    }
+
+    return { startCommand: cmd, port: finalPort, baseURL: finalBaseURL, appliedFixes };
+  }
+
   persistUploadedPrd(statusDir, prdPayload) {
     if (!prdPayload?.textContent) {
       return undefined;
@@ -472,14 +598,32 @@ class HealixMCPServer {
       const prdFiles = this.persistUploadedPrdFiles(statusDir, validatedConfig.prdFiles);
       const normalizedCredentials = this.normalizeCredentials(validatedConfig.credentials);
 
+      // Auto-correct port/startCommand alignment BEFORE the pipeline starts.
+      // Without this, a Vite project with submitted port 8000 + startCommand
+      // "npm run dev" runs the dev server on Vite's default 5173, leaves 8000
+      // empty, and every Playwright test fails with ECONNREFUSED or invalid
+      // URL. See autoCorrectPortConfig for the framework-aware logic.
+      const corrected = this.autoCorrectPortConfig({
+        projectPath: baseConfig.projectPath,
+        startCommand: validatedConfig.startCommand,
+        port: this.extractPortFromBaseURL(validatedConfig.baseURL, baseConfig.port),
+        baseURL: validatedConfig.baseURL,
+      });
+      if (corrected.appliedFixes && corrected.appliedFixes.length > 0) {
+        for (const fix of corrected.appliedFixes) {
+          Logger.info('Index', `Config auto-correction [${fix.kind}]: ${fix.detail}`);
+        }
+      }
+
       const finalConfig = {
         ...baseConfig,
         testType: validatedConfig.testType,
         generateTests: validatedConfig.generateTests,
         openDashboard: validatedConfig.openDashboard,
-        startCommand: validatedConfig.startCommand,
-        baseURL: validatedConfig.baseURL,
-        port: this.extractPortFromBaseURL(validatedConfig.baseURL, baseConfig.port),
+        startCommand: corrected.startCommand,
+        baseURL: corrected.baseURL,
+        port: corrected.port,
+        configAutoFixes: corrected.appliedFixes || [],
         prdFile: prdFile || (prdFiles.length > 0 ? prdFiles[0] : undefined),
         prdFiles: prdFiles.length > 0 ? prdFiles : (prdFile ? [prdFile] : []),
       };
@@ -488,13 +632,33 @@ class HealixMCPServer {
         finalConfig.testCredentials = normalizedCredentials;
       }
 
+      const appliedFixSummaries = (corrected.appliedFixes || [])
+        .filter((fix) => fix.kind !== 'port_matches_framework_default')
+        .map((fix) => fix.detail);
+
       this.writeRunStatus(statusFile, {
         runId,
         phase: 'starting_pipeline',
-        message: 'Validated configuration. Starting Healix worker...',
+        message: appliedFixSummaries.length > 0
+          ? `Validated configuration (auto-corrected ${appliedFixSummaries.length} item${appliedFixSummaries.length === 1 ? '' : 's'}). Starting Healix worker...`
+          : 'Validated configuration. Starting Healix worker...',
         project: baseConfig.projectName,
         aiOnlyEnforced: finalConfig.strictAIGeneration !== false,
+        configAutoFixes: corrected.appliedFixes || [],
       });
+
+      if (appliedFixSummaries.length > 0) {
+        this.emitTelemetry({
+          toolName: 'healix_test_my_app',
+          eventType: 'config_auto_fixed',
+          runId,
+          phase: 'starting_pipeline',
+          status: 'info',
+          success: true,
+          message: `Auto-corrected ${appliedFixSummaries.length} config item${appliedFixSummaries.length === 1 ? '' : 's'}`,
+          metadata: { fixes: corrected.appliedFixes },
+        });
+      }
 
       // Write 'started' BEFORE forking so the status is never permanently stuck at
       // 'starting_pipeline' even if the fork takes a moment on Windows.
@@ -961,15 +1125,39 @@ class HealixMCPServer {
       throw err;
     }
 
+    // If HEALIX_DASHBOARD_URL is unset, the rest of the stack silently falls
+    // back to http://localhost:3000 (see webapp-client.js). That default almost
+    // never points at a real Healix webapp — it's usually the user's own dev
+    // server (or nothing), which makes every downstream fetch fail late with
+    // WEBAPP_UNREACHABLE. Probe once up-front and fail fast with an actionable
+    // message pointing at the MCP config.
+    const effectiveDashboardUrl = dashboardUrl || 'http://localhost:3000';
     if (!dashboardUrl) {
-      return;
+      const { defaultProbeWebappHealth } = require('./port-preflight');
+      const webappAlive = await defaultProbeWebappHealth(effectiveDashboardUrl, 2000);
+      if (!webappAlive) {
+        const err = new Error(
+          '❌ HEALIX_DASHBOARD_URL is not set and no Healix webapp is reachable at the default (http://localhost:3000).\n\n' +
+          'Healix cannot validate your API key or ingest results without a dashboard URL.\n\n' +
+          'Fix one of the following:\n' +
+          '  1) Set HEALIX_DASHBOARD_URL in your MCP config to your deployed Healix instance, e.g.\n' +
+          '       "HEALIX_DASHBOARD_URL": "https://app.healix.dev"\n' +
+          '     Cursor   → ~/.cursor/mcp.json\n' +
+          '     Windsurf → ~/.codeium/windsurf/mcp_config.json\n' +
+          '  2) Or run the Healix webapp locally:  cd webapp && npm run dev\n\n' +
+          'Then restart your IDE for the MCP server to pick up the change.'
+        );
+        err.code = 'WEBAPP_UNREACHABLE';
+        throw err;
+      }
+      // Local webapp is up; fall through and validate against it.
     }
 
     let response;
     try {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 6000);
-      response = await fetch(`${dashboardUrl}/api/mcp-auth/validate`, {
+      response = await fetch(`${effectiveDashboardUrl}/api/mcp-auth/validate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ api_key: apiKey }),
@@ -980,7 +1168,7 @@ class HealixMCPServer {
       Logger.error('Index', 'API key validation request failed (network/timeout)', { error: networkErr.message });
       const err = new Error(
         '❌ Cannot reach the Healix dashboard to validate your API key.\n\n' +
-        `Tried: ${dashboardUrl}/api/mcp-auth/validate\n` +
+        `Tried: ${effectiveDashboardUrl}/api/mcp-auth/validate\n` +
         `Error: ${networkErr.message}\n\n` +
         'Check your internet connection, the HEALIX_DASHBOARD_URL value in your MCP config,\n' +
         'and that the Healix webapp is reachable. We won\'t run tests against an un-validated key.'

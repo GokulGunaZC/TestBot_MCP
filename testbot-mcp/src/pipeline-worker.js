@@ -42,11 +42,16 @@ const MCPTelemetryReporter = require('./mcp-telemetry');
 Logger.initialize();
 
 const DEFAULT_TOTAL_BUDGET_MS = 3600000; // 60 minutes
+// Generation used to be 6 min and was hit routinely by real-world repos. With
+// the per-agent parallel fan-out (P1-d) 5 concurrent <60s calls give a typical
+// wall-clock of ~2 min, but we budget generously (15 min) for slow customers,
+// cold Vercel starts, and occasional webapp retries. Users can override per
+// run via HEALIX_GEN_BUDGET_MS.
 const DEFAULT_STAGE_CAPS_MS = {
   jira: 45000,
   context: 90000,
   prdParse: 90000,
-  generation: 360000,  // 6 minutes
+  generation: 900000,  // 15 minutes
   validation: 90000,
   execution: 2400000,  // 40 minutes
   aiTriage: 60000,
@@ -173,11 +178,28 @@ function createRunBudget(config = {}) {
     stageCaps[stage] = toFiniteNumber(config.stageCaps?.[stage] || process.env[envKey], fallback);
   }
 
+  // Friendly alias for the generation stage — `HEALIX_GEN_BUDGET_MS` is the
+  // knob most customers reach for when their codebase is too large to
+  // generate inside the default 15-minute cap. Precedence:
+  //   explicit config.stageCaps.generation  >  HEALIX_GEN_BUDGET_MS
+  //     >  HEALIX_STAGE_GENERATION_MS        >  default
+  // If the user set the env alias, treat it as an "explicit" cap so the
+  // adaptive-strictAI floor below doesn't silently raise it back up.
+  const genBudgetOverride = toFiniteNumber(process.env.HEALIX_GEN_BUDGET_MS, null);
+  const explicitConfigGen = Number.isFinite(Number(config.stageCaps?.generation)) && Number(config.stageCaps.generation) > 0;
+  if (!explicitConfigGen && genBudgetOverride !== null && genBudgetOverride > 0) {
+    stageCaps.generation = genBudgetOverride;
+    Logger.info?.('pipeline-worker', `generation stage budget overridden via HEALIX_GEN_BUDGET_MS=${genBudgetOverride}ms`);
+  }
+
   const strictAI = strictAIEnabled(config);
   const coverageProfile = String(config.coverageProfile || 'qa-max').toLowerCase();
   const twoPhase = String(config.phaseMode || 'two-phase') === 'two-phase';
 
-  const hasExplicitGenerationCap = Boolean(config.stageCaps?.generation) || Boolean(process.env.HEALIX_STAGE_GENERATION_MS);
+  const hasExplicitGenerationCap =
+    Boolean(config.stageCaps?.generation) ||
+    Boolean(process.env.HEALIX_STAGE_GENERATION_MS) ||
+    Boolean(process.env.HEALIX_GEN_BUDGET_MS);
   if (strictAI && !hasExplicitGenerationCap) {
     const requestedMinTests = toFiniteNumber(config.minGeneratedTests, 50);
     const adaptiveGenerationCap = coverageProfile === 'exhaustive' || requestedMinTests >= 75
@@ -247,6 +269,47 @@ function listGeneratedTestFiles(projectPath) {
   return fs.readdirSync(generatedDir)
     .filter((name) => /\.spec\.(ts|js)$/i.test(name))
     .map((name) => path.join(generatedDir, name));
+}
+
+/**
+ * Detect when the user's playwright.config.* declares a `webServer` block
+ * whose URL disagrees with the Healix-configured baseURL. When this mismatch
+ * exists AND Healix is also starting its own dev server, Playwright will
+ * waste 120s waiting for its own spawned webServer to come up and then throw
+ * "Timed out waiting 120000ms from config.webServer". This function returns
+ * `{ ext, configuredUrl }` on conflict or `null` when safe.
+ *
+ * Intentionally regex-based — we don't execute the user's TS config. This is
+ * best-effort; we only act when we're confident (explicit url: '...' literal).
+ */
+function detectPlaywrightWebServerConflict(projectPath, healixBaseURL) {
+  const candidates = [
+    'playwright.config.ts',
+    'playwright.config.js',
+    'playwright.config.mjs',
+    'playwright.config.cjs',
+  ];
+  for (const fileName of candidates) {
+    const full = path.join(projectPath, fileName);
+    if (!fs.existsSync(full)) continue;
+    let content = '';
+    try { content = fs.readFileSync(full, 'utf-8'); } catch { continue; }
+    const webServerMatch = content.match(/webServer\s*:\s*\{([\s\S]*?)\}/);
+    if (!webServerMatch) return null; // no webServer block → safe
+    const body = webServerMatch[1];
+    const urlMatch = body.match(/url\s*:\s*['"`]([^'"`]+)['"`]/);
+    if (!urlMatch) return null; // webServer without url → safe (Playwright spawns only, won't probe)
+    const configuredUrl = urlMatch[1];
+    let cfgPort = null;
+    let basePort = null;
+    try { cfgPort = new URL(configuredUrl).port || (configuredUrl.startsWith('https') ? '443' : '80'); } catch { return null; }
+    try { basePort = new URL(healixBaseURL).port || (healixBaseURL.startsWith('https') ? '443' : '80'); } catch { return null; }
+    if (cfgPort && basePort && cfgPort !== basePort) {
+      return { ext: fileName.split('.').pop(), configuredUrl };
+    }
+    return null;
+  }
+  return null;
 }
 
 function toCoverageProfile(value) {
@@ -507,7 +570,115 @@ function minimumCategoryHitsByProfile(profile) {
   return 1;
 }
 
-function evaluateGenerationQualityGates({ config, context, quality }) {
+// Compute a 0-100 quality score and a list of "if you do X, quality can
+// improve by Y%" suggestions. Heuristic on purpose — the dashboard banner
+// isn't a scientific rubric, it's a nudge that tells users WHY we couldn't
+// generate higher-quality tests and how they could help next run.
+function computeQualityScoreAndSuggestions({
+  quality,
+  requiredCategories,
+  missingCategories,
+  minSelectorQuality,
+  prdContent,
+  parsedPRD,
+  context,
+  requirementsCoverage,
+}) {
+  // Start at 100 and subtract for each quality signal that's below target.
+  // Caps at 35 so we never show "quality 0%" which reads as "broken".
+  let score = 100;
+  const suggestions = [];
+
+  // Selector quality: below threshold is the #1 driver of flaky/brittle tests.
+  const selQ = Number(quality.selectorQuality ?? 1);
+  if (selQ < minSelectorQuality) {
+    const deficit = Math.round((minSelectorQuality - selQ) * 100);
+    score -= Math.min(20, deficit);
+    suggestions.push({
+      key: 'selector_quality',
+      potentialImprovement: Math.min(20, deficit),
+      text: `Add data-testid attributes to interactive elements — current selector quality ${Math.round(selQ * 100)}%, target ${Math.round(minSelectorQuality * 100)}%.`,
+    });
+  }
+
+  // Missing coverage categories: each missing category removes a meaningful
+  // chunk of the suite's surface area.
+  if (missingCategories.length > 0) {
+    const perCategory = 8;
+    score -= Math.min(30, missingCategories.length * perCategory);
+    suggestions.push({
+      key: 'missing_categories',
+      potentialImprovement: Math.min(30, missingCategories.length * perCategory),
+      text: `Suite is missing coverage for: ${missingCategories.join(', ')}. Re-run with broader \`testType\` or expand the codebase exploration.`,
+    });
+  }
+
+  // PRD / acceptance-criteria signal. The generator produces much tighter
+  // tests when AC are available to trace against — this is the most common
+  // "why is my suite thin" cause.
+  const prdText = String(prdContent || '').trim();
+  const parsedAcCount = Array.isArray(parsedPRD?.acceptanceCriteria)
+    ? parsedPRD.acceptanceCriteria.length
+    : (parsedPRD && typeof parsedPRD === 'object'
+        ? Object.values(parsedPRD).reduce((n, v) => n + (Array.isArray(v?.acceptanceCriteria) ? v.acceptanceCriteria.length : 0), 0)
+        : 0);
+  if (prdText.length < 200) {
+    score -= 18;
+    suggestions.push({
+      key: 'missing_prd',
+      potentialImprovement: 18,
+      text: 'Add a PRD or BRD file (README, docs/*.md, etc.) describing what the app should do — generation currently has no product context to trace against.',
+    });
+  } else if (parsedAcCount < 3) {
+    score -= 12;
+    suggestions.push({
+      key: 'thin_acceptance_criteria',
+      potentialImprovement: 12,
+      text: `Add explicit acceptance criteria to your PRD (found ${parsedAcCount}) — tests would then assert against user-stated requirements instead of inferred behavior.`,
+    });
+  }
+
+  // BRD requirement trace. When PRD has REQ-### tags but none made it into
+  // generated tests, suggest enabling AC-trace or upgrading the PRD format.
+  if (
+    requirementsCoverage &&
+    requirementsCoverage.totalRequirements > 0 &&
+    requirementsCoverage.mappedRequirements === 0
+  ) {
+    score -= 10;
+    suggestions.push({
+      key: 'zero_brd_trace',
+      potentialImprovement: 10,
+      text: `Your PRD has ${requirementsCoverage.totalRequirements} requirement tag(s) (REQ-###/AC-###/US-###) but none appear in generated tests — consider enabling stricter AC-trace or re-running after bulking up the PRD.`,
+    });
+  }
+
+  // Exploration thinness: fewer pages/endpoints = thinner coverage.
+  const pageCount = (context?.pages || []).length;
+  const endpointCount = (context?.apiEndpoints || []).length;
+  if (pageCount + endpointCount < 3) {
+    score -= 8;
+    suggestions.push({
+      key: 'thin_exploration',
+      potentialImprovement: 8,
+      text: `Only ${pageCount} page(s) and ${endpointCount} endpoint(s) discovered — run with browser exploration enabled or point Healix at a running dev server for richer context.`,
+    });
+  }
+
+  score = Math.max(35, Math.min(100, Math.round(score)));
+  const totalPotentialImprovement = Math.min(
+    100 - score,
+    suggestions.reduce((sum, s) => sum + (s.potentialImprovement || 0), 0)
+  );
+
+  return {
+    qualityScore: score,
+    totalPotentialImprovement,
+    suggestions,
+  };
+}
+
+function evaluateGenerationQualityGates({ config, context, quality, prdContent, parsedPRD, requirementsCoverage }) {
   const requiredCategories = requiredCategoriesForRun({
     testType: config.testType,
     context,
@@ -524,8 +695,22 @@ function evaluateGenerationQualityGates({ config, context, quality }) {
     Logger.warn('PipelineWorker', `Generated tests ${quality.totalTests} below minimum ${minGeneratedTests}, but continuing pipeline`);
   }
 
-  if (missingCategories.length > 0 || quality.selectorQuality < minSelectorQuality) {
-    const error = new Error(`Coverage gates failed. Missing categories: ${missingCategories.join(', ') || 'none'}, selectorQuality=${quality.selectorQuality}`);
+  const warnings = [];
+  if (missingCategories.length > 0) {
+    warnings.push(`missing categories: ${missingCategories.join(', ')}`);
+  }
+  if (quality.selectorQuality < minSelectorQuality) {
+    warnings.push(`selectorQuality=${quality.selectorQuality} below ${minSelectorQuality}`);
+  }
+
+  // Only hard-fail when there are literally zero tests to run. A suite that
+  // fell short on one coverage category or is a few percentage points below
+  // the selector-quality threshold is still worth executing — Playwright's
+  // pass/fail verdict is more useful to the user than an abort that leaves
+  // them with nothing. Match the philosophy already used for
+  // MIN_TEST_COUNT_NOT_MET above (warn and continue).
+  if (warnings.length > 0 && quality.totalTests === 0) {
+    const error = new Error(`Coverage gates failed with zero tests generated. ${warnings.join('; ')}`);
     error.code = 'COVERAGE_GATES_FAILED';
     error.generationQuality = {
       ...quality,
@@ -538,15 +723,37 @@ function evaluateGenerationQualityGates({ config, context, quality }) {
     return { ok: false, error };
   }
 
+  const scoreBundle = computeQualityScoreAndSuggestions({
+    quality,
+    requiredCategories,
+    missingCategories,
+    minSelectorQuality,
+    prdContent,
+    parsedPRD,
+    context,
+    requirementsCoverage,
+  });
+
+  if (warnings.length > 0) {
+    Logger.warn(
+      'PipelineWorker',
+      `Coverage gates flagged warnings but continuing to execution: ${warnings.join('; ')} (quality=${scoreBundle.qualityScore}%)`
+    );
+  }
+
   return {
     ok: true,
     result: {
       ...quality,
       minGeneratedTests,
       requiredCategories,
-      missingCategories: [],
+      missingCategories,
       minSelectorQuality,
       coverageProfile: profile,
+      warnings,
+      qualityScore: scoreBundle.qualityScore,
+      potentialImprovement: scoreBundle.totalPotentialImprovement,
+      improvementSuggestions: scoreBundle.suggestions,
     },
   };
 }
@@ -994,6 +1201,53 @@ function resetGeneratedTestsDir(projectPath) {
   fs.rmSync(testsDir, { recursive: true, force: true });
   ensureDir(testsDir);
   return testsDir;
+}
+
+/**
+ * Inspect the generated-tests directory and decide whether we can rescue
+ * a budget-exhausted generation attempt. Returns a synthetic result
+ * resembling what maybeGenerateViaSaaS would have returned — file paths +
+ * count — or null if nothing is on disk.
+ *
+ * Why not just look at the in-flight meta: the whole point is that the
+ * Promise chain rejected, so the meta object never made it back out.
+ * Disk is the only source of truth that survived the budget trip.
+ */
+function rescuePartialGeneration({ projectPath, generatorName, error, startedAt, summarizedReason }) {
+  const testsDir = path.join(projectPath, 'tests', 'generated');
+  if (!fs.existsSync(testsDir)) return null;
+
+  let entries;
+  try {
+    entries = fs.readdirSync(testsDir, { withFileTypes: true });
+  } catch {
+    return null;
+  }
+
+  const files = entries
+    .filter((e) => e.isFile() && /\.spec\.(ts|js)$/i.test(e.name))
+    .map((e) => ({
+      path: path.join(testsDir, e.name),
+      filename: e.name,
+      type: 'generated',
+    }));
+
+  if (files.length === 0) return null;
+
+  Logger.warn('PipelineWorker', 'Rescuing partial generation after budget trip', {
+    generator: generatorName,
+    partialsCount: files.length,
+    elapsedMs: Date.now() - startedAt,
+    summarizedReason,
+    errorCode: error?.code || null,
+  });
+
+  return {
+    generated: files.length,
+    files,
+    provider: 'saas',
+    partial: true,
+  };
 }
 
 function sanitizeGeneratedFilename(rawFilename, fallbackPrefix, index) {
@@ -1638,7 +1892,49 @@ function installMissingDependencies(projectPath, testsDir) {
   }
 }
 
-async function maybeGenerateViaSaaS({ config, context, prdContent, testsDir, projectInfo, parsedPRD, explorationArtifact, roles }) {
+/**
+ * Pick the set of agents to fan out to, mirroring the webapp's internal gating
+ * rules (openai-generator.ts:241-272). Filtering MCP-side avoids wasted Vercel
+ * invocations for agents that the webapp would no-op anyway, and keeps the
+ * `generation_partial` telemetry honest (N/N never overcounts).
+ *
+ * apiOnly short-circuits everything UI-adjacent → just `api`. Non-apiOnly
+ * backend still gets `smoke` because the existing smoke generator emits
+ * backend smokes too when applicable.
+ */
+function pickAgentsForRun(testType, projectInfo = {}) {
+  const apiOnly = projectInfo && projectInfo.apiOnly === true;
+  if (apiOnly) return ['api'];
+
+  const agents = ['smoke'];
+  if (testType === 'frontend' || testType === 'both' || !testType) {
+    agents.push('frontend');
+  }
+  if (testType === 'backend' || testType === 'both' || !testType) {
+    agents.push('api');
+  }
+  // workflow + error are UI-driven (skipped under apiOnly above); they still
+  // run for backend testType because they exercise end-to-end flows that
+  // may hit a UI. The webapp does its own membership check — if the
+  // project has no workflows/errorScenarios, its branch is skipped and it
+  // returns [] fast.
+  agents.push('workflow', 'error');
+  return agents;
+}
+
+async function maybeGenerateViaSaaS({
+  config,
+  context,
+  prdContent,
+  testsDir,
+  projectInfo,
+  parsedPRD,
+  explorationArtifact,
+  roles,
+  statusDir = null,
+  runId = null,
+  runBudget = null,
+}) {
   const healixApiKey = process.env.HEALIX_API_KEY;
   if (!healixApiKey) {
     const err = new Error(
@@ -1660,9 +1956,9 @@ async function maybeGenerateViaSaaS({ config, context, prdContent, testsDir, pro
   }
 
   const strictAI = strictAIEnabled(config);
-
   const client = new WebappClient({ apiKey: healixApiKey });
-  const payload = await client.generateTests({
+
+  const sharedPayload = {
     context,
     prd: prdContent || '',
     parsedPRD: parsedPRD || null,
@@ -1678,29 +1974,578 @@ async function maybeGenerateViaSaaS({ config, context, prdContent, testsDir, pro
       coverageProfile: config.coverageProfile || 'qa-max',
       minGeneratedTests: toFiniteNumber(config.minGeneratedTests, 50),
     },
-  });
+  };
 
-  const tests = Array.isArray(payload.tests) ? payload.tests : [];
+  const agents = pickAgentsForRun(config.testType, projectInfo);
+
+  // ── P1.5 planner pre-pass ────────────────────────────────────────────────
+  // One HTTP call to /api/generate-tests/plan BEFORE the fan-out. The plan
+  // gets projected into per-agent slices so each agent's prompt scopes down
+  // to its assigned targets. Gated on !HEALIX_SKIP_PLANNER so an env flip
+  // can disable the new path without redeploying. Any failure (timeout,
+  // network, 5xx, feature-absent 404) degrades cleanly to the legacy
+  // no-plan fan-out.
+  let plan = null;
+  let planMeta = null;
+  if (!process.env.HEALIX_SKIP_PLANNER) {
+    try {
+      const planResult = await client.planGeneration({
+        context,
+        prd: prdContent || '',
+        parsedPRD: parsedPRD || null,
+        explorationArtifact: explorationArtifact || null,
+        roles: roles || [],
+        projectInfo,
+        options: sharedPayload.options,
+      });
+      if (planResult && planResult.fallback) {
+        planMeta = { status: `plan_skipped_${planResult.fallback}` };
+      } else if (planResult && planResult.plan) {
+        plan = planResult.plan;
+        planMeta = {
+          status: 'plan_generated',
+          totalPlannedTests: plan.totalPlannedTests,
+          cache: planResult.cache || null,
+        };
+        // Persist the plan to runDir for post-mortem inspection. The MCP
+        // already writes status.json / manifest here, so reusing the same
+        // dir keeps all run telemetry in one place.
+        const runDir = statusDir; // statusDir == runDir when provided
+        if (runDir) {
+          try {
+            fs.writeFileSync(
+              path.join(runDir, 'plan.json'),
+              JSON.stringify(plan, null, 2),
+            );
+          } catch {
+            /* best-effort — never block generation on a disk hiccup */
+          }
+          try {
+            updateStatus(runDir, 'plan_generated', {
+              totalPlannedTests: plan.totalPlannedTests,
+              runId,
+            });
+          } catch {
+            /* noop */
+          }
+        }
+      }
+    } catch (err) {
+      planMeta = {
+        status: err?.code === 'WEBAPP_TIMEOUT' ? 'plan_skipped_timeout' : 'plan_failed_fallback',
+        error: err?.message || String(err),
+      };
+    }
+  } else {
+    planMeta = { status: 'plan_skipped_env_flag' };
+  }
+
+  const planSliceFor = (agent) => {
+    // Expansion sits outside the planner's scope — it's a coverage
+    // gap-filler triggered post-fan-out, so no slice applies.
+    if (agent === 'expansion') return null;
+    if (!plan) return null;
+    const fe = plan.frontendPlan || null;
+    const be = plan.backendPlan || null;
+    switch (agent) {
+      case 'smoke':
+        return {
+          smokeTargets: fe?.smokeTargets || [],
+          plannedTests: fe?.plannedTests || 0,
+        };
+      case 'frontend':
+        return {
+          pages: fe?.pages || [],
+          workflows: fe?.workflows || [],
+        };
+      case 'api':
+        return {
+          endpoints: be?.endpoints || [],
+          apiFlows: be?.apiFlows || [],
+        };
+      case 'workflow':
+        return {
+          workflows: fe?.workflows || [],
+        };
+      case 'error': {
+        const negativeRegex = /not |fail|error|invalid/i;
+        const negativeAssertions = (fe?.pages || []).flatMap((p) =>
+          (p.assertions || []).filter((a) => negativeRegex.test(String(a))),
+        );
+        const errorCases = (be?.endpoints || []).flatMap((e) => e.errorCases || []);
+        return { negativeAssertions, errorCases };
+      }
+      default:
+        return null;
+    }
+  };
+
+  // ── P2-h async branch decision ───────────────────────────────────────────
+  // When HEALIX_GEN_ASYNC=true, skip the per-agent HTTP fan-out and enqueue
+  // a single async generation job instead, progressively polling for partials.
+  // The webapp orchestrator handles per-agent dispatch on the server side.
+  const asyncMode = String(process.env.HEALIX_GEN_ASYNC || '').toLowerCase() === 'true';
+  if (asyncMode) {
+    return await runAsyncGenerationPath({
+      client,
+      agents,
+      sharedPayload,
+      testsDir,
+      runId,
+      statusDir,
+      runBudget,
+      plan,
+      planMeta,
+      config,
+      // Phase-1 sync fallback reuses these to stay DRY:
+      context,
+      prdContent,
+      projectInfo,
+      parsedPRD,
+      explorationArtifact,
+      roles,
+      planSliceFor,
+    });
+  }
+
+  return await runPhase1FanOut({
+    client,
+    agents,
+    sharedPayload,
+    testsDir,
+    runId,
+    statusDir,
+    config,
+    plan,
+    planMeta,
+    planSliceFor,
+  });
+}
+
+/**
+ * P1 per-agent parallel fan-out — one generateTestsForAgent call per agent,
+ * all in flight simultaneously. A rejection in one agent cannot cancel the
+ * others; failures accumulate in `agentFailures[]` and we only hard-fail the
+ * stage if every agent rejected AND nothing landed on disk.
+ *
+ * Extracted so the P2-h async path can reuse it as a `{mode:'sync'}`
+ * back-compat fallback when the webapp doesn't understand the async contract.
+ */
+async function runPhase1FanOut({
+  client,
+  agents,
+  sharedPayload,
+  testsDir,
+  runId,
+  statusDir,
+  config,
+  plan,
+  planMeta,
+  planSliceFor,
+}) {
   const used = new Set();
   const files = [];
+  const agentFailures = [];
+  const agentsCompleted = [];
+  const agentMeta = [];
+  let doneCount = 0;
 
-  tests.forEach((test, index) => {
-    const written = safeWriteGeneratedTest(testsDir, test, index, 'saas-generated', used);
-    files.push({ ...written, type: test.type || 'generated' });
+  // One HTTP call per agent, all in flight simultaneously. Each call fits
+  // under the 55 s timeout in webapp-client.js (5 s margin under Vercel's
+  // 60 s hard cap).
+  const settled = await Promise.allSettled(
+    agents.map(async (agent) => {
+      try {
+        const agentSlice = planSliceFor(agent);
+        const agentPayload = { agent, ...sharedPayload };
+        if (plan && agentSlice) {
+          agentPayload.plan = { slice: agentSlice, planVersion: 1 };
+        }
+        const payload = await client.generateTestsForAgent(agentPayload);
+        const tests = Array.isArray(payload?.tests) ? payload.tests : [];
+        // Write this agent's tests to disk the moment the call returns —
+        // makes partials durable even if a later agent blows up the run.
+        tests.forEach((test) => {
+          try {
+            const written = safeWriteGeneratedTest(
+              testsDir,
+              test,
+              files.length,
+              `${agent}-saas`,
+              used,
+            );
+            files.push({ ...written, type: test.type || 'generated', agent });
+          } catch (writeErr) {
+            // Single-file write failures shouldn't discard an agent's whole
+            // result — log and skip this file only.
+            Logger.warn('PipelineWorker', 'safeWriteGeneratedTest failed for one test', {
+              agent,
+              filename: test?.filename,
+              reason: writeErr?.message,
+            });
+          }
+        });
+        agentsCompleted.push(agent);
+        if (payload?.generationMeta) {
+          agentMeta.push({ agent, generationMeta: payload.generationMeta });
+        }
+        doneCount += 1;
+        if (statusDir) {
+          try {
+            updateStatus(statusDir, 'generation_partial', {
+              runId,
+              agent,
+              agentsCompleted: doneCount,
+              totalAgents: agents.length,
+              generatedCount: files.length,
+            });
+          } catch {
+            // status-writes are best-effort; never break the generator
+          }
+        }
+        return { agent, count: tests.length };
+      } catch (err) {
+        agentFailures.push({
+          agent,
+          code: err?.code || 'AGENT_FAILED',
+          message: err?.message || String(err),
+        });
+        throw err;
+      }
+    }),
+  );
+
+  const fulfilled = settled.filter((s) => s.status === 'fulfilled').length;
+  const rejected = settled.length - fulfilled;
+
+  Logger.info('PipelineWorker', 'Per-agent generation settled', {
+    totalAgents: agents.length,
+    fulfilled,
+    rejected,
+    filesWritten: files.length,
+    agentFailures: agentFailures.map((f) => `${f.agent}:${f.code}`),
   });
 
-  // Install any missing dependencies (e.g., axios) that generated tests require
+  // Hard fail only if every agent rejected AND nothing landed on disk.
+  // Partial-success path: even a single agent's tests is enough to keep
+  // the pipeline alive — validation + execution will run on what we have.
+  if (files.length === 0 && rejected === agents.length) {
+    const firstFailure = agentFailures[0];
+    const err = new Error(
+      `All ${agents.length} agent generations failed` +
+        (firstFailure ? `: ${firstFailure.agent}=${firstFailure.code}` : ''),
+    );
+    err.code = firstFailure?.code || 'GENERATION_FAILED';
+    err.agentFailures = agentFailures;
+    throw err;
+  }
+
+  // All agents fulfilled but every one returned zero tests. This happens when
+  // OpenAI times out + strict mode suppresses the fallback suite, so the webapp
+  // returns {success:true, tests:[]} for every scoped call. Surface as a
+  // classifiable error instead of the generic "produced no files (unknown)"
+  // that defaults to unclassified_pipeline_error downstream.
+  if (files.length === 0 && rejected === 0) {
+    const emptyAgents = agentMeta
+      .filter((m) => {
+        const t = m?.generationMeta?.totalGeneratedTests;
+        return typeof t !== 'number' || t === 0;
+      })
+      .map((m) => m.agent);
+    const err = new Error(
+      `All ${agents.length} agent generations returned zero tests` +
+        (emptyAgents.length > 0 ? ` (empty: ${emptyAgents.join(', ')})` : ''),
+    );
+    err.code = 'AGENTS_RETURNED_ZERO_TESTS';
+    err.agentFailures = agentFailures;
+    throw err;
+  }
+
+  // Deps must be installed once, after all writes are done (dedupes axios/etc.
+  // across agents — installing during the Promise.allSettled loop would race).
   installMissingDependencies(config.projectPath, testsDir);
 
   return {
     generated: files.length,
     files,
     provider: 'saas',
-    generationMeta: payload.generationMeta || null,
+    generationMeta: {
+      chunkingStrategy: 'per_agent_parallel',
+      agentsRequested: agents,
+      agentsCompleted,
+      agentFailures,
+      partialsWrittenCount: files.length,
+      plannedTests: plan?.totalPlannedTests ?? 0,
+      planStatus: planMeta?.status || null,
+      agentMeta,
+    },
   };
 }
 
-async function generateWithFallbackChain({ config, context, prdContent, runBudget, projectInfo, parsedPRD, explorationArtifact, roles }) {
+/**
+ * P2-h async generation path. Enqueues one job on the webapp orchestrator
+ * and polls for partials, writing each new test spec to disk as it arrives
+ * (dedupe by filename). Falls back to the Phase-1 fan-out if the webapp
+ * replies with {mode:'sync'} (i.e. the server doesn't speak async yet).
+ *
+ * Error policy:
+ *   - client.generateTestsAsync throws → propagate; outer tryGenerator handles.
+ *   - pollGenerationJob POLL_ABORTED → propagate (outer run-budget fired).
+ *   - pollGenerationJob WEBAPP_TIMEOUT → propagate → TIME_BUDGET_EXCEEDED.
+ *   - pollGenerationJob WEBAPP_UNREACHABLE → propagate → rescue path scavenges.
+ *   - final status === 'failed' && files.length === 0 → throw ALL_AGENTS_FAILED.
+ *   - final status === 'partial' | 'succeeded' → return normally.
+ */
+async function runAsyncGenerationPath({
+  client,
+  agents,
+  sharedPayload,
+  testsDir,
+  runId,
+  statusDir,
+  runBudget,
+  plan,
+  planMeta,
+  config,
+  planSliceFor,
+}) {
+  // Build a whole-plan slice for the orchestrator (it fans out internally).
+  const planArg = plan
+    ? { slice: plan, planVersion: 1 }
+    : undefined;
+
+  const enqueueResp = await client.generateTestsAsync({
+    agents,
+    context: sharedPayload.context,
+    prd: sharedPayload.prd,
+    parsedPRD: sharedPayload.parsedPRD,
+    explorationArtifact: sharedPayload.explorationArtifact,
+    roles: sharedPayload.roles,
+    projectInfo: sharedPayload.projectInfo,
+    options: sharedPayload.options,
+    plan: planArg,
+    idempotencyKey: runId ? `${runId}-saas-gen-v1` : undefined,
+  });
+
+  // Back-compat: older webapp returned a full sync payload. Two options:
+  //   (1) write the payload's tests here inline, (2) fall through to Phase-1.
+  // (2) is simpler + keeps the sync-path invariants, so call runPhase1FanOut.
+  // Note: the sync payload itself contains pre-computed tests but those came
+  // from the webapp's legacy non-async pipeline — there's no harm writing
+  // them here directly since that's what Phase-1 would have produced. But
+  // for simplicity (and to keep a single source of truth for the sync
+  // contract), we just re-invoke the fan-out loop, which will call
+  // generateTestsForAgent the same way the non-async branch does.
+  //
+  // Exception: if the sync payload actually carries tests, prefer writing
+  // them directly — avoids a second round-trip.
+  if (enqueueResp?.mode === 'sync') {
+    const syncPayload = enqueueResp.payload || {};
+    const syncTests = Array.isArray(syncPayload.tests) ? syncPayload.tests : null;
+    if (syncTests) {
+      const used = new Set();
+      const files = [];
+      const seen = new Set();
+      for (const t of syncTests) {
+        if (!t?.filename || seen.has(t.filename)) continue;
+        seen.add(t.filename);
+        try {
+          const written = safeWriteGeneratedTest(testsDir, t, files.length, 'saas-sync', used);
+          files.push({ ...written, type: t.type || 'generated', agent: t.agent || null });
+        } catch (writeErr) {
+          Logger.warn('PipelineWorker', 'safeWriteGeneratedTest failed (sync fallback)', {
+            filename: t?.filename,
+            reason: writeErr?.message,
+          });
+        }
+      }
+
+      if (files.length === 0) {
+        const err = new Error('Async sync-fallback returned zero writable tests');
+        err.code = 'GENERATION_FAILED';
+        throw err;
+      }
+
+      installMissingDependencies(config.projectPath, testsDir);
+
+      return {
+        generated: files.length,
+        files,
+        provider: 'saas',
+        generationMeta: {
+          chunkingStrategy: 'async_sync_fallback',
+          agentsRequested: agents,
+          agentsCompleted: [],
+          agentFailures: [],
+          partialsWrittenCount: files.length,
+          plannedTests: plan?.totalPlannedTests ?? 0,
+          planStatus: planMeta?.status || null,
+          ...(syncPayload.generationMeta || {}),
+        },
+      };
+    }
+
+    // No tests in the sync payload → degrade all the way to Phase-1 fan-out.
+    return await runPhase1FanOut({
+      client,
+      agents,
+      sharedPayload,
+      testsDir,
+      runId,
+      statusDir,
+      config,
+      plan,
+      planMeta,
+      planSliceFor,
+    });
+  }
+
+  const { jobId, agentsRequested } = enqueueResp;
+  const agentsRequestedList = Array.isArray(agentsRequested) && agentsRequested.length > 0
+    ? agentsRequested
+    : agents;
+
+  if (statusDir) {
+    try {
+      updateStatus(statusDir, 'generation_async_enqueued', {
+        runId,
+        jobId,
+        agentsRequested: agentsRequestedList,
+      });
+    } catch { /* status writes are best-effort */ }
+  }
+
+  // Compute poll timeout: bounded by remaining stage budget. If no runBudget
+  // is threaded (e.g. from a direct test invocation), fall back to a 15-min
+  // ceiling — still short enough that a stuck job can't black-hole the run.
+  const stageCap = runBudget?.stageCaps?.generation ?? 15 * 60 * 1000;
+  const remaining = runBudget ? getBudgetRemainingMs(runBudget) : stageCap;
+  const pollTimeoutMs = Math.max(60_000, Math.min(remaining, stageCap));
+
+  // Hook an AbortController so outer orchestration (e.g. withStageBudget) can
+  // cancel an in-flight poll. We expose the controller via runBudget if the
+  // budget struct carries an `abortSignals` registry (future-proofing —
+  // today's runBudget doesn't, so this is a no-op).
+  const abortController = new AbortController();
+  if (runBudget && Array.isArray(runBudget.abortSignals)) {
+    try { runBudget.abortSignals.push(abortController); } catch { /* noop */ }
+  }
+
+  const used = new Set();
+  const files = [];
+  const seenFilenames = new Set();
+
+  const writeNewTests = (incoming, sourceTag) => {
+    let newlyWritten = 0;
+    for (const t of incoming || []) {
+      if (!t?.filename || seenFilenames.has(t.filename)) continue;
+      seenFilenames.add(t.filename);
+      try {
+        const written = safeWriteGeneratedTest(
+          testsDir,
+          t,
+          files.length,
+          sourceTag,
+          used,
+        );
+        files.push({ ...written, type: t.type || 'generated', agent: t.agent || null });
+        newlyWritten += 1;
+      } catch (writeErr) {
+        Logger.warn('PipelineWorker', 'safeWriteGeneratedTest failed (async path)', {
+          filename: t?.filename,
+          reason: writeErr?.message,
+        });
+      }
+    }
+    return newlyWritten;
+  };
+
+  const finalResp = await client.pollGenerationJob({
+    jobId,
+    pollIntervalMs: 3_000,
+    timeoutMs: pollTimeoutMs,
+    signal: abortController.signal,
+    onProgress: ({ status, agentsCompleted, tests }) => {
+      const newlyWritten = writeNewTests(tests, 'saas-async');
+      if (statusDir) {
+        try {
+          const completedCount = Array.isArray(agentsCompleted)
+            ? agentsCompleted.length
+            : (Number.isFinite(agentsCompleted) ? agentsCompleted : 0);
+          updateStatus(statusDir, 'generation_async_progress', {
+            runId,
+            jobId,
+            status,
+            agentsCompleted: completedCount,
+            agentsRequested: agentsRequestedList.length,
+            generatedCount: files.length,
+            newlyWritten,
+          });
+        } catch { /* status writes are best-effort */ }
+      }
+    },
+  });
+
+  // The server's final response may contain tests we haven't seen via
+  // onProgress (e.g. the last tick batched a bunch). Fold them in.
+  if (finalResp && Array.isArray(finalResp.tests)) {
+    writeNewTests(finalResp.tests, 'saas-async');
+  }
+
+  const agentFailures = Array.isArray(finalResp?.errors)
+    ? finalResp.errors.map((e) => ({
+        agent: e?.agent || 'unknown',
+        code: e?.code || e?.errorCode || 'AGENT_FAILED',
+        message: e?.message || '',
+      }))
+    : [];
+
+  const agentsCompletedList = Array.isArray(finalResp?.agentsCompleted)
+    ? finalResp.agentsCompleted
+        .map((a) => (typeof a === 'string' ? a : a?.agent))
+        .filter(Boolean)
+    : [];
+
+  // Hard fail only if the orchestrator says failed AND nothing landed on
+  // disk. Matches Phase-1 behavior: any partial survives; only an empty
+  // total-failure throws.
+  if (finalResp?.status === 'failed' && files.length === 0) {
+    const firstFailure = agentFailures[0];
+    const err = new Error(
+      `Async generation job failed (jobId=${jobId})` +
+        (firstFailure ? `: ${firstFailure.agent}=${firstFailure.code}` : ''),
+    );
+    err.code = 'ALL_AGENTS_FAILED';
+    err.agentFailures = agentFailures.length > 0
+      ? agentFailures
+      : [{ agent: 'unknown', code: 'ALL_AGENTS_FAILED', message: err.message }];
+    err.jobId = jobId;
+    throw err;
+  }
+
+  // Deps install once after all writes (dedupes axios/etc. across agents).
+  installMissingDependencies(config.projectPath, testsDir);
+
+  return {
+    generated: files.length,
+    files,
+    provider: 'saas',
+    generationMeta: {
+      chunkingStrategy: 'async_inngest',
+      jobId,
+      status: finalResp?.status || 'unknown',
+      agentsRequested: agentsRequestedList,
+      agentsCompleted: agentsCompletedList,
+      agentFailures,
+      partialsWrittenCount: files.length,
+      plannedTests: plan?.totalPlannedTests ?? 0,
+      planStatus: planMeta?.status || null,
+      ...(finalResp?.generationMeta || {}),
+    },
+  };
+}
+
+async function generateWithFallbackChain({ config, context, prdContent, runBudget, projectInfo, parsedPRD, explorationArtifact, roles, statusDir = null, runId = null }) {
   const generationMeta = {
     provider: null,
     selectedGenerator: null,
@@ -1808,6 +2653,66 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
     } catch (error) {
       const summarizedReason = summarizeGenerationAttemptError(error);
       const errorCode = error?.code ? String(error.code) : classifyErrorCode(error);
+
+      // Partial-survival path: when withStageBudget trips TIME_BUDGET_EXCEEDED
+      // mid-run, the per-agent Promise.allSettled inside maybeGenerateViaSaaS
+      // may have already landed some agents' tests on disk. Rescue those
+      // partials so validation + execution still run, rather than hard-failing
+      // the run and throwing away completed work.
+      //
+      // Why only TIME_BUDGET_EXCEEDED: other errors (GENERATION_VALIDATION_FAILED,
+      // OPENAI_KEY_MISSING, etc.) are semantically "this generator is broken,
+      // try the next" and should fall through to the fallback chain. Budget
+      // exhaustion is the one case where a correctly-behaving generator
+      // simply ran out of clock.
+      if (errorCode === 'TIME_BUDGET_EXCEEDED') {
+        const rescued = rescuePartialGeneration({
+          projectPath: config.projectPath,
+          generatorName,
+          error,
+          startedAt,
+          summarizedReason,
+        });
+        if (rescued) {
+          // Run validation on the partial suite — if the written tests don't
+          // compile, we still want the fallback chain to take over. If they
+          // do, we continue to execution with whatever landed.
+          try {
+            const validation = await runValidation(`${generatorName}-partial`);
+            generationMeta.provider = generatorName;
+            generationMeta.selectedGenerator = generatorName;
+            generationMeta.fallbackUsed = false;
+            generationMeta.partialGenerationWarning = {
+              reason: 'budget_exceeded',
+              generator: generatorName,
+              partialsWrittenCount: rescued.generated,
+              message: `Generation stage ran out of budget; proceeding with ${rescued.generated} test(s) that completed in time.`,
+            };
+            generationMeta.attempts.push({
+              generator: generatorName,
+              status: 'partial',
+              reason: summarizedReason,
+              rawReason: normalizeErrorText(error?.message),
+              errorCode,
+              generated: rescued.generated,
+              validation,
+              durationMs: Date.now() - startedAt,
+            });
+            return { ...rescued, generationMeta: { ...(rescued?.generationMeta || {}), ...generationMeta } };
+          } catch (validationErr) {
+            Logger.warn(
+              'PipelineWorker',
+              'Partial-rescue validation failed — falling through to full-failure path',
+              {
+                generator: generatorName,
+                reason: validationErr?.message,
+              },
+            );
+            // fall through to the normal failure path below
+          }
+        }
+      }
+
       generationMeta.attempts.push({
         generator: generatorName,
         status: 'failed',
@@ -1832,6 +2737,9 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
       parsedPRD: parsedPRD || null,
       explorationArtifact: explorationArtifact || null,
       roles: roles || [],
+      statusDir,
+      runId,
+      runBudget,
     });
 
     if (!saasResult.generated) {
@@ -1860,7 +2768,7 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
 
   return {
     ...result,
-    generationMeta,
+    generationMeta: { ...(result?.generationMeta || {}), ...generationMeta },
   };
 }
 
@@ -2355,6 +3263,8 @@ async function runPipeline(config, runId) {
         roles,
         runBudget,
         projectInfo,
+        statusDir,
+        runId,
       });
 
       generationMeta = generationResult.generationMeta;
@@ -2364,28 +3274,56 @@ async function runPipeline(config, runId) {
       ensurePlaywrightConfig(config.projectPath, projectInfo, roles);
 
       const qualityScan = collectGenerationQuality(config.projectPath);
+      // Build requirements coverage FIRST so the gate can feed the BRD-trace
+      // signal into the quality score + suggestions block.
+      requirementsCoverage = buildRequirementsCoverage({
+        prdContent: combinedPrdContent,
+        prdContents,
+        projectPath: config.projectPath,
+      });
       const qualityGate = evaluateGenerationQualityGates({
         config,
         context: codebaseContext || {},
         quality: qualityScan,
+        prdContent: combinedPrdContent,
+        parsedPRD,
+        requirementsCoverage,
       });
       if (!qualityGate.ok) {
         qualityGate.error.generationMeta = generationMeta;
         throw qualityGate.error;
       }
       generationQuality = qualityGate.result;
-      requirementsCoverage = buildRequirementsCoverage({
-        prdContent: combinedPrdContent,
-        prdContents,
-        projectPath: config.projectPath,
-      });
+
+      // Plumb a non-fatal qualityWarning onto generationMeta so the dashboard
+      // can render a yellow "quality = X%, add PRD/testids to improve by Y%"
+      // banner instead of a red failure. Only attached when there's something
+      // actionable to say — full-score suites stay quiet.
+      if (
+        generationMeta &&
+        generationQuality &&
+        Array.isArray(generationQuality.improvementSuggestions) &&
+        generationQuality.improvementSuggestions.length > 0
+      ) {
+        generationMeta.qualityWarning = {
+          qualityScore: generationQuality.qualityScore,
+          potentialImprovement: generationQuality.potentialImprovement,
+          suggestions: generationQuality.improvementSuggestions,
+          totalTests: generationQuality.totalTests,
+          selectorQuality: generationQuality.selectorQuality,
+          coverageProfile: generationQuality.coverageProfile,
+          missingCategories: generationQuality.missingCategories,
+        };
+      }
 
       if (aiOnlyEnforced && requirementsCoverage.totalRequirements > 0 && requirementsCoverage.mappedRequirements === 0) {
-        const requirementsError = new Error('BRD requirement trace coverage is zero in generated suite');
-        requirementsError.code = 'COVERAGE_GATES_FAILED';
-        requirementsError.generationMeta = generationMeta;
-        requirementsError.generationQuality = generationQuality;
-        throw requirementsError;
+        // Warn-and-continue: the suite may still exercise real behavior even
+        // without explicit [REQ-###] tags. Blocking execution here means the
+        // user gets nothing; letting Playwright run gives them a real verdict.
+        Logger.warn(
+          'PipelineWorker',
+          `BRD requirement trace coverage is zero (0/${requirementsCoverage.totalRequirements}) — continuing to execution anyway`
+        );
       }
 
       Logger.info('PipelineWorker', 'Generated tests', {
@@ -2515,6 +3453,73 @@ async function runPipeline(config, runId) {
       } catch (err) {
         Logger.warn('PipelineWorker', 'Failed to start secondary services — continuing with primary only', { reason: err.message });
       }
+    }
+
+    // Guard: before we spin up the user's dev server + Playwright, verify
+    // that there's actually something to run. Otherwise Playwright exits 1
+    // and its stderr gets polluted by benign webServer warnings (e.g.
+    // Next.js's `baseline-browser-mapping` line), which then surface as the
+    // pipeline error and drown out the real cause (nothing to execute).
+    try {
+      const generatedSpecFiles = listGeneratedTestFiles(config.projectPath);
+      if (!Array.isArray(generatedSpecFiles) || generatedSpecFiles.length === 0) {
+        const err = new Error(
+          `No Playwright spec files found in ${path.join(config.projectPath, 'tests', 'generated')}. ` +
+          'Re-run with test generation enabled, or point Healix at a project that already has specs.'
+        );
+        err.code = 'NO_TESTS_TO_RUN';
+        throw err;
+      }
+
+      // Guard: when the user ran with `generateTests: false` but the only
+      // specs on disk are Healix fallback stubs from a previous generation
+      // attempt (filenames start with `fallback-`), running is almost never
+      // what the user wants — they get 8 generic smoke tests against an
+      // arbitrary root route. Fail fast with an actionable message.
+      if (config.generateTests === false) {
+        const nonFallbackCount = generatedSpecFiles.filter((f) => !path.basename(f).startsWith('fallback-')).length;
+        const fallbackCount = generatedSpecFiles.length - nonFallbackCount;
+        if (nonFallbackCount === 0 && fallbackCount > 0) {
+          const err = new Error(
+            `Test generation was disabled for this run, but the only specs in ${path.join(config.projectPath, 'tests', 'generated')} are Healix fallback stubs ` +
+            `(${fallbackCount} file${fallbackCount === 1 ? '' : 's'} matching fallback-*.spec.*) from a prior generation attempt. ` +
+            'These are generic probes, not AC-traced tests. Re-run with "Generate tests" enabled in the config form to get real tests, ' +
+            'or manually delete the fallback-*.spec.* files and point Healix at your own specs.'
+          );
+          err.code = 'ONLY_FALLBACK_SPECS_EXIST';
+          throw err;
+        }
+      }
+    } catch (preCheckErr) {
+      if (preCheckErr && (preCheckErr.code === 'NO_TESTS_TO_RUN' || preCheckErr.code === 'ONLY_FALLBACK_SPECS_EXIST')) throw preCheckErr;
+      // filesystem read errors are non-fatal here — fall through to Playwright
+    }
+
+    // Guard: Playwright's built-in `webServer` block races Healix's own dev
+    // server manager. If the user has `webServer: { url, command, ... }` in
+    // playwright.config and Healix is also starting a server (config.startCommand
+    // is set), the two ports typically disagree — Playwright's webServer waits
+    // 120s for its URL to respond, never does, and we get a cryptic
+    // "Timed out waiting 120000ms from config.webServer". Detect the mismatch
+    // upfront and throw an actionable error instead of burning 2 minutes.
+    try {
+      if (config.startCommand && config.baseURL) {
+        const conflict = detectPlaywrightWebServerConflict(config.projectPath, config.baseURL);
+        if (conflict) {
+          const err = new Error(
+            `playwright.config.${conflict.ext} has a \`webServer\` block whose URL (${conflict.configuredUrl}) ` +
+            `does not match the Healix-configured baseURL (${config.baseURL}). ` +
+            `Playwright would try to start a second dev server and time out after 120s. ` +
+            `Fix: either delete the \`webServer\` block from playwright.config.${conflict.ext} so Healix owns the dev server, ` +
+            `or change its \`url\` to match ${config.baseURL} (and ensure \`reuseExistingServer: true\`).`
+          );
+          err.code = 'PLAYWRIGHT_WEBSERVER_TIMEOUT';
+          throw err;
+        }
+      }
+    } catch (preCheckErr) {
+      if (preCheckErr && preCheckErr.code === 'PLAYWRIGHT_WEBSERVER_TIMEOUT') throw preCheckErr;
+      // other errors here are diagnostic — don't block the run
     }
 
     playwright = new PlaywrightIntegration({
@@ -3092,4 +4097,10 @@ module.exports = {
   detectProjectModuleType,
   getCursorFixtureContent,
   ensureCursorFixtureFiles,
+  createRunBudget,
+  DEFAULT_STAGE_CAPS_MS,
+  DEFAULT_TOTAL_BUDGET_MS,
+  maybeGenerateViaSaaS,
+  pickAgentsForRun,
+  rescuePartialGeneration,
 };

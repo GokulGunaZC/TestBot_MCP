@@ -23,7 +23,15 @@ export const generateTestsSchema = z.object({
   context: z.unknown().optional(),
   testType: z.enum(['frontend', 'backend', 'both']).optional(),
   prd: z.string().max(MAX_PROMPT_CHARS).optional(),
+  parsedPRD: z.unknown().optional(),
+  explorationArtifact: z.unknown().optional(),
+  roles: z.array(z.unknown()).optional(),
   projectInfo: z.unknown().optional(),
+  // Optional per-agent scoping. Route-level validation does the known-name
+  // check; here we just let the shape through so a bad list doesn't 422 with
+  // a confusing "INVALID_INPUT_LIMIT" when the real intent is a 400
+  // INVALID_AGENTS / EMPTY_AGENTS from the route.
+  agents: z.array(z.string()).optional(),
   options: z
     .object({
       minGeneratedTests: z

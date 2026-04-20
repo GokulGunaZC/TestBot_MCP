@@ -1,9 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
-import { apiKeys } from '@/lib/db/schema'
-import { eq, and } from 'drizzle-orm'
+import { apiKeys, generationJobs, profiles } from '@/lib/db/schema'
+import { eq, and, inArray, sql } from 'drizzle-orm'
 import { hashApiKey } from '@/lib/utils/api-keys'
-import { dispatchAgents } from '@/lib/test-generation/agent-dispatcher'
+import { dispatchAgents, planAgents } from '@/lib/test-generation/agent-dispatcher'
+import { inngest } from '@/lib/inngest/client'
 import type {
   CapturedContext,
   GenerationOptions,
@@ -12,7 +13,9 @@ import type {
   ExplorationArtifact,
   Role,
   AgentRunRecord,
+  AgentName,
 } from '@/lib/test-generation/types'
+import { CURRENT_PLAN_VERSION } from '@/lib/test-generation/plan-schema'
 import { checkRateLimit } from '@/lib/rate-limit'
 import { checkTokenBalance, deductTokens } from '@/lib/tokens'
 import { checkConcurrencyLimit } from '@/lib/concurrency-limit'
@@ -23,6 +26,35 @@ import { runAbuseDetection } from '@/lib/abuse-detector'
 import { logBlockedRequest } from '@/lib/security-logger'
 
 const ENDPOINT = '/api/generate-tests'
+
+// Vercel Hobby caps any route at 60s. We declare it explicitly so the cap is
+// obvious in code, not silently inherited. Each call is now scoped to a single
+// agent (see `agents` body field) so the 60s ceiling is survivable — the MCP
+// fans out 5 parallel per-agent calls instead of one monolithic one.
+export const maxDuration = 60
+
+const KNOWN_AGENTS: readonly AgentName[] = ['smoke', 'frontend', 'api', 'workflow', 'error', 'expansion']
+
+// Normalise an incoming agents[] list: lowercase, trim, dedupe. Returns either
+// a validated Set<AgentName> or a ValidationIssue the caller turns into 400.
+function normalizeAgents(raw: unknown):
+  | { ok: true; set: Set<AgentName> | null }
+  | { ok: false; code: 'INVALID_AGENTS' | 'EMPTY_AGENTS'; unknown?: string[] } {
+  if (raw === undefined || raw === null || raw === false) return { ok: true, set: null }
+  if (!Array.isArray(raw)) return { ok: false, code: 'INVALID_AGENTS' }
+
+  const cleaned = raw
+    .filter((v) => typeof v === 'string')
+    .map((v) => (v as string).trim().toLowerCase())
+    .filter((v) => v.length > 0)
+
+  if (cleaned.length === 0) return { ok: false, code: 'EMPTY_AGENTS' }
+
+  const unknown = cleaned.filter((a) => !KNOWN_AGENTS.includes(a as AgentName))
+  if (unknown.length > 0) return { ok: false, code: 'INVALID_AGENTS', unknown }
+
+  return { ok: true, set: new Set(cleaned as AgentName[]) }
+}
 
 // ── Main POST handler ─────────────────────────────────────────────────
 export async function POST(request: NextRequest) {
@@ -97,6 +129,41 @@ export async function POST(request: NextRequest) {
       return NextResponse.json(validationError, { status: 422 })
     }
 
+    // 6a. Validate optional agents[] body field. When present, only the named
+    // agents run — this is how the MCP chunks generation across multiple <60s
+    // Vercel invocations. Omitted / null / false → run all agents (back-compat).
+    const agentsResult = normalizeAgents((body as { agents?: unknown }).agents)
+    if (agentsResult.ok === false) {
+      const errPayload: Record<string, unknown> = {
+        error: agentsResult.code,
+        allowed: KNOWN_AGENTS,
+      }
+      if (agentsResult.code === 'INVALID_AGENTS' && agentsResult.unknown) {
+        errPayload.unknown = agentsResult.unknown
+      }
+      return NextResponse.json(errPayload, { status: 400 })
+    }
+    const agentsAllowlist = agentsResult.set
+
+    // 6b. Optional per-agent plan slice. When the MCP ran the P1.5 planner
+    // pre-pass, it projects a slice per agent and passes it through here so
+    // the agent-level prompt can scope itself to "only these targets". A
+    // planVersion mismatch means the caller is on an old client / schema
+    // drift; we reject eagerly rather than silently ignore the slice.
+    const planBody = (body as { plan?: { slice?: unknown; planVersion?: unknown } }).plan
+    let agentPlanSlice: Record<string, unknown> | undefined
+    if (planBody) {
+      if (planBody.planVersion !== CURRENT_PLAN_VERSION) {
+        return NextResponse.json(
+          { error: 'INCOMPATIBLE_PLAN_VERSION', expected: CURRENT_PLAN_VERSION, got: planBody.planVersion ?? null },
+          { status: 400 },
+        )
+      }
+      if (planBody.slice && typeof planBody.slice === 'object' && !Array.isArray(planBody.slice)) {
+        agentPlanSlice = planBody.slice as Record<string, unknown>
+      }
+    }
+
     // 7. AI cost guard
     const aiGuardResult = await checkAiGuard({ userId, endpoint: ENDPOINT })
     if (!aiGuardResult.allowed) {
@@ -114,6 +181,195 @@ export async function POST(request: NextRequest) {
       .update(apiKeys)
       .set({ lastUsedAt: new Date() })
       .where(eq(apiKeys.id, apiKeyRecord.id))
+
+    // ── Dual-mode decision: sync (Phase 1) vs async Inngest enqueue (Phase 2) ──
+    //
+    // Async path is opt-in per-request via `x-healix-async: 1` header (or
+    // `body.async: true`) AND gated by either the global env flag
+    // `HEALIX_GEN_ASYNC=true` or the per-user early-access override
+    // `profile.settings.gen_async_enabled=true`. Legacy MCP clients that
+    // never send the header stay on the sync path even when the env flag
+    // is on — a zero-risk rollout.
+    //
+    // Manual smoke test for this block:
+    //   curl -X POST http://localhost:3000/api/generate-tests \
+    //     -H "x-api-key: $HEALIX_KEY" \
+    //     -H "x-healix-async: 1" \
+    //     -H "content-type: application/json" \
+    //     -d '{"context":{},"testType":"backend","projectInfo":{"apiOnly":true}}'
+    //   # expect: { jobId, status:"queued", agentsRequested, pollUrl } with HTTP 202
+    const asyncHeader = request.headers.get('x-healix-async')
+    const asyncBodyFlag = (body as { async?: unknown })?.async === true
+    // Best-effort user-level override lookup. The `profiles` table doesn't
+    // currently carry a `settings` jsonb, so this cast stays a no-op until
+    // that column ships — at which point the override lights up automatically
+    // without further code change. Failures are swallowed: if we can't read
+    // the row we just fall back to env-only gating.
+    let userOverrideEnabled = false
+    try {
+      const [profile] = await db
+        .select()
+        .from(profiles)
+        .where(eq(profiles.id, userId))
+        .limit(1)
+      userOverrideEnabled = Boolean(
+        (profile as unknown as { settings?: { gen_async_enabled?: unknown } })?.settings?.gen_async_enabled
+      )
+    } catch {
+      // swallow: env flag remains the only gate
+    }
+    const flagEnabled = process.env.HEALIX_GEN_ASYNC === 'true' || userOverrideEnabled
+    const wantAsync = (asyncHeader === '1' || asyncBodyFlag) && flagEnabled
+
+    let fallbackToSync = false
+
+    if (wantAsync) {
+      // 1. Per-user concurrent-job cap. `count(*)` here is cheap because
+      //    the partial index `generation_jobs_status_idx` covers
+      //    WHERE status IN ('queued','running') — Postgres plans this as
+      //    an index-only scan on a tiny row subset. We also report the
+      //    true in-flight count in the error message via future edits.
+      const MAX_CONCURRENT_JOBS = 3
+      const inFlight = await db
+        .select({ count: sql<number>`count(*)` })
+        .from(generationJobs)
+        .where(
+          and(
+            eq(generationJobs.userId, userId),
+            inArray(generationJobs.status, ['queued', 'running'])
+          )
+        )
+      const currentInFlight = Number(inFlight[0]?.count ?? 0)
+      if (currentInFlight >= MAX_CONCURRENT_JOBS) {
+        return NextResponse.json(
+          {
+            error: 'TOO_MANY_CONCURRENT_JOBS',
+            message: `You have ${MAX_CONCURRENT_JOBS} generation jobs in flight. Wait for one to complete.`,
+          },
+          { status: 429 }
+        )
+      }
+
+      // 2. Determine the agent list. Either the caller pinned the set
+      //    explicitly via `body.agents[]` (already validated above into
+      //    `agentsAllowlist`), or we run the same rule-based planner the
+      //    sync path uses so the Inngest orchestrator fans out the same
+      //    shape the sync path would have produced.
+      let agentsRequested: AgentName[]
+      if (agentsAllowlist && agentsAllowlist.size > 0) {
+        agentsRequested = Array.from(agentsAllowlist)
+      } else {
+        const plan = planAgents({
+          testType: (body.testType || 'both') as 'frontend' | 'backend' | 'both',
+          projectInfo: (body.projectInfo || {}) as ProjectInfo,
+          context: (body.context || {}) as CapturedContext,
+          parsedPRD: (body.parsedPRD || null) as ParsedPRD | null,
+          explorationArtifact: (body.explorationArtifact || null) as ExplorationArtifact | null,
+          options: (body.options || {}) as GenerationOptions,
+        })
+        agentsRequested = plan.agents
+      }
+
+      // 3. Per-user idempotency: if a prior job exists for the same
+      //    (userId, idempotencyKey), replay the 202 shape. Honors both the
+      //    header and the body field — same contract as the sync path.
+      const asyncIdemKey =
+        request.headers.get('x-idempotency-key') ||
+        (typeof (body as { idempotencyKey?: unknown })?.idempotencyKey === 'string'
+          ? ((body as { idempotencyKey?: string }).idempotencyKey as string)
+          : null)
+      if (asyncIdemKey) {
+        const [existing] = await db
+          .select()
+          .from(generationJobs)
+          .where(
+            and(
+              eq(generationJobs.userId, userId),
+              eq(generationJobs.idempotencyKey, asyncIdemKey)
+            )
+          )
+          .limit(1)
+        if (existing) {
+          return NextResponse.json(
+            {
+              jobId: existing.id,
+              status: existing.status,
+              agentsRequested: existing.agentsRequested ?? [],
+              pollUrl: `/api/generate-tests/jobs/${existing.id}`,
+            },
+            { status: 202 }
+          )
+        }
+      }
+
+      // 4. Insert the job row with the frozen payload. The Inngest worker
+      //    re-hydrates the request from this row, so we store the *raw*
+      //    validated body (including `plan.slice` etc.) rather than the
+      //    post-unpack variables.
+      const [inserted] = await db
+        .insert(generationJobs)
+        .values({
+          userId,
+          apiKeyId: apiKeyRecord.id,
+          status: 'queued',
+          payload: body as Record<string, unknown>,
+          agentsRequested: agentsRequested as string[],
+          idempotencyKey: asyncIdemKey,
+        })
+        .returning({ id: generationJobs.id })
+
+      const jobId = inserted.id
+
+      // 5. Send the Inngest event. On failure we mark the orphaned row as
+      //    failed (best-effort) and FALL THROUGH to the sync path so the
+      //    caller gets a real 200 response rather than a 500 — an
+      //    Inngest outage must never turn into a user-visible outage.
+      try {
+        await inngest.send({ name: 'generation/job.requested', data: { jobId } })
+      } catch (inngestErr) {
+        const msg = inngestErr instanceof Error ? inngestErr.message : String(inngestErr)
+        console.warn('[generate-tests] inngest.send failed, falling back to sync', {
+          jobId,
+          err: msg,
+        })
+        await db
+          .update(generationJobs)
+          .set({
+            status: 'failed',
+            completedAt: new Date(),
+            error: { reason: 'inngest_send_failed', message: msg },
+          })
+          .where(eq(generationJobs.id, jobId))
+          .catch(() => {
+            /* swallow; best-effort cleanup */
+          })
+        fallbackToSync = true
+      }
+
+      if (!fallbackToSync) {
+        const responsePayload = {
+          jobId,
+          status: 'queued' as const,
+          agentsRequested,
+          pollUrl: `/api/generate-tests/jobs/${jobId}`,
+        }
+        if (asyncIdemKey) {
+          await storeIdempotencyResult({
+            idempotencyKey: asyncIdemKey,
+            userId,
+            endpoint: ENDPOINT,
+            responseBody: responsePayload,
+          })
+        }
+        console.log('[generate-tests] async-enqueue', {
+          userId,
+          jobId,
+          agents: agentsRequested,
+        })
+        return NextResponse.json(responsePayload, { status: 202 })
+      }
+      // fall through to the sync path below
+    }
 
     // Business logic
     const { context, testType, prd, parsedPRD, explorationArtifact, roles, projectInfo, options } = body
@@ -142,6 +398,8 @@ export async function POST(request: NextRequest) {
       testType: type,
       projectInfo: info,
       options: genOptions,
+      agentsAllowlist: agentsAllowlist ?? undefined,
+      agentPlanSlice,
       generatorConfig: {
         apiKey: process.env.OPENAI_API_KEY,
         // gpt-5.4 only. The generator hardcodes this too, but we pass it

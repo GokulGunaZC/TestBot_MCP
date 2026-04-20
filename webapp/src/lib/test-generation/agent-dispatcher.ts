@@ -105,6 +105,16 @@ export function planAgents(input: {
 export interface DispatchParams extends GenerateTestsParams {
   generatorConfig?: OpenAITestGeneratorConfig
   onAgentComplete?: AgentCompleteHook
+  // Optional per-agent scoping. When provided, only agents in the set run.
+  // When undefined, the rule-based / LLM plan chooses. The actual filtering
+  // happens inside OpenAITestGenerator (see P1-a2); this type lets callers
+  // (the /api/generate-tests route) thread the value through today.
+  agentsAllowlist?: Set<AgentName>
+  // P1.5 — optional per-agent plan slice. When present, the generator folds
+  // it into the agent-level prompt as an "ONLY generate tests for these
+  // targets" preamble. When absent, the generator falls back to its
+  // open-ended prompt (existing behavior).
+  agentPlanSlice?: Record<string, unknown>
 }
 
 export interface DispatchResult {
@@ -161,6 +171,8 @@ export async function dispatchAgents(params: DispatchParams): Promise<DispatchRe
     projectInfo: params.projectInfo,
     options: params.options,
     onAgentComplete: params.onAgentComplete,
+    agentsAllowlist: params.agentsAllowlist,
+    agentPlanSlice: params.agentPlanSlice,
   })
 
   const summary = generator.getSummary()

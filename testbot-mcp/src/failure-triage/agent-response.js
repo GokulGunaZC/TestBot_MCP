@@ -231,7 +231,7 @@ function buildAgentResponse({ report, projectPath = null, dashboardUrl = null, t
 
   if (report?.pipelineError) {
     const pe = report.pipelineError;
-    const remediation = buildRemediationBlock({
+    const remediationBlock = buildRemediationBlock({
       errorCode: pe.errorCode,
       fallbackMessage: pe.userFacingMessage,
     });
@@ -242,7 +242,8 @@ function buildAgentResponse({ report, projectPath = null, dashboardUrl = null, t
       stderrPreview: typeof pe.stderr === 'string' ? pe.stderr.slice(0, 2000) : null,
       generatedSpecCount: pe.generatedSpecCount ?? null,
       userFacingMessage: pe.userFacingMessage ?? null,
-      remediation,
+      remediation: remediationBlock?.headline || remediationBlock?.fallbackMessage || pe.userFacingMessage || '',
+      remediationBlock,
       dashboardUrl: response.dashboardUrl,
     };
   }
@@ -296,9 +297,9 @@ function formatActionPlan(resp) {
     lines.push(`- stage: ${pe.stage}, reason: ${pe.reason}, errorCode: ${pe.errorCode || 'UNCLASSIFIED'}`);
     if (pe.userFacingMessage) lines.push(`  ${pe.userFacingMessage}`);
     if (pe.dashboardUrl) lines.push(`  Dashboard: ${pe.dashboardUrl}`);
-    if (pe.remediation) {
+    if (pe.remediationBlock) {
       lines.push('');
-      lines.push(formatRemediationBlock(pe.remediation));
+      lines.push(formatRemediationBlock(pe.remediationBlock));
     }
   }
 

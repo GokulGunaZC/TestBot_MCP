@@ -37,17 +37,69 @@ const ENDPOINT_TIMEOUTS_MS = {
   analyze: 600_000,          // 10 min — gpt-5.4 high-reasoning triage
   planExploration: 600_000,  // 10 min
   parsePRD: 600_000,         // 10 min
-  generateTests: 1_200_000,  // 20 min — parallel gpt-5.4 code-gen
+  generateTests: 1_200_000,  // 20 min — legacy monolithic code-gen
+  // Per-agent chunked generation. The webapp route declares
+  // `export const maxDuration = 60` (Vercel Hobby hard cap); this timeout
+  // leaves a 5-second client-side margin so the AbortError fires BEFORE
+  // Vercel's own 504, giving us a clean WEBAPP_TIMEOUT error code instead of
+  // an HTML gateway response.
+  generateTestsForAgent: 55_000,
+  // P1.5 planner pre-pass. Same 55s ceiling as generateTestsForAgent —
+  // `export const maxDuration = 60` on /api/generate-tests/plan.
+  planGeneration: 55_000,
+  // P2-g async generation. The enqueue call should return in well under a
+  // second — it only writes a row and returns a jobId — so this timeout is
+  // deliberately tight to surface a "webapp is wedged" condition fast.
+  generateTestsAsync: 10_000,
+  // Per-GET for job-status polling. The caller's overall poll budget
+  // (pollGenerationJob's `timeoutMs`) is separate and typically minutes long.
+  pollGenerationJob: 10_000,
 };
+
+// Backoff schedule for pollGenerationJob. Maps consecutive no-state-change
+// iterations to the next sleep (ms). After the first 10 polls at the caller's
+// base interval, we gradually stretch gaps so idle jobs don't hammer the webapp.
+// Exported (via module.exports below) so the tests can pin the exact schedule.
+function computePollBackoffMs(consecutiveNoChangeIterations, baseIntervalMs) {
+  const n = consecutiveNoChangeIterations;
+  if (n < 10) return baseIntervalMs;
+  if (n < 20) return Math.max(baseIntervalMs, 5_000);
+  if (n < 30) return Math.max(baseIntervalMs, 8_000);
+  if (n < 40) return Math.max(baseIntervalMs, 12_000);
+  return Math.max(baseIntervalMs, 15_000);
+}
+
+const TERMINAL_JOB_STATUSES = new Set(['succeeded', 'partial', 'failed']);
+
+const KNOWN_AGENTS = Object.freeze(['smoke', 'frontend', 'api', 'workflow', 'error', 'expansion']);
 
 function getFetch() {
   return global.fetch || require('node-fetch');
 }
 
+// Node 18+ fetch (undici) uses Happy Eyeballs and tries IPv6 (::1) before IPv4
+// (127.0.0.1) for `localhost`. Next.js dev defaults to binding IPv4 only, so a
+// fetch from a forked Node child to `http://localhost:3000` can spuriously
+// fail with "fetch failed" even when the webapp is clearly up (reproducing in
+// the pm-app 2026-04-19 incident). Normalize localhost → 127.0.0.1 at the
+// client boundary to avoid the IPv6 hole.
+function normalizeLocalhost(url) {
+  if (!url) return url;
+  try {
+    const u = new URL(url);
+    if (u.hostname === 'localhost' || u.hostname === '::1') {
+      u.hostname = '127.0.0.1';
+    }
+    return u.toString().replace(/\/+$/, '');
+  } catch {
+    return url.replace(/\/+$/, '');
+  }
+}
+
 class WebappClient {
   constructor({ apiKey, dashboardUrl, timeoutMs } = {}) {
     this.apiKey = apiKey || process.env.HEALIX_API_KEY || null;
-    this.dashboardUrl = (dashboardUrl || process.env.HEALIX_DASHBOARD_URL || 'http://localhost:3000').replace(/\/+$/, '');
+    this.dashboardUrl = normalizeLocalhost(dashboardUrl || process.env.HEALIX_DASHBOARD_URL || 'http://localhost:3000');
     this.timeoutMs = Number.isFinite(timeoutMs) ? timeoutMs : DEFAULT_TIMEOUT_MS;
   }
 
@@ -62,33 +114,54 @@ class WebappClient {
   async _post(path, body, { timeoutMs } = {}) {
     const url = `${this.dashboardUrl}${path}`;
     const fetchFn = getFetch();
-    const controller = new AbortController();
     const limit = Number.isFinite(timeoutMs) ? timeoutMs : this.timeoutMs;
-    const timer = setTimeout(() => controller.abort(), limit);
 
+    // Transient "fetch failed" errors (Next.js dev HMR restarts, IPv6/IPv4
+    // happy-eyeballs flake, dropped sockets during long streaming responses)
+    // show up as generic TypeError — retry those up to 3× with backoff. We do
+    // NOT retry AbortError (timeout) or HTTP-level errors; the caller handles
+    // those by surfacing a proper error code.
+    const RETRY_DELAYS_MS = [0, 750, 2250];
+    let lastNetworkErr = null;
     let response;
-    try {
-      response = await fetchFn(url, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-api-key': this.apiKey || '',
-        },
-        body: JSON.stringify(body || {}),
-        signal: controller.signal,
-      });
-    } catch (networkErr) {
-      clearTimeout(timer);
-      if (networkErr.name === 'AbortError') {
-        const err = new Error(`Healix webapp call timed out after ${limit}ms: ${path}`);
-        err.code = 'WEBAPP_TIMEOUT';
-        throw err;
+    for (let attempt = 0; attempt < RETRY_DELAYS_MS.length; attempt++) {
+      if (RETRY_DELAYS_MS[attempt] > 0) {
+        await new Promise((r) => setTimeout(r, RETRY_DELAYS_MS[attempt]));
+        Logger.warn?.('WebappClient', `Retrying ${path} (attempt ${attempt + 1}/${RETRY_DELAYS_MS.length})`, {
+          prevError: lastNetworkErr?.message,
+        });
       }
-      const err = new Error(`Cannot reach Healix webapp at ${url}: ${networkErr.message}`);
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), limit);
+      try {
+        response = await fetchFn(url, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-api-key': this.apiKey || '',
+          },
+          body: JSON.stringify(body || {}),
+          signal: controller.signal,
+        });
+        clearTimeout(timer);
+        lastNetworkErr = null;
+        break;
+      } catch (networkErr) {
+        clearTimeout(timer);
+        if (networkErr.name === 'AbortError') {
+          const err = new Error(`Healix webapp call timed out after ${limit}ms: ${path}`);
+          err.code = 'WEBAPP_TIMEOUT';
+          throw err;
+        }
+        lastNetworkErr = networkErr;
+        // fall through to next retry
+      }
+    }
+    if (lastNetworkErr) {
+      const err = new Error(`Cannot reach Healix webapp at ${url} after ${RETRY_DELAYS_MS.length} attempts: ${lastNetworkErr.message}`);
       err.code = 'WEBAPP_UNREACHABLE';
       throw err;
     }
-    clearTimeout(timer);
 
     let payload = null;
     const rawText = await response.text().catch(() => '');
@@ -136,6 +209,549 @@ class WebappClient {
       },
       { timeoutMs: ENDPOINT_TIMEOUTS_MS.generateTests }
     );
+  }
+
+  /**
+   * Per-agent chunked generation. The MCP fans out 5 parallel calls (one per
+   * agent) so each request fits inside Vercel Hobby's 60-second ceiling.
+   *
+   * Contract:
+   *   - Body sends `agents: [agent]` so the webapp runs only that agent.
+   *   - Timeout is 55s (5s margin under Vercel's hard 60s cap), so we error
+   *     out as WEBAPP_TIMEOUT before the platform returns a 504 HTML page.
+   *   - Agent name is validated client-side to avoid a wasted round-trip.
+   *
+   * Same return shape as `generateTests` (tests[], generationMeta, agentRuns);
+   * just narrower — typically a single agent's tests.
+   */
+  async generateTestsForAgent({ agent, context, prd, parsedPRD, explorationArtifact, roles, testType, projectInfo, options }) {
+    this._assertKey('/api/generate-tests');
+    if (!KNOWN_AGENTS.includes(agent)) {
+      const err = new Error(
+        `generateTestsForAgent: unknown agent "${agent}". Allowed: ${KNOWN_AGENTS.join(', ')}`
+      );
+      err.code = 'INVALID_AGENT';
+      throw err;
+    }
+    return this._post(
+      '/api/generate-tests',
+      {
+        api_key: this.apiKey,
+        agents: [agent],
+        context,
+        prd: prd || '',
+        parsedPRD: parsedPRD || null,
+        explorationArtifact: explorationArtifact || null,
+        roles: roles || [],
+        testType,
+        projectInfo,
+        options,
+      },
+      { timeoutMs: ENDPOINT_TIMEOUTS_MS.generateTestsForAgent }
+    );
+  }
+
+  /**
+   * P1.5 planner pre-pass. Runs ONCE per pipeline run before the per-agent
+   * fan-out. The resulting plan is projected into per-agent slices by the
+   * pipeline-worker, scoping each agent's prompt to just the targets the
+   * planner selected. This eliminates duplicate "what's worth testing"
+   * reasoning across the 5 agents and gives the dashboard a `plannedTests`
+   * denominator for partial-run progress.
+   *
+   * Special return shapes the caller must handle:
+   *   - HTTP 404 → { fallback: 'endpoint_absent' }   (older webapp w/o route)
+   *   - HTTP 200, success:false → passthrough         (inspect `fallback`)
+   *   - HTTP 200, success:true → { plan, cache }
+   *   - AbortError → throw with err.code === 'WEBAPP_TIMEOUT'
+   *
+   * The 404 path is load-bearing: the MCP rolls forward independently of
+   * webapp deploys, so a new MCP calling an old webapp must degrade to the
+   * legacy no-plan path without throwing.
+   */
+  async planGeneration({ context, prd, parsedPRD, explorationArtifact, roles, projectInfo, options } = {}) {
+    this._assertKey('/api/generate-tests/plan');
+    const path = '/api/generate-tests/plan';
+    const url = `${this.dashboardUrl}${path}`;
+    const fetchFn = getFetch();
+    const limit = ENDPOINT_TIMEOUTS_MS.planGeneration;
+
+    const body = {
+      api_key: this.apiKey,
+      context: context || {},
+      prd: prd || '',
+      parsedPRD: parsedPRD || null,
+      explorationArtifact: explorationArtifact || null,
+      roles: roles || [],
+      projectInfo: projectInfo || {},
+      options: options || {},
+      apiOnly: projectInfo?.apiOnly === true,
+    };
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), limit);
+    let response;
+    try {
+      response = await fetchFn(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': this.apiKey || '',
+        },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+    } catch (networkErr) {
+      clearTimeout(timer);
+      if (networkErr.name === 'AbortError') {
+        const err = new Error(`Healix webapp call timed out after ${limit}ms: ${path}`);
+        err.code = 'WEBAPP_TIMEOUT';
+        throw err;
+      }
+      const err = new Error(
+        `Cannot reach Healix webapp at ${url}: ${networkErr.message}`,
+      );
+      err.code = 'WEBAPP_UNREACHABLE';
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
+
+    // Feature-detection path: older webapp without the /plan route returns
+    // 404. We translate that into a structured signal so the pipeline-worker
+    // can skip the planner pre-pass and move straight to the fan-out.
+    if (response.status === 404) {
+      return { fallback: 'endpoint_absent' };
+    }
+
+    let payload = null;
+    const rawText = await response.text().catch(() => '');
+    try {
+      payload = rawText ? JSON.parse(rawText) : null;
+    } catch {
+      payload = null;
+    }
+
+    if (!response.ok) {
+      const detail = payload?.error || rawText.slice(0, 400) || `HTTP ${response.status}`;
+      const err = new Error(`Healix webapp ${path} failed (${response.status}): ${detail}`);
+      err.code =
+        response.status === 401 ? 'INVALID_API_KEY' :
+        response.status === 402 ? 'INSUFFICIENT_CREDITS' :
+        response.status === 429 ? 'RATE_LIMITED' :
+        response.status >= 500 ? 'WEBAPP_SERVER_ERROR' : 'WEBAPP_ERROR';
+      err.status = response.status;
+      err.payload = payload;
+      throw err;
+    }
+
+    // HTTP 200 with success:false → passthrough so the pipeline-worker can
+    // read `.fallback` and decide whether to proceed without a plan.
+    if (payload && payload.success === false) {
+      return payload;
+    }
+
+    // Normal success path.
+    if (payload && payload.success === true && payload.plan) {
+      return { plan: payload.plan, cache: payload.cache || null };
+    }
+
+    // Defensive: webapp returned 200 but no recognizable shape. Treat as a
+    // soft fallback so we don't block the pipeline on a schema mismatch.
+    return { fallback: 'unexpected_response' };
+  }
+
+  /**
+   * P2-g async generation entry point. Enqueues a job and returns immediately.
+   *
+   * Body sends the same shape as `generateTestsForAgent` plus `async: true`.
+   * The `x-healix-async: 1` header lets the webapp's `/api/generate-tests`
+   * route branch into the async-enqueue code path without inspecting the body.
+   *
+   * Return shapes:
+   *   - 202 → { mode: 'async', jobId, status, agentsRequested[] }
+   *   - 200 → { mode: 'sync',  payload }  (older webapp didn't accept async;
+   *           the caller falls back to the sync codegen path — do NOT throw).
+   *   - non-2xx → throw with the usual err.code shape.
+   *   - AbortError → throw with err.code === 'WEBAPP_TIMEOUT'.
+   */
+  async generateTestsAsync({ agents, context, prd, parsedPRD, explorationArtifact, roles, projectInfo, options, plan } = {}) {
+    this._assertKey('/api/generate-tests');
+    const path = '/api/generate-tests';
+    const url = `${this.dashboardUrl}${path}`;
+    const fetchFn = getFetch();
+    const limit = ENDPOINT_TIMEOUTS_MS.generateTestsAsync;
+
+    const body = {
+      api_key: this.apiKey,
+      async: true,
+      agents: Array.isArray(agents) ? agents : undefined,
+      context: context || {},
+      prd: prd || '',
+      parsedPRD: parsedPRD || null,
+      explorationArtifact: explorationArtifact || null,
+      roles: roles || [],
+      projectInfo: projectInfo || {},
+      options: options || {},
+      plan: plan || null,
+    };
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), limit);
+    let response;
+    try {
+      response = await fetchFn(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': this.apiKey || '',
+          'x-healix-async': '1',
+        },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+    } catch (networkErr) {
+      clearTimeout(timer);
+      if (networkErr.name === 'AbortError') {
+        const err = new Error(`Healix webapp call timed out after ${limit}ms: ${path}`);
+        err.code = 'WEBAPP_TIMEOUT';
+        throw err;
+      }
+      const err = new Error(`Cannot reach Healix webapp at ${url}: ${networkErr.message}`);
+      err.code = 'WEBAPP_UNREACHABLE';
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
+
+    let payload = null;
+    const rawText = await response.text().catch(() => '');
+    try {
+      payload = rawText ? JSON.parse(rawText) : null;
+    } catch {
+      payload = null;
+    }
+
+    if (response.status === 202) {
+      return {
+        mode: 'async',
+        jobId: payload?.jobId,
+        status: payload?.status || 'queued',
+        agentsRequested: Array.isArray(payload?.agentsRequested) ? payload.agentsRequested : [],
+      };
+    }
+
+    if (response.status === 200) {
+      // Back-compat: older webapp doesn't understand async — it ran the
+      // synchronous pipeline and returned the full tests payload. Let the
+      // caller fall through to the sync-mode handling.
+      return { mode: 'sync', payload };
+    }
+
+    const detail = payload?.error || rawText.slice(0, 400) || `HTTP ${response.status}`;
+    const err = new Error(`Healix webapp ${path} failed (${response.status}): ${detail}`);
+    err.code =
+      response.status === 401 ? 'INVALID_API_KEY' :
+      response.status === 402 ? 'INSUFFICIENT_CREDITS' :
+      response.status === 429 ? 'RATE_LIMITED' :
+      response.status >= 500 ? 'WEBAPP_SERVER_ERROR' : 'WEBAPP_ERROR';
+    err.status = response.status;
+    err.payload = payload;
+    throw err;
+  }
+
+  /**
+   * Poll a generation job until it reaches a terminal status.
+   *
+   * Returns the final response object (NOT just tests) so the caller can
+   * surface `errors`, `generationMeta`, etc.
+   *
+   * - Per-GET timeout: 10s (treated as transient on fire).
+   * - Transient 5xx / network errors: retry up to 5× with 2s backoff.
+   * - 401 mid-poll → INVALID_API_KEY (no retry).
+   * - 403 mid-poll → JOB_ACCESS_DENIED (no retry).
+   * - 404 mid-poll → JOB_NOT_FOUND (no retry).
+   * - Overall timeoutMs (default 20 min) → WEBAPP_TIMEOUT.
+   * - Abort signal → POLL_ABORTED (AbortError).
+   * - ETag + If-None-Match: on 304, re-emit the previously parsed response to
+   *   onProgress; don't re-parse the (empty) body.
+   * - Backoff: after 10 consecutive non-terminal responses with no state change
+   *   (agentsCompleted didn't grow), stretch the poll gap per computePollBackoffMs.
+   */
+  async pollGenerationJob({
+    jobId,
+    onProgress,
+    pollIntervalMs = 3_000,
+    timeoutMs = 1_200_000,
+    signal,
+  } = {}) {
+    this._assertKey('/api/generate-tests/jobs');
+    if (!jobId || typeof jobId !== 'string') {
+      const err = new Error('pollGenerationJob: jobId is required');
+      err.code = 'INVALID_JOB_ID';
+      throw err;
+    }
+
+    const path = `/api/generate-tests/jobs/${encodeURIComponent(jobId)}`;
+    const url = `${this.dashboardUrl}${path}`;
+    const fetchFn = getFetch();
+    const perRequestTimeout = ENDPOINT_TIMEOUTS_MS.pollGenerationJob;
+
+    const startedAt = Date.now();
+    let lastEtag = null;
+    let lastResponseBody = null; // most recent 200-body, reused on 304
+    let consecutiveFailures = 0;
+    let consecutiveNoChange = 0;
+    let lastAgentsCompleted = -1;
+
+    // Early abort: if the caller aborts between iterations, we resolve the
+    // waiter's promise and throw on next loop tick.
+    let abortListener = null;
+    const abortState = { aborted: false, reason: null };
+    if (signal && typeof signal.addEventListener === 'function') {
+      if (signal.aborted) {
+        const err = new Error('Poll aborted by caller');
+        err.name = 'AbortError';
+        err.code = 'POLL_ABORTED';
+        throw err;
+      }
+      abortListener = () => { abortState.aborted = true; };
+      signal.addEventListener('abort', abortListener);
+    }
+
+    const cleanup = () => {
+      if (signal && abortListener) signal.removeEventListener('abort', abortListener);
+    };
+
+    const throwIfAborted = () => {
+      if (abortState.aborted) {
+        const err = new Error('Poll aborted by caller');
+        err.name = 'AbortError';
+        err.code = 'POLL_ABORTED';
+        throw err;
+      }
+    };
+
+    // Interruptible sleep — resolves early on abort so we don't burn wall
+    // time waiting before rejecting.
+    const sleepInterruptible = (ms) =>
+      new Promise((resolve) => {
+        if (ms <= 0) return resolve();
+        const timer = setTimeout(() => {
+          if (signal && abortListener) signal.removeEventListener('abort', onAbort);
+          resolve();
+        }, ms);
+        const onAbort = () => {
+          clearTimeout(timer);
+          resolve();
+        };
+        if (signal && typeof signal.addEventListener === 'function') {
+          signal.addEventListener('abort', onAbort, { once: true });
+        }
+      });
+
+    try {
+      // eslint-disable-next-line no-constant-condition
+      while (true) {
+        throwIfAborted();
+        if (Date.now() - startedAt > timeoutMs) {
+          const err = new Error(
+            `pollGenerationJob timed out after ${timeoutMs}ms (jobId=${jobId})`,
+          );
+          err.code = 'WEBAPP_TIMEOUT';
+          throw err;
+        }
+
+        const perReqController = new AbortController();
+        const perReqTimer = setTimeout(() => perReqController.abort(), perRequestTimeout);
+        // Propagate outer abort into the in-flight fetch so we don't wait for
+        // the per-request timeout after a caller abort.
+        let outerAbortForward = null;
+        if (signal && typeof signal.addEventListener === 'function') {
+          outerAbortForward = () => perReqController.abort();
+          signal.addEventListener('abort', outerAbortForward, { once: true });
+        }
+
+        const headers = {
+          'x-api-key': this.apiKey || '',
+        };
+        if (lastEtag) headers['If-None-Match'] = lastEtag;
+
+        let response = null;
+        let networkErr = null;
+        try {
+          response = await fetchFn(url, {
+            method: 'GET',
+            headers,
+            signal: perReqController.signal,
+          });
+        } catch (e) {
+          networkErr = e;
+        } finally {
+          clearTimeout(perReqTimer);
+          if (outerAbortForward && signal && typeof signal.removeEventListener === 'function') {
+            signal.removeEventListener('abort', outerAbortForward);
+          }
+        }
+
+        // Caller-initiated abort takes precedence over any in-flight result.
+        throwIfAborted();
+
+        if (networkErr) {
+          // Per-request timeout AND network errors both count toward the 5-
+          // failure transient budget. Only AbortError from the OUTER signal is
+          // POLL_ABORTED; that case is handled above by throwIfAborted().
+          consecutiveFailures += 1;
+          if (consecutiveFailures >= 5) {
+            const err = new Error(
+              `pollGenerationJob unreachable after ${consecutiveFailures} attempts: ${networkErr.message}`,
+            );
+            err.code = 'WEBAPP_UNREACHABLE';
+            throw err;
+          }
+          await sleepInterruptible(2_000);
+          continue;
+        }
+
+        // Hard auth/access failures — fail fast, don't retry.
+        if (response.status === 401) {
+          const err = new Error(`pollGenerationJob: invalid API key (jobId=${jobId})`);
+          err.code = 'INVALID_API_KEY';
+          err.status = 401;
+          throw err;
+        }
+        if (response.status === 403) {
+          const err = new Error(`pollGenerationJob: access denied (jobId=${jobId})`);
+          err.code = 'JOB_ACCESS_DENIED';
+          err.status = 403;
+          throw err;
+        }
+        if (response.status === 404) {
+          const err = new Error(`pollGenerationJob: job not found (jobId=${jobId})`);
+          err.code = 'JOB_NOT_FOUND';
+          err.status = 404;
+          throw err;
+        }
+
+        // Transient server errors — retry budget.
+        if (response.status >= 500) {
+          consecutiveFailures += 1;
+          if (consecutiveFailures >= 5) {
+            const err = new Error(
+              `pollGenerationJob failed after ${consecutiveFailures} 5xx responses (jobId=${jobId})`,
+            );
+            err.code = 'WEBAPP_UNREACHABLE';
+            err.status = response.status;
+            throw err;
+          }
+          await sleepInterruptible(2_000);
+          continue;
+        }
+
+        // Good response — reset the transient counter.
+        consecutiveFailures = 0;
+
+        let parsed;
+        if (response.status === 304) {
+          if (!lastResponseBody) {
+            // Server returned 304 before we ever got a 200. Treat as transient
+            // and retry.
+            consecutiveFailures += 1;
+            if (consecutiveFailures >= 5) {
+              const err = new Error(
+                `pollGenerationJob received 304 without a prior 200 after ${consecutiveFailures} tries`,
+              );
+              err.code = 'WEBAPP_UNREACHABLE';
+              throw err;
+            }
+            await sleepInterruptible(2_000);
+            continue;
+          }
+          parsed = lastResponseBody;
+        } else if (response.status === 200) {
+          const rawText = await response.text().catch(() => '');
+          try {
+            parsed = rawText ? JSON.parse(rawText) : null;
+          } catch {
+            parsed = null;
+          }
+          if (!parsed) {
+            consecutiveFailures += 1;
+            if (consecutiveFailures >= 5) {
+              const err = new Error(
+                `pollGenerationJob got ${consecutiveFailures} unparseable responses`,
+              );
+              err.code = 'WEBAPP_UNREACHABLE';
+              throw err;
+            }
+            await sleepInterruptible(2_000);
+            continue;
+          }
+          lastResponseBody = parsed;
+          // Capture ETag for subsequent If-None-Match.
+          try {
+            const etag =
+              (response.headers && typeof response.headers.get === 'function'
+                ? response.headers.get('etag') || response.headers.get('ETag')
+                : null) || null;
+            if (etag) lastEtag = etag;
+          } catch {
+            // headers.get not implemented on the mock — ignore.
+          }
+        } else {
+          // Any other non-2xx we didn't explicitly handle above: treat as error.
+          const rawText = await response.text().catch(() => '');
+          let errPayload = null;
+          try { errPayload = rawText ? JSON.parse(rawText) : null; } catch { errPayload = null; }
+          const detail = errPayload?.error || rawText.slice(0, 400) || `HTTP ${response.status}`;
+          const err = new Error(`pollGenerationJob ${path} failed (${response.status}): ${detail}`);
+          err.code =
+            response.status === 402 ? 'INSUFFICIENT_CREDITS' :
+            response.status === 429 ? 'RATE_LIMITED' : 'WEBAPP_ERROR';
+          err.status = response.status;
+          err.payload = errPayload;
+          throw err;
+        }
+
+        // Progress callback — fire for BOTH 200 and 304 so the caller sees
+        // liveness even when the ETag shortcut kicked in.
+        if (typeof onProgress === 'function') {
+          try {
+            onProgress({
+              status: parsed.status,
+              agentsCompleted: parsed.agentsCompleted,
+              agentsRequested: parsed.agentsRequested,
+              tests: parsed.tests,
+              generationMeta: parsed.generationMeta,
+              errors: parsed.errors,
+            });
+          } catch (_cbErr) {
+            // onProgress is best-effort; don't crash the poll loop on a
+            // buggy listener.
+          }
+        }
+
+        // Terminal state — we're done.
+        if (TERMINAL_JOB_STATUSES.has(parsed.status)) {
+          return parsed;
+        }
+
+        // Track state change for backoff. Any growth in agentsCompleted resets
+        // the no-change counter.
+        const ac = Number.isFinite(parsed.agentsCompleted) ? parsed.agentsCompleted : 0;
+        if (ac > lastAgentsCompleted) {
+          lastAgentsCompleted = ac;
+          consecutiveNoChange = 0;
+        } else {
+          consecutiveNoChange += 1;
+        }
+
+        const nextSleepMs = computePollBackoffMs(consecutiveNoChange, pollIntervalMs);
+        await sleepInterruptible(nextSleepMs);
+      }
+    } finally {
+      cleanup();
+    }
   }
 
   async parsePRD({ prdContent, prdHash }) {
@@ -217,3 +833,6 @@ class WebappClient {
 }
 
 module.exports = WebappClient;
+module.exports.KNOWN_AGENTS = KNOWN_AGENTS;
+module.exports.ENDPOINT_TIMEOUTS_MS = ENDPOINT_TIMEOUTS_MS;
+module.exports.computePollBackoffMs = computePollBackoffMs;

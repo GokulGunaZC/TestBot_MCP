@@ -202,6 +202,14 @@ export interface GenerationMeta {
   startedAt: string
   finishedAt: string | null
   generationQuality?: GenerationQuality
+  // Populated when one or more agents in the parallel fan-out reject with an
+  // unexpected error (rather than simply returning 0 tests). Mirrored to the
+  // MCP so it can land a partialGenerationWarning on the dashboard.
+  agentFailures?: Array<{
+    agent: AgentName | 'unknown'
+    code: string | null
+    message: string
+  }>
 }
 
 export type AcceptanceCriterionKind = 'positive' | 'negative' | 'boundary'
@@ -313,6 +321,15 @@ export interface GenerateTestsParams {
   projectInfo?: ProjectInfo
   options?: GenerationOptions
   onAgentComplete?: AgentCompleteHook
+  // When set, only agents whose name is in the set are run. Undefined means
+  // "run the full rule-based plan" (legacy behavior). The MCP sets this to
+  // `new Set(['smoke'])` etc. to chunk generation across 5 parallel HTTP calls
+  // so each call fits under Vercel Hobby's 60s ceiling.
+  agentsAllowlist?: Set<AgentName>
+  // P1.5 — per-agent plan slice. When present, each generate*Tests method
+  // prepends an "ONLY generate tests for these targets: {slice}" preamble to
+  // the prompt so the agent's output is scoped to the planner's decisions.
+  agentPlanSlice?: Record<string, unknown>
 }
 
 export interface OpenAIClientConfig {
@@ -324,6 +341,7 @@ export interface OpenAIClientConfig {
   maxTokens?: number
   temperature?: number
   timeout?: number
+  reasoningEffort?: 'low' | 'medium' | 'high'
 }
 
 export interface OpenAIMessage {
