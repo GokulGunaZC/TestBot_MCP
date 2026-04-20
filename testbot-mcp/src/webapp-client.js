@@ -96,11 +96,29 @@ function normalizeLocalhost(url) {
   }
 }
 
+const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '0.0.0.0', '::1']);
+
 class WebappClient {
   constructor({ apiKey, dashboardUrl, timeoutMs } = {}) {
     this.apiKey = apiKey || process.env.HEALIX_API_KEY || null;
     this.dashboardUrl = normalizeLocalhost(dashboardUrl || process.env.HEALIX_DASHBOARD_URL || 'http://localhost:3000');
     this.timeoutMs = Number.isFinite(timeoutMs) ? timeoutMs : DEFAULT_TIMEOUT_MS;
+    // When the webapp runs locally there is no Vercel 60 s hard cap.
+    // Use generous per-agent timeouts so gpt-5.4 high-reasoning can finish.
+    try {
+      this._isLocal = LOCAL_HOSTS.has(new URL(this.dashboardUrl).hostname);
+    } catch {
+      this._isLocal = false;
+    }
+  }
+
+  // Returns the effective timeout for a given endpoint key, bumping the
+  // Vercel-capped limits when the webapp is local.
+  _timeout(key) {
+    if (this._isLocal && (key === 'generateTestsForAgent' || key === 'planGeneration')) {
+      return 600_000; // 10 min — no Vercel cap for local webapp; frontend agent needs ~5–8 min
+    }
+    return ENDPOINT_TIMEOUTS_MS[key];
   }
 
   _assertKey(endpoint) {
@@ -247,7 +265,7 @@ class WebappClient {
         projectInfo,
         options,
       },
-      { timeoutMs: ENDPOINT_TIMEOUTS_MS.generateTestsForAgent }
+      { timeoutMs: this._timeout('generateTestsForAgent') }
     );
   }
 
@@ -274,7 +292,7 @@ class WebappClient {
     const path = '/api/generate-tests/plan';
     const url = `${this.dashboardUrl}${path}`;
     const fetchFn = getFetch();
-    const limit = ENDPOINT_TIMEOUTS_MS.planGeneration;
+    const limit = this._timeout('planGeneration');
 
     const body = {
       api_key: this.apiKey,

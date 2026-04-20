@@ -1263,10 +1263,24 @@ test.describe('${this.sanitizeString(scenario.name)}', () => {
       return { message: this.stripAnsi(String(error)) };
     };
 
+    // Status priority for aggregating across browser projects.
+    // A spec that passes on chromium but fails on firefox counts as failed.
+    const STATUS_PRIORITY = { failed: 4, flaky: 3, skipped: 2, passed: 1, unknown: 0 };
+
     const processSpec = (spec, suiteName) => {
-      if (!Array.isArray(spec.tests)) {
+      if (!Array.isArray(spec.tests) || spec.tests.length === 0) {
         return;
       }
+
+      // Build one testObj per browser-project run (for artifact/error detail),
+      // but count the spec only once using the worst status across all runs.
+      const specTitle = this.stripAnsi(String(spec.title || 'Unnamed test'));
+      const specFile  = this.stripAnsi(String(spec.file || ''));
+      const specSuite = this.stripAnsi(String(suiteName || ''));
+
+      let worstStatus = 'unknown';
+      let worstError  = null;
+      let totalDuration = 0;
 
       for (const test of spec.tests) {
         const lastResult = test.results?.[test.results.length - 1] || null;
@@ -1290,48 +1304,52 @@ test.describe('${this.sanitizeString(scenario.name)}', () => {
         const hasFailingAttempt = resultStatuses.some((s) => s === 'failed' || s === 'unexpected' || s === 'timedout');
         const testLevelStatus = String(test.status || '').toLowerCase();
         const isFlaky = testLevelStatus === 'flaky' || (hasPassingRetry && hasFailingAttempt);
-        if (isFlaky) {
-          normalizedStatus = 'flaky';
-        }
+        if (isFlaky) normalizedStatus = 'flaky';
 
-        const testObj = {
-          id: `${suiteName}-${spec.title}-${test.projectName || 'default'}`.replace(/\s+/g, '-'),
-          title: this.stripAnsi(String(spec.title || test.title || 'Unnamed test')),
-          suite: this.stripAnsi(String(suiteName || '')),
-          file: this.stripAnsi(String(spec.file || '')),
+        // Track worst status and first error across browser projects.
+        if ((STATUS_PRIORITY[normalizedStatus] || 0) > (STATUS_PRIORITY[worstStatus] || 0)) {
+          worstStatus = normalizedStatus;
+          if (normalizedStatus === 'failed') worstError = normalizedError;
+        }
+        totalDuration += lastResult?.duration || 0;
+
+        // Still push per-browser testObj so the UI can show per-browser detail.
+        results.tests.push({
+          id: `${specSuite}-${specTitle}-${test.projectName || 'default'}`.replace(/\s+/g, '-'),
+          title: specTitle,
+          suite: specSuite,
+          file: specFile,
           status: normalizedStatus,
           duration: lastResult?.duration || 0,
           retries: Math.max(0, (test.results?.length || 1) - 1),
           projectName: test.projectName || null,
           error: normalizedError,
           artifacts,
-        };
+        });
+      }
 
-        results.tests.push(testObj);
-        results.total += 1;
-        results.duration += testObj.duration;
+      // Headline counters count each spec once (not once per browser project).
+      results.total += 1;
+      results.duration += totalDuration;
 
-        if (normalizedStatus === 'passed') {
-          results.passed += 1;
-        } else if (normalizedStatus === 'flaky') {
-          results.flaky = (results.flaky || 0) + 1;
-          // Count as passed for the headline pass-rate — triage system tracks
-          // flakiness separately so the dashboard can surface a yellow badge.
-          results.passed += 1;
-        } else if (normalizedStatus === 'failed') {
-          results.failed += 1;
-          results.failures.push({
-            testName: testObj.title,
-            file: testObj.file,
-            error: normalizedError,
-            status: normalizedStatus,
-            duration: testObj.duration,
-            artifacts,
-            projectName: testObj.projectName,
-          });
-        } else if (normalizedStatus === 'skipped') {
-          results.skipped += 1;
-        }
+      if (worstStatus === 'passed') {
+        results.passed += 1;
+      } else if (worstStatus === 'flaky') {
+        results.flaky = (results.flaky || 0) + 1;
+        results.passed += 1;
+      } else if (worstStatus === 'failed') {
+        results.failed += 1;
+        results.failures.push({
+          testName: specTitle,
+          file: specFile,
+          error: worstError,
+          status: worstStatus,
+          duration: totalDuration,
+          artifacts: [],
+          projectName: null,
+        });
+      } else if (worstStatus === 'skipped') {
+        results.skipped += 1;
       }
     };
 

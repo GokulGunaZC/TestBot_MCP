@@ -596,6 +596,20 @@
             return lastDot >= 0 ? fileNameValue.slice(lastDot).toLowerCase() : '';
         }
 
+        let pendingFileReads = 0;
+
+        function setPendingReads(delta) {
+            pendingFileReads += delta;
+            if (pendingFileReads > 0) {
+                submitBtn.disabled = true;
+                submitBtn.textContent = 'Reading files…';
+            } else {
+                pendingFileReads = 0;
+                submitBtn.disabled = false;
+                submitBtn.textContent = 'Run Tests →';
+            }
+        }
+
         function handlePRDFiles(files) {
             clearError();
             const filesToAdd = Array.from(files);
@@ -621,6 +635,7 @@
                     return;
                 }
 
+                setPendingReads(+1);
                 const reader = new FileReader();
                 reader.onload = (event) => {
                     state.prdFiles.push({
@@ -629,9 +644,11 @@
                         textContent: String(event.target.result || ''),
                     });
                     renderPRDFiles();
+                    setPendingReads(-1);
                 };
                 reader.onerror = () => {
                     showError(`Failed to read file ${file.name}.`);
+                    setPendingReads(-1);
                 };
                 reader.readAsText(file);
             });

@@ -116,48 +116,65 @@ export class OpenAIClient {
   }
 
   async callResponsesAPI(messages: OpenAIMessage[], model: string): Promise<{ text: string; usage: OpenAIUsage }> {
-    const controller = new AbortController()
-    const timeout = setTimeout(() => controller.abort(), this.config.timeout)
+    const RETRYABLE = new Set([502, 503, 504])
+    const MAX_ATTEMPTS = 3
+    const RETRY_DELAYS_MS = [0, 3000, 6000]
 
-    try {
-      const response = await fetch(`${this.baseUrl}/responses`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${this.config.apiKey}`,
-        },
-        body: JSON.stringify({
-          model,
-          input: this.buildResponsesInput(messages),
-          reasoning: { effort: this.config.reasoningEffort || 'high' },
-        }),
-        signal: controller.signal,
-      })
-
-      if (!response.ok) {
-        const errorData = await response.json().catch(() => ({}))
-        const errorMsg = (errorData as { error?: { message?: string } }).error?.message || `HTTP ${response.status}`
-        throw new Error(`OpenAI responses API error: ${errorMsg}`)
+    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+      if (RETRY_DELAYS_MS[attempt] > 0) {
+        await new Promise((r) => setTimeout(r, RETRY_DELAYS_MS[attempt]))
       }
 
-      const data = await response.json() as Record<string, unknown>
-      const text = this.extractResponseText(data)
-      if (!text) throw new Error('Responses API returned no text content')
-      const rawUsage = data.usage as Record<string, unknown> | undefined
-      const usage: OpenAIUsage = {
-        promptTokens: (rawUsage?.input_tokens as number) ?? 0,
-        completionTokens: (rawUsage?.output_tokens as number) ?? 0,
-        totalTokens: (rawUsage?.total_tokens as number) ?? ((rawUsage?.input_tokens as number ?? 0) + (rawUsage?.output_tokens as number ?? 0)),
+      const controller = new AbortController()
+      const timeout = setTimeout(() => controller.abort(), this.config.timeout)
+
+      try {
+        const response = await fetch(`${this.baseUrl}/responses`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${this.config.apiKey}`,
+          },
+          body: JSON.stringify({
+            model,
+            input: this.buildResponsesInput(messages),
+            reasoning: { effort: this.config.reasoningEffort || 'high' },
+          }),
+          signal: controller.signal,
+        })
+
+        if (!response.ok) {
+          if (RETRYABLE.has(response.status) && attempt < MAX_ATTEMPTS - 1) {
+            clearTimeout(timeout)
+            continue
+          }
+          const errorData = await response.json().catch(() => ({}))
+          const errorMsg = (errorData as { error?: { message?: string } }).error?.message || `HTTP ${response.status}`
+          throw new Error(`OpenAI responses API error: ${errorMsg}`)
+        }
+
+        const data = await response.json() as Record<string, unknown>
+        const text = this.extractResponseText(data)
+        if (!text) throw new Error('Responses API returned no text content')
+        const rawUsage = data.usage as Record<string, unknown> | undefined
+        const usage: OpenAIUsage = {
+          promptTokens: (rawUsage?.input_tokens as number) ?? 0,
+          completionTokens: (rawUsage?.output_tokens as number) ?? 0,
+          totalTokens: (rawUsage?.total_tokens as number) ?? ((rawUsage?.input_tokens as number ?? 0) + (rawUsage?.output_tokens as number ?? 0)),
+        }
+        return { text, usage }
+      } catch (error) {
+        clearTimeout(timeout)
+        if (error instanceof Error && error.name === 'AbortError') {
+          throw new Error(`OpenAI responses API request timeout (${Math.ceil(this.config.timeout / 1000)}s)`)
+        }
+        throw error
+      } finally {
+        clearTimeout(timeout)
       }
-      return { text, usage }
-    } catch (error) {
-      if (error instanceof Error && error.name === 'AbortError') {
-        throw new Error(`OpenAI responses API request timeout (${Math.ceil(this.config.timeout / 1000)}s)`)
-      }
-      throw error
-    } finally {
-      clearTimeout(timeout)
     }
+
+    throw new Error('OpenAI responses API failed after retries')
   }
 
   async callChatCompletionsAPI(messages: OpenAIMessage[], model: string): Promise<{ text: string; usage: OpenAIUsage }> {

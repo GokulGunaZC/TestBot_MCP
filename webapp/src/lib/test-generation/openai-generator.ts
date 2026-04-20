@@ -647,6 +647,7 @@ Rules:
 - Test responsive design with different viewports
 - Use proper async/await patterns
 - Add descriptive test names and comments
+- Splash / intro screens: if the app may show a splash or intro overlay on first visit, wait for it to disappear before asserting page content. Use \`page.waitForSelector('main:not([aria-hidden="true"])', { timeout: 8000 }).catch(() => {})\` or wait for a known landmark to become visible. Never assert on content that may be hidden behind a splash.
 
 ## Output Format
 Return a JSON array of test files:
@@ -691,6 +692,7 @@ IMPORTANT: Return ONLY valid JSON, no markdown code blocks or explanations.`
 - Add meaningful comments explaining test logic
 - Group related tests in describe blocks
 - Include proper test isolation
+- Splash / intro screens: always wait for the main content area to become interactive before asserting. If the app uses \`aria-hidden\` on \`<main>\` during a splash, use \`await page.waitForSelector('main:not([aria-hidden="true"])', { timeout: 8000 }).catch(() => {})\` after navigation. The __healix-fixture already injects sessionStorage keys to bypass known splash screens, but add the wait as a safety net.
 
 ## Framework: ${projectInfo.framework || 'React/Next.js'}
 ## Base URL: ${projectInfo.baseURL || 'http://localhost:3000'}
@@ -970,6 +972,11 @@ IMPORTANT: Return ONLY valid JSON.`
       eventHandlers: (component.eventHandlers || []).slice(0, 10),
     }))
 
+    // Frontend tests only need UI-facing context. Dropping API contracts and
+    // schemas for the frontend agent cuts prompt tokens by ~30%, which reduces
+    // gpt-5.4 reasoning time enough to stay within the webapp-client timeout.
+    const isFrontendAgent = testKind === 'frontend'
+
     return {
       meta: {
         projectInfo: {
@@ -993,12 +1000,12 @@ IMPORTANT: Return ONLY valid JSON.`
       },
       context: {
         pages,
-        apiEndpoints: endpoints,
+        ...(isFrontendAgent ? {} : { apiEndpoints: endpoints }),
         workflows,
         forms,
         authPatterns: (context.authPatterns || []).slice(0, 8),
-        apiSchemas: (context.apiSchemas || []).slice(0, 10),
-        mockableApiContracts: apiContracts,
+        ...(isFrontendAgent ? {} : { apiSchemas: (context.apiSchemas || []).slice(0, 10) }),
+        ...(isFrontendAgent ? {} : { mockableApiContracts: apiContracts }),
         componentDetails,
         navigationGraph: context.navigationGraph || null,
         selectorHints: (context.selectorHints || []).slice(0, 20),

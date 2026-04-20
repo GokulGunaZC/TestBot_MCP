@@ -1153,23 +1153,41 @@ class HealixMCPServer {
       // Local webapp is up; fall through and validate against it.
     }
 
+    // Retry on transient network errors and 5xx responses (e.g. Next.js dev-mode
+    // first-request compilation returns 500 before the route is ready).
+    const VALIDATE_RETRY_DELAYS_MS = [0, 1500, 3000];
     let response;
-    try {
+    let lastNetworkErr = null;
+    for (let attempt = 0; attempt < VALIDATE_RETRY_DELAYS_MS.length; attempt++) {
+      if (VALIDATE_RETRY_DELAYS_MS[attempt] > 0) {
+        await new Promise((r) => setTimeout(r, VALIDATE_RETRY_DELAYS_MS[attempt]));
+        Logger.warn('Index', `Retrying API key validation (attempt ${attempt + 1}/${VALIDATE_RETRY_DELAYS_MS.length})`, {
+          prevError: lastNetworkErr?.message,
+        });
+      }
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 6000);
-      response = await fetch(`${effectiveDashboardUrl}/api/mcp-auth/validate`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ api_key: apiKey }),
-        signal: controller.signal,
-      });
-      clearTimeout(timeout);
-    } catch (networkErr) {
-      Logger.error('Index', 'API key validation request failed (network/timeout)', { error: networkErr.message });
+      try {
+        response = await fetch(`${effectiveDashboardUrl}/api/mcp-auth/validate`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ api_key: apiKey }),
+          signal: controller.signal,
+        });
+        clearTimeout(timeout);
+        if (response.status < 500) break; // success or client error — stop retrying
+        lastNetworkErr = new Error(`HTTP ${response.status}`);
+      } catch (networkErr) {
+        clearTimeout(timeout);
+        lastNetworkErr = networkErr;
+      }
+    }
+    if (!response && lastNetworkErr) {
+      Logger.error('Index', 'API key validation request failed (network/timeout)', { error: lastNetworkErr.message });
       const err = new Error(
         '❌ Cannot reach the Healix dashboard to validate your API key.\n\n' +
         `Tried: ${effectiveDashboardUrl}/api/mcp-auth/validate\n` +
-        `Error: ${networkErr.message}\n\n` +
+        `Error: ${lastNetworkErr.message}\n\n` +
         'Check your internet connection, the HEALIX_DASHBOARD_URL value in your MCP config,\n' +
         'and that the Healix webapp is reachable. We won\'t run tests against an un-validated key.'
       );
@@ -1605,7 +1623,7 @@ Return the JSON structure above based on what you find in the codebase.
           ],
         };
       }
-      if (['queued','detecting','exploring','auth_injecting','generating','running_tests','tests_complete','reporting','uploading_artifacts'].includes(recent.data.phase) && ageMs < 10 * 60 * 1000) {
+      if (['queued','started','detecting','context','context_enrichment','jira','port_conflict','warning','parsing_prd','prd_parsed','plan_generated','exploring','explored','auth_injecting','auth_injected','generating','generation_partial','generation_async_enqueued','generation_async_progress','running','running_tests','secondary_services_started','tests_complete','reporting','uploading_artifacts','artifacts_uploaded'].includes(recent.data.phase) && ageMs < 30 * 60 * 1000) {
         return {
           content: [
             {
@@ -1895,7 +1913,13 @@ Return the JSON structure above based on what you find in the codebase.
           type: 'text',
           text: JSON.stringify({
             ...base,
-            agentInstructions: `The pipeline is still at phase='${status.phase || 'unknown'}'. Call healix_check_run_status again in ~15 seconds with the same runId. Do not conclude the task until isTerminal is true.`,
+            agentInstructions: `The pipeline is still at phase='${status.phase || 'unknown'}'. ${
+              ['parsing_prd','generating','generation_async_enqueued','generation_async_progress','plan_generated','exploring'].includes(status.phase)
+                ? 'This phase can take 1–3 minutes — call healix_check_run_status again in ~60 seconds.'
+                : ['running','running_tests','secondary_services_started','tests_complete'].includes(status.phase)
+                  ? 'Call healix_check_run_status again in ~30 seconds.'
+                  : 'Call healix_check_run_status again in ~20 seconds.'
+            } Do not call healix_test_my_app again — a run is already in progress. Do not conclude the task until isTerminal is true.`,
           }, null, 2),
         }],
       };

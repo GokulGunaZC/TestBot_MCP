@@ -1066,14 +1066,108 @@ function detectProjectModuleType(projectPath) {
   }
 }
 
-function getCursorFixtureContent(serializedInitScript, moduleType = 'commonjs') {
+/**
+ * Scan the project source for splash-screen patterns and return the
+ * sessionStorage keys that need to be set to bypass them in headless tests.
+ *
+ * Patterns detected:
+ *   - sessionStorage.getItem('key') used inside a showSplash/splash/intro/
+ *     firstVisit conditional, OR
+ *   - aria-hidden controlled by a state variable that reads from sessionStorage
+ *
+ * Returns an array of { key, value } objects (may be empty).
+ */
+function detectSplashScreenStorageKeys(projectPath) {
+  if (!projectPath) return [];
+  const results = [];
+  const seen = new Set();
+
+  // Directories that typically contain app-level components/layouts.
+  const dirsToScan = ['src', 'app', 'pages', 'components', 'layouts'].map((d) =>
+    path.join(projectPath, d)
+  );
+
+  // Patterns that indicate "read from sessionStorage to control a splash/intro".
+  // Group 1 captures the key string.
+  const SESSION_READ_RE =
+    /sessionStorage\.getItem\(\s*['"`]([^'"`]+)['"`]\s*\)/g;
+  const SPLASH_CONTEXT_RE =
+    /splash|intro|firstVisit|first_visit|hasSeenSplash|showSplash|splashVisible|skipIntro/i;
+
+  function scanFile(filePath) {
+    let content;
+    try {
+      content = fs.readFileSync(filePath, 'utf-8');
+    } catch {
+      return;
+    }
+    if (!SPLASH_CONTEXT_RE.test(content)) return; // fast skip
+
+    let match;
+    SESSION_READ_RE.lastIndex = 0;
+    while ((match = SESSION_READ_RE.exec(content)) !== null) {
+      const key = match[1];
+      if (seen.has(key)) continue;
+      // Only include keys whose surrounding context looks splash-related.
+      const snippet = content.slice(Math.max(0, match.index - 200), match.index + 200);
+      if (SPLASH_CONTEXT_RE.test(snippet)) {
+        seen.add(key);
+        results.push({ key, value: 'true' });
+      }
+    }
+  }
+
+  function scanDir(dirPath, depth = 0) {
+    if (depth > 4) return;
+    let entries;
+    try {
+      entries = fs.readdirSync(dirPath, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (entry.name.startsWith('.') || entry.name === 'node_modules') continue;
+      const full = path.join(dirPath, entry.name);
+      if (entry.isDirectory()) {
+        scanDir(full, depth + 1);
+      } else if (/\.(tsx?|jsx?)$/.test(entry.name)) {
+        scanFile(full);
+      }
+    }
+  }
+
+  for (const dir of dirsToScan) {
+    if (fs.existsSync(dir)) scanDir(dir);
+  }
+
+  return results;
+}
+
+function getCursorFixtureContent(serializedInitScript, moduleType = 'commonjs', splashStorageKeys = []) {
+  // Splash-screen bypass: set sessionStorage keys before the page loads so
+  // headless Playwright never sees an empty-session splash (the user's browser
+  // always has these keys set after their first visit; Playwright starts fresh).
+  const splashLines = (splashStorageKeys || []).map(
+    ({ key, value }) =>
+      `      sessionStorage.setItem(${JSON.stringify(key)}, ${JSON.stringify(value)});`
+  );
+  const splashBlock = splashLines.length
+    ? `    await page.addInitScript(() => {\n${splashLines.join('\n')}\n    });\n`
+    : '';
+
+  // The page fixture runs both the splash bypass (if any) and the cursor
+  // overlay in a single extend block.
+  const pageFixtureBody =
+    `async ({ page }, use) => {\n` +
+    splashBlock +
+    `    await page.addInitScript(${serializedInitScript});\n` +
+    `    await use(page);\n` +
+    `  }`;
+
   const ts = `import { test as base, expect, request } from '@playwright/test';
 
 const test = base.extend({
-  page: async ({ page }, use) => {
-    await page.addInitScript(${serializedInitScript});
-    await use(page);
-  },
+  page: ${pageFixtureBody},
 });
 
 export { test, expect, request };
@@ -1085,10 +1179,7 @@ export { test, expect, request };
   const jsEsm = `import { test as base, expect, request } from '@playwright/test';
 
 const test = base.extend({
-  page: async ({ page }, use) => {
-    await page.addInitScript(${serializedInitScript});
-    await use(page);
-  },
+  page: ${pageFixtureBody},
 });
 
 export { test, expect, request };
@@ -1097,10 +1188,7 @@ export { test, expect, request };
   const jsCjs = `const { test: base, expect, request } = require('@playwright/test');
 
 const test = base.extend({
-  page: async ({ page }, use) => {
-    await page.addInitScript(${serializedInitScript});
-    await use(page);
-  },
+  page: ${pageFixtureBody},
 });
 
 module.exports = { test, expect, request };
@@ -1116,7 +1204,11 @@ function ensureCursorFixtureFiles(generatedDir, projectPath = null) {
   // it so we emit the correct module-system body for this project.
   const resolvedProject = projectPath || path.resolve(generatedDir, '..', '..');
   const moduleType = detectProjectModuleType(resolvedProject);
-  const { ts, js } = getCursorFixtureContent(serializedInitScript, moduleType);
+  const splashKeys = detectSplashScreenStorageKeys(resolvedProject);
+  if (splashKeys.length > 0) {
+    Logger.info('PipelineWorker', `Splash screen detected — injecting sessionStorage bypass for keys: ${splashKeys.map(k => k.key).join(', ')}`);
+  }
+  const { ts, js } = getCursorFixtureContent(serializedInitScript, moduleType, splashKeys);
 
   const fixtureTs = path.join(generatedDir, `${CURSOR_FIXTURE_BASENAME}.ts`);
   const fixtureJs = path.join(generatedDir, `${CURSOR_FIXTURE_BASENAME}.js`);
