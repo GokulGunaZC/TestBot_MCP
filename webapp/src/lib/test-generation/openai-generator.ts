@@ -130,7 +130,20 @@ export class OpenAITestGenerator {
         process.env.OPENAI_SYNTAX_VALIDATION_MODE ||
         'fail-open',
       strictAIGeneration: config.strictAIGeneration === true,
-      timeout: config.timeout || 90000,
+      // Per-agent OpenAI call cap. Mirrors OpenAIClient's resolution chain so
+      // a single env var governs both: config.timeout → OPENAI_TIMEOUT_MS →
+      // 540s. The 90s hardcode that used to live here silently capped every
+      // agent — frontend routinely exceeds that — and also defeated the whole
+      // purpose of the Inngest background path (which has no Vercel 60s cap).
+      // Callers on the Vercel-sync path explicitly set timeout ≤ 55000 in
+      // generatorConfig so OpenAI fails before Vercel's maxDuration fires.
+      timeout:
+        Number.isFinite(Number(config.timeout)) && Number(config.timeout) > 0
+          ? Number(config.timeout)
+          : Number.isFinite(Number(process.env.OPENAI_TIMEOUT_MS)) &&
+              Number(process.env.OPENAI_TIMEOUT_MS) > 0
+            ? Number(process.env.OPENAI_TIMEOUT_MS)
+            : 540_000,
     }
 
     this.generatedFiles = []

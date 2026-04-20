@@ -102,6 +102,13 @@ export const generateTestsAgent = inngest.createFunction(
         const dispatchResult = await dispatchAgents({
           ...payload,
           agentsAllowlist: new Set<AgentName>([agent]),
+          // Inngest has no Vercel 60s cap — let OpenAI run its natural
+          // latency. Without this, the dispatcher inherits the sync-path
+          // 55s cap (or worse, the old 90s hardcode) and Phase 2 is moot.
+          generatorConfig: {
+            apiKey: process.env.OPENAI_API_KEY,
+            timeout: 540_000,
+          },
         })
         return {
           ok: true as const,
