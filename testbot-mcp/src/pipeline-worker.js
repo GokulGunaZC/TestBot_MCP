@@ -1513,7 +1513,13 @@ function safeWriteGeneratedTest(testsDir, test, index, fallbackPrefix, usedFilen
     throw new Error(`Unsafe generated filename rejected: ${safeFilename}`);
   }
 
-  fs.writeFileSync(targetPath, content, 'utf-8');
+  // Belt-and-braces: always redirect @playwright/test imports to the healix
+  // fixture so the file is correct even when the webapp prompt slips.
+  const rewrittenContent = content
+    .replace(/from\s+(['"])@playwright\/test\1/g, "from $1./__healix-fixture$1")
+    .replace(/require\((['"])@playwright\/test\1\)/g, "require($1./__healix-fixture$1)");
+
+  fs.writeFileSync(targetPath, rewrittenContent, 'utf-8');
   return {
     path: targetPath,
     filename: safeFilename,
@@ -1528,10 +1534,29 @@ function ensurePlaywrightConfig(projectPath, projectInfo = {}, roles = []) {
     'playwright.config.cjs',
   ];
 
+  const verifiedRolesForCheck = (roles || []).filter((r) => r && r.loginVerified && r.storageStatePath);
+
   // Check if config already exists
   for (const name of candidates) {
     const candidate = path.join(projectPath, name);
     if (fs.existsSync(candidate)) {
+      // When we have freshly verified roles, check whether the existing
+      // Healix-managed config is missing tierB-auth projects. If so, regenerate
+      // it. Only touch configs that Healix owns (marked by testDir: './tests/generated').
+      if (verifiedRolesForCheck.length > 0) {
+        try {
+          const existing = fs.readFileSync(candidate, 'utf-8');
+          const isHealixManaged = existing.includes("testDir: './tests/generated'");
+          const hasTierB = existing.includes('tierB-auth');
+          if (isHealixManaged && !hasTierB) {
+            Logger.info('PipelineWorker', 'Regenerating playwright.config.ts to add tierB-auth projects', {
+              path: candidate,
+              roles: verifiedRolesForCheck.map((r) => r.role),
+            });
+            break; // fall through to regenerate
+          }
+        } catch { /* unreadable — leave as-is */ }
+      }
       Logger.debug('PipelineWorker', 'Playwright config already exists', { path: candidate });
       return;
     }
@@ -2828,6 +2853,24 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
 
     try {
       const result = await withStageBudget(runBudget, 'generation', runFn);
+
+      // Always ensure the __healix-fixture files exist in tests/generated/.
+      // The fixture is needed for all generated specs (not just video-cursor
+      // runs) because storeTestFile redirects @playwright/test imports to it.
+      if (config.generateTests) {
+        try {
+          const genDir = path.join(config.projectPath, 'tests', 'generated');
+          if (fs.existsSync(genDir)) {
+            ensureCursorFixtureFiles(genDir, config.projectPath);
+          }
+        } catch (fixtureErr) {
+          Logger.warn('PipelineWorker', 'Failed to write __healix-fixture files', {
+            generator: generatorName,
+            reason: fixtureErr.message,
+          });
+        }
+      }
+
       let cursorOverlay = null;
       if (config.generateTests) {
         try {
@@ -3130,6 +3173,26 @@ async function runPipeline(config, runId) {
   const healixReportsDir = path.join(config.projectPath, 'healix-reports');
   const serverPidFile = path.join(healixReportsDir, HEALIX_SERVER_PID_FILENAME);
   killOrphanedHealixProcess(serverPidFile, 'dev-server');
+
+  // Config auto-upgrade: localhost targets with strictAIGeneration: false route to
+  // the legacy monolithic generator and reliably hit TIME_BUDGET_EXCEEDED. Force
+  // strict AI + qa-max whenever baseURL is localhost so runs produce real tests.
+  const _isLocalhostBaseURL = /^https?:\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0)(:\d+)?/i.test(config.baseURL || '');
+  if (_isLocalhostBaseURL && config.strictAIGeneration === false) {
+    const _upgraded = {
+      strictAIGeneration: true,
+      coverageProfile: config.coverageProfile && config.coverageProfile !== 'balanced' ? config.coverageProfile : 'qa-max',
+      minGeneratedTests: Math.max(toFiniteNumber(config.minGeneratedTests, 0), 50),
+    };
+    config = { ...config, ..._upgraded };
+    updateStatus(statusDir, 'config_auto_upgraded', {
+      runId,
+      message: 'Config auto-upgraded: localhost target requires strictAIGeneration=true.',
+      reason: 'localhost_strict_ai_required',
+      upgrades: _upgraded,
+    }, telemetryReporter);
+    Logger.info('PipelineWorker', 'Auto-upgraded config for localhost target', _upgraded);
+  }
 
   const runBudget = createRunBudget(config);
   let generationMeta = null;
@@ -3533,6 +3596,25 @@ async function runPipeline(config, runId) {
         prdContents,
         projectPath: config.projectPath,
       });
+      // Surface per-agent failure details before the quality gate so the
+      // dashboard shows actionable info even when the gate aborts the run.
+      const _agentFailures = generationMeta?.agentFailures || [];
+      if (_agentFailures.length > 0) {
+        updateStatus(statusDir, 'generation_agent_failures', {
+          runId,
+          message: `${_agentFailures.length} generation agent(s) failed`,
+          agentFailures: _agentFailures.map((f) => ({
+            agent: f.agent,
+            code: f.code,
+            message: String(f.message || '').slice(0, 300),
+          })),
+        }, telemetryReporter);
+        Logger.warn('PipelineWorker', 'Some generation agents failed', {
+          count: _agentFailures.length,
+          failures: _agentFailures.map((f) => `${f.agent}:${f.code}`).join(', '),
+        });
+      }
+
       const qualityGate = evaluateGenerationQualityGates({
         config,
         context: codebaseContext || {},
@@ -3542,10 +3624,29 @@ async function runPipeline(config, runId) {
         requirementsCoverage,
       });
       if (!qualityGate.ok) {
-        qualityGate.error.generationMeta = generationMeta;
-        throw qualityGate.error;
+        const _actualTests = qualityGate.error.generationQuality?.totalTests ?? 0;
+        // MIN_TEST_COUNT_NOT_MET with real tests on disk = partial agent run.
+        // Warn and proceed rather than discarding work that completed agents did.
+        if (qualityGate.error.code === 'MIN_TEST_COUNT_NOT_MET' && _actualTests > 0) {
+          Logger.warn('PipelineWorker', 'Proceeding with partial generation (below minimum count)', {
+            actualTests: _actualTests,
+            minimum: qualityGate.error.generationQuality?.minGeneratedTests,
+            agentFailures: _agentFailures.map((f) => `${f.agent}:${f.code}`),
+          });
+          updateStatus(statusDir, 'generation_below_minimum', {
+            runId,
+            message: `Generated ${_actualTests} tests (below minimum ${qualityGate.error.generationQuality?.minGeneratedTests ?? 50}) — proceeding to execution with available tests.`,
+            actualTests: _actualTests,
+            agentFailures: _agentFailures,
+          }, telemetryReporter);
+          generationQuality = { ...qualityGate.error.generationQuality, belowMinimum: true };
+        } else {
+          qualityGate.error.generationMeta = generationMeta;
+          throw qualityGate.error;
+        }
+      } else {
+        generationQuality = qualityGate.result;
       }
-      generationQuality = qualityGate.result;
 
       // Plumb a non-fatal qualityWarning onto generationMeta so the dashboard
       // can render a yellow "quality = X%, add PRD/testids to improve by Y%"

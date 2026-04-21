@@ -4,7 +4,7 @@ import { useState, useEffect } from 'react';
 import { useRouter } from 'next/navigation';
 import Link from 'next/link';
 import { motion } from 'framer-motion';
-import type { TestRun, TestList, Profile } from '@/lib/types/database';
+import type { TestRun, ImportSession, Profile } from '@/lib/types/database';
 import { toDisplayUnits } from '@/lib/token-units';
 
 
@@ -72,28 +72,28 @@ export default function HomePage() {
   const router = useRouter();
   const [loading, setLoading] = useState(true);
   const [recentTests, setRecentTests] = useState<TestRun[]>([]);
-  const [testLists, setTestLists] = useState<TestList[]>([]);
+  const [imports, setImports] = useState<ImportSession[]>([]);
   const [profile, setProfile] = useState<Profile | null>(null);
 
   useEffect(() => {
     async function fetchData() {
       setLoading(true);
       try {
-        const [runsRes, listsRes, profileRes] = await Promise.all([
+        const [runsRes, importsRes, profileRes] = await Promise.all([
           fetch('/api/test-runs?limit=5&sort_by=created_at&order=desc'),
-          fetch('/api/test-lists'),
+          fetch('/api/import-tests'),
           fetch('/api/profile'),
         ]);
 
         const runsJson = await runsRes.json();
-        const listsJson = await listsRes.json();
+        const importsJson = await importsRes.json();
         const profileJson = await profileRes.json();
 
         const runs: TestRun[] = runsJson.data ?? [];
-        const lists: TestList[] = listsJson.data ?? [];
+        const importsList: ImportSession[] = importsJson.data ?? [];
 
         setRecentTests(runs);
-        setTestLists(lists.slice(0, 5));
+        setImports(importsList.slice(0, 5));
         setProfile(profileJson.data ?? null);
       } catch (err) {
         console.error('Failed to fetch home data:', err);
@@ -278,16 +278,16 @@ export default function HomePage() {
 
         {/* Right column: Test Lists + Plan Card */}
         <div className="flex flex-col gap-5">
-          {/* Test Lists Panel */}
+          {/* Import Tests Panel */}
           <motion.div variants={itemVariants} className="glass-card rounded-2xl overflow-hidden">
             <div className="flex items-center justify-between px-5 py-4 border-b border-white/8">
-              <h3 className="text-[#F0F6FF] font-semibold text-sm">My Test Lists</h3>
+              <h3 className="text-[#F0F6FF] font-semibold text-sm">My Imports</h3>
               <div className="flex items-center gap-2">
-                <Link href="/test-lists" className="text-[#60A5FA] text-xs hover:text-[#93C5FD] transition-colors font-medium">
+                <Link href="/import-tests" className="text-[#60A5FA] text-xs hover:text-[#93C5FD] transition-colors font-medium">
                   View All →
                 </Link>
                 <Link
-                  href="/test-lists"
+                  href="/import-tests"
                   className="w-6 h-6 rounded-md bg-blue-500/20 border border-blue-500/30 flex items-center justify-center text-[#60A5FA] hover:bg-blue-500/30 transition-colors"
                 >
                   <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
@@ -305,20 +305,22 @@ export default function HomePage() {
                   <SkeletonListItem />
                 </>
               ) : (
-                testLists.map((list) => (
+                imports.map((imp) => (
                   <Link
-                    key={list.id}
-                    href="/test-lists"
+                    key={imp.id}
+                    href={`/import-tests/${imp.id}`}
                     className="flex items-center gap-3 px-3 py-2.5 rounded-xl hover:bg-white/5 transition-colors group"
                   >
                     <div className="w-8 h-8 rounded-lg bg-blue-500/10 border border-blue-500/20 flex items-center justify-center flex-shrink-0">
                       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#60A5FA" strokeWidth="2">
-                        <path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z" />
+                        <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4" />
+                        <polyline points="7 10 12 15 17 10" />
+                        <line x1="12" y1="15" x2="12" y2="3" />
                       </svg>
                     </div>
                     <div className="flex-1 min-w-0">
-                      <div className="text-[#F0F6FF] text-sm font-medium truncate group-hover:text-[#60A5FA] transition-colors">{list.name}</div>
-                      <div className="text-[#4A6280] text-xs">{list.test_count} tests</div>
+                      <div className="text-[#F0F6FF] text-sm font-medium truncate group-hover:text-[#60A5FA] transition-colors">{imp.name}</div>
+                      <div className="text-[#4A6280] text-xs">{imp.test_case_count} test cases · {imp.status}</div>
                     </div>
                     <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="text-[#4A6280] group-hover:text-[#8BA4C8] transition-colors">
                       <polyline points="9 18 15 12 9 6" />
@@ -328,13 +330,15 @@ export default function HomePage() {
               )}
 
               <Link
-                href="/test-lists"
+                href="/import-tests"
                 className="flex items-center gap-2 px-3 py-2.5 rounded-xl text-[#60A5FA] hover:bg-blue-500/10 transition-colors text-sm font-medium mt-1"
               >
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                  <line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" />
+                  <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4" />
+                  <polyline points="7 10 12 15 17 10" />
+                  <line x1="12" y1="15" x2="12" y2="3" />
                 </svg>
-                New Test List
+                Import Excel
               </Link>
             </div>
           </motion.div>

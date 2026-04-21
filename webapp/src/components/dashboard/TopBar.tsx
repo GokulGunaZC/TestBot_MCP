@@ -9,7 +9,7 @@ const PAGE_TITLES: Record<string, string> = {
   '/mcp-tests': 'MCP Tests',
   '/create-tests': 'Create Tests',
   '/all-tests': 'All Tests',
-  '/test-lists': 'Test Lists',
+  '/import-tests': 'Import Tests',
   // '/monitoring': 'Monitoring',
   '/profile': 'Profile',
   '/plan-billing': 'Plan & Billing',

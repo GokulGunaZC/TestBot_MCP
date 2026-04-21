@@ -704,7 +704,8 @@ Rules:
     return `You are an expert Playwright test engineer. Generate comprehensive smoke tests that verify an application's basic health and functionality.
 
 ## Guidelines
-- Use Playwright's @playwright/test framework with TypeScript
+- ALWAYS import test and expect from './__healix-fixture', NOT from '@playwright/test'.
+  First line of every file MUST be: \`import { test, expect } from './__healix-fixture';\`
 - Tests should be fast and reliable
 - Focus on critical paths that indicate the app is working
 - Include console error detection
@@ -748,7 +749,8 @@ IMPORTANT: Return ONLY valid JSON, no markdown code blocks or explanations.`
     return `You are an expert Playwright test engineer specializing in frontend E2E testing. Generate comprehensive, production-ready tests.
 
 ## Guidelines
-- Use Playwright's @playwright/test framework with TypeScript
+- ALWAYS import test and expect from './__healix-fixture', NOT from '@playwright/test'.
+  First line of every file MUST be: \`import { test, expect } from './__healix-fixture';\`
 - Include proper assertions (visibility, content, accessibility)
 - Handle async operations with proper waits (avoid arbitrary timeouts)
 - Test both happy paths and error scenarios
@@ -870,6 +872,8 @@ IMPORTANT: Return ONLY valid JSON, no markdown code blocks.`
     return `You are an expert E2E testing engineer. Generate comprehensive workflow tests that simulate complete user journeys.
 
 ## Guidelines
+- ALWAYS import test and expect from './__healix-fixture', NOT from '@playwright/test'.
+  First line of every file MUST be: \`import { test, expect } from './__healix-fixture';\`
 - Test complete flows from start to finish
 - Include both happy paths and error scenarios
 - Handle async operations and page transitions
@@ -2060,8 +2064,11 @@ Return JSON array only.`
     }
 
     let content = this.normalizeGeneratedContent(test.content || '')
-    if (!content.includes("from '@playwright/test'")) {
-      content = `import { test, expect } from '@playwright/test';\n\n${content}`
+    // Always redirect @playwright/test imports to the healix fixture so auth
+    // storageState and splash-bypass hooks are always active.
+    content = content.replace(/from\s+['"]@playwright\/test['"]/g, "from './__healix-fixture'")
+    if (!content.includes("from './__healix-fixture'")) {
+      content = `import { test, expect } from './__healix-fixture';\n\n${content}`
     }
 
     this.generatedFiles.push({
@@ -2148,7 +2155,7 @@ Return JSON array only.`
           type,
           source: 'fallback',
           fallbackReason: reason,
-          content: `import { test, expect } from '@playwright/test';
+          content: `import { test, expect } from './__healix-fixture';
 
 ${baseUrlComment}
 // Fallback reason: ${reason}
@@ -2185,7 +2192,7 @@ test.describe('Fallback smoke checks', () => {
           type,
           source: 'fallback',
           fallbackReason: reason,
-          content: `import { test, expect } from '@playwright/test';
+          content: `import { test, expect } from './__healix-fixture';
 
 ${baseUrlComment}
 // Fallback reason: ${reason}
@@ -2216,7 +2223,7 @@ test.describe('Fallback frontend checks', () => {
           type,
           source: 'fallback',
           fallbackReason: reason,
-          content: `import { test, expect } from '@playwright/test';
+          content: `import { test, expect } from './__healix-fixture';
 
 ${baseUrlComment}
 // Fallback reason: ${reason}
@@ -2271,7 +2278,7 @@ test.describe('Fallback API checks', () => {
           type,
           source: 'fallback',
           fallbackReason: reason,
-          content: `import { test, expect } from '@playwright/test';
+          content: `import { test, expect } from './__healix-fixture';
 
 ${baseUrlComment}
 // Fallback reason: ${reason}
@@ -2305,7 +2312,7 @@ test.describe('Fallback workflow checks', () => {
           type,
           source: 'fallback',
           fallbackReason: reason,
-          content: `import { test, expect } from '@playwright/test';
+          content: `import { test, expect } from './__healix-fixture';
 
 ${baseUrlComment}
 // Fallback reason: ${reason}
