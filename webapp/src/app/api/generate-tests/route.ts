@@ -409,14 +409,11 @@ export async function POST(request: NextRequest) {
         enforceValidation: true,
         syntaxValidationMode: 'fail-open',
         strictAIGeneration: genOptions.strictAIGeneration === true,
-        // Sync path is gated by `export const maxDuration = 60` on Vercel —
-        // OpenAI must fail inside ~55s so we still have a moment to emit a
-        // fallback response before the function is killed. Outside Vercel
-        // (localhost / self-hosted) there is no such cap, and slower agents
-        // (frontend especially) legitimately need minutes, so we lift the
-        // ceiling. Async (Inngest) path sets its own timeout and does not
-        // touch this route.
-        timeout: process.env.VERCEL ? 55_000 : 540_000,
+        // Localhost-first: generation legitimately runs for minutes under
+        // gpt-5.4 high-reasoning, especially for the frontend and error
+        // agents. HEALIX_OPENAI_TIMEOUT_MS lets operators tighten this
+        // when running behind a reverse proxy with its own budget.
+        timeout: Number(process.env.HEALIX_OPENAI_TIMEOUT_MS) || 540_000,
       },
       onAgentComplete: async (record) => {
         agentTelemetry.push(record)

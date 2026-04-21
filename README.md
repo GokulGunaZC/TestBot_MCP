@@ -80,6 +80,12 @@ Behavior: the MCP enqueues a job, polls for progress, and writes partials to dis
 
 Rollback: flip `HEALIX_GEN_ASYNC=false`. The next request uses the sync Phase-1 path unchanged. In-flight Inngest jobs keep running and writing to their row — no orphaned users.
 
+### Running Healix locally (localhost-first)
+
+Healix was originally architected around Vercel's 60-second serverless function cap — that constraint is why the `HEALIX_GEN_ASYNC`/Inngest background-job path exists in the first place. When you run the Healix webapp on your own machine (e.g. `next dev` on `http://localhost:3000`) there is no 60s ceiling, so the synchronous generation path is not only supported, it's the recommended way to develop against Healix locally.
+
+Do **not** enable `HEALIX_GEN_ASYNC=true` for localhost development: the async path adds Inngest setup, polling overhead, and an extra failure surface that all exist to sidestep a Vercel-only limitation. It is off-path for local dev. Point the MCP at your local webapp (`HEALIX_DASHBOARD_URL=http://localhost:3000` and/or `HEALIX_WEBAPP_URL=http://localhost:3000`) and leave `HEALIX_GEN_ASYNC` unset (or `false`). The pipeline will log a one-line warning on stderr if it detects `HEALIX_GEN_ASYNC=true` combined with a localhost dashboard/webapp URL.
+
 ### Tool Parameters
 
 The `healix_test_my_app` tool accepts:

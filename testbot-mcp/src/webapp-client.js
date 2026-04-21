@@ -38,15 +38,14 @@ const ENDPOINT_TIMEOUTS_MS = {
   planExploration: 600_000,  // 10 min
   parsePRD: 600_000,         // 10 min
   generateTests: 1_200_000,  // 20 min — legacy monolithic code-gen
-  // Per-agent chunked generation. The webapp route declares
-  // `export const maxDuration = 60` (Vercel Hobby hard cap); this timeout
-  // leaves a 5-second client-side margin so the AbortError fires BEFORE
-  // Vercel's own 504, giving us a clean WEBAPP_TIMEOUT error code instead of
-  // an HTML gateway response.
-  generateTestsForAgent: 55_000,
-  // P1.5 planner pre-pass. Same 55s ceiling as generateTestsForAgent —
-  // `export const maxDuration = 60` on /api/generate-tests/plan.
-  planGeneration: 55_000,
+  // Per-agent chunked generation. Localhost-first: each agent slice routinely
+  // needs minutes under gpt-5.4 high-reasoning (frontend and error agents
+  // especially). Override via HEALIX_WEBAPP_TIMEOUT_MS if you need a tighter
+  // global ceiling. The old 55s value was a Vercel-hobby accommodation.
+  generateTestsForAgent: 600_000,
+  // P1.5 planner pre-pass. Same 10 min ceiling as generateTestsForAgent —
+  // planning can fan out acceptance criteria across the whole app.
+  planGeneration: 600_000,
   // P2-g async generation. The enqueue call should return in well under a
   // second — it only writes a row and returns a jobId — so this timeout is
   // deliberately tight to surface a "webapp is wedged" condition fast.

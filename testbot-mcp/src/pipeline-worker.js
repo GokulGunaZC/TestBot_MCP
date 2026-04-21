@@ -272,6 +272,108 @@ function listGeneratedTestFiles(projectPath) {
 }
 
 /**
+ * Auto-discover candidate PRD / spec / design docs in the project root when the
+ * user didn't explicitly pass a PRD. Healix was coming up empty on runs where
+ * the repo clearly had a README / walkthrough describing the product — this
+ * closes that gap without forcing CLI flags on the user.
+ *
+ * Priority:
+ *   1. Well-known top-level filenames (README.md, PRD.md, SPEC.md, DESIGN.md,
+ *      walkthrough.md) in that order.
+ *   2. docs/*.md (depth-1)
+ *   3. docs/**\/*.md (depth-2 only; we cap depth to avoid blowing out on
+ *      accidentally-shipped site generators or monorepo docs).
+ *
+ * Hard caps:
+ *   - total aggregated bytes ≤ MAX (~30 KB) so we don't drown the generator
+ *     prompt
+ *   - ignores node_modules / dist / build / .next
+ */
+function autoDiscoverPrdDocs(projectPath) {
+  if (!projectPath || typeof projectPath !== 'string') return { paths: [], content: null, totalBytes: 0 };
+  const MAX_TOTAL_BYTES = 30 * 1024; // ~30 KB aggregated
+  const IGNORED_DIRS = new Set(['node_modules', 'dist', 'build', '.next', '.git']);
+  const WELL_KNOWN = ['README.md', 'PRD.md', 'SPEC.md', 'DESIGN.md', 'walkthrough.md'];
+
+  const picked = [];
+  const seen = new Set();
+  let totalBytes = 0;
+
+  const safeStat = (p) => {
+    try { return fs.statSync(p); } catch { return null; }
+  };
+
+  const addCandidate = (absPath) => {
+    if (!absPath || seen.has(absPath)) return false;
+    const st = safeStat(absPath);
+    if (!st || !st.isFile()) return false;
+    if (totalBytes >= MAX_TOTAL_BYTES) return false;
+    let content;
+    try {
+      content = fs.readFileSync(absPath, 'utf-8');
+    } catch {
+      return false;
+    }
+    const remaining = MAX_TOTAL_BYTES - totalBytes;
+    const truncated = content.length > remaining ? content.slice(0, remaining) : content;
+    picked.push({ path: absPath, content: truncated });
+    seen.add(absPath);
+    totalBytes += truncated.length;
+    return true;
+  };
+
+  // Pass 1: well-known root filenames
+  for (const name of WELL_KNOWN) {
+    if (totalBytes >= MAX_TOTAL_BYTES) break;
+    addCandidate(path.join(projectPath, name));
+  }
+
+  // Pass 2 & 3: docs/ tree at depth ≤ 2
+  const docsRoot = path.join(projectPath, 'docs');
+  const docsStat = safeStat(docsRoot);
+  if (docsStat && docsStat.isDirectory() && totalBytes < MAX_TOTAL_BYTES) {
+    const walk = (dir, depth) => {
+      if (depth > 2 || totalBytes >= MAX_TOTAL_BYTES) return;
+      let entries;
+      try {
+        entries = fs.readdirSync(dir, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      // Files first (shallow-preferred ordering), then subdirs.
+      const files = entries.filter((e) => e.isFile() && /\.md$/i.test(e.name))
+        .sort((a, b) => a.name.localeCompare(b.name));
+      for (const f of files) {
+        if (totalBytes >= MAX_TOTAL_BYTES) return;
+        addCandidate(path.join(dir, f.name));
+      }
+      if (depth === 2) return; // leaf depth
+      const subdirs = entries.filter((e) => e.isDirectory() && !IGNORED_DIRS.has(e.name))
+        .sort((a, b) => a.name.localeCompare(b.name));
+      for (const d of subdirs) {
+        if (totalBytes >= MAX_TOTAL_BYTES) return;
+        walk(path.join(dir, d.name), depth + 1);
+      }
+    };
+    walk(docsRoot, 1);
+  }
+
+  if (picked.length === 0) {
+    return { paths: [], content: null, totalBytes: 0 };
+  }
+
+  const aggregated = picked
+    .map((p) => `# === ${path.relative(projectPath, p.path) || p.path} ===\n\n${p.content}`)
+    .join('\n\n---\n\n');
+
+  return {
+    paths: picked.map((p) => p.path),
+    content: aggregated,
+    totalBytes,
+  };
+}
+
+/**
  * Detect when the user's playwright.config.* declares a `webServer` block
  * whose URL disagrees with the Healix-configured baseURL. When this mismatch
  * exists AND Healix is also starting its own dev server, Playwright will
@@ -690,8 +792,27 @@ function evaluateGenerationQualityGates({ config, context, quality, prdContent, 
   const minGeneratedTests = toFiniteNumber(config.minGeneratedTests, 50);
   const minSelectorQuality = profile === 'balanced' ? 0.35 : (profile === 'exhaustive' ? 0.6 : 0.5);
 
-  // Log warning if below minimum but don't fail the pipeline
+  // Hard-fail when running under a strict coverage profile (qa-max / exhaustive)
+  // with strictAIGeneration enabled. Non-strict profiles (balanced) retain the
+  // legacy warn-and-continue behavior so dev-loop runs still produce artifacts
+  // even when generation undershoots.
   if (quality.totalTests < minGeneratedTests) {
+    const strictCoverage = profile === 'qa-max' || profile === 'exhaustive';
+    if (strictAIEnabled(config) && strictCoverage) {
+      const error = new Error(
+        `Generated tests ${quality.totalTests} below minimum ${minGeneratedTests} for strict profile ${profile}`
+      );
+      error.code = 'MIN_TEST_COUNT_NOT_MET';
+      error.generationQuality = {
+        ...quality,
+        minGeneratedTests,
+        requiredCategories,
+        missingCategories,
+        minSelectorQuality,
+        coverageProfile: profile,
+      };
+      return { ok: false, error };
+    }
     Logger.warn('PipelineWorker', `Generated tests ${quality.totalTests} below minimum ${minGeneratedTests}, but continuing pipeline`);
   }
 
@@ -2967,6 +3088,17 @@ async function runPipeline(config, runId) {
   ensureDir(statusDir);
   const telemetryReporter = new MCPTelemetryReporter();
 
+  // Localhost + HEALIX_GEN_ASYNC is off-path. The async route was added to
+  // escape Vercel's 60s cap; for local dev the sync path is faster and doesn't
+  // require Inngest. Warn once instead of silently going down the async fork.
+  if (process.env.HEALIX_GEN_ASYNC === 'true') {
+    const dashUrl = String(config.dashboardUrl || '');
+    const webUrl = String(config.webappUrl || '');
+    if (/localhost|127\.0\.0\.1/.test(dashUrl) || /localhost|127\.0\.0\.1/.test(webUrl)) {
+      process.stderr.write('[HEALIX] HEALIX_GEN_ASYNC=true detected with localhost webapp — sync path is supported; async is off-path for local dev.\n');
+    }
+  }
+
   // Install durable-state + stage-budget reporters (fire-and-forget). Both are
   // best-effort: if the webapp is unreachable the pipeline keeps running.
   const durableClient = process.env.HEALIX_API_KEY
@@ -3186,6 +3318,34 @@ async function runPipeline(config, runId) {
         prdErrors,
       }, telemetryReporter);
       process.stderr.write(`[HEALIX] PRD read failures for run ${runId}: ${JSON.stringify(prdErrors)}\n`);
+    }
+
+    // Auto-ingest: if the user didn't hand us any PRD at all, sniff the project
+    // root for obvious candidates (README, PRD.md, docs/*.md). This is the
+    // silent fallback that lets Healix still benefit from whatever the repo
+    // ships — previously an empty prdFiles list just skipped this stage.
+    const userSuppliedPrd = Boolean(
+      config.prdFile || (Array.isArray(config.prdFiles) && config.prdFiles.length > 0)
+    );
+    if (!userSuppliedPrd && prdContents.length === 0 && config.projectPath) {
+      try {
+        const discovered = autoDiscoverPrdDocs(config.projectPath);
+        if (discovered.paths.length > 0 && discovered.content) {
+          prdContents.push(discovered.content);
+          Logger.info('PipelineWorker', 'Auto-ingested PRD candidates', {
+            paths: discovered.paths,
+            totalBytes: discovered.totalBytes,
+          });
+          updateStatus(statusDir, 'auto_ingested_prd', {
+            runId,
+            paths: discovered.paths,
+            totalBytes: discovered.totalBytes,
+          }, telemetryReporter);
+        }
+      } catch (error) {
+        // Silent-on-failure: autoscan must never break a run.
+        Logger.warn('PipelineWorker', 'PRD auto-ingest failed (best-effort)', { reason: error.message });
+      }
     }
 
     const combinedPrdContent = prdContents.length > 0 ? prdContents.join('\n\n---\n\n') : null;
@@ -3529,7 +3689,23 @@ async function runPipeline(config, runId) {
         const started = await startSecondaryServices({
           projectPath: config.projectPath,
           services: config.services,
-          waitMs: toFiniteNumber(config.serverStartTimeoutMs, 60_000),
+          // 30 s cap matches the HTTP readiness-probe budget. Beyond that we
+          // don't want to burn wall-clock on a dead service — emit a warning
+          // and let Playwright probe routes directly.
+          waitMs: toFiniteNumber(config.serverStartTimeoutMs, 30_000),
+          // Telemetry: when a secondary becomes HTTP-ready, emit
+          // `dev_server_ready` so the dashboard / MCP client can distinguish
+          // cold-start latency from genuine Playwright flakes.
+          onReady: ({ elapsedMs, url, service }) => {
+            updateStatus(statusDir, 'dev_server_ready', {
+              runId,
+              message: `${service?.role || 'secondary'} service ready at ${url} (${elapsedMs}ms)`,
+              elapsedMs,
+              url,
+              role: service?.role || null,
+              port: service?.port || null,
+            }, telemetryReporter);
+          },
         });
         if (started.length > 0) {
           updateStatus(statusDir, 'secondary_services_started', {
@@ -3619,6 +3795,18 @@ async function runPipeline(config, runId) {
       timeout: executionTimeout,
       serverPidFile,
       onTestProgress: telemetryReporter && telemetryReporter.isEnabled() ? onTestProgress : undefined,
+      // Emit a `dev_server_ready` telemetry event once the primary dev server
+      // responds (HTTP 2xx/3xx/4xx or TCP fallback). Downstream consumers use
+      // this to distinguish cold-start latency from genuine Playwright flakes.
+      onServerReady: ({ elapsedMs, url }) => {
+        updateStatus(statusDir, 'dev_server_ready', {
+          runId,
+          message: `Primary dev server ready at ${url} (${elapsedMs}ms)`,
+          elapsedMs,
+          url,
+          role: 'primary',
+        }, telemetryReporter);
+      },
     });
 
     const mcpParallelEnabled =
