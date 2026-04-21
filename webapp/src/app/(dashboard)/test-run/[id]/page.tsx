@@ -2211,7 +2211,19 @@ export default function TestRunDetailPage() {
           }
           if (data.eventType === 'test_result' && (data.metadata as Record<string, unknown>)?.test) {
             const t = (data.metadata as Record<string, unknown>).test as LiveTestResult;
-            setLiveTestResults(prev => [...prev, t]);
+            // Playwright emits one test_result per attempt; with retries=2 a single
+            // failing test fires up to 3 events. Key on (suite, name, file) and keep
+            // the latest outcome so counts reflect distinct tests, not attempts.
+            setLiveTestResults(prev => {
+              const key = `${t.su ?? ''}::${t.n ?? ''}::${t.f ?? ''}`;
+              const idx = prev.findIndex(x => `${x.su ?? ''}::${x.n ?? ''}::${x.f ?? ''}` === key);
+              if (idx >= 0) {
+                const next = prev.slice();
+                next[idx] = t;
+                return next;
+              }
+              return [...prev, t];
+            });
           }
           if (data.eventType === 'test_results' && Array.isArray((data.metadata as Record<string, unknown>)?.tests)) {
             const batch = (data.metadata as Record<string, unknown>).tests as LiveTestResult[];
@@ -2499,9 +2511,16 @@ export default function TestRunDetailPage() {
   const liveFailed = liveTestResults.filter(t => t.s === 'failed').length;
   const liveSkipped = liveTestResults.filter(t => t.s === 'skipped').length;
   const liveTotal = liveTestResults.length;
-  const hasLiveStats = liveTotal > 0;
+  // Only treat live as the primary source while the pipeline is still running.
+  // Once pipelineEnded fires, the ingested report (testRun.* / report.stats) is
+  // authoritative — preferring live here caused mismatches like All(17)/Passed(14)/Failed(61)
+  // because "All" is driven off displayTests while the other pills were driven off
+  // liveTotal, which accumulates retry attempts.
+  const reportTotal = testRun.total_tests || report?.summary?.total || report?.stats?.total || 0;
+  const hasIngestedStats = reportTotal > 0;
+  const hasLiveStats = liveTotal > 0 && !(pipelineEnded && hasIngestedStats);
 
-  // Priority: pipeline_error (zero real tests ran) > live > DB stats > generated > real
+  // Priority: pipeline_error (zero real tests ran) > live (mid-run only) > DB stats > generated > real
   //
   // When the pipeline errored before any test reported, the ingest payload
   // still carries the fake synthetic row in testRun.total_tests / failed_tests.
@@ -2512,7 +2531,7 @@ export default function TestRunDetailPage() {
     ? 0
     : (hasLiveStats
         ? liveTotal
-        : (testRun.total_tests || report?.summary?.total || report?.stats?.total || generatedTestCount || realTestsCount));
+        : (reportTotal || generatedTestCount || realTestsCount));
   const passedTests = pipelineError ? 0 : (hasLiveStats ? livePassed : (testRun.passed_tests || report?.summary?.passed || report?.stats?.passed || displayTests.filter(t => ['passed', 'pass'].includes(t.status.toLowerCase())).length));
   const failedTests = pipelineError ? 0 : (hasLiveStats ? liveFailed : (testRun.failed_tests || report?.summary?.failed || report?.stats?.failed || displayTests.filter(t => ['failed', 'fail'].includes(t.status.toLowerCase())).length));
   const skippedTests = pipelineError ? 0 : (hasLiveStats ? liveSkipped : (testRun.skipped_tests || report?.summary?.skipped || report?.stats?.skipped || displayTests.filter(t => ['skipped', 'skip', 'pending'].includes(t.status.toLowerCase())).length));
@@ -2981,7 +3000,7 @@ export default function TestRunDetailPage() {
                       : 'bg-white/5 text-[#4A6280] border border-transparent hover:border-white/10'
                   }`}
                 >
-                  {f === 'all' ? `All (${displayTests.length})` : f === 'passed' ? `Passed (${passedTests})` : f === 'failed' ? `Failed (${failedTests})` : `Skipped (${skippedTests})`}
+                  {f === 'all' ? `All (${totalTests})` : f === 'passed' ? `Passed (${passedTests})` : f === 'failed' ? `Failed (${failedTests})` : `Skipped (${skippedTests})`}
                 </button>
               ))}
               <div className="w-px h-4 bg-white/10 mx-1" />
