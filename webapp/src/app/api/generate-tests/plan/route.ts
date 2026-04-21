@@ -22,9 +22,9 @@ import {
 } from '@/lib/test-generation/plan-schema'
 import { checkRateLimit } from '@/lib/rate-limit'
 import { checkTokenBalance, deductTokens } from '@/lib/tokens'
+import { checkAiGuard, recordAiCall } from '@/lib/ai-guard'
 import { checkConcurrencyLimit } from '@/lib/concurrency-limit'
 import { checkIdempotency, storeIdempotencyResult } from '@/lib/idempotency'
-import { checkAiGuard } from '@/lib/ai-guard'
 import { logBlockedRequest } from '@/lib/security-logger'
 
 const ENDPOINT = '/api/generate-tests/plan'
@@ -33,10 +33,6 @@ const ENDPOINT = '/api/generate-tests/plan'
 // planner itself uses a 30s timeout per call, so two parallel planners plus
 // bookkeeping comfortably fit under 60s.
 export const maxDuration = 60
-
-// Rough token budget for one planner call — used to deduct from the user's
-// token balance so plan calls don't become a free-hit on the AI cost guard.
-const PLANNER_TOKEN_COST = 1000
 
 function canonicalJSON(value: unknown): string {
   // Stable stringify: sort object keys recursively so the hash is
@@ -260,7 +256,7 @@ export async function POST(request: NextRequest) {
 
       if (cached?.planJson) {
         const cachedPlan = cached.planJson as GenerationPlan
-        const hitBody = { success: true, plan: cachedPlan, cache: 'hit' as const }
+        const hitBody = { success: true, plan: cachedPlan, cache: 'hit' as const, plannerTokens: { promptTokens: 0, completionTokens: 0, totalTokens: 0 } }
         if (idempotencyKey) {
           await storeIdempotencyResult({
             idempotencyKey,
@@ -293,6 +289,7 @@ export async function POST(request: NextRequest) {
     let frontendPlan: FrontendPlan | null = null
     let backendPlan: BackendPlan | null = null
     const warnings: PlanWarning[] = []
+    let plannerTokens = { promptTokens: 0, completionTokens: 0, totalTokens: 0 }
 
     try {
       const [feResult, beResult] = await Promise.all([
@@ -306,6 +303,27 @@ export async function POST(request: NextRequest) {
       if (beResult) {
         backendPlan = beResult.plan
         warnings.push(...beResult.warnings)
+      }
+
+      const plannerPrompt = (feResult?.tokenUsage.promptTokens ?? 0) + (beResult?.tokenUsage.promptTokens ?? 0)
+      const plannerCompletion = (feResult?.tokenUsage.completionTokens ?? 0) + (beResult?.tokenUsage.completionTokens ?? 0)
+      const plannerTotal = plannerPrompt + plannerCompletion
+      plannerTokens = { promptTokens: plannerPrompt, completionTokens: plannerCompletion, totalTokens: plannerTotal }
+      if (plannerTotal > 0) {
+        try {
+          await deductTokens({ userId, tokensUsed: plannerTotal })
+          await recordAiCall({
+            userId,
+            apiKeyId: apiKeyRecord.id,
+            endpoint: ENDPOINT,
+            modelUsed: 'gpt-5.4',
+            tokensPrompt: plannerPrompt,
+            tokensCompletion: plannerCompletion,
+            tokensTotal: plannerTotal,
+          })
+        } catch (deductErr) {
+          console.warn('[generate-tests/plan] token deduction failed (non-fatal)', deductErr)
+        }
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
@@ -343,14 +361,7 @@ export async function POST(request: NextRequest) {
       console.warn('[generate-tests/plan] cache insert failed (non-fatal)', insertErr)
     }
 
-    // Deduct a flat token cost per planner run (one gpt-5.4 call per axis).
-    try {
-      await deductTokens({ userId, tokensUsed: PLANNER_TOKEN_COST })
-    } catch (deductErr) {
-      console.warn('[generate-tests/plan] token deduction failed (non-fatal)', deductErr)
-    }
-
-    const responseBody = { success: true, plan, cache: 'miss' as const }
+    const responseBody = { success: true, plan, cache: 'miss' as const, plannerTokens }
 
     if (idempotencyKey) {
       await storeIdempotencyResult({

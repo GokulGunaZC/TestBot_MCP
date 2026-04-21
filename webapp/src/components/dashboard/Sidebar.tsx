@@ -1,9 +1,10 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import { motion, AnimatePresence } from 'framer-motion';
+import { toDisplayUnits } from '@/lib/token-units';
 
 interface NavItem {
   href: string;
@@ -143,9 +144,35 @@ interface SidebarProps {
   plan?: string;
 }
 
-export default function Sidebar({ tokensRemaining = 0, tokensTotal = 0, plan = 'free' }: SidebarProps) {
+export default function Sidebar({ tokensRemaining: initialRemaining = 0, tokensTotal: initialTotal = 0, plan: initialPlan = 'free' }: SidebarProps) {
   const pathname = usePathname();
   const [mobileOpen, setMobileOpen] = useState(false);
+  const [tokensRemaining, setTokensRemaining] = useState(initialRemaining);
+  const [tokensTotal, setTokensTotal] = useState(initialTotal);
+  const [plan, setPlan] = useState(initialPlan);
+
+  const fetchProfile = useCallback(async () => {
+    try {
+      const res = await fetch('/api/profile');
+      if (!res.ok) return;
+      const { data } = await res.json();
+      if (data) {
+        setTokensRemaining(toDisplayUnits(data.tokens_remaining));
+        setTokensTotal(toDisplayUnits(data.tokens_total));
+        setPlan(data.plan ?? 'free');
+      }
+    } catch { }
+  }, []);
+
+  useEffect(() => {
+    fetchProfile();
+    window.addEventListener('focus', fetchProfile);
+    window.addEventListener('healix:profile-updated', fetchProfile);
+    return () => {
+      window.removeEventListener('focus', fetchProfile);
+      window.removeEventListener('healix:profile-updated', fetchProfile);
+    };
+  }, [fetchProfile]);
 
   const isActive = (href: string) => pathname === href || pathname.startsWith(href + '/');
 
@@ -212,8 +239,8 @@ export default function Sidebar({ tokensRemaining = 0, tokensTotal = 0, plan = '
       <div className="px-3 py-4 border-t-2 border-[#333]">
         <div className="bg-[#0a0a0a] border-2 border-[#333] p-3">
           <div className="flex items-center justify-between mb-2">
-            <span className="text-[#a0a0a0] text-xs font-mono uppercase tracking-wider">Tokens</span>
-            <span className="y2k-badge">{plan}</span>
+            <span className="text-[#a0a0a0] text-xs font-mono uppercase tracking-wider">Credits</span>
+            <span className="y2k-badge">{plan === 'free' ? 'trial' : plan}</span>
           </div>
           <div className={`font-black text-lg font-mono mb-2 ${tokensRemaining === 0 ? 'text-red-400' : 'text-white'}`}>{tokensRemaining}</div>
           <div className="h-1.5 bg-[#222] overflow-hidden mb-3 border border-[#333]">
@@ -224,7 +251,7 @@ export default function Sidebar({ tokensRemaining = 0, tokensTotal = 0, plan = '
           </div>
           {tokensRemaining === 0 && (
             <div className="text-[10px] text-red-400 font-mono mb-2 uppercase tracking-wider">
-              ⚠ Out of tokens
+              ⚠ Out of credits
             </div>
           )}
           <Link

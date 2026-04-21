@@ -91,14 +91,22 @@ export interface PlanContext {
   options?: GenerationOptions
 }
 
+export interface PlannerTokenUsage {
+  promptTokens: number
+  completionTokens: number
+  totalTokens: number
+}
+
 export interface FrontendPlanResult {
   plan: FrontendPlan
   warnings: PlanWarning[]
+  tokenUsage: PlannerTokenUsage
 }
 
 export interface BackendPlanResult {
   plan: BackendPlan
   warnings: PlanWarning[]
+  tokenUsage: PlannerTokenUsage
 }
 
 function buildClient(): OpenAIClient | null {
@@ -262,11 +270,14 @@ function hasEmptyContext(ctx: PlanContext): boolean {
 export async function planFrontend(ctx: PlanContext): Promise<FrontendPlanResult> {
   const warnings: PlanWarning[] = []
 
+  const zeroUsage: PlannerTokenUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 }
+
   if (hasEmptyContext(ctx)) {
     warnings.push({ kind: 'empty_context', detail: 'no pages/endpoints/prd' })
     return {
       plan: { pages: [], workflows: [], smokeTargets: [], plannedTests: 0 },
       warnings,
+      tokenUsage: zeroUsage,
     }
   }
 
@@ -285,6 +296,7 @@ export async function planFrontend(ctx: PlanContext): Promise<FrontendPlanResult
     return {
       plan: { pages: [], workflows: [], smokeTargets: [], plannedTests: 0 },
       warnings,
+      tokenUsage: zeroUsage,
     }
   }
 
@@ -317,12 +329,14 @@ export async function planFrontend(ctx: PlanContext): Promise<FrontendPlanResult
   ].join('\n')
 
   let rawText = ''
+  let callUsage: PlannerTokenUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 }
   try {
     const result = await client.callOpenAI([
       { role: 'system', content: system },
       { role: 'user', content: user },
     ])
     rawText = result.text
+    callUsage = { promptTokens: result.usage.promptTokens, completionTokens: result.usage.completionTokens, totalTokens: result.usage.totalTokens }
   } catch (err) {
     // Let the caller decide fallback semantics — planner errors bubble up.
     throw err
@@ -334,6 +348,7 @@ export async function planFrontend(ctx: PlanContext): Promise<FrontendPlanResult
     return {
       plan: { pages: [], workflows: [], smokeTargets: [], plannedTests: 0 },
       warnings,
+      tokenUsage: callUsage,
     }
   }
 
@@ -377,7 +392,7 @@ export async function planFrontend(ctx: PlanContext): Promise<FrontendPlanResult
   }
   plan.plannedTests = countFrontendTests(plan)
 
-  return { plan, warnings }
+  return { plan, warnings, tokenUsage: callUsage }
 }
 
 /**
@@ -387,11 +402,14 @@ export async function planFrontend(ctx: PlanContext): Promise<FrontendPlanResult
 export async function planBackend(ctx: PlanContext): Promise<BackendPlanResult> {
   const warnings: PlanWarning[] = []
 
+  const zeroUsage: PlannerTokenUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 }
+
   if (hasEmptyContext(ctx)) {
     warnings.push({ kind: 'empty_context', detail: 'no pages/endpoints/prd' })
     return {
       plan: { endpoints: [], apiFlows: [], plannedTests: 0 },
       warnings,
+      tokenUsage: zeroUsage,
     }
   }
 
@@ -410,6 +428,7 @@ export async function planBackend(ctx: PlanContext): Promise<BackendPlanResult> 
     return {
       plan: { endpoints: [], apiFlows: [], plannedTests: 0 },
       warnings,
+      tokenUsage: zeroUsage,
     }
   }
 
@@ -442,12 +461,14 @@ export async function planBackend(ctx: PlanContext): Promise<BackendPlanResult> 
   ].join('\n')
 
   let rawText = ''
+  let callUsage: PlannerTokenUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 }
   try {
     const result = await client.callOpenAI([
       { role: 'system', content: system },
       { role: 'user', content: user },
     ])
     rawText = result.text
+    callUsage = { promptTokens: result.usage.promptTokens, completionTokens: result.usage.completionTokens, totalTokens: result.usage.totalTokens }
   } catch (err) {
     throw err
   }
@@ -458,6 +479,7 @@ export async function planBackend(ctx: PlanContext): Promise<BackendPlanResult> 
     return {
       plan: { endpoints: [], apiFlows: [], plannedTests: 0 },
       warnings,
+      tokenUsage: callUsage,
     }
   }
 
@@ -507,5 +529,5 @@ export async function planBackend(ctx: PlanContext): Promise<BackendPlanResult> 
   }
   plan.plannedTests = countBackendTests(plan)
 
-  return { plan, warnings }
+  return { plan, warnings, tokenUsage: callUsage }
 }

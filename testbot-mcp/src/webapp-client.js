@@ -187,12 +187,28 @@ class WebappClient {
 
     if (!response.ok) {
       const detail = payload?.error || rawText.slice(0, 400) || `HTTP ${response.status}`;
-      const err = new Error(`Healix webapp ${path} failed (${response.status}): ${detail}`);
-      err.code =
+      const errCode =
         response.status === 401 ? 'INVALID_API_KEY' :
         response.status === 402 ? 'INSUFFICIENT_CREDITS' :
         response.status === 429 ? 'RATE_LIMITED' :
         response.status >= 500 ? 'WEBAPP_SERVER_ERROR' : 'WEBAPP_ERROR';
+
+      if (response.status === 402) {
+        Logger.error('WebappClient', `[TOKEN GATE] ❌ INSUFFICIENT_CREDITS — ${path} returned 402. No tokens remaining.`, null, {
+          endpoint: path,
+          detail,
+          hint: 'Check your token balance in the Healix dashboard. Top up or upgrade your plan.',
+        });
+      } else if (response.status === 401) {
+        Logger.error('WebappClient', `[AUTH GATE] ❌ INVALID_API_KEY — ${path} returned 401`, null, { endpoint: path, detail });
+      } else if (response.status === 429) {
+        Logger.warn('WebappClient', `[RATE GATE] ⚠️  RATE_LIMITED — ${path} returned 429`, { endpoint: path, detail });
+      } else if (response.status >= 500) {
+        Logger.error('WebappClient', `[WEBAPP ERROR] ${path} returned ${response.status}`, null, { endpoint: path, detail });
+      }
+
+      const err = new Error(`Healix webapp ${path} failed (${response.status}): ${detail}`);
+      err.code = errCode;
       err.status = response.status;
       err.payload = payload;
       throw err;
