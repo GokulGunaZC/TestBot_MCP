@@ -493,6 +493,17 @@ class HealixMCPServer {
     return normalized;
   }
 
+  looksLikeLocalProjectPath(projectPath) {
+    if (!projectPath || typeof projectPath !== 'string') return false;
+    const trimmed = projectPath.trim();
+    if (!trimmed) return false;
+    if (/^https?:\/\//i.test(trimmed)) return false;
+    // POSIX absolute path or Windows drive-letter path. Relative paths are not
+    // considered "local project" here because they're too ambiguous to trust
+    // for auto-upgrading the generation profile.
+    return /^\//.test(trimmed) || /^[A-Za-z]:[\\/]/.test(trimmed);
+  }
+
   resolveHeadlessPreference(params = {}) {
     const envHeadless = resolveBoolean(process.env.HEALIX_HEADLESS, true);
     return resolveBoolean(params.headless, envHeadless);
@@ -507,15 +518,101 @@ class HealixMCPServer {
   }
 
   createBasePipelineConfig(context, params) {
-    const strictAIGeneration = params.strictAIGeneration !== false;
-    const resolvedGenerationMode = strictAIGeneration
+    const normalizedCodebase = this.normalizeCodebaseContext(params.codebaseContext);
+    const hasLocalProject = this.looksLikeLocalProjectPath(context.projectPath);
+    const pageCount = Array.isArray(normalizedCodebase?.pages) ? normalizedCodebase.pages.length : 0;
+    const workflowCount = Array.isArray(normalizedCodebase?.workflows) ? normalizedCodebase.workflows.length : 0;
+    const shouldAutoUpgrade = hasLocalProject && (pageCount > 0 || workflowCount > 0);
+
+    // configAutoUpgrades tracks every upgrade we apply here so the user can see
+    // why we overrode their weak profile. Downstream merges these into
+    // finalConfig.configAutoFixes alongside the port/startCommand corrections.
+    const configAutoUpgrades = [];
+
+    // strictAIGeneration normalization. The canonical default is TRUE. If we're
+    // auto-upgrading (local project with pages), we also force this true even
+    // if the caller passed false, because template-only generation on local
+    // codebases reliably produces low-quality suites (the l9ptet incident).
+    let strictAIGeneration = params.strictAIGeneration !== false;
+    if (shouldAutoUpgrade && params.strictAIGeneration === false) {
+      strictAIGeneration = true;
+      configAutoUpgrades.push({
+        kind: 'config_auto_upgraded',
+        detail: 'Promoted strictAIGeneration=false → true for local project with detected pages/workflows',
+        field: 'strictAIGeneration',
+        from: false,
+        to: true,
+      });
+    }
+
+    // Initial generationMode resolution (before auto-upgrade).
+    let resolvedGenerationMode = strictAIGeneration
       ? 'openai-only'
       : (params.generationMode || 'openai-first');
+    if (shouldAutoUpgrade && (params.generationMode === 'template-only' || params.generationMode === 'saas-only')) {
+      const previous = params.generationMode;
+      resolvedGenerationMode = 'openai-only';
+      configAutoUpgrades.push({
+        kind: 'config_auto_upgraded',
+        detail: `Promoted generationMode=${previous} → openai-only for local project with detected pages/workflows`,
+        field: 'generationMode',
+        from: previous,
+        to: 'openai-only',
+      });
+    }
 
     const parsedMinGeneratedTests = Number(params.minGeneratedTests);
-    const minGeneratedTests = Number.isFinite(parsedMinGeneratedTests) && parsedMinGeneratedTests > 0
+    let minGeneratedTests = Number.isFinite(parsedMinGeneratedTests) && parsedMinGeneratedTests > 0
       ? Math.floor(parsedMinGeneratedTests)
       : 50;
+    if (shouldAutoUpgrade && minGeneratedTests < 50) {
+      const previous = minGeneratedTests;
+      minGeneratedTests = 50;
+      configAutoUpgrades.push({
+        kind: 'config_auto_upgraded',
+        detail: `Promoted minGeneratedTests=${previous} → 50 for local project with detected pages/workflows`,
+        field: 'minGeneratedTests',
+        from: previous,
+        to: 50,
+      });
+    }
+
+    // coverageProfile upgrade — 'balanced' on a local project with pages
+    // produced the zapminds l9ptet 42% pass rate; 'qa-max' is the new floor.
+    let coverageProfile = params.coverageProfile || 'qa-max';
+    if (shouldAutoUpgrade && params.coverageProfile === 'balanced') {
+      coverageProfile = 'qa-max';
+      configAutoUpgrades.push({
+        kind: 'config_auto_upgraded',
+        detail: 'Promoted coverageProfile=balanced → qa-max for local project with detected pages/workflows',
+        field: 'coverageProfile',
+        from: 'balanced',
+        to: 'qa-max',
+      });
+    }
+
+    if (configAutoUpgrades.length > 0) {
+      Logger.info('Index', `Auto-upgraded ${configAutoUpgrades.length} generation config field(s) for local project`, {
+        projectPath: context.projectPath,
+        pageCount,
+        workflowCount,
+        upgrades: configAutoUpgrades.map((u) => `${u.field}:${u.from}→${u.to}`),
+      });
+    }
+
+    // P0-3c: Even after auto-upgrade, reject template-only at normalization so
+    // the caller gets a fast, clear error rather than waiting for the worker
+    // to spin up and throw INCOMPATIBLE_GENERATION_MODE. The worker keeps its
+    // own guard as defense-in-depth.
+    if (resolvedGenerationMode === 'template-only') {
+      const err = new Error(
+        'generationMode=template-only is no longer supported — the worker only runs AI-backed per-agent parallel generation. ' +
+        'Use strictAIGeneration=true (the default) or explicitly set generationMode=openai-only.'
+      );
+      err.code = 'INCOMPATIBLE_GENERATION_MODE';
+      throw err;
+    }
+
     const headless = this.resolveHeadlessPreference(params);
     const autoOpenBrowser = this.resolveAutoOpenBrowserPreference(params, headless);
 
@@ -535,7 +632,7 @@ class HealixMCPServer {
       testType: params.testType || defaultTestType,
       generateTests: params.generateTests !== false,
       prdFile: params.prdFile,
-      codebaseContext: this.normalizeCodebaseContext(params.codebaseContext),
+      codebaseContext: normalizedCodebase,
       baseURL: params.baseURL || context.baseURL,
       port: params.port || context.port,
       startCommand: params.startCommand || context.startCommand,
@@ -554,7 +651,8 @@ class HealixMCPServer {
       strictAIGeneration,
       aiOnlyEnforced: strictAIGeneration,
       minGeneratedTests,
-      coverageProfile: params.coverageProfile || 'qa-max',
+      coverageProfile,
+      configAutoFixes: configAutoUpgrades,
       phaseMode: params.phaseMode || 'two-phase',
       serverStartTimeoutMs: params.serverStartTimeoutMs,
       serverHealthCheckIntervalMs: params.serverHealthCheckIntervalMs,
@@ -615,6 +713,14 @@ class HealixMCPServer {
         }
       }
 
+      // Merge the generation-profile auto-upgrades (set in createBasePipelineConfig)
+      // with the port/startCommand auto-corrections from autoCorrectPortConfig so
+      // every applied fix is visible in status + telemetry together.
+      const allAutoFixes = [
+        ...(Array.isArray(baseConfig.configAutoFixes) ? baseConfig.configAutoFixes : []),
+        ...(corrected.appliedFixes || []),
+      ];
+
       const finalConfig = {
         ...baseConfig,
         testType: validatedConfig.testType,
@@ -623,7 +729,7 @@ class HealixMCPServer {
         startCommand: corrected.startCommand,
         baseURL: corrected.baseURL,
         port: corrected.port,
-        configAutoFixes: corrected.appliedFixes || [],
+        configAutoFixes: allAutoFixes,
         prdFile: prdFile || (prdFiles.length > 0 ? prdFiles[0] : undefined),
         prdFiles: prdFiles.length > 0 ? prdFiles : (prdFile ? [prdFile] : []),
       };
@@ -632,7 +738,7 @@ class HealixMCPServer {
         finalConfig.testCredentials = normalizedCredentials;
       }
 
-      const appliedFixSummaries = (corrected.appliedFixes || [])
+      const appliedFixSummaries = allAutoFixes
         .filter((fix) => fix.kind !== 'port_matches_framework_default')
         .map((fix) => fix.detail);
 
@@ -644,7 +750,7 @@ class HealixMCPServer {
           : 'Validated configuration. Starting Healix worker...',
         project: baseConfig.projectName,
         aiOnlyEnforced: finalConfig.strictAIGeneration !== false,
-        configAutoFixes: corrected.appliedFixes || [],
+        configAutoFixes: allAutoFixes,
       });
 
       if (appliedFixSummaries.length > 0) {
@@ -656,7 +762,7 @@ class HealixMCPServer {
           status: 'info',
           success: true,
           message: `Auto-corrected ${appliedFixSummaries.length} config item${appliedFixSummaries.length === 1 ? '' : 's'}`,
-          metadata: { fixes: corrected.appliedFixes },
+          metadata: { fixes: allAutoFixes },
         });
       }
 

@@ -41,17 +41,18 @@ const MCPTelemetryReporter = require('./mcp-telemetry');
 // Initialize logger for the worker process
 Logger.initialize();
 
-const DEFAULT_TOTAL_BUDGET_MS = 3600000; // 60 minutes
+const DEFAULT_TOTAL_BUDGET_MS = 7200000; // 120 minutes
 // Generation used to be 6 min and was hit routinely by real-world repos. With
 // the per-agent parallel fan-out (P1-d) 5 concurrent <60s calls give a typical
-// wall-clock of ~2 min, but we budget generously (15 min) for slow customers,
-// cold Vercel starts, and occasional webapp retries. Users can override per
-// run via HEALIX_GEN_BUDGET_MS.
+// wall-clock of ~2 min, but we budget generously (30 min) for slow customers,
+// cold Vercel starts, occasional webapp retries, and larger projects like
+// zapminds_PM that routinely exceeded the prior 15-min cap. Users can override
+// per run via HEALIX_GEN_BUDGET_MS.
 const DEFAULT_STAGE_CAPS_MS = {
   jira: 45000,
   context: 90000,
   prdParse: 90000,
-  generation: 900000,  // 15 minutes
+  generation: 1800000,  // 30 minutes
   validation: 90000,
   execution: 2400000,  // 40 minutes
   aiTriage: 60000,
@@ -1340,7 +1341,7 @@ function ensureCursorFixtureFiles(generatedDir, projectPath = null) {
   return [fixtureTs, fixtureJs];
 }
 
-function rewritePlaywrightImportForCursor(content, fixtureImportPath) {
+function rewritePlaywrightImportToFixture(content, fixtureImportPath) {
   let rewritten = String(content || '');
   const importPattern = /from\s+(['"])@playwright\/test\1/g;
   const requirePattern = /require\((['"])@playwright\/test\1\)/g;
@@ -1351,14 +1352,14 @@ function rewritePlaywrightImportForCursor(content, fixtureImportPath) {
   return rewritten;
 }
 
-function applyMouseCursorOverlayToGeneratedTests({ projectPath, enabled }) {
-  if (!enabled) {
-    return { enabled: false, reason: 'disabled' };
-  }
-
+// Runs unconditionally after generation. The Healix fixture bundles splash-bypass
+// and storageState auto-load that auth-gated SPAs need — without it, every UI
+// test redirects to '/' and fails on `url.toContain('/dashboard')`. The cursor
+// overlay is a separate, optional concern; see applyMouseCursorOverlayToGeneratedTests.
+function ensureHealixFixtureImports({ projectPath }) {
   const generatedDir = path.join(projectPath, 'tests', 'generated');
   if (!fs.existsSync(generatedDir)) {
-    return { enabled: false, reason: 'generated_dir_missing' };
+    return { applied: false, reason: 'generated_dir_missing' };
   }
 
   const testFiles = fs.readdirSync(generatedDir)
@@ -1366,38 +1367,59 @@ function applyMouseCursorOverlayToGeneratedTests({ projectPath, enabled }) {
     .map((name) => path.join(generatedDir, name));
 
   if (testFiles.length === 0) {
-    return { enabled: false, reason: 'no_generated_test_files' };
+    return { applied: false, reason: 'no_generated_test_files' };
   }
 
   const fixtureFiles = ensureCursorFixtureFiles(generatedDir, projectPath);
   let patchedFiles = 0;
-  let skippedFiles = 0;
+  let alreadyUsingFixture = 0;
 
   for (const testFile of testFiles) {
     const raw = fs.readFileSync(testFile, 'utf-8');
     if (!raw.includes('@playwright/test')) {
-      skippedFiles += 1;
+      alreadyUsingFixture += 1;
       continue;
     }
 
     const fixtureBasePath = path.join(generatedDir, CURSOR_FIXTURE_BASENAME);
     const relativeFixturePath = path.relative(path.dirname(testFile), fixtureBasePath);
     const fixtureImportPath = toImportPath(relativeFixturePath);
-    const rewritten = rewritePlaywrightImportForCursor(raw, fixtureImportPath);
+    const rewritten = rewritePlaywrightImportToFixture(raw, fixtureImportPath);
 
     if (rewritten !== raw) {
       fs.writeFileSync(testFile, rewritten, 'utf-8');
       patchedFiles += 1;
-    } else {
-      skippedFiles += 1;
     }
   }
 
   return {
-    enabled: true,
+    applied: true,
     patchedFiles,
-    skippedFiles,
+    alreadyUsingFixture,
+    totalFiles: testFiles.length,
     fixtureFiles: fixtureFiles.map((filePath) => path.basename(filePath)),
+  };
+}
+
+function applyMouseCursorOverlayToGeneratedTests({ projectPath, enabled }) {
+  if (!enabled) {
+    return { enabled: false, reason: 'disabled' };
+  }
+
+  // Fixture files + import rewrite are owned by ensureHealixFixtureImports now
+  // and run unconditionally. This function is responsible only for the cursor
+  // overlay init script, which is the reason fixtures were originally touched
+  // here. If the fixture's already in place we're a no-op.
+  const result = ensureHealixFixtureImports({ projectPath });
+  if (!result.applied) {
+    return { enabled: false, reason: result.reason };
+  }
+
+  return {
+    enabled: true,
+    patchedFiles: result.patchedFiles,
+    skippedFiles: result.alreadyUsingFixture,
+    fixtureFiles: result.fixtureFiles,
   };
 }
 
@@ -1513,17 +1535,67 @@ function safeWriteGeneratedTest(testsDir, test, index, fallbackPrefix, usedFilen
     throw new Error(`Unsafe generated filename rejected: ${safeFilename}`);
   }
 
-  // Belt-and-braces: always redirect @playwright/test imports to the healix
-  // fixture so the file is correct even when the webapp prompt slips.
-  const rewrittenContent = content
-    .replace(/from\s+(['"])@playwright\/test\1/g, "from $1./__healix-fixture$1")
-    .replace(/require\((['"])@playwright\/test\1\)/g, "require($1./__healix-fixture$1)");
-
-  fs.writeFileSync(targetPath, rewrittenContent, 'utf-8');
+  fs.writeFileSync(targetPath, content, 'utf-8');
   return {
     path: targetPath,
     filename: safeFilename,
   };
+}
+
+function writeSupplementalAuthConfig(projectPath, baseURL, verifiedRoles) {
+  if (!verifiedRoles || verifiedRoles.length === 0) return null;
+  const tierBProjects = verifiedRoles.map((r) => `    {
+      name: 'tierB-auth-${String(r.role || 'user').replace(/[^a-zA-Z0-9_-]/g, '_')}',
+      grep: /@auth|@tierB/,
+      retries: 2,
+      use: {
+        ...devices['Desktop Chrome'],
+        storageState: ${JSON.stringify(r.storageStatePath)},
+      },
+    }`).join(',\n');
+
+  const body = `// Generated by Healix — supplemental Playwright config for the tierB-auth projects.
+// Your own playwright.config.* remains the source of truth for the default run.
+// Use \`npx playwright test --config=playwright.auth.config.ts\` to exercise
+// @auth-tagged tests with pre-loaded storageState for each verified role.
+import { defineConfig, devices } from '@playwright/test';
+
+export default defineConfig({
+  testDir: './tests/generated',
+  fullyParallel: true,
+  forbidOnly: !!process.env.CI,
+  retries: process.env.CI ? 2 : 0,
+  workers: process.env.CI ? 1 : 2,
+  reporter: [
+    ['list'],
+    ['json', { outputFile: 'healix-reports/results/auth-results.json' }],
+  ],
+  use: {
+    baseURL: '${baseURL}',
+    trace: 'retain-on-failure',
+    screenshot: 'only-on-failure',
+    video: 'retain-on-failure',
+  },
+  projects: [
+${tierBProjects}
+  ],
+});
+`;
+
+  const authConfigPath = path.join(projectPath, 'playwright.auth.config.ts');
+  try {
+    fs.writeFileSync(authConfigPath, body, 'utf-8');
+    Logger.info('PipelineWorker', 'Emitted supplemental playwright.auth.config.ts', {
+      path: authConfigPath,
+      tierBRoles: verifiedRoles.map((r) => r.role),
+    });
+    return authConfigPath;
+  } catch (err) {
+    Logger.warn('PipelineWorker', 'Failed to write playwright.auth.config.ts — @auth tier skipped', {
+      reason: err.message,
+    });
+    return null;
+  }
 }
 
 function ensurePlaywrightConfig(projectPath, projectInfo = {}, roles = []) {
@@ -1534,31 +1606,50 @@ function ensurePlaywrightConfig(projectPath, projectInfo = {}, roles = []) {
     'playwright.config.cjs',
   ];
 
-  const verifiedRolesForCheck = (roles || []).filter((r) => r && r.loginVerified && r.storageStatePath);
+  // verifiedRoles determine how many tierB-auth-<role> projects we would have
+  // emitted if generating from scratch. We compute it up-front so the early-exit
+  // log can tell the user exactly what tier-aware config they're missing.
+  const verifiedRolesSummary = (roles || [])
+    .filter((r) => r && r.loginVerified && r.storageStatePath)
+    .map((r) => r.role || 'user');
 
   // Check if config already exists
   for (const name of candidates) {
     const candidate = path.join(projectPath, name);
     if (fs.existsSync(candidate)) {
-      // When we have freshly verified roles, check whether the existing
-      // Healix-managed config is missing tierB-auth projects. If so, regenerate
-      // it. Only touch configs that Healix owns (marked by testDir: './tests/generated').
-      if (verifiedRolesForCheck.length > 0) {
-        try {
-          const existing = fs.readFileSync(candidate, 'utf-8');
-          const isHealixManaged = existing.includes("testDir: './tests/generated'");
-          const hasTierB = existing.includes('tierB-auth');
-          if (isHealixManaged && !hasTierB) {
-            Logger.info('PipelineWorker', 'Regenerating playwright.config.ts to add tierB-auth projects', {
-              path: candidate,
-              roles: verifiedRolesForCheck.map((r) => r.role),
-            });
-            break; // fall through to regenerate
-          }
-        } catch { /* unreadable — leave as-is */ }
+      // When the user has their own config we don't touch it. But if we have
+      // verified roles we still need tierB-auth projects to exist somewhere, so
+      // emit a SIBLING `playwright.auth.config.ts` that the runner (and user)
+      // can opt-in via `--config=playwright.auth.config.ts`. The sibling never
+      // runs implicitly — it's an additive artifact that preserves the user's
+      // primary config as the single source of truth for their normal workflow.
+      let supplementalAuthConfigPath = null;
+      if (verifiedRolesSummary.length > 0) {
+        const verifiedRoles = (roles || []).filter((r) => r && r.loginVerified && r.storageStatePath);
+        const baseURL = projectInfo.baseURL || 'http://localhost:3000';
+        supplementalAuthConfigPath = writeSupplementalAuthConfig(projectPath, baseURL, verifiedRoles);
       }
-      Logger.debug('PipelineWorker', 'Playwright config already exists', { path: candidate });
-      return;
+      // INFO (not debug): the user needs to see this because any tierB-auth
+      // projects we would have wired up are being skipped — their @auth-tagged
+      // tests will execute against tierA without a storageState and hit the
+      // login wall. See P0-2b for the supplemental-config follow-up.
+      Logger.info('PipelineWorker', 'Existing Playwright config detected — skipping tier-aware config generation', {
+        path: candidate,
+        skippedTierBRoles: verifiedRolesSummary,
+        supplementalAuthConfigPath,
+        hint: verifiedRolesSummary.length > 0
+          ? (supplementalAuthConfigPath
+              ? `User config preserved; @auth tier lives in ${path.basename(supplementalAuthConfigPath)} — run with --config=${path.basename(supplementalAuthConfigPath)} to exercise tierB-auth projects`
+              : 'User config will not auto-include storageState for verified roles; @auth tests may hit login redirects')
+          : null,
+      });
+      return {
+        applied: false,
+        reason: 'existing_config',
+        existingConfigPath: candidate,
+        skippedTierBRoles: verifiedRolesSummary,
+        supplementalAuthConfigPath,
+      };
     }
   }
 
@@ -1635,6 +1726,12 @@ ${projectsBlock}
     path: configPath,
     tierBRoles: verifiedRoles.map((r) => r.role),
   });
+  return {
+    applied: true,
+    reason: 'generated',
+    configPath,
+    tierBRoles: verifiedRoles.map((r) => r.role),
+  };
 }
 
 function resolvePlaywrightConfig(projectPath) {
@@ -2191,6 +2288,28 @@ async function maybeGenerateViaSaaS({
 
   if (!context) {
     return { generated: 0, files: [], skipped: true, reason: 'missing_context' };
+  }
+
+  // Guard: template-only generationMode is fundamentally incompatible with the
+  // per-agent fan-out path we're about to take. The webapp client needs
+  // AI-backed generation to fulfil per-agent scoped requests; template-only
+  // bypasses the webapp entirely. If a caller reaches this point with
+  // template-only, it means P0-3b's auto-upgrade didn't fire (probably because
+  // the project isn't a local path) — we'd rather fail loudly than silently
+  // ignore the user's requested mode. See P0-3c.
+  if (config.generationMode === 'template-only') {
+    const err = new Error(
+      'generationMode=template-only is incompatible with the per-agent parallel fan-out. ' +
+      'Either set strictAIGeneration=true (default) to use the AI-backed generator, or run ' +
+      'against a project where the template-only path still exists. The current worker only ' +
+      'supports AI-backed per_agent_parallel generation.'
+    );
+    err.code = 'INCOMPATIBLE_GENERATION_MODE';
+    err.metadata = {
+      generationMode: config.generationMode,
+      chunkingStrategy: 'per_agent_parallel',
+    };
+    throw err;
   }
 
   const strictAI = strictAIEnabled(config);
@@ -2848,29 +2967,37 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
     };
   });
 
+  // Rewrites bare @playwright/test imports to the Healix fixture and emits the
+  // fixture file next to the specs. Runs unconditionally — the cursor overlay
+  // flag no longer gates fixture wiring. Without this, auth-gated SPAs never
+  // get storageState + splash bypass and every UI test redirects to '/'.
+  const applyFixtureWiring = (generatorName) => {
+    if (!config.generateTests) return null;
+    try {
+      const fixtureResult = ensureHealixFixtureImports({ projectPath: config.projectPath });
+      if (fixtureResult.applied && fixtureResult.patchedFiles > 0) {
+        Logger.info('PipelineWorker', 'Rewrote @playwright/test imports to __healix-fixture', {
+          generator: generatorName,
+          patched: fixtureResult.patchedFiles,
+          total: fixtureResult.totalFiles,
+        });
+      }
+      return fixtureResult;
+    } catch (fixtureError) {
+      Logger.warn('PipelineWorker', 'Failed to wire Healix fixture into generated specs', {
+        generator: generatorName,
+        reason: fixtureError.message,
+      });
+      return { applied: false, reason: 'patch_failed', error: fixtureError.message };
+    }
+  };
+
   const tryGenerator = async (generatorName, runFn) => {
     const startedAt = Date.now();
 
     try {
       const result = await withStageBudget(runBudget, 'generation', runFn);
-
-      // Always ensure the __healix-fixture files exist in tests/generated/.
-      // The fixture is needed for all generated specs (not just video-cursor
-      // runs) because storeTestFile redirects @playwright/test imports to it.
-      if (config.generateTests) {
-        try {
-          const genDir = path.join(config.projectPath, 'tests', 'generated');
-          if (fs.existsSync(genDir)) {
-            ensureCursorFixtureFiles(genDir, config.projectPath);
-          }
-        } catch (fixtureErr) {
-          Logger.warn('PipelineWorker', 'Failed to write __healix-fixture files', {
-            generator: generatorName,
-            reason: fixtureErr.message,
-          });
-        }
-      }
-
+      const fixtureWiring = applyFixtureWiring(generatorName);
       let cursorOverlay = null;
       if (config.generateTests) {
         try {
@@ -2891,6 +3018,7 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
         }
       }
       const validation = await runValidation(generatorName);
+      generationMeta.fixtureWiring = fixtureWiring;
 
       generationMeta.provider = generatorName;
       generationMeta.selectedGenerator = generatorName;
@@ -2934,6 +3062,11 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
           // compile, we still want the fallback chain to take over. If they
           // do, we continue to execution with whatever landed.
           try {
+            // Apply fixture wiring BEFORE validation so rescued partials don't
+            // compile-fail on missing fixture imports. Without this, a TIME_BUDGET
+            // rescue followed by UI tests hitting auth gates loses storageState.
+            const rescueFixtureWiring = applyFixtureWiring(`${generatorName}-partial`);
+            generationMeta.fixtureWiring = rescueFixtureWiring;
             const validation = await runValidation(`${generatorName}-partial`);
             generationMeta.provider = generatorName;
             generationMeta.selectedGenerator = generatorName;
@@ -3173,26 +3306,6 @@ async function runPipeline(config, runId) {
   const healixReportsDir = path.join(config.projectPath, 'healix-reports');
   const serverPidFile = path.join(healixReportsDir, HEALIX_SERVER_PID_FILENAME);
   killOrphanedHealixProcess(serverPidFile, 'dev-server');
-
-  // Config auto-upgrade: localhost targets with strictAIGeneration: false route to
-  // the legacy monolithic generator and reliably hit TIME_BUDGET_EXCEEDED. Force
-  // strict AI + qa-max whenever baseURL is localhost so runs produce real tests.
-  const _isLocalhostBaseURL = /^https?:\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0)(:\d+)?/i.test(config.baseURL || '');
-  if (_isLocalhostBaseURL && config.strictAIGeneration === false) {
-    const _upgraded = {
-      strictAIGeneration: true,
-      coverageProfile: config.coverageProfile && config.coverageProfile !== 'balanced' ? config.coverageProfile : 'qa-max',
-      minGeneratedTests: Math.max(toFiniteNumber(config.minGeneratedTests, 0), 50),
-    };
-    config = { ...config, ..._upgraded };
-    updateStatus(statusDir, 'config_auto_upgraded', {
-      runId,
-      message: 'Config auto-upgraded: localhost target requires strictAIGeneration=true.',
-      reason: 'localhost_strict_ai_required',
-      upgrades: _upgraded,
-    }, telemetryReporter);
-    Logger.info('PipelineWorker', 'Auto-upgraded config for localhost target', _upgraded);
-  }
 
   const runBudget = createRunBudget(config);
   let generationMeta = null;
@@ -3586,7 +3699,10 @@ async function runPipeline(config, runId) {
       fallbackUsed = !!generationMeta?.fallbackUsed;
 
       // Ensure playwright.config.ts exists after test generation
-      ensurePlaywrightConfig(config.projectPath, projectInfo, roles);
+      const playwrightConfigResult = ensurePlaywrightConfig(config.projectPath, projectInfo, roles);
+      if (generationMeta && playwrightConfigResult) {
+        generationMeta.playwrightConfig = playwrightConfigResult;
+      }
 
       const qualityScan = collectGenerationQuality(config.projectPath);
       // Build requirements coverage FIRST so the gate can feed the BRD-trace
@@ -3596,25 +3712,6 @@ async function runPipeline(config, runId) {
         prdContents,
         projectPath: config.projectPath,
       });
-      // Surface per-agent failure details before the quality gate so the
-      // dashboard shows actionable info even when the gate aborts the run.
-      const _agentFailures = generationMeta?.agentFailures || [];
-      if (_agentFailures.length > 0) {
-        updateStatus(statusDir, 'generation_agent_failures', {
-          runId,
-          message: `${_agentFailures.length} generation agent(s) failed`,
-          agentFailures: _agentFailures.map((f) => ({
-            agent: f.agent,
-            code: f.code,
-            message: String(f.message || '').slice(0, 300),
-          })),
-        }, telemetryReporter);
-        Logger.warn('PipelineWorker', 'Some generation agents failed', {
-          count: _agentFailures.length,
-          failures: _agentFailures.map((f) => `${f.agent}:${f.code}`).join(', '),
-        });
-      }
-
       const qualityGate = evaluateGenerationQualityGates({
         config,
         context: codebaseContext || {},
@@ -3624,29 +3721,10 @@ async function runPipeline(config, runId) {
         requirementsCoverage,
       });
       if (!qualityGate.ok) {
-        const _actualTests = qualityGate.error.generationQuality?.totalTests ?? 0;
-        // MIN_TEST_COUNT_NOT_MET with real tests on disk = partial agent run.
-        // Warn and proceed rather than discarding work that completed agents did.
-        if (qualityGate.error.code === 'MIN_TEST_COUNT_NOT_MET' && _actualTests > 0) {
-          Logger.warn('PipelineWorker', 'Proceeding with partial generation (below minimum count)', {
-            actualTests: _actualTests,
-            minimum: qualityGate.error.generationQuality?.minGeneratedTests,
-            agentFailures: _agentFailures.map((f) => `${f.agent}:${f.code}`),
-          });
-          updateStatus(statusDir, 'generation_below_minimum', {
-            runId,
-            message: `Generated ${_actualTests} tests (below minimum ${qualityGate.error.generationQuality?.minGeneratedTests ?? 50}) — proceeding to execution with available tests.`,
-            actualTests: _actualTests,
-            agentFailures: _agentFailures,
-          }, telemetryReporter);
-          generationQuality = { ...qualityGate.error.generationQuality, belowMinimum: true };
-        } else {
-          qualityGate.error.generationMeta = generationMeta;
-          throw qualityGate.error;
-        }
-      } else {
-        generationQuality = qualityGate.result;
+        qualityGate.error.generationMeta = generationMeta;
+        throw qualityGate.error;
       }
+      generationQuality = qualityGate.result;
 
       // Plumb a non-fatal qualityWarning onto generationMeta so the dashboard
       // can render a yellow "quality = X%, add PRD/testids to improve by Y%"
@@ -4478,6 +4556,9 @@ module.exports = {
   detectProjectModuleType,
   getCursorFixtureContent,
   ensureCursorFixtureFiles,
+  ensureHealixFixtureImports,
+  ensurePlaywrightConfig,
+  writeSupplementalAuthConfig,
   createRunBudget,
   DEFAULT_STAGE_CAPS_MS,
   DEFAULT_TOTAL_BUDGET_MS,

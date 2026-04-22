@@ -343,7 +343,7 @@ export async function POST(request: NextRequest) {
       console.warn('[generate-tests/plan] cache insert failed (non-fatal)', insertErr)
     }
 
-    // Deduct a flat token cost per planner run (one gpt-5.4 call per axis).
+    // Deduct a flat token cost per planner run (one gpt-5.4-mini call per axis).
     try {
       await deductTokens({ userId, tokensUsed: PLANNER_TOKEN_COST })
     } catch (deductErr) {
