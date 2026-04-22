@@ -100,23 +100,45 @@ export interface TestRun {
   is_live?: boolean
 }
 
-export interface TestList {
+export interface ImportSession {
   id: string
   user_id: string
   name: string
   description: string | null
-  test_count: number
-  last_run_at: string | null
+  original_filename: string
+  file_storage_path: string | null
+  status: 'pending' | 'processing' | 'completed' | 'failed'
+  test_case_count: number
+  groovy_file_count: number
+  error_message: string | null
   created_at: string
   updated_at: string
 }
 
-export interface TestListItem {
+export interface ImportedTestCase {
   id: string
-  list_id: string
-  test_run_id: string | null
-  test_name: string
-  test_config: Record<string, unknown> | null
+  import_id: string
+  tc_id: string
+  active: string | null
+  functional_area: string | null
+  scenario: string | null
+  description: string | null
+  environment_name: string | null
+  ndc_version: string | null
+  pcc: string | null
+  raw_data: Record<string, unknown> | null
+  created_at: string
+}
+
+export interface GeneratedGroovyFile {
+  id: string
+  import_id: string
+  file_name: string
+  class_name: string
+  api_type: string
+  groovy_content: string
+  status: 'generated' | 'failed'
+  error_message: string | null
   created_at: string
 }
 
