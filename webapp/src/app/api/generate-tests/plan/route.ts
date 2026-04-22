@@ -361,7 +361,18 @@ export async function POST(request: NextRequest) {
       console.warn('[generate-tests/plan] cache insert failed (non-fatal)', insertErr)
     }
 
+<<<<<<< bugfix/tokens-gating
     const responseBody = { success: true, plan, cache: 'miss' as const, plannerTokens }
+=======
+    // Deduct a flat token cost per planner run (one gpt-5.4-mini call per axis).
+    try {
+      await deductTokens({ userId, tokensUsed: PLANNER_TOKEN_COST })
+    } catch (deductErr) {
+      console.warn('[generate-tests/plan] token deduction failed (non-fatal)', deductErr)
+    }
+
+    const responseBody = { success: true, plan, cache: 'miss' as const }
+>>>>>>> capillary/sabre
 
     if (idempotencyKey) {
       await storeIdempotencyResult({

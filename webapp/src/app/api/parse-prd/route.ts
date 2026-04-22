@@ -136,8 +136,8 @@ export async function POST(request: NextRequest) {
 
     const { parsedPRD, tokenUsage } = await parsePRD(prdText, {
       openaiApiKey: process.env.OPENAI_API_KEY,
-      // gpt-5.4 only — env override intentionally ignored.
-      model: 'gpt-5.4',
+      // gpt-5.4-mini only — env override intentionally ignored.
+      model: 'gpt-5.4-mini',
     })
 
     if (tokenUsage.totalTokens > 0) {

@@ -402,15 +402,15 @@ export async function POST(request: NextRequest) {
       agentPlanSlice,
       generatorConfig: {
         apiKey: process.env.OPENAI_API_KEY,
-        // gpt-5.4 only. The generator hardcodes this too, but we pass it
+        // gpt-5.4-mini only. The generator hardcodes this too, but we pass it
         // explicitly so env drift is impossible.
-        model: 'gpt-5.4',
+        model: 'gpt-5.4-mini',
         fallbackOnFailure: genOptions.strictAIGeneration !== true,
         enforceValidation: true,
         syntaxValidationMode: 'fail-open',
         strictAIGeneration: genOptions.strictAIGeneration === true,
         // Localhost-first: generation legitimately runs for minutes under
-        // gpt-5.4 high-reasoning, especially for the frontend and error
+        // gpt-5.4-mini high-reasoning, especially for the frontend and error
         // agents. HEALIX_OPENAI_TIMEOUT_MS lets operators tighten this
         // when running behind a reverse proxy with its own budget.
         timeout: Number(process.env.HEALIX_OPENAI_TIMEOUT_MS) || 540_000,

@@ -100,9 +100,9 @@ export class OpenAITestGenerator {
 
     this.config = {
       apiKey: config.apiKey || process.env.OPENAI_API_KEY || '',
-      // gpt-5.4 is the only model we run. Runtime config and env vars are
+      // gpt-5.4-mini is the only model we run. Runtime config and env vars are
       // intentionally ignored so no stale OPENAI_MODEL can sneak in.
-      model: 'gpt-5.4',
+      model: 'gpt-5.4-mini',
       maxTokens: config.maxTokens || (Number.isFinite(envMaxTokens) ? envMaxTokens : 12000),
       temperature:
         config.temperature !== undefined
@@ -704,8 +704,7 @@ Rules:
     return `You are an expert Playwright test engineer. Generate comprehensive smoke tests that verify an application's basic health and functionality.
 
 ## Guidelines
-- ALWAYS import test and expect from './__healix-fixture', NOT from '@playwright/test'.
-  First line of every file MUST be: \`import { test, expect } from './__healix-fixture';\`
+- Import Playwright primitives from the Healix fixture: \`import { test, expect } from './__healix-fixture'\`. Do NOT import from '@playwright/test' — the fixture wraps Playwright with splash-bypass and storageState auto-load required for auth-gated apps.
 - Tests should be fast and reliable
 - Focus on critical paths that indicate the app is working
 - Include console error detection
@@ -749,8 +748,7 @@ IMPORTANT: Return ONLY valid JSON, no markdown code blocks or explanations.`
     return `You are an expert Playwright test engineer specializing in frontend E2E testing. Generate comprehensive, production-ready tests.
 
 ## Guidelines
-- ALWAYS import test and expect from './__healix-fixture', NOT from '@playwright/test'.
-  First line of every file MUST be: \`import { test, expect } from './__healix-fixture';\`
+- Import Playwright primitives from the Healix fixture: \`import { test, expect } from './__healix-fixture'\`. Do NOT import from '@playwright/test' — the fixture wraps Playwright with splash-bypass and storageState auto-load required for auth-gated apps.
 - Include proper assertions (visibility, content, accessibility)
 - Handle async operations with proper waits (avoid arbitrary timeouts)
 - Test both happy paths and error scenarios
@@ -872,8 +870,6 @@ IMPORTANT: Return ONLY valid JSON, no markdown code blocks.`
     return `You are an expert E2E testing engineer. Generate comprehensive workflow tests that simulate complete user journeys.
 
 ## Guidelines
-- ALWAYS import test and expect from './__healix-fixture', NOT from '@playwright/test'.
-  First line of every file MUST be: \`import { test, expect } from './__healix-fixture';\`
 - Test complete flows from start to finish
 - Include both happy paths and error scenarios
 - Handle async operations and page transitions
@@ -1042,7 +1038,7 @@ IMPORTANT: Return ONLY valid JSON.`
 
     // Frontend tests only need UI-facing context. Dropping API contracts and
     // schemas for the frontend agent cuts prompt tokens by ~30%, which reduces
-    // gpt-5.4 reasoning time enough to stay within the webapp-client timeout.
+    // gpt-5.4-mini reasoning time enough to stay within the webapp-client timeout.
     const isFrontendAgent = testKind === 'frontend'
 
     return {
@@ -2064,10 +2060,11 @@ Return JSON array only.`
     }
 
     let content = this.normalizeGeneratedContent(test.content || '')
-    // Always redirect @playwright/test imports to the healix fixture so auth
-    // storageState and splash-bypass hooks are always active.
-    content = content.replace(/from\s+['"]@playwright\/test['"]/g, "from './__healix-fixture'")
-    if (!content.includes("from './__healix-fixture'")) {
+    const hasPwImport = content.includes("from '@playwright/test'")
+    const hasFixtureImport = content.includes("from './__healix-fixture'")
+    if (hasPwImport) {
+      content = content.replace(/from\s+(['"])@playwright\/test\1/g, "from './__healix-fixture'")
+    } else if (!hasFixtureImport) {
       content = `import { test, expect } from './__healix-fixture';\n\n${content}`
     }
 
@@ -2155,7 +2152,7 @@ Return JSON array only.`
           type,
           source: 'fallback',
           fallbackReason: reason,
-          content: `import { test, expect } from './__healix-fixture';
+          content: `import { test, expect } from '@playwright/test';
 
 ${baseUrlComment}
 // Fallback reason: ${reason}
@@ -2192,7 +2189,7 @@ test.describe('Fallback smoke checks', () => {
           type,
           source: 'fallback',
           fallbackReason: reason,
-          content: `import { test, expect } from './__healix-fixture';
+          content: `import { test, expect } from '@playwright/test';
 
 ${baseUrlComment}
 // Fallback reason: ${reason}
@@ -2223,7 +2220,7 @@ test.describe('Fallback frontend checks', () => {
           type,
           source: 'fallback',
           fallbackReason: reason,
-          content: `import { test, expect } from './__healix-fixture';
+          content: `import { test, expect } from '@playwright/test';
 
 ${baseUrlComment}
 // Fallback reason: ${reason}
@@ -2278,7 +2275,7 @@ test.describe('Fallback API checks', () => {
           type,
           source: 'fallback',
           fallbackReason: reason,
-          content: `import { test, expect } from './__healix-fixture';
+          content: `import { test, expect } from '@playwright/test';
 
 ${baseUrlComment}
 // Fallback reason: ${reason}
@@ -2312,7 +2309,7 @@ test.describe('Fallback workflow checks', () => {
           type,
           source: 'fallback',
           fallbackReason: reason,
-          content: `import { test, expect } from './__healix-fixture';
+          content: `import { test, expect } from '@playwright/test';
 
 ${baseUrlComment}
 // Fallback reason: ${reason}

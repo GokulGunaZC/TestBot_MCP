@@ -307,7 +307,7 @@ export const projectUsage = pgTable(
 /**
  * P1.5 planner-pass cache. Each user's (prd + parsedPRD + contextDigest +
  * projectInfoDigest + roles) hash maps to a single cached GenerationPlan
- * for 24h. Skipping the planner on a cache hit eliminates two gpt-5.4 calls
+ * for 24h. Skipping the planner on a cache hit eliminates two gpt-5.4-mini calls
  * per pipeline run for repeat generations against the same repo snapshot.
  */
 export const generationPlans = pgTable(
