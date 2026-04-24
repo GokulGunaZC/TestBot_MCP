@@ -6,7 +6,7 @@
 
 const path = require('path');
 const fs = require('fs');
-const { spawn, execSync } = require('child_process');
+const { spawn, execSync, spawnSync } = require('child_process');
 
 // Load environment variables from multiple paths
 const dotenvPaths = [
@@ -32,7 +32,7 @@ const ArtifactUploader = require('./artifact-uploader');
 const DashboardLauncher = require('./dashboard-launcher');
 const AIAnalyzer = require('./ai-providers/index');
 const WebappClient = require('./webapp-client');
-const { startSecondaryServices, stopSecondaryServices } = require('./multi-service-starter');
+const { startSecondaryServices, stopSecondaryServices, probeHttpReady, waitForServiceReady } = require('./multi-service-starter');
 const { runExplorationPhase, EMPTY_ARTIFACT } = require('./exploration-phase');
 const { injectCredentials } = require('./credentials-injector');
 const Logger = require('./logger');
@@ -40,6 +40,19 @@ const MCPTelemetryReporter = require('./mcp-telemetry');
 
 // Initialize logger for the worker process
 Logger.initialize();
+
+function killPreStartedProc(proc) {
+  if (!proc?.pid) return;
+  try {
+    if (process.platform === 'win32') {
+      spawnSync('taskkill', ['/F', '/T', '/PID', String(proc.pid)], { stdio: 'ignore' });
+    } else {
+      try { process.kill(-proc.pid, 'SIGKILL'); } catch {
+        try { process.kill(proc.pid, 'SIGKILL'); } catch { /* already gone */ }
+      }
+    }
+  } catch { /* ignore */ }
+}
 
 const DEFAULT_TOTAL_BUDGET_MS = 7200000; // 120 minutes
 // Generation used to be 6 min and was hit routinely by real-world repos. With
@@ -51,7 +64,7 @@ const DEFAULT_TOTAL_BUDGET_MS = 7200000; // 120 minutes
 const DEFAULT_STAGE_CAPS_MS = {
   jira: 45000,
   context: 90000,
-  prdParse: 90000,
+  prdParse: 300000,
   generation: 1800000,  // 30 minutes
   validation: 90000,
   execution: 2400000,  // 40 minutes
@@ -980,6 +993,28 @@ function setDurablePhaseReporter(fn) {
 }
 
 /**
+ * Circular-reference-safe JSON serialiser for status payloads.
+ * Handles Buffers, Errors, BigInts, and circular refs — all of which can appear
+ * in Playwright's testResults or phaseResults and would otherwise silently
+ * prevent status.json from being updated (JSON.stringify throws, caught by the
+ * outer try/catch, and the file is never written).
+ */
+function safeStatusStringify(obj) {
+  const seen = new WeakSet();
+  return JSON.stringify(obj, (_key, value) => {
+    if (typeof value === 'bigint') return value.toString();
+    if (typeof value === 'function') return undefined;
+    if (value instanceof Error) return { message: value.message, code: value.code || undefined };
+    if (Buffer.isBuffer(value)) return `[Buffer(${value.length})]`;
+    if (typeof value === 'object' && value !== null) {
+      if (seen.has(value)) return '[Circular]';
+      seen.add(value);
+    }
+    return value;
+  }, 2);
+}
+
+/**
  * Write status update to disk so the caller can track progress.
  */
 function updateStatus(statusDir, phase, data, telemetryReporter = null) {
@@ -991,7 +1026,7 @@ function updateStatus(statusDir, phase, data, telemetryReporter = null) {
     };
     fs.writeFileSync(
       path.join(statusDir, 'status.json'),
-      JSON.stringify(payload, null, 2)
+      safeStatusStringify(payload)
     );
     emitPipelineTelemetry(telemetryReporter, payload);
     if (__durablePhaseReporter) {
@@ -2158,12 +2193,33 @@ function auditGeneratedTestQuality({ projectPath, testType, context }) {
     ? Number((uiFilesWithPreferredSelectors / summary.uiFiles).toFixed(2))
     : 1;
 
-  if ((testType === 'backend' || testType === 'both') && (context?.apiEndpoints || []).length > 0) {
+  // Full-stack frameworks (Next.js, Nuxt, Remix) expose server-side logic
+  // through UI flows and server actions rather than standalone REST clients.
+  // Their generated tests look like UI tests to the auditor even when they
+  // cover server routes, so we demote these to warnings rather than errors.
+  const isFullStackFramework = ['nextjs', 'nuxt', 'remix'].includes(
+    context?.projectStructure?.framework
+  );
+
+  // API-file checks only hard-fail for testType === 'backend' on non-full-stack
+  // frameworks. For testType === 'both' and full-stack frameworks (Next.js,
+  // Nuxt, Remix), server-side logic is tested via UI flows / server actions so
+  // there will legitimately be zero request.get/post() API test files.
+  // The context-gatherer also injects a synthetic /api/health endpoint when no
+  // real ones are found, so apiEndpoints.length > 0 is not a reliable signal.
+  if (testType === 'backend' && !isFullStackFramework && (context?.apiEndpoints || []).length > 1) {
     if (summary.apiFiles === 0) {
       summary.errors.push('missing_api_test_files');
     }
     if (!summary.hasApiBurstCoverage) {
-      summary.errors.push('missing_api_burst_coverage');
+      summary.warnings.push('missing_api_burst_coverage');
+    }
+  } else if ((testType === 'backend' || testType === 'both') && (context?.apiEndpoints || []).length > 0) {
+    if (summary.apiFiles === 0) {
+      summary.warnings.push('missing_api_test_files');
+    }
+    if (!summary.hasApiBurstCoverage) {
+      summary.warnings.push('missing_api_burst_coverage');
     }
   }
 
@@ -3312,6 +3368,7 @@ async function runPipeline(config, runId) {
   let fallbackUsed = false;
   let generationQuality = null;
   let playwright = null; // declared here so catch can call stopServer() on budget timeout
+  let preStartedProc = null; // declared here so catch can kill it on pipeline failure
   let requirementsCoverage = null;
   let phaseResults = null;
   const aiOnlyEnforced = strictAIEnabled(config);
@@ -3601,6 +3658,65 @@ async function runPipeline(config, runId) {
     };
 
     // -------------------------------------------------------
+    // 3b-pre. Start primary app before exploration.
+    // Browser-use and the Playwright heuristic explorer both need a live server
+    // to navigate. If the user supplied a startCommand and the app is not yet
+    // responding at baseURL, spawn it here and wait for HTTP readiness before
+    // handing off to the exploration phase.  The same process will serve the
+    // Playwright execution phase — PlaywrightIntegration.runTests() checks
+    // config._primaryAppPreStarted and skips its own startServer() call so a
+    // second instance is never spawned.
+    // -------------------------------------------------------
+    const explorationSkipped =
+      config.skipExploration === true
+      || process.env.HEALIX_SKIP_EXPLORATION === '1';
+
+    if (!explorationSkipped && config.startCommand && config.baseURL) {
+      const alreadyUp = await probeHttpReady(config.baseURL);
+      if (alreadyUp) {
+        Logger.info('PipelineWorker', 'Primary app already running — reusing for exploration', { url: config.baseURL });
+        config = { ...config, _primaryAppPreStarted: true };
+      } else {
+        updateStatus(statusDir, 'starting_app', {
+          runId,
+          message: `Starting app before exploration: ${config.startCommand}`,
+        }, telemetryReporter);
+        try {
+          const detached = process.platform !== 'win32';
+          preStartedProc = spawn(config.startCommand, {
+            cwd: config.projectPath,
+            shell: true,
+            detached,
+            env: { ...process.env, PORT: String(config.port || '') },
+            stdio: ['ignore', 'ignore', 'ignore'],
+          });
+          if (preStartedProc.pid) {
+            const ready = await waitForServiceReady({
+              baseURL: config.baseURL,
+              totalTimeoutMs: toFiniteNumber(config.serverStartTimeoutMs, 60_000),
+              label: 'primary app',
+              onReady: ({ elapsedMs, url }) => updateStatus(statusDir, 'dev_server_ready', {
+                runId,
+                message: `App ready at ${url} (${elapsedMs}ms)`,
+                elapsedMs,
+                url,
+              }, telemetryReporter),
+            });
+            if (ready) {
+              config = { ...config, _primaryAppPreStarted: true };
+              Logger.info('PipelineWorker', 'Primary app pre-started for exploration', { url: config.baseURL, pid: preStartedProc.pid });
+            } else {
+              Logger.warn('PipelineWorker', 'Primary app did not become ready within timeout — exploration will attempt anyway', { url: config.baseURL });
+            }
+          }
+        } catch (startErr) {
+          Logger.warn('PipelineWorker', 'Failed to pre-start primary app for exploration', { reason: startErr.message });
+          preStartedProc = null;
+        }
+      }
+    }
+
+    // -------------------------------------------------------
     // 3b. Browser-use exploration (Phase C). Opt-in via config.enableExploration
     // or HEALIX_ENABLE_EXPLORATION=1. Degrades gracefully: if browser-use isn't
     // installed, or exploration fails, we continue with an empty artifact and
@@ -3610,9 +3726,6 @@ async function runPipeline(config, runId) {
     // Exploration is ON by default now that we have a Playwright heuristic
     // fallback — the user can still opt out via config.skipExploration or
     // HEALIX_SKIP_EXPLORATION=1 if, e.g., the dev server doesn't come up.
-    const explorationSkipped =
-      config.skipExploration === true
-      || process.env.HEALIX_SKIP_EXPLORATION === '1';
     if (!explorationSkipped) {
       updateStatus(statusDir, 'exploring', {
         runId,
@@ -3623,10 +3736,16 @@ async function runPipeline(config, runId) {
           statusDir,
           baseURL: config.baseURL,
           credentials: config.testCredentials,
+          projectPath: config.projectPath,
           skipExploration: explorationSkipped,
           totalTimeoutMs: 120_000,
         });
         explorationArtifact = result.artifact;
+        // preAuthRoles carries the storageState files written during the
+        // exploration pre-auth pass — used in step 3c to skip redundant logins.
+        if (Array.isArray(result.preAuthRoles)) {
+          config = { ...config, _preAuthRoles: result.preAuthRoles };
+        }
         updateStatus(statusDir, 'explored', {
           runId,
           message: `Exploration ${result.source}${result.reason ? ` (${result.reason})` : ''}`,
@@ -3646,29 +3765,62 @@ async function runPipeline(config, runId) {
     // and expose the role list to the generator so Tier B tests can run under
     // the right role. Graceful degradation: if login fails for a role, that
     // role is excluded from Tier B (but Tier A + Tier C continue).
+    //
+    // Optimisation: if exploration's pre-auth already verified all roles AND
+    // exploration found no authFlow (nothing to improve on), we reuse the
+    // pre-auth storageStates rather than running another headless login round-trip.
+    // If a better authFlow was discovered, we re-inject so Playwright gets the
+    // most accurate selectors / success indicator.
     // -------------------------------------------------------
     let roles = [];
     if (Array.isArray(config.testCredentials) && config.testCredentials.length > 0) {
-      updateStatus(statusDir, 'auth_injecting', {
-        runId,
-        message: `Verifying credentials for ${config.testCredentials.length} role(s)...`,
-      }, telemetryReporter);
-      try {
-        roles = await injectCredentials({
-          projectPath: config.projectPath,
-          baseURL: config.baseURL,
-          credentials: config.testCredentials,
-          authFlow: explorationArtifact?.authFlow || null,
+      const preAuthRoles = Array.isArray(config._preAuthRoles) ? config._preAuthRoles : [];
+      const allPreAuthVerified = preAuthRoles.length > 0
+        && config.testCredentials.every((cred) => {
+          const role = cred.role || 'user';
+          return preAuthRoles.some((r) => r.role === role && r.loginVerified);
         });
-        const verifiedCount = roles.filter((r) => r.loginVerified).length;
+      const hasAuthFlow = !!(explorationArtifact?.authFlow);
+
+      if (allPreAuthVerified && !hasAuthFlow) {
+        // Pre-auth storageStates are sufficient and there is no better authFlow
+        // from exploration — skip the redundant login round-trip.
+        roles = preAuthRoles;
+        Logger.info('PipelineWorker', 'Reusing pre-auth storageStates — skipping duplicate credential injection', {
+          roles: roles.map((r) => r.role),
+        });
         updateStatus(statusDir, 'auth_injected', {
           runId,
-          message: `${verifiedCount}/${roles.length} role login(s) verified`,
+          message: `${roles.filter((r) => r.loginVerified).length}/${roles.length} role login(s) verified (reused from pre-auth)`,
           roles: roles.map((r) => ({ role: r.role, loginVerified: !!r.loginVerified, reason: r.reason || null })),
         }, telemetryReporter);
-      } catch (credErr) {
-        Logger.warn('PipelineWorker', 'Credential injection failed (best-effort)', { reason: credErr.message });
-        roles = [];
+      } else {
+        // Either pre-auth failed for some roles OR exploration found a richer
+        // authFlow — run a fresh injection so storageStates use the best available selectors.
+        updateStatus(statusDir, 'auth_injecting', {
+          runId,
+          message: hasAuthFlow
+            ? `Re-injecting credentials with discovered authFlow for ${config.testCredentials.length} role(s)...`
+            : `Verifying credentials for ${config.testCredentials.length} role(s)...`,
+        }, telemetryReporter);
+        try {
+          roles = await injectCredentials({
+            projectPath: config.projectPath,
+            baseURL: config.baseURL,
+            credentials: config.testCredentials,
+            authFlow: explorationArtifact?.authFlow || null,
+          });
+          const verifiedCount = roles.filter((r) => r.loginVerified).length;
+          updateStatus(statusDir, 'auth_injected', {
+            runId,
+            message: `${verifiedCount}/${roles.length} role login(s) verified`,
+            roles: roles.map((r) => ({ role: r.role, loginVerified: !!r.loginVerified, reason: r.reason || null })),
+          }, telemetryReporter);
+        } catch (credErr) {
+          Logger.warn('PipelineWorker', 'Credential injection failed (best-effort)', { reason: credErr.message });
+          // Fall back to whatever pre-auth gave us rather than leaving roles empty.
+          roles = preAuthRoles.length > 0 ? preAuthRoles : [];
+        }
       }
     }
 
@@ -4340,8 +4492,10 @@ async function runPipeline(config, runId) {
     });
 
     // Stop any secondary (monorepo) services we started — primary server is
-    // handled by playwright.runTests()'s own teardown.
+    // handled by playwright.runTests()'s own teardown (or by our pre-start
+    // cleanup below when _primaryAppPreStarted is set).
     try { stopSecondaryServices(config.projectPath); } catch { /* ignore */ }
+    killPreStartedProc(preStartedProc);
   } catch (error) {
     // Ensure the dev server is killed immediately even when the budget timeout
     // races ahead of playwright.runTests()'s own finally{stopServer()} block.
@@ -4349,6 +4503,7 @@ async function runPipeline(config, runId) {
       try { playwright.stopServer(); } catch { /* ignore */ }
     }
     try { stopSecondaryServices(config.projectPath); } catch { /* ignore */ }
+    killPreStartedProc(preStartedProc);
 
     const errorCode = classifyErrorCode(error);
     const userFacingError = buildUserFacingPipelineError(errorCode, error);

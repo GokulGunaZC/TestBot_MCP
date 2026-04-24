@@ -802,12 +802,38 @@
             submitBtn.disabled = true;
             submitBtn.textContent = 'Sending…';
 
+            // --- Health check: verify the session is still alive before POSTing.
+            // If the server has closed (timeout / force re-run), the health check
+            // fails immediately (connection refused / network error) instead of
+            // hanging for the full 15 s AbortController timeout.
+            const healthCtrl = new AbortController();
+            const healthTimer = setTimeout(() => healthCtrl.abort(), 3000);
+            try {
+                const health = await fetch(`http://localhost:${serverPort}/api/health`, {
+                    signal: healthCtrl.signal,
+                });
+                clearTimeout(healthTimer);
+                if (!health.ok) throw new Error('unhealthy');
+            } catch (healthErr) {
+                clearTimeout(healthTimer);
+                showError('Session expired or the Healix server was restarted. Please close this tab and re-invoke the Healix tool to start a new session.');
+                submitBtn.disabled = false;
+                submitBtn.textContent = 'Run Tests →';
+                return;
+            }
+
+            const abortCtrl = new AbortController();
+            const abortTimer = setTimeout(() => abortCtrl.abort(), 15000);
+
             try {
                 const response = await fetch(`http://localhost:${serverPort}/api/config`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(payload),
+                    signal: abortCtrl.signal,
                 });
+
+                clearTimeout(abortTimer);
 
                 if (!response.ok) {
                     const body = await response.json().catch(() => ({}));
@@ -816,7 +842,18 @@
 
                 successOverlay.classList.remove('hidden');
             } catch (error) {
-                showError(error.message || 'Could not send configuration to Healix server.');
+                clearTimeout(abortTimer);
+                const isTimeout = error.name === 'AbortError';
+                const isNetworkError = !isTimeout && (error instanceof TypeError || error.name === 'TypeError');
+                let errMsg;
+                if (isNetworkError) {
+                    errMsg = 'Session expired or the server was restarted. Please reload this page and resubmit.';
+                } else if (isTimeout) {
+                    errMsg = 'Request timed out — the Healix server did not respond. Please reload this page and resubmit.';
+                } else {
+                    errMsg = error.message || 'Could not send configuration to Healix server.';
+                }
+                showError(errMsg);
                 submitBtn.disabled = false;
                 submitBtn.textContent = 'Run Tests →';
             }

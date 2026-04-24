@@ -59,6 +59,7 @@ function isBrowserUseInstalled(pythonCmd) {
 function driveExploration({
   targetUrl,
   credentials,
+  allCredentials,
   totalTimeoutMs = DEFAULT_TIMEOUT_MS,
   onHeartbeat,
 } = {}) {
@@ -87,12 +88,31 @@ function driveExploration({
       return;
     }
 
+    // Derive the LLM proxy URL from the dashboard URL so the Python runner
+    // can route LLM calls through the Healix webapp — no local OPENAI_API_KEY
+    // needed on the user's machine.
+    const dashboardUrl = (process.env.HEALIX_DASHBOARD_URL || 'http://localhost:3000').replace(/\/+$/, '');
+    const llmProxyUrl = `${dashboardUrl}/api/llm-proxy`;
+
+    // Build a comma-separated role list so the Python runner can inform the
+    // LLM that multiple roles exist (admin, user, super_admin, etc.).
+    const allRoles = Array.isArray(allCredentials) && allCredentials.length > 0
+      ? allCredentials.map((c) => c.role || 'user').join(', ')
+      : (credentials?.role || '');
+
     const env = {
       ...process.env,
       HEALIX_TARGET_URL: targetUrl,
       HEALIX_LOGIN_USERNAME: credentials?.username || '',
       HEALIX_LOGIN_PASSWORD: credentials?.password || '',
       HEALIX_TOTAL_TIMEOUT_S: String(Math.max(10, Math.round(totalTimeoutMs / 1000))),
+      HEALIX_ALL_ROLES: allRoles,
+      // Proxy-mode credentials — forwarded to browser_use_runner.py so it
+      // authenticates LLM calls via the Healix webapp rather than a local key.
+      HEALIX_LLM_PROXY_URL: llmProxyUrl,
+      // HEALIX_API_KEY is already in process.env; include it explicitly so it
+      // is never accidentally shadowed by a dotenv override.
+      HEALIX_API_KEY: process.env.HEALIX_API_KEY || '',
     };
 
     let settled = false;

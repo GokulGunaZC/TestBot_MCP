@@ -386,7 +386,7 @@ export async function generateGroovyFile(
     apiKey: openaiApiKey,
     maxTokens: 8000,
     reasoningEffort: 'medium',
-    timeout: 120_000,
+    timeout: 300_000,
   })
 
   const systemPrompt = `You are a Katalon Studio Groovy expert generating NDC airline API test classes.

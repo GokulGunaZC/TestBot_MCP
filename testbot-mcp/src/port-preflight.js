@@ -54,7 +54,7 @@ async function defaultProbeWebappHealth(dashboardUrl, timeoutMs = 1500) {
   if (!dashboardUrl) return false;
   const base = String(dashboardUrl).replace(/\/+$/, '');
   const candidates = [
-    `${base}/api/mcp/validate`,   // POST-only, but responds 405/400 — still a Healix signal
+    `${base}/api/mcp-auth/validate`, // POST-only, but responds 405/400 — still a Healix signal
     `${base}/api/test-runs/phase`,// Healix-specific
     `${base}/`,                    // Next.js serves something here if it's the Healix webapp
   ];

@@ -30,14 +30,12 @@ export class OpenAIClient {
         ? (envEffort as 'low' | 'medium' | 'high')
         : 'medium')
 
-    // gpt-5.4-mini only. No chat-fallback, no model alternates.
-    // gpt-5.4-mini runs on the Responses API (/v1/responses) with `input` +
-    // `reasoning`, per https://developers.openai.com/api/docs/quickstart.
+    const resolvedModel = config.model || process.env.OPENAI_MODEL || 'gpt-4.1-mini'
     this.config = {
       apiKey: config.apiKey,
-      model: 'gpt-5.4-mini',
-      chatFallbackModel: 'gpt-5.4-mini',
-      latestGPTModel: 'gpt-5.4-mini',
+      model: resolvedModel,
+      chatFallbackModel: resolvedModel,
+      latestGPTModel: resolvedModel,
       modelFallbacks: [],
       maxTokens:
         config.maxTokens || parseInt(process.env.OPENAI_MAX_TOKENS || '4000') || 4000,
@@ -48,17 +46,25 @@ export class OpenAIClient {
   }
 
   async callOpenAI(messages: OpenAIMessage[], _options: { model?: string } = {}): Promise<OpenAICallResult> {
-    // Single model, single endpoint. No silent failover.
-    const result = await this.callResponsesAPI(messages, 'gpt-5.4-mini')
-    return { text: result.text, usage: result.usage, modelUsed: 'gpt-5.4-mini' }
+    const model = this.config.model
+    try {
+      const result = await this.callResponsesAPI(messages, model)
+      return { text: result.text, usage: result.usage, modelUsed: model }
+    } catch (err) {
+      // Responses API failed (model not found, format unsupported, etc.) —
+      // fall back to Chat Completions so the pipeline keeps working.
+      const msg = err instanceof Error ? err.message : String(err)
+      console.warn(`[openai-client] Responses API failed (${msg}), falling back to Chat Completions`)
+      const result = await this.callChatCompletionsAPI(messages, model)
+      return { text: result.text, usage: result.usage, modelUsed: model }
+    }
   }
 
   buildPreferredModelList(_requestedModel: string): string[] {
-    return ['gpt-5.4-mini']
+    return [this.config.model]
   }
 
   isLikelyCodexModel(_model: string): boolean {
-    // All our calls go through gpt-5.4-mini on the Responses API.
     return true
   }
 
@@ -192,7 +198,7 @@ export class OpenAIClient {
           model,
           messages,
           temperature: this.config.temperature,
-          max_tokens: this.config.maxTokens,
+          max_completion_tokens: this.config.maxTokens,
         }),
         signal: controller.signal,
       })

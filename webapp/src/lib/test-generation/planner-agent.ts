@@ -77,7 +77,7 @@ export async function runPlannerAgent(_input: PlannerInput): Promise<AgentPlan |
 // pushing a `dropped_hallucination` warning so the dashboard can surface it.
 // ────────────────────────────────────────────────────────────────────────────
 
-const PLANNER_TIMEOUT_MS = 30_000
+const PLANNER_TIMEOUT_MS = Number(process.env.HEALIX_PLANNER_TIMEOUT_MS) || 300_000
 const PAGE_CAP = 60
 const ENDPOINT_CAP = 80
 
@@ -106,7 +106,7 @@ function buildClient(): OpenAIClient | null {
   if (!apiKey) return null
   return new OpenAIClient({
     apiKey,
-    model: 'gpt-5.4-mini',
+    model: process.env.OPENAI_MODEL || 'gpt-4.1-mini',
     temperature: 0.1,
     timeout: PLANNER_TIMEOUT_MS,
   })

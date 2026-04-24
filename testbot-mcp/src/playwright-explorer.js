@@ -11,19 +11,20 @@
  *     { available: false, reason }
  *
  * Strategy:
- *   1. Open baseURL in headless chromium.
- *   2. Enumerate up to N same-origin anchors, visit each, classify requiresAuth
- *      by the presence of a login form OR a 401/403 response.
- *   3. Detect a login form on whichever route exposes one. Seed authFlow with
- *      the field selectors so `credentials-injector.js` can drive it later.
- *   4. Capture any console errors observed during the walk.
- *
- * Output is an ExplorationArtifact that matches the browser-use runner's shape.
+ *   1. Run one walk per provided storageState (role). If no auth sessions are
+ *      available, run a single unauthenticated walk.
+ *   2. Each walk: open baseURL, scroll each page to reveal lazy-loaded content,
+ *      enumerate up to MAX_ROUTES_PER_WALK same-origin routes.
+ *   3. Detect login forms and seed authFlow for credentials-injector.js.
+ *   4. Merge all walks into one artifact — routes from different roles are
+ *      combined so the generator sees the full surface area of the app.
  */
 
-const MAX_ROUTES = 10;
+const fs = require('fs');
+
+const MAX_ROUTES_PER_WALK = 12;
 const GOTO_TIMEOUT_MS = 15_000;
-const EXPLORE_WAIT_MS = 1500;
+const SETTLE_WAIT_MS = 800;
 
 function sameOrigin(hrefAbs, originAbs) {
   try {
@@ -33,15 +34,43 @@ function sameOrigin(hrefAbs, originAbs) {
   }
 }
 
+/**
+ * Scroll the page incrementally to trigger lazy-loaded and virtualized content,
+ * then return to the top so subsequent DOM scrapes see a consistent viewport.
+ */
+async function _scrollToReveal(page) {
+  try {
+    await page.evaluate(async () => {
+      await new Promise((resolve) => {
+        const step = 280;
+        const intervalMs = 120;
+        const maxMs = 2500;
+        let elapsed = 0;
+        const timer = setInterval(() => {
+          window.scrollBy(0, step);
+          elapsed += intervalMs;
+          const atBottom = window.scrollY + window.innerHeight >= document.body.scrollHeight - 10;
+          if (atBottom || elapsed >= maxMs) {
+            clearInterval(timer);
+            window.scrollTo(0, 0);
+            resolve();
+          }
+        }, intervalMs);
+      });
+    });
+    await page.waitForTimeout(400);
+  } catch {
+    // non-fatal — page may have navigated or context closed
+  }
+}
+
 async function _collectRouteSignals(page) {
-  // Pull everything we need for one route in a single DOM scrape so we avoid
-  // round-trips.
   return page.evaluate(() => {
     const safeText = (el) => (el?.textContent || '').trim().slice(0, 80);
     const anchors = Array.from(document.querySelectorAll('a[href]'))
       .map((a) => ({ href: a.href, text: safeText(a) }))
       .filter((a) => a.href && !a.href.startsWith('javascript:'))
-      .slice(0, 50);
+      .slice(0, 60);
 
     const forms = Array.from(document.querySelectorAll('form')).map((form) => {
       const fields = Array.from(form.querySelectorAll('input, textarea, select')).map((el) => ({
@@ -80,7 +109,7 @@ async function _collectRouteSignals(page) {
       : null;
 
     const landmarks = Array.from(document.querySelectorAll('button, [role="button"]'))
-      .slice(0, 10)
+      .slice(0, 15)
       .map((el) => ({
         role: el.getAttribute('role') || el.tagName.toLowerCase(),
         name: safeText(el),
@@ -95,27 +124,12 @@ async function _collectRouteSignals(page) {
   });
 }
 
-async function exploreWithPlaywright({ baseURL, credentials, onHeartbeat } = {}) {
-  if (!baseURL) {
-    return { available: false, reason: 'No baseURL provided to playwright-explorer' };
-  }
-
-  let chromium;
-  try {
-    ({ chromium } = require('playwright'));
-  } catch {
-    return { available: false, reason: 'playwright not installed — cannot run heuristic exploration' };
-  }
-
-  const origin = (() => {
-    try { return new URL(baseURL).origin; } catch { return null; }
-  })();
-  if (!origin) {
-    return { available: false, reason: `Invalid baseURL: ${baseURL}` };
-  }
-
-  const browser = await chromium.launch({ headless: true });
-  const context = await browser.newContext();
+/**
+ * Walk up to MAX_ROUTES_PER_WALK routes in a single browser context.
+ * Returns the raw walk results (routes, forms, authFlow, keyFlows, observedErrors).
+ */
+async function _walkRoutes({ browser, contextOptions, baseURL, origin, credentials, onHeartbeat }) {
+  const context = await browser.newContext(contextOptions);
   const page = await context.newPage();
 
   const observedErrors = [];
@@ -128,10 +142,10 @@ async function exploreWithPlaywright({ baseURL, credentials, onHeartbeat } = {})
   const routes = [];
   const formsOut = [];
   let authFlow = null;
-
   const queue = [baseURL];
+
   try {
-    while (queue.length && routes.length < MAX_ROUTES) {
+    while (queue.length && routes.length < MAX_ROUTES_PER_WALK) {
       const url = queue.shift();
       const parsed = (() => { try { return new URL(url); } catch { return null; } })();
       if (!parsed) continue;
@@ -146,7 +160,12 @@ async function exploreWithPlaywright({ baseURL, credentials, onHeartbeat } = {})
         observedErrors.push(`goto(${pathKey}): ${err.message.slice(0, 200)}`);
         continue;
       }
-      await page.waitForTimeout(EXPLORE_WAIT_MS);
+
+      await page.waitForTimeout(SETTLE_WAIT_MS);
+
+      // Scroll to reveal lazy-loaded / below-fold content before collecting.
+      await _scrollToReveal(page);
+
       if (typeof onHeartbeat === 'function') {
         try { onHeartbeat({ type: 'heartbeat', path: pathKey }); } catch { /* ignore */ }
       }
@@ -167,11 +186,7 @@ async function exploreWithPlaywright({ baseURL, credentials, onHeartbeat } = {})
       });
 
       for (const form of signals.forms || []) {
-        formsOut.push({
-          route: pathKey,
-          fields: form.fields,
-          submitLabel: form.submitLabel,
-        });
+        formsOut.push({ route: pathKey, fields: form.fields, submitLabel: form.submitLabel });
       }
 
       if (!authFlow && signals.authElements) {
@@ -187,7 +202,7 @@ async function exploreWithPlaywright({ baseURL, credentials, onHeartbeat } = {})
       }
 
       for (const a of signals.anchors || []) {
-        if (queue.length + routes.length >= MAX_ROUTES) break;
+        if (queue.length + routes.length >= MAX_ROUTES_PER_WALK) break;
         if (!sameOrigin(a.href, origin)) continue;
         const aPath = (() => { try { return new URL(a.href).pathname; } catch { return null; } })();
         if (!aPath || visitedPaths.has(aPath)) continue;
@@ -220,17 +235,130 @@ async function exploreWithPlaywright({ baseURL, credentials, onHeartbeat } = {})
       });
     }
 
-    return {
-      available: true,
-      source: 'playwright-heuristic',
-      artifact: {
-        routes,
-        forms: formsOut,
-        authFlow,
-        keyFlows,
-        observedErrors: observedErrors.slice(0, 20),
-      },
-    };
+    return { routes, forms: formsOut, authFlow, keyFlows, observedErrors };
+  } finally {
+    try { await context.close(); } catch { /* ignore */ }
+  }
+}
+
+/**
+ * Merge N per-role walk results into one artifact.
+ * Routes found in multiple walks are deduplicated; elements are union-merged.
+ */
+function _mergeWalks(walks) {
+  const routeMap = new Map();
+  const formMap = new Map();
+  let authFlow = null;
+  const keyFlowNames = new Set();
+  const keyFlows = [];
+  const errorSet = new Set();
+
+  for (const walk of walks) {
+    for (const route of walk.routes || []) {
+      if (routeMap.has(route.path)) {
+        const existing = routeMap.get(route.path);
+        const combined = [...existing.elements, ...route.elements];
+        existing.elements = combined
+          .filter((e, i, arr) => arr.findIndex((x) => x.name === e.name) === i)
+          .slice(0, 20);
+        // A route that was requiresAuth in the unauthenticated walk but
+        // accessible in an auth walk stays flagged as requiresAuth.
+      } else {
+        routeMap.set(route.path, { ...route, elements: [...(route.elements || [])] });
+      }
+    }
+    for (const form of walk.forms || []) {
+      if (!formMap.has(form.route)) formMap.set(form.route, form);
+    }
+    if (!authFlow && walk.authFlow) authFlow = walk.authFlow;
+    for (const kf of walk.keyFlows || []) {
+      if (!keyFlowNames.has(kf.name)) {
+        keyFlowNames.add(kf.name);
+        keyFlows.push(kf);
+      }
+    }
+    for (const err of walk.observedErrors || []) {
+      errorSet.add(err);
+    }
+  }
+
+  return {
+    routes: Array.from(routeMap.values()),
+    forms: Array.from(formMap.values()),
+    authFlow,
+    keyFlows,
+    observedErrors: Array.from(errorSet).slice(0, 20),
+  };
+}
+
+/**
+ * @param {object} opts
+ * @param {string} opts.baseURL
+ * @param {object} [opts.credentials]   Primary credential for unauthenticated keyFlow building.
+ * @param {Array<{role: string, storageStatePath: string}>} [opts.storageStatePaths]
+ *   One entry per verified role. When provided, one authenticated walk is run
+ *   per role so that role-specific routes are all discovered.
+ * @param {Function} [opts.onHeartbeat]
+ */
+async function exploreWithPlaywright({ baseURL, credentials, storageStatePaths = [], onHeartbeat } = {}) {
+  if (!baseURL) {
+    return { available: false, reason: 'No baseURL provided to playwright-explorer' };
+  }
+
+  let chromium;
+  try {
+    ({ chromium } = require('playwright'));
+  } catch {
+    return { available: false, reason: 'playwright not installed — cannot run heuristic exploration' };
+  }
+
+  const origin = (() => {
+    try { return new URL(baseURL).origin; } catch { return null; }
+  })();
+  if (!origin) {
+    return { available: false, reason: `Invalid baseURL: ${baseURL}` };
+  }
+
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const walks = [];
+
+    const validStatePaths = (Array.isArray(storageStatePaths) ? storageStatePaths : [])
+      .filter((s) => s?.storageStatePath && fs.existsSync(s.storageStatePath));
+
+    if (validStatePaths.length > 0) {
+      // Run one authenticated walk per role so role-specific routes are captured.
+      for (const { role, storageStatePath } of validStatePaths) {
+        try {
+          const walk = await _walkRoutes({
+            browser,
+            contextOptions: { storageState: storageStatePath },
+            baseURL,
+            origin,
+            credentials,
+            onHeartbeat,
+          });
+          walks.push({ role, ...walk });
+        } catch (err) {
+          // Non-fatal: log and continue with other roles
+          walks.push({ role, routes: [], forms: [], authFlow: null, keyFlows: [], observedErrors: [`walk_error: ${err.message}`] });
+        }
+      }
+    } else {
+      // No auth sessions available — unauthenticated walk only.
+      const walk = await _walkRoutes({
+        browser,
+        contextOptions: {},
+        baseURL,
+        origin,
+        credentials,
+        onHeartbeat,
+      });
+      walks.push({ role: null, ...walk });
+    }
+
+    const artifact = _mergeWalks(walks);
+    return { available: true, source: 'playwright-heuristic', artifact };
   } catch (err) {
     return { available: false, reason: `Playwright explorer error: ${err.message}` };
   } finally {
