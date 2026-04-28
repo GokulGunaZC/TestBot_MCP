@@ -35,6 +35,11 @@ export const profiles = pgTable('profiles', {
   tokensRemaining: bigint('tokens_remaining', { mode: 'number' }).default(240000),
   tokensTotal: bigint('tokens_total', { mode: 'number' }).default(240000),
   onboardingCompleted: boolean('onboarding_completed').default(false),
+  // Stripe billing — populated by webhook, never by client-side redirects
+  stripeCustomerId: text('stripe_customer_id'),
+  stripeSubscriptionId: text('stripe_subscription_id'),
+  subscriptionStatus: text('subscription_status').default('inactive'),
+  stripeLastInvoiceId: text('stripe_last_invoice_id'),
   createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
   updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow(),
 })

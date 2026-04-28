@@ -1,16 +1,15 @@
 import { NextRequest, NextResponse } from 'next/server'
-import Stripe from 'stripe'
+import { db } from '@/lib/db'
+import { profiles } from '@/lib/db/schema'
+import { eq } from 'drizzle-orm'
 import { getCurrentProfile } from '@/lib/auth/session'
-
-const PLAN_PRICE_IDS: Record<string, string> = {
-  starter: process.env.STRIPE_PRICE_STARTER ?? '',
-  team: process.env.STRIPE_PRICE_TEAM ?? '',
-}
+import { getStripe } from '@/lib/stripe'
+import { PLAN_PRICE_IDS } from '@/lib/plans'
+import { invoiceDescription, invoiceMetadata } from '@/lib/stripe-invoice'
 
 export async function POST(request: NextRequest) {
   try {
-    const stripeKey = process.env.STRIPE_SECRET_KEY
-    if (!stripeKey) {
+    if (!process.env.STRIPE_SECRET_KEY) {
       return NextResponse.json({ error: 'Stripe not configured' }, { status: 503 })
     }
 
@@ -20,27 +19,48 @@ export async function POST(request: NextRequest) {
     }
 
     const { plan } = await request.json()
-    if (!plan || !PLAN_PRICE_IDS[plan]) {
+    const priceId = PLAN_PRICE_IDS[plan]
+    if (!plan || !priceId) {
       return NextResponse.json({ error: 'Invalid plan' }, { status: 400 })
     }
 
-    const priceId = PLAN_PRICE_IDS[plan]
-    if (!priceId) {
-      return NextResponse.json({ error: `Stripe price ID for plan "${plan}" not configured` }, { status: 503 })
-    }
-
-    const stripe = new Stripe(stripeKey, { apiVersion: '2026-03-25.dahlia' })
-
+    const stripe = getStripe()
     const appUrl = process.env.NEXT_PUBLIC_APP_URL ?? 'http://localhost:3000'
+    const profile = result.profile
+
+    // Reuse existing Stripe customer to preserve payment methods and billing history.
+    let customerId: string
+    if (profile.stripeCustomerId) {
+      customerId = profile.stripeCustomerId
+    } else {
+      const customer = await stripe.customers.create({
+        email: profile.email,
+        metadata: { userId: profile.id },
+      })
+      customerId = customer.id
+      await db
+        .update(profiles)
+        .set({ stripeCustomerId: customerId, updatedAt: new Date() })
+        .where(eq(profiles.id, profile.id))
+    }
 
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
+      customer: customerId,
       payment_method_types: ['card'],
       line_items: [{ price: priceId, quantity: 1 }],
-      client_reference_id: result.profile.id,
-      customer_email: result.profile.email,
-      metadata: { plan, userId: result.profile.id },
-      success_url: `${appUrl}/plan-billing?payment=success&plan=${plan}`,
+      client_reference_id: profile.id,
+      metadata: { plan, userId: profile.id },
+
+      // Disable promotion codes — we don't run discount campaigns.
+      allow_promotion_codes: false,
+
+      subscription_data: {
+        description: invoiceDescription(plan),
+        metadata: { plan, userId: profile.id, ...invoiceMetadata(profile.id, plan) },
+      },
+
+      success_url: `${appUrl}/plan-billing?payment=success&plan=${plan}&session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `${appUrl}/plan-billing?payment=cancelled`,
     })
 

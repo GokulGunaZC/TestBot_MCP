@@ -90,14 +90,30 @@ class AutoDetector {
 
     const apiOnly = services.length > 0 && services.every((s) => s.role === 'backend');
 
+    // When root-level detection found no startCommand (e.g. monorepo with no root
+    // package.json), derive the primary startCommand and baseURL from the frontend
+    // service so the config UI pre-fills a runnable command instead of falling back
+    // to the generic 'npm run dev' in the wrong directory.
+    let effectiveStartCommand = startCommand;
+    let effectiveBaseURL = baseURL;
+    let effectivePort = port;
+    if (!effectiveStartCommand && services.length > 0) {
+      const feSvc = services.find((s) => s.role === 'frontend' || s.role === 'fullstack');
+      if (feSvc && feSvc.startCommand && feSvc.path && feSvc.path !== '.') {
+        effectiveStartCommand = `cd ${feSvc.path} && ${feSvc.startCommand}`;
+        if (!effectiveBaseURL && feSvc.baseURL) effectiveBaseURL = feSvc.baseURL;
+        if (!effectivePort && feSvc.port) effectivePort = feSvc.port;
+      }
+    }
+
     const settings = {
       projectPath: resolvedPath,
       projectName,
       language: langInfo.language,
       ecosystem: langInfo.ecosystem,
-      port,
-      baseURL,
-      startCommand,
+      port: effectivePort,
+      baseURL: effectiveBaseURL,
+      startCommand: effectiveStartCommand,
       hasPlaywright: !!playwrightConfig,
       hasJira: this.detectJiraConfig(envFile),
       testDirs,
@@ -145,6 +161,7 @@ class AutoDetector {
       { fe: 'apps/client', be: 'apps/server' },
       { fe: 'packages/web', be: 'packages/api' },
       { fe: 'frontend', be: 'backend' },
+      { fe: 'frontend', be: 'app' },
       { fe: 'client', be: 'server' },
       { fe: 'web', be: 'api' },
       { fe: 'webapp', be: 'server' },

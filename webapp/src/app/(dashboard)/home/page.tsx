@@ -113,7 +113,15 @@ export default function HomePage() {
   const tokensTotal = toDisplayUnits(profile?.tokens_total);
   const tokensUsed = Math.max(0, tokensTotal - tokensRemaining);
   const tokensUsedPct = tokensTotal > 0 ? Math.min(100, (tokensUsed / tokensTotal) * 100) : 0;
-  const plan = profile?.plan ?? 'Free';
+  const plan = profile?.plan ?? 'free';
+
+  // Determine the next upgrade target so the CTA always reflects reality.
+  const nextPlan: { id: string; label: string; description: string } | null =
+    plan === 'free'
+      ? { id: 'starter', label: 'Starter', description: 'Get 2,500 credits/mo + advanced AI models + Jira integration.' }
+      : plan === 'starter'
+      ? { id: 'team', label: 'Team', description: 'Get 10,000 credits/mo + CI/CD integration + priority support.' }
+      : null // team / enterprise — already on top plan
 
   const containerVariants = {
     hidden: {},
@@ -382,16 +390,26 @@ export default function HomePage() {
                     </div>
                   </div>
 
-                  <p className="text-[#4A6280] text-xs mt-3">
-                    Upgrade to Pro for more tokens + Jira integration + all AI providers.
-                  </p>
-
-                  <Link
-                    href="/plan-billing"
-                    className="mt-4 block w-full py-2.5 rounded-xl btn-gradient text-black font-semibold text-sm text-center"
-                  >
-                    Upgrade to Pro
-                  </Link>
+                  {nextPlan ? (
+                    <>
+                      <p className="text-[#4A6280] text-xs mt-3">
+                        {nextPlan.description}
+                      </p>
+                      <Link
+                        href="/plan-billing"
+                        className="mt-4 block w-full py-2.5 rounded-xl btn-gradient text-black font-semibold text-sm text-center"
+                      >
+                        Upgrade to {nextPlan.label}
+                      </Link>
+                    </>
+                  ) : (
+                    <Link
+                      href="/plan-billing"
+                      className="mt-4 block w-full py-2.5 rounded-xl border border-white/10 text-[#8BA4C8] font-semibold text-sm text-center hover:bg-white/5 transition-colors"
+                    >
+                      Manage Plan →
+                    </Link>
+                  )}
                 </>
               )}
             </div>
