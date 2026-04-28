@@ -15,11 +15,14 @@ class SaaSClient {
 
   async analyzeFailures(failures) {
     const payload = await this._client.analyzeFailures(failures);
-    return Array.isArray(payload?.analyses) ? payload.analyses : [];
+    return {
+      analyses: Array.isArray(payload?.analyses) ? payload.analyses : [],
+      tokenUsage: payload?.tokenUsage ?? null,
+    };
   }
 
   async analyzeFailure(failure) {
-    const results = await this.analyzeFailures([failure]);
+    const { analyses: results } = await this.analyzeFailures([failure]);
     return results[0] || {
       failure,
       testName: failure.testName,

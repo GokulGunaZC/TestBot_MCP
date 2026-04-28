@@ -1,24 +1,41 @@
 'use client'
 
-import { useState, useEffect } from 'react'
-import { motion } from 'framer-motion'
+import { useState, useEffect, useCallback } from 'react'
+import { useSearchParams, useRouter } from 'next/navigation'
+import { motion, AnimatePresence } from 'framer-motion'
 import { Profile } from '@/lib/types/database'
 import Card from '@/components/ui/Card'
 import Button from '@/components/ui/Button'
 import Badge from '@/components/ui/Badge'
 import { toDisplayUnits } from '@/lib/token-units'
 
-const PLANS = [
+type PlanId = 'free' | 'starter' | 'team' | 'enterprise'
+
+const PLAN_RANK: Record<PlanId, number> = { free: 0, starter: 1, team: 2, enterprise: 3 }
+
+const PLANS: {
+  id: PlanId
+  name: string
+  price: string
+  priceNote: string
+  description: string
+  tokens: number
+  tokenLabel: string
+  features: string[]
+  cta: string
+  ctaHref?: string
+  highlighted: boolean
+}[] = [
   {
     id: 'free',
-    name: 'Free',
+    name: 'Trial',
     price: 'Free',
     priceNote: 'forever',
     description: 'Start free. No credit card required.',
     tokens: 240_000,
-    tokenLabel: '50 tokens / month',
+    tokenLabel: '50 credits / month',
     features: ['1 user · 1 project', 'Basic AI models', 'Basic test types', 'Community support'],
-    cta: 'Current Plan',
+    cta: 'Downgrade to Trial',
     highlighted: false,
   },
   {
@@ -28,7 +45,7 @@ const PLANS = [
     priceNote: '/month',
     description: 'Advanced AI for growing teams.',
     tokens: 2_400_000,
-    tokenLabel: '500 tokens / month',
+    tokenLabel: '500 credits / month',
     features: ['Advanced AI models', 'All test types · self healing', 'Jira / ADO integration', 'Priority support'],
     cta: 'Upgrade to Starter',
     highlighted: false,
@@ -40,7 +57,7 @@ const PLANS = [
     priceNote: '/month',
     description: 'Scalable testing for engineering teams.',
     tokens: 4_800_000,
-    tokenLabel: '1,000 tokens / month',
+    tokenLabel: '1,000 credits / month',
     features: [
       'Advanced models + priority queue',
       'Custom integrations (10 hrs onboarding)',
@@ -57,7 +74,7 @@ const PLANS = [
     priceNote: '',
     description: 'Custom AI, dedicated infrastructure, and SLA.',
     tokens: Infinity,
-    tokenLabel: 'Unlimited tokens',
+    tokenLabel: 'Unlimited credits',
     features: [
       'Custom AI model selection',
       'API access + custom agents',
@@ -68,7 +85,7 @@ const PLANS = [
     ctaHref: 'mailto:Swathi.Dharshna@zapcg.com',
     highlighted: false,
   },
-] as const
+]
 
 // Display ratio + toDisplayUnits imported from @/lib/tokens so the billing
 // page, the sidebar, and the home plan card all derive from the same source.
@@ -80,7 +97,7 @@ function TokenMeter({ remaining, total }: { remaining: number; total: number }) 
   return (
     <div>
       <div className="flex justify-between text-sm mb-2">
-        <span className="text-text-secondary">Tokens remaining</span>
+        <span className="text-text-secondary">Credits remaining</span>
         <span className="text-text-primary font-semibold">
           {toDisplayUnits(remaining).toLocaleString()} / {toDisplayUnits(total).toLocaleString()}
         </span>
@@ -102,23 +119,111 @@ function TokenMeter({ remaining, total }: { remaining: number; total: number }) 
 export default function PlanBillingPage() {
   const [profile, setProfile] = useState<Profile | null>(null)
   const [loading, setLoading] = useState(true)
+  const [checkingOut, setCheckingOut] = useState<PlanId | null>(null)
+  const [banner, setBanner] = useState<{ type: 'success' | 'error' | 'cancelled'; message: string } | null>(null)
+  const [downgradeTarget, setDowngradeTarget] = useState<typeof PLANS[number] | null>(null)
 
-  useEffect(() => {
-    const load = async () => {
-      try {
-        const res = await fetch('/api/profile')
-        if (!res.ok) return
-        const { data } = await res.json()
-        if (data) setProfile(data)
-      } catch (err) {
-        console.error('Failed to load profile:', err)
-      }
-      setLoading(false)
+  const searchParams = useSearchParams()
+  const router = useRouter()
+
+  const loadProfile = useCallback(async () => {
+    try {
+      const res = await fetch('/api/profile')
+      if (!res.ok) return
+      const { data } = await res.json()
+      if (data) setProfile(data)
+    } catch (err) {
+      console.error('Failed to load profile:', err)
     }
-    load()
+    setLoading(false)
   }, [])
 
-  const currentPlan = profile?.plan ?? 'free'
+  useEffect(() => {
+    loadProfile()
+  }, [loadProfile])
+
+  useEffect(() => {
+    const payment = searchParams.get('payment')
+    const plan = searchParams.get('plan')
+    if (payment === 'success' && plan) {
+      setBanner({ type: 'success', message: `You're now on the ${plan.charAt(0).toUpperCase() + plan.slice(1)} plan! Your credits have been refreshed.` })
+      loadProfile().then(() => window.dispatchEvent(new Event('healix:profile-updated')))
+      router.replace('/plan-billing')
+    } else if (payment === 'cancelled') {
+      setBanner({ type: 'cancelled', message: 'Payment was cancelled. Your plan has not changed.' })
+      router.replace('/plan-billing')
+    }
+  }, [searchParams, router, loadProfile])
+
+  const currentPlan: PlanId = (profile?.plan as PlanId) ?? 'free'
+
+  const handlePlanAction = (plan: typeof PLANS[number]) => {
+    if (plan.id === currentPlan) return
+    if (plan.ctaHref) {
+      window.location.href = plan.ctaHref
+      return
+    }
+
+    const targetRank = PLAN_RANK[plan.id]
+    const currentRank = PLAN_RANK[currentPlan]
+
+    if (targetRank < currentRank) {
+      setDowngradeTarget(plan)
+      return
+    }
+
+    void executeUpgrade(plan)
+  }
+
+  const executeDowngrade = async () => {
+    if (!downgradeTarget) return
+    const plan = downgradeTarget
+    setDowngradeTarget(null)
+    setCheckingOut(plan.id)
+    setBanner(null)
+    try {
+      const res = await fetch('/api/profile/plan', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ plan: plan.id }),
+      })
+      if (!res.ok) {
+        const { error } = await res.json()
+        setBanner({ type: 'error', message: error ?? 'Downgrade failed. Please try again.' })
+        return
+      }
+      await loadProfile()
+      window.dispatchEvent(new Event('healix:profile-updated'))
+      setBanner({ type: 'success', message: `Downgraded to ${plan.name}. Your remaining credits are preserved.` })
+    } catch {
+      setBanner({ type: 'error', message: 'An unexpected error occurred. Please try again.' })
+    } finally {
+      setCheckingOut(null)
+    }
+  }
+
+  const executeUpgrade = async (plan: typeof PLANS[number]) => {
+    setCheckingOut(plan.id)
+    setBanner(null)
+    try {
+      const res = await fetch('/api/stripe/checkout', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ plan: plan.id }),
+      })
+      if (!res.ok) {
+        const { error } = await res.json()
+        setBanner({ type: 'error', message: error ?? 'Could not start checkout. Please try again.' })
+        return
+      }
+      const { url } = await res.json()
+      window.location.href = url
+    } catch {
+      setBanner({ type: 'error', message: 'An unexpected error occurred. Please try again.' })
+    } finally {
+      setCheckingOut(null)
+    }
+  }
 
   return (
     <div className="min-h-screen bg-bg-darkest p-6">
@@ -131,6 +236,28 @@ export default function PlanBillingPage() {
           <h1 className="text-2xl font-bold text-text-primary mb-1">Plan & Billing</h1>
           <p className="text-text-muted text-sm mb-8">Manage your subscription and token usage</p>
         </motion.div>
+
+        <AnimatePresence>
+          {banner && (
+            <motion.div
+              key="banner"
+              initial={{ opacity: 0, y: -8 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -8 }}
+              transition={{ duration: 0.25 }}
+              className={`flex items-center justify-between gap-4 px-4 py-3 rounded-none border-2 mb-6 text-sm font-medium ${
+                banner.type === 'success'
+                  ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400'
+                  : banner.type === 'cancelled'
+                  ? 'bg-amber-500/10 border-amber-500/30 text-amber-400'
+                  : 'bg-red-500/10 border-red-500/30 text-red-400'
+              }`}
+            >
+              <span>{banner.message}</span>
+              <button onClick={() => setBanner(null)} className="shrink-0 opacity-70 hover:opacity-100 transition-opacity">✕</button>
+            </motion.div>
+          )}
+        </AnimatePresence>
 
         {/* Current plan summary */}
         <Card delay={0.1} gradient className="p-6 mb-8">
@@ -146,17 +273,12 @@ export default function PlanBillingPage() {
                 <div>
                   <p className="text-text-muted text-sm mb-1">Current plan</p>
                   <div className="flex items-center gap-2">
-                    <h2 className="text-xl font-bold text-text-primary capitalize">{currentPlan}</h2>
+                    <h2 className="text-xl font-bold text-text-primary capitalize">{currentPlan === 'free' ? 'Trial' : currentPlan}</h2>
                     <Badge variant={currentPlan === 'enterprise' ? 'info' : currentPlan === 'team' || currentPlan === 'starter' ? 'success' : 'neutral'}>
                       Active
                     </Badge>
                   </div>
                 </div>
-                {/* {currentPlan !== 'enterprise' && (
-                  <Button variant="secondary" size="sm">
-                    Manage Billing
-                  </Button>
-                )} */}
               </div>
               <TokenMeter
                 remaining={profile?.tokens_remaining ?? 0}
@@ -171,6 +293,8 @@ export default function PlanBillingPage() {
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
           {PLANS.map((plan, i) => {
             const isCurrent = plan.id === currentPlan
+            const isLoading = checkingOut === plan.id
+            const isAnyLoading = checkingOut !== null
             return (
               <Card
                 key={plan.id}
@@ -208,21 +332,88 @@ export default function PlanBillingPage() {
                     </li>
                   ))}
                 </ul>
-                <a href={plan.ctaHref}>
-                  <Button
-                    variant={isCurrent ? 'secondary' : plan.highlighted ? 'primary' : 'secondary'}
-                    size="md"
-                    className="w-full"
-                    disabled={isCurrent}
-                  >
-                    {isCurrent ? 'Current Plan' : plan.cta}
-                  </Button>
-                </a>
+                <Button
+                  variant={isCurrent ? 'secondary' : plan.highlighted ? 'primary' : 'secondary'}
+                  size="md"
+                  className="w-full"
+                  disabled={isCurrent || isAnyLoading}
+                  loading={isLoading}
+                  onClick={() => handlePlanAction(plan)}
+                >
+                  {isCurrent ? 'Current Plan' : plan.cta}
+                </Button>
               </Card>
             )
           })}
         </div>
       </div>
+
+      {/* Downgrade confirmation modal */}
+      <AnimatePresence>
+        {downgradeTarget && (
+          <motion.div
+            key="downgrade-modal"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            transition={{ duration: 0.2 }}
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm px-4"
+            onClick={() => setDowngradeTarget(null)}
+          >
+            <motion.div
+              initial={{ scale: 0.95, y: 12 }}
+              animate={{ scale: 1, y: 0 }}
+              exit={{ scale: 0.95, y: 12 }}
+              transition={{ duration: 0.2 }}
+              className="bg-[#111111] border-2 border-[#333333] shadow-[6px_6px_0px_#555555] w-full max-w-md p-6"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="flex items-start gap-3 mb-5">
+                <div className="mt-0.5 shrink-0 w-8 h-8 flex items-center justify-center rounded-full bg-amber-500/15 border border-amber-500/30">
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#f59e0b" strokeWidth="2.5">
+                    <path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" />
+                    <line x1="12" y1="9" x2="12" y2="13" />
+                    <line x1="12" y1="17" x2="12.01" y2="17" />
+                  </svg>
+                </div>
+                <div>
+                  <h3 className="text-text-primary font-bold text-base mb-1">Downgrade to {downgradeTarget.name}?</h3>
+                  <p className="text-text-muted text-sm leading-relaxed">
+                    You will lose access to{' '}
+                    <span className="text-text-secondary font-medium capitalize">{currentPlan}</span> features immediately.
+                    Your remaining credit balance will be preserved — you can continue using it on the Trial plan.
+                  </p>
+                </div>
+              </div>
+
+              <div className="bg-white/5 border border-white/10 px-4 py-3 mb-6 text-xs text-text-muted space-y-1">
+                <p>✓ Your remaining credits are <span className="text-emerald-400 font-medium">kept</span> — they won't be wiped.</p>
+                <p>✗ AI model access reverts to <span className="text-amber-400 font-medium">Basic</span> tier immediately.</p>
+                <p>✗ Jira/ADO integrations and priority support are <span className="text-red-400 font-medium">disabled</span>.</p>
+              </div>
+
+              <div className="flex gap-3">
+                <Button
+                  variant="secondary"
+                  size="md"
+                  className="flex-1"
+                  onClick={() => setDowngradeTarget(null)}
+                >
+                  Keep Current Plan
+                </Button>
+                <Button
+                  variant="primary"
+                  size="md"
+                  className="flex-1 !bg-amber-500 !border-amber-600 !text-black hover:!bg-amber-400"
+                  onClick={executeDowngrade}
+                >
+                  Yes, Downgrade
+                </Button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   )
 }

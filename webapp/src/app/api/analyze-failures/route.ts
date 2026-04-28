@@ -501,7 +501,16 @@ export async function POST(request: NextRequest) {
       })
     }
 
-    const responseBody = { success: true, analyses }
+    const responseBody = {
+      success: true,
+      analyses,
+      tokenUsage: {
+        promptTokens: totalPromptTokens,
+        completionTokens: totalCompletionTokens,
+        totalTokens: totalTokensConsumed,
+        modelUsed: lastModelUsed,
+      },
+    }
 
     // 9. Store idempotency result
     if (idempotencyKey) {

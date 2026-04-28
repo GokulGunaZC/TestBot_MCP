@@ -26,8 +26,10 @@ class Logger {
   static initialize() {
     if (this.initialized) return;
 
-    // Use current working directory for logs (often project root)
-    this.logsDir = path.join(process.cwd(), 'logs');
+    // Use __dirname (testbot-mcp/src/) so the log path is always the same
+    // absolute location regardless of process.cwd() — important for the
+    // pipeline-worker which is forked and may inherit a different cwd.
+    this.logsDir = path.join(__dirname, '..', 'logs');
     
     // Create logs directory if it doesn't exist
     try {
@@ -41,10 +43,12 @@ class Logger {
 
     this.mcpLogPath = path.join(this.logsDir, 'mcp.log');
     this.errorLogPath = path.join(this.logsDir, 'error.log');
+    this.tokenGatingLogPath = path.join(this.logsDir, 'token-gating.log');
 
     // Optionally rotate large old logs
     this._rotateLogFile(this.mcpLogPath);
     this._rotateLogFile(this.errorLogPath);
+    this._rotateLogFile(this.tokenGatingLogPath);
 
     this.initialized = true;
     this.info('Logger', 'Central logging initialized');
@@ -124,6 +128,12 @@ class Logger {
         
         if (level === 'ERROR') {
           fs.appendFileSync(this.errorLogPath, fileOutput);
+        }
+
+        // Tee token-gating relevant messages to a dedicated file for easy tailing.
+        // Matches the prefixes added to all gating/token log calls.
+        if (this.tokenGatingLogPath && /\[(TOKEN|QUALITY|AUTH GATE|RATE GATE|WEBAPP ERROR)/i.test(safeMessage)) {
+          fs.appendFileSync(this.tokenGatingLogPath, fileOutput);
         }
       } catch (e) {
         // Silent fail on file write issues to prevent crashing the server

@@ -2054,6 +2054,9 @@ function buildPipelineDiagnostics({ projectPath, stage, reason, stderr, stdout, 
 
 function auditGeneratedTestQuality({ projectPath, testType, context }) {
   const generatedDir = path.join(projectPath, 'tests', 'generated');
+  const apiEndpointCount = (context?.apiEndpoints || []).length;
+  Logger.info('PipelineWorker', `[QUALITY AUDIT] Starting audit — testType=${testType} apiEndpoints=${apiEndpointCount} dir=${generatedDir}`);
+
   const summary = {
     totalFiles: 0,
     apiFiles: 0,
@@ -2067,14 +2070,17 @@ function auditGeneratedTestQuality({ projectPath, testType, context }) {
   };
 
   if (!fs.existsSync(generatedDir)) {
+    Logger.warn('PipelineWorker', `[QUALITY AUDIT] ❌ generated dir missing: ${generatedDir}`);
     summary.errors.push('generated_tests_missing');
     return { valid: false, ...summary };
   }
 
   const files = fs.readdirSync(generatedDir).filter((name) => /\.spec\.(ts|js)$/i.test(name));
   summary.totalFiles = files.length;
+  Logger.info('PipelineWorker', `[QUALITY AUDIT] Found ${files.length} spec file(s): ${files.join(', ') || '(none)'}`);
 
   if (files.length === 0) {
+    Logger.warn('PipelineWorker', `[QUALITY AUDIT] ❌ No spec files found in ${generatedDir}`);
     summary.errors.push('no_generated_tests');
     return { valid: false, ...summary };
   }
@@ -2144,8 +2150,12 @@ function auditGeneratedTestQuality({ projectPath, testType, context }) {
     const isApiFile = /request\.(get|post|put|patch|delete|fetch)\(/i.test(content) || /api/i.test(name);
     if (isApiFile) {
       summary.apiFiles += 1;
-      if (/Promise\.all|HEALIX_API_STRESS_BURST|burst|p95|percentile/i.test(content)) {
+      const burstMatch = /Promise\.all|HEALIX_API_STRESS_BURST|burst|p95|percentile/i.test(content);
+      if (burstMatch) {
         summary.hasApiBurstCoverage = true;
+        Logger.info('PipelineWorker', `[QUALITY AUDIT]   ${name} → API file ✅ burst coverage detected`);
+      } else {
+        Logger.warn('PipelineWorker', `[QUALITY AUDIT]   ${name} → API file ⚠️  NO burst coverage (need Promise.all|HEALIX_API_STRESS_BURST|burst|p95|percentile)`);
       }
     } else {
       summary.uiFiles += 1;
@@ -2209,6 +2219,7 @@ function auditGeneratedTestQuality({ projectPath, testType, context }) {
   // real ones are found, so apiEndpoints.length > 0 is not a reliable signal.
   if (testType === 'backend' && !isFullStackFramework && (context?.apiEndpoints || []).length > 1) {
     if (summary.apiFiles === 0) {
+      Logger.warn('PipelineWorker', `[QUALITY AUDIT] ❌ GATE FAIL: missing_api_test_files — no files matched API pattern despite ${apiEndpointCount} detected endpoint(s)`);
       summary.errors.push('missing_api_test_files');
     }
     if (!summary.hasApiBurstCoverage) {
@@ -2221,6 +2232,8 @@ function auditGeneratedTestQuality({ projectPath, testType, context }) {
     if (!summary.hasApiBurstCoverage) {
       summary.warnings.push('missing_api_burst_coverage');
     }
+  } else {
+    Logger.info('PipelineWorker', `[QUALITY AUDIT] Backend gate skipped — testType=${testType} apiEndpoints=${apiEndpointCount}`);
   }
 
   if ((testType === 'frontend' || testType === 'both') && summary.uiFiles > 0 && summary.selectorCoverageRatio < 0.5) {
@@ -2229,8 +2242,15 @@ function auditGeneratedTestQuality({ projectPath, testType, context }) {
 
   summary.riskyFiles = [...new Set(summary.riskyFiles)];
 
+  const auditValid = summary.errors.length === 0;
+  if (auditValid) {
+    Logger.info('PipelineWorker', `[QUALITY AUDIT] ✅ PASS — apiFiles=${summary.apiFiles} uiFiles=${summary.uiFiles} hasApiBurstCoverage=${summary.hasApiBurstCoverage} warnings=${summary.warnings.length}`);
+  } else {
+    Logger.warn('PipelineWorker', `[QUALITY AUDIT] ❌ FAIL — errors=${JSON.stringify(summary.errors)} apiFiles=${summary.apiFiles} uiFiles=${summary.uiFiles} hasApiBurstCoverage=${summary.hasApiBurstCoverage}`);
+  }
+
   return {
-    valid: summary.errors.length === 0,
+    valid: auditValid,
     ...summary,
   };
 }
@@ -2420,6 +2440,12 @@ async function maybeGenerateViaSaaS({
           totalPlannedTests: plan.totalPlannedTests,
           cache: planResult.cache || null,
         };
+        const pt = planResult.plannerTokens;
+        if (pt && pt.totalTokens > 0) {
+          Logger.info('PipelineWorker', '[TOKEN USAGE] planner prompt=' + pt.promptTokens + ' completion=' + pt.completionTokens + ' total=' + pt.totalTokens + ' cache=' + (planResult.cache || 'miss'));
+        } else {
+          Logger.info('PipelineWorker', '[TOKEN USAGE] planner — cache=' + (planResult.cache || 'miss') + ' (no tokens charged)');
+        }
         // Persist the plan to runDir for post-mortem inspection. The MCP
         // already writes status.json / manifest here, so reusing the same
         // dir keeps all run telemetry in one place.
@@ -2561,6 +2587,7 @@ async function runPhase1FanOut({
   const agentFailures = [];
   const agentsCompleted = [];
   const agentMeta = [];
+  const allTokenRuns = [];
   let doneCount = 0;
 
   // One HTTP call per agent, all in flight simultaneously. Each call fits
@@ -2575,6 +2602,19 @@ async function runPhase1FanOut({
           agentPayload.plan = { slice: agentSlice, planVersion: 1 };
         }
         const payload = await client.generateTestsForAgent(agentPayload);
+
+        // ── Token usage logging ──────────────────────────────────────────
+        const REAL_TOKENS_PER_DISPLAY_UNIT = 4800;
+        if (Array.isArray(payload?.agentRuns) && payload.agentRuns.length > 0) {
+          for (const run of payload.agentRuns) {
+            allTokenRuns.push(run);
+            const displayUnits = Math.floor((run.tokensTotal || 0) / REAL_TOKENS_PER_DISPLAY_UNIT);
+            Logger.info('PipelineWorker', `[TOKEN USAGE] agent=${run.agent || agent} prompt=${run.tokensPrompt ?? 'n/a'} completion=${run.tokensCompletion ?? 'n/a'} total=${run.tokensTotal ?? 'n/a'} displayUnits=${displayUnits}`);
+          }
+        } else {
+          Logger.info('PipelineWorker', `[TOKEN USAGE] agent=${agent} — no agentRuns in response (token data unavailable)`);
+        }
+
         const tests = Array.isArray(payload?.tests) ? payload.tests : [];
         // Write this agent's tests to disk the moment the call returns —
         // makes partials durable even if a later agent blows up the run.
@@ -2630,6 +2670,19 @@ async function runPhase1FanOut({
 
   const fulfilled = settled.filter((s) => s.status === 'fulfilled').length;
   const rejected = settled.length - fulfilled;
+
+  // ── Aggregated token summary ─────────────────────────────────────────────
+  {
+    const REAL_TOKENS_PER_DISPLAY_UNIT = 4800;
+    let totalPrompt = 0, totalCompletion = 0, totalReal = 0;
+    for (const run of allTokenRuns) {
+      totalPrompt += run.tokensPrompt || 0;
+      totalCompletion += run.tokensCompletion || 0;
+      totalReal += run.tokensTotal || 0;
+    }
+    const totalDisplayUnits = Math.floor(totalReal / REAL_TOKENS_PER_DISPLAY_UNIT);
+    Logger.info('PipelineWorker', `[TOKEN SUMMARY] All agents settled — totalRealTokens=${totalReal} (prompt=${totalPrompt} completion=${totalCompletion}) displayUnitsConsumed=${totalDisplayUnits} (1 unit = ${REAL_TOKENS_PER_DISPLAY_UNIT} real tokens)`);
+  }
 
   Logger.info('PipelineWorker', 'Per-agent generation settled', {
     totalAgents: agents.length,
@@ -2999,7 +3052,25 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
       context,
     });
 
+    Logger.info('PipelineWorker', '[QUALITY GATE] auditGeneratedTestQuality result', {
+      valid: qualityAudit.valid,
+      errors: qualityAudit.errors,
+      warnings: qualityAudit.warnings,
+      apiFiles: qualityAudit.apiFiles,
+      uiFiles: qualityAudit.uiFiles,
+      hasApiBurstCoverage: qualityAudit.hasApiBurstCoverage,
+      selectorCoverageRatio: qualityAudit.selectorCoverageRatio,
+      totalFiles: qualityAudit.totalFiles,
+    });
+
     if (!qualityAudit.valid) {
+      Logger.error('PipelineWorker', `[QUALITY GATE] ❌ Quality audit FAILED for generator="${generator}" — errors: ${qualityAudit.errors.join(', ')}`, null, {
+        generator,
+        errors: qualityAudit.errors,
+        apiFiles: qualityAudit.apiFiles,
+        hasApiBurstCoverage: qualityAudit.hasApiBurstCoverage,
+        hint: 'If missing_api_burst_coverage: the generated API spec files need at least one burst/stress test using Promise.all, burst, p95, or percentile patterns.',
+      });
       const error = new Error(`${generator} generation failed quality audit: ${qualityAudit.errors.join(',')}`);
       error.code = 'GENERATION_VALIDATION_FAILED';
       error.validation = {
@@ -3302,9 +3373,17 @@ async function maybeRunFailureTriage({ config, testResults, runBudget, runId }) 
 
   return withStageBudget(runBudget, 'aiTriage', async () => {
     const analyzer = AIAnalyzer.create(providerConfig.provider, providerConfig.apiKey);
-    const analysis = await analyzer.analyzeFailures(payload);
+    const { analyses, tokenUsage: analyzeTokenUsage } = await analyzer.analyzeFailures(payload);
+    if (analyzeTokenUsage && analyzeTokenUsage.totalTokens > 0) {
+      Logger.info('PipelineWorker', '[TOKEN USAGE] analyze-failures', {
+        prompt: analyzeTokenUsage.promptTokens,
+        completion: analyzeTokenUsage.completionTokens,
+        total: analyzeTokenUsage.totalTokens,
+        model: analyzeTokenUsage.modelUsed,
+      });
+    }
     return {
-      analysis: Array.isArray(analysis) ? analysis : null,
+      analysis: Array.isArray(analyses) ? analyses : null,
       evidenceBundles: bundleResult.bundles,
       verdicts: classifierResult.verdicts,
       clusters: classifierResult.clusters,
@@ -3607,6 +3686,12 @@ async function runPipeline(config, runId) {
           client.parsePRD({ prdContent: combinedPrdContent })
         );
         parsedPRD = parseResponse?.parsedPRD || null;
+        const prdTokens = parseResponse?.tokenUsage;
+        if (prdTokens && prdTokens.totalTokens > 0) {
+          Logger.info('PipelineWorker', '[TOKEN USAGE] parse-prd prompt=' + prdTokens.promptTokens + ' completion=' + prdTokens.completionTokens + ' total=' + prdTokens.totalTokens);
+        } else if (parseResponse?.cached) {
+          Logger.info('PipelineWorker', '[TOKEN USAGE] parse-prd — cached (no tokens charged)');
+        }
         if (parsedPRD) {
           try {
             fs.writeFileSync(

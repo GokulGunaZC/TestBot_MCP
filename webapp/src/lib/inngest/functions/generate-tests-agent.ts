@@ -38,7 +38,9 @@ import { db } from '@/lib/db'
 import { generationJobs } from '@/lib/db/schema'
 import { eq, sql } from 'drizzle-orm'
 import { dispatchAgents } from '@/lib/test-generation/agent-dispatcher'
-import type { AgentName, GenerateTestsParams } from '@/lib/test-generation/types'
+import type { AgentName, GenerateTestsParams, AgentRunRecord } from '@/lib/test-generation/types'
+import { deductTokens } from '@/lib/tokens'
+import { recordAiCall } from '@/lib/ai-guard'
 
 interface AgentRequestedEventData {
   jobId: string
@@ -99,6 +101,7 @@ export const generateTestsAgent = inngest.createFunction(
       const t0 = Date.now()
       try {
         const payload = job.payload as GenerateTestsParams
+        const agentTelemetry: AgentRunRecord[] = []
         const dispatchResult = await dispatchAgents({
           ...payload,
           agentsAllowlist: new Set<AgentName>([agent]),
@@ -109,7 +112,28 @@ export const generateTestsAgent = inngest.createFunction(
             apiKey: process.env.OPENAI_API_KEY,
             timeout: 540_000,
           },
+          onAgentComplete: async (record) => {
+            agentTelemetry.push(record)
+            await recordAiCall({
+              userId: job.userId,
+              apiKeyId: job.apiKeyId ?? '',
+              endpoint: '/api/generate-tests',
+              agent: record.agent,
+              latencyMs: record.latencyMs,
+              modelUsed: record.modelUsed ?? undefined,
+              tokensPrompt: record.tokensPrompt,
+              tokensCompletion: record.tokensCompletion,
+              tokensTotal: record.tokensTotal,
+              success: record.success,
+              errorCode: record.errorCode ?? null,
+            })
+          },
         })
+
+        const tokensConsumed = dispatchResult.summary?.tokenUsage?.totalTokens ?? 0
+        if (tokensConsumed > 0) {
+          await deductTokens({ userId: job.userId, tokensUsed: tokensConsumed })
+        }
         return {
           ok: true as const,
           files: dispatchResult.files ?? [],

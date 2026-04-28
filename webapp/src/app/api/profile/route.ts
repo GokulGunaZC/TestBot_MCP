@@ -4,6 +4,8 @@ import { profiles } from '@/lib/db/schema'
 import { eq } from 'drizzle-orm'
 import { getCurrentProfile } from '@/lib/auth/session'
 
+const PLAN_TOKEN_TOTALS: Record<string, number> = { free: 240_000, starter: 2_400_000, team: 4_800_000 }
+
 function mapProfileToSnakeCase(profile: typeof profiles.$inferSelect) {
   return {
     id: profile.id,
@@ -32,7 +34,19 @@ export async function GET() {
     if (!result.profile) {
       return NextResponse.json({ error: 'Profile not found' }, { status: 404 })
     }
-    return NextResponse.json({ data: mapProfileToSnakeCase(result.profile) })
+
+    let profile = result.profile
+    const expectedTotal = PLAN_TOKEN_TOTALS[profile.plan ?? 'free']
+    if (expectedTotal !== undefined && profile.tokensTotal !== expectedTotal) {
+      const [fixed] = await db
+        .update(profiles)
+        .set({ tokensTotal: expectedTotal, updatedAt: new Date() })
+        .where(eq(profiles.id, profile.id))
+        .returning()
+      profile = fixed
+    }
+
+    return NextResponse.json({ data: mapProfileToSnakeCase(profile) })
   } catch (error) {
     console.error('Profile GET error:', error)
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })

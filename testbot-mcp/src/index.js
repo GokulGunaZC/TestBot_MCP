@@ -859,12 +859,14 @@ class HealixMCPServer {
       Logger.warn('Index', 'Could not write config temp file; falling back to IPC send', { error: writeErr.message });
     }
 
-    // Use 'ignore' for stdout/stderr: all important output is written to
-    // logs/mcp.log via Logger.  Piping would require draining to avoid
-    // back-pressure, and writing to process.stderr from the drain handler
-    // re-introduces the Windows synchronous pipe-blocking hang.
+    // stderr → 'inherit': lets the worker's Logger output flow to the same
+    // terminal as the MCP server so token-gating and quality-audit logs are
+    // visible in real time. 'inherit' passes the parent's fd directly — it
+    // does NOT create a pipe, so there is no back-pressure or event-loop
+    // blocking risk (unlike 'pipe' which requires active draining).
+    // stdout stays 'ignore'; all important output goes through Logger/stderr.
     const child = fork(workerPath, [], {
-      stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
+      stdio: ['ignore', 'ignore', 'inherit', 'ipc'],
       env: { ...process.env },
     });
 
