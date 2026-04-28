@@ -22,6 +22,7 @@ const path = require('path');
 const Logger = require('./logger');
 const { driveExploration } = require('./browser-use-driver');
 const { exploreWithPlaywright } = require('./playwright-explorer');
+const { injectCredentials } = require('./credentials-injector');
 
 const EMPTY_ARTIFACT = Object.freeze({
   routes: [],
@@ -44,6 +45,7 @@ async function runExplorationPhase({
   statusDir,
   baseURL,
   credentials,
+  projectPath,
   skipExploration = false,
   totalTimeoutMs = 120_000,
 }) {
@@ -59,12 +61,41 @@ async function runExplorationPhase({
   const cred = primaryCredential(credentials);
   const credsForAgent = cred ? { username: cred.username, password: cred.password } : undefined;
 
+  // Pre-authenticate ALL roles before exploration so every role's protected
+  // routes are reachable. We use fallback selectors (no authFlow yet) for a
+  // best-effort login. The resulting storageState files are passed to the
+  // Playwright heuristic explorer which runs one walk per role and merges the
+  // results. browser-use handles its own login via the improved task prompt.
+  let preAuthRoles = [];
+  if (cred && projectPath) {
+    try {
+      const allCreds = Array.isArray(credentials) ? credentials : [cred];
+      const injected = await injectCredentials({
+        projectPath,
+        baseURL,
+        credentials: allCreds,
+        authFlow: null,
+      });
+      preAuthRoles = injected.filter((r) => r.loginVerified && r.storageStatePath);
+      if (preAuthRoles.length > 0) {
+        Logger.info('ExplorationPhase', `Pre-auth login succeeded for ${preAuthRoles.length} role(s) — explorer will start authenticated`, {
+          roles: preAuthRoles.map((r) => r.role),
+        });
+      } else {
+        Logger.info('ExplorationPhase', 'Pre-auth login could not be verified for any role — exploring as unauthenticated');
+      }
+    } catch (preAuthErr) {
+      Logger.warn('ExplorationPhase', 'Pre-auth attempt failed (best-effort)', { reason: preAuthErr.message });
+    }
+  }
+
   // Prefer browser-use when its deps are in place; fall back to heuristic
   // Playwright exploration so the MCP works out of the box without requiring
   // an OPENAI_API_KEY on the user's machine.
   let result = await driveExploration({
     targetUrl: baseURL,
     credentials: credsForAgent,
+    allCredentials: Array.isArray(credentials) ? credentials : (cred ? [cred] : []),
     totalTimeoutMs,
     onHeartbeat: () => { /* noop — heartbeats could be surfaced to status later */ },
   });
@@ -77,6 +108,7 @@ async function runExplorationPhase({
     const fallback = await exploreWithPlaywright({
       baseURL,
       credentials: credsForAgent,
+      storageStatePaths: preAuthRoles,
       onHeartbeat: () => { /* noop */ },
     });
     if (fallback.available) {
@@ -115,7 +147,7 @@ async function runExplorationPhase({
     }
   }
 
-  return { artifact, source };
+  return { artifact, source, preAuthRoles };
 }
 
 module.exports = {

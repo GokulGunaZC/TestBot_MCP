@@ -27,11 +27,10 @@ import { logBlockedRequest } from '@/lib/security-logger'
 
 const ENDPOINT = '/api/generate-tests'
 
-// Vercel Hobby caps any route at 60s. We declare it explicitly so the cap is
-// obvious in code, not silently inherited. Each call is now scoped to a single
-// agent (see `agents` body field) so the 60s ceiling is survivable — the MCP
-// fans out 5 parallel per-agent calls instead of one monolithic one.
-export const maxDuration = 60
+// Matches vercel.json maxDuration for this route. Previously set to 60 (Hobby
+// ceiling) but that silently killed agents before gpt-5.4-mini could respond.
+// Set to 800 to match vercel.json; local Next.js ignores this entirely.
+export const maxDuration = 800
 
 const KNOWN_AGENTS: readonly AgentName[] = ['smoke', 'frontend', 'api', 'workflow', 'error', 'expansion']
 
@@ -402,9 +401,7 @@ export async function POST(request: NextRequest) {
       agentPlanSlice,
       generatorConfig: {
         apiKey: process.env.OPENAI_API_KEY,
-        // gpt-5.4-mini only. The generator hardcodes this too, but we pass it
-        // explicitly so env drift is impossible.
-        model: 'gpt-5.4-mini',
+        model: process.env.OPENAI_MODEL || 'gpt-4.1-mini',
         fallbackOnFailure: genOptions.strictAIGeneration !== true,
         enforceValidation: true,
         syntaxValidationMode: 'fail-open',

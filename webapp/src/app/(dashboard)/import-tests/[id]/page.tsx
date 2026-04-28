@@ -38,6 +38,7 @@ export default function ImportDetailPage() {
   const [searchQuery, setSearchQuery] = useState('')
   const [generating, setGenerating] = useState(false)
   const [expandedFileId, setExpandedFileId] = useState<string | null>(null)
+  const [expandedTcId, setExpandedTcId] = useState<string | null>(null)
 
   const fetchData = useCallback(async () => {
     try {
@@ -252,25 +253,74 @@ export default function ImportDetailPage() {
                         </td>
                       </tr>
                     ) : (
-                      filteredTestCases.map((tc) => (
-                        <tr key={tc.id} className="border-b border-[#1a1a1a] hover:bg-white/[0.02] transition-colors">
-                          <td className="px-3 py-2 text-white font-bold whitespace-nowrap">{tc.tc_id}</td>
-                          <td className="px-3 py-2">
-                            <span className={tc.active === 'Y' ? 'text-emerald-400' : 'text-[#505050]'}>
-                              {tc.active ?? '—'}
-                            </span>
-                          </td>
-                          <td className="px-3 py-2 text-[#a0a0a0] whitespace-nowrap">{tc.functional_area ?? '—'}</td>
-                          <td className="px-3 py-2 text-[#60A5FA] whitespace-nowrap max-w-[200px] truncate" title={tc.scenario ?? ''}>
-                            {tc.scenario ?? '—'}
-                          </td>
-                          <td className="px-3 py-2 text-[#a0a0a0] whitespace-nowrap">{tc.pcc ?? '—'}</td>
-                          <td className="px-3 py-2 text-[#a0a0a0] whitespace-nowrap">{tc.ndc_version ?? '—'}</td>
-                          <td className="px-3 py-2 text-[#505050] max-w-[240px] truncate" title={tc.description ?? ''}>
-                            {tc.description ?? '—'}
-                          </td>
-                        </tr>
-                      ))
+                      filteredTestCases.flatMap((tc) => {
+                        const isExpanded = expandedTcId === tc.id
+                        const rawEntries = tc.raw_data ? Object.entries(tc.raw_data as Record<string, unknown>) : []
+                        const rows = [
+                          <tr
+                            key={tc.id}
+                            onClick={() => setExpandedTcId(isExpanded ? null : tc.id)}
+                            className="border-b border-[#1a1a1a] hover:bg-white/[0.02] transition-colors cursor-pointer select-none"
+                          >
+                            <td className="px-3 py-2 text-white font-bold whitespace-nowrap">
+                              <span className="flex items-center gap-1.5">
+                                <svg
+                                  width="8" height="8" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"
+                                  className={`text-[#505050] transition-transform flex-shrink-0 ${isExpanded ? 'rotate-90' : ''}`}
+                                >
+                                  <polyline points="9 18 15 12 9 6" />
+                                </svg>
+                                {tc.tc_id}
+                              </span>
+                            </td>
+                            <td className="px-3 py-2">
+                              <span className={tc.active === 'Y' ? 'text-emerald-400' : 'text-[#505050]'}>
+                                {tc.active ?? '—'}
+                              </span>
+                            </td>
+                            <td className="px-3 py-2 text-[#a0a0a0] whitespace-nowrap">{tc.functional_area ?? '—'}</td>
+                            <td className="px-3 py-2 text-[#60A5FA] whitespace-nowrap max-w-[200px] truncate" title={tc.scenario ?? ''}>
+                              {tc.scenario ?? '—'}
+                            </td>
+                            <td className="px-3 py-2 text-[#a0a0a0] whitespace-nowrap">{tc.pcc ?? '—'}</td>
+                            <td className="px-3 py-2 text-[#a0a0a0] whitespace-nowrap">{tc.ndc_version ?? '—'}</td>
+                            <td className="px-3 py-2 text-[#505050] max-w-[240px] truncate" title={tc.description ?? ''}>
+                              {tc.description ?? '—'}
+                            </td>
+                          </tr>,
+                        ]
+                        if (isExpanded) {
+                          rows.push(
+                            <tr key={`${tc.id}-detail`} className="border-b border-[#222] bg-[#080808]">
+                              <td colSpan={7} className="px-4 py-4">
+                                <div className="grid grid-cols-2 gap-x-8 gap-y-2 text-xs font-mono">
+                                  {(
+                                    [
+                                      ['TC ID', tc.tc_id],
+                                      ['Active', tc.active],
+                                      ['Functional Area', tc.functional_area],
+                                      ['Scenario', tc.scenario],
+                                      ['Description', tc.description],
+                                      ['Environment', tc.environment_name],
+                                      ['NDC Version', tc.ndc_version],
+                                      ['PCC', tc.pcc],
+                                      ...rawEntries
+                                        .filter(([k]) => !['Active','TestCase_ID','Functional_Area','Scenario','Description','Environment_Name','NDC_Version','PCC'].includes(k))
+                                        .map(([k, v]) => [k, v]),
+                                    ] as [string, unknown][]
+                                  ).map(([label, value]) => (
+                                    <div key={label} className="flex gap-2 min-w-0">
+                                      <span className="text-[#505050] whitespace-nowrap flex-shrink-0 w-36">{label}:</span>
+                                      <span className="text-[#a0a0a0] break-all">{value != null ? String(value) : '—'}</span>
+                                    </div>
+                                  ))}
+                                </div>
+                              </td>
+                            </tr>
+                          )
+                        }
+                        return rows
+                      })
                     )}
                   </tbody>
                 </table>

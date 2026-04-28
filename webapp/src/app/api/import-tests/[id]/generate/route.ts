@@ -5,6 +5,9 @@ import { importSessions, importedTestCases, generatedGroovyFiles } from '@/lib/d
 import { eq, and } from 'drizzle-orm'
 import { generateGroovyFile } from '@/lib/groovy-generator'
 
+// Allow up to 5 minutes for parallel Groovy generation (Next.js default is 60s)
+export const maxDuration = 300
+
 // Derive the unique set of API class names from test case scenarios
 function extractApiTypesFromCases(
   cases: { scenario: string | null }[]
@@ -66,10 +69,13 @@ export async function POST(_req: NextRequest, { params }: { params: Promise<{ id
     return NextResponse.json({ error: 'OpenAI API key not configured' }, { status: 503 })
   }
 
+  // Clear any previous (failed) groovy files before re-generating
+  await db.delete(generatedGroovyFiles).where(eq(generatedGroovyFiles.importId, id))
+
   // Mark as processing
   await db
     .update(importSessions)
-    .set({ status: 'processing', updatedAt: new Date() })
+    .set({ status: 'processing', groovyFileCount: 0, updatedAt: new Date() })
     .where(eq(importSessions.id, id))
 
   const testCases = await db
@@ -99,11 +105,49 @@ export async function POST(_req: NextRequest, { params }: { params: Promise<{ id
     raw_data: (tc.rawData as Record<string, unknown>) ?? {},
   }))
 
+  // Generate all Groovy files in parallel to avoid sequential timeout
+  const generationPromises = apiTypes.map((apiType) =>
+    generateGroovyFile(apiType, parsedCases, apiKey)
+      .then((result) => ({ apiType, result, error: null }))
+      .catch((err) => ({
+        apiType,
+        result: null,
+        error: err instanceof Error ? err.message : String(err),
+      }))
+  )
+
+  const generationResults = await Promise.all(generationPromises)
+
   const results = []
   let hadError = false
 
-  for (const apiType of apiTypes) {
-    const result = await generateGroovyFile(apiType, parsedCases, apiKey)
+  for (const { apiType, result, error } of generationResults) {
+    if (error || !result) {
+      // Generation threw an exception before returning a result
+      const [inserted] = await db
+        .insert(generatedGroovyFiles)
+        .values({
+          importId: id,
+          fileName: `${apiType}.groovy`,
+          className: apiType,
+          apiType,
+          groovyContent: `// Generation failed: ${error}`,
+          status: 'failed',
+          errorMessage: error ?? 'Unknown error',
+        })
+        .returning()
+
+      results.push({
+        id: inserted.id,
+        file_name: inserted.fileName,
+        class_name: inserted.className,
+        api_type: inserted.apiType,
+        status: inserted.status,
+        error_message: inserted.errorMessage,
+      })
+      hadError = true
+      continue
+    }
 
     const [inserted] = await db
       .insert(generatedGroovyFiles)
