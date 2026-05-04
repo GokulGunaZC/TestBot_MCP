@@ -164,7 +164,7 @@ export const generateTestsAgent = inngest.createFunction(
               endpoint: '/api/generate-tests',
               agent: record.agent,
               latencyMs: record.latencyMs,
-              modelUsed: record.modelUsed ?? undefined,
+              modelUsed: resolveModel(record.modelUsed),
               tokensPrompt: record.tokensPrompt,
               tokensCompletion: record.tokensCompletion,
               tokensTotal: record.tokensTotal,

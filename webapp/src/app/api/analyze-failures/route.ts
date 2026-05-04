@@ -504,7 +504,7 @@ export async function POST(request: NextRequest) {
         userId,
         apiKeyId: apiKeyRecord.id,
         endpoint: ENDPOINT,
-        modelUsed: lastModelUsed,
+        modelUsed: resolveModel(lastModelUsed),
         tokensPrompt: totalPromptTokens,
         tokensCompletion: totalCompletionTokens,
         tokensTotal: totalTokensConsumed,

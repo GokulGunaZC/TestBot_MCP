@@ -6,6 +6,7 @@ import { hashApiKey } from '@/lib/utils/api-keys'
 import { parsePRD, hashPRD } from '@/lib/prd-parser'
 import { checkRateLimit } from '@/lib/rate-limit'
 import { checkTokenBalance, recordTokenUsage, MIN_TOKENS_PARSE_PRD, REC_TOKENS_PARSE_PRD } from '@/lib/tokens'
+import { resolveModel } from '@/lib/pricing'
 import { checkConcurrencyLimit } from '@/lib/concurrency-limit'
 import { checkAiGuard, recordAiCall } from '@/lib/ai-guard'
 import { logBlockedRequest } from '@/lib/security-logger'
@@ -144,7 +145,7 @@ export async function POST(request: NextRequest) {
         userId,
         endpoint: ENDPOINT,
         agent: 'parse_prd',
-        model: tokenUsage.modelUsed,
+        model: resolveModel(tokenUsage.modelUsed),
         tokensInput:  tokenUsage.promptTokens,
         tokensOutput: tokenUsage.completionTokens,
         referenceType: 'parse_prd',
@@ -154,7 +155,7 @@ export async function POST(request: NextRequest) {
         userId,
         apiKeyId: apiKeyRecord.id,
         endpoint: ENDPOINT,
-        modelUsed: tokenUsage.modelUsed,
+        modelUsed: resolveModel(tokenUsage.modelUsed),
         tokensPrompt: tokenUsage.promptTokens,
         tokensCompletion: tokenUsage.completionTokens,
         tokensTotal: tokenUsage.totalTokens,

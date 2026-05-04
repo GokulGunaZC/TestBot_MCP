@@ -447,7 +447,7 @@ export async function POST(request: NextRequest) {
           endpoint: ENDPOINT,
           agent: record.agent,
           latencyMs: record.latencyMs,
-          modelUsed: record.modelUsed ?? undefined,
+          modelUsed: resolveModel(record.modelUsed),
           tokensPrompt: record.tokensPrompt,
           tokensCompletion: record.tokensCompletion,
           tokensTotal: record.tokensTotal,
