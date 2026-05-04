@@ -10,6 +10,7 @@
     "webapp/src/app/api/exploration/plan/route.ts": { "maxDuration": 600 },
     "webapp/src/app/api/analyze-failures/route.ts": { "maxDuration": 600 },
     "webapp/src/app/api/test-runs/ingest/route.ts": { "maxDuration": 60 },
-    "webapp/src/app/api/test-runs/phase/route.ts": { "maxDuration": 10 }
+    "webapp/src/app/api/test-runs/phase/route.ts": { "maxDuration": 10 },
+    "webapp/src/app/api/import-tests/[id]/generate/route.ts": { "maxDuration": 600 }
   }
 }

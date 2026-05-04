@@ -17,7 +17,7 @@
 const Logger = require('./logger');
 
 // Heavy AI endpoints (generate-tests, parse-prd, exploration/plan, analyze-failures)
-// can legitimately take 10-20 minutes for non-trivial projects — gpt-5.4 runs on
+// can legitimately take 10-20 minutes for non-trivial projects — gpt-5.4-mini runs on
 // the Responses API with `reasoning: { effort: "high" }`, which trades latency
 // for quality. Default is intentionally long; lightweight endpoints pass their
 // own short timeoutMs explicitly.
@@ -34,19 +34,18 @@ const ENDPOINT_TIMEOUTS_MS = {
   validate: 6_000,
   phase: 4_000,
   ingest: 60_000,
-  analyze: 600_000,          // 10 min — gpt-5.4 high-reasoning triage
+  analyze: 600_000,          // 10 min — gpt-5.4-mini high-reasoning triage
   planExploration: 600_000,  // 10 min
   parsePRD: 600_000,         // 10 min
   generateTests: 1_200_000,  // 20 min — legacy monolithic code-gen
-  // Per-agent chunked generation. The webapp route declares
-  // `export const maxDuration = 60` (Vercel Hobby hard cap); this timeout
-  // leaves a 5-second client-side margin so the AbortError fires BEFORE
-  // Vercel's own 504, giving us a clean WEBAPP_TIMEOUT error code instead of
-  // an HTML gateway response.
-  generateTestsForAgent: 55_000,
-  // P1.5 planner pre-pass. Same 55s ceiling as generateTestsForAgent —
-  // `export const maxDuration = 60` on /api/generate-tests/plan.
-  planGeneration: 55_000,
+  // Per-agent chunked generation. Localhost-first: each agent slice routinely
+  // needs minutes under gpt-5.4-mini high-reasoning (frontend and error agents
+  // especially). Override via HEALIX_WEBAPP_TIMEOUT_MS if you need a tighter
+  // global ceiling. The old 55s value was a Vercel-hobby accommodation.
+  generateTestsForAgent: 600_000,
+  // P1.5 planner pre-pass. Same 10 min ceiling as generateTestsForAgent —
+  // planning can fan out acceptance criteria across the whole app.
+  planGeneration: 600_000,
   // P2-g async generation. The enqueue call should return in well under a
   // second — it only writes a row and returns a jobId — so this timeout is
   // deliberately tight to surface a "webapp is wedged" condition fast.
@@ -104,7 +103,7 @@ class WebappClient {
     this.dashboardUrl = normalizeLocalhost(dashboardUrl || process.env.HEALIX_DASHBOARD_URL || 'http://localhost:3000');
     this.timeoutMs = Number.isFinite(timeoutMs) ? timeoutMs : DEFAULT_TIMEOUT_MS;
     // When the webapp runs locally there is no Vercel 60 s hard cap.
-    // Use generous per-agent timeouts so gpt-5.4 high-reasoning can finish.
+    // Use generous per-agent timeouts so gpt-5.4-mini high-reasoning can finish.
     try {
       this._isLocal = LOCAL_HOSTS.has(new URL(this.dashboardUrl).hostname);
     } catch {

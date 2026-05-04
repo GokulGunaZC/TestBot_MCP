@@ -27,11 +27,10 @@ import { logBlockedRequest } from '@/lib/security-logger'
 
 const ENDPOINT = '/api/generate-tests'
 
-// Vercel Hobby caps any route at 60s. We declare it explicitly so the cap is
-// obvious in code, not silently inherited. Each call is now scoped to a single
-// agent (see `agents` body field) so the 60s ceiling is survivable — the MCP
-// fans out 5 parallel per-agent calls instead of one monolithic one.
-export const maxDuration = 60
+// Matches vercel.json maxDuration for this route. Previously set to 60 (Hobby
+// ceiling) but that silently killed agents before gpt-5.4-mini could respond.
+// Set to 800 to match vercel.json; local Next.js ignores this entirely.
+export const maxDuration = 800
 
 const KNOWN_AGENTS: readonly AgentName[] = ['smoke', 'frontend', 'api', 'workflow', 'error', 'expansion']
 
@@ -402,21 +401,16 @@ export async function POST(request: NextRequest) {
       agentPlanSlice,
       generatorConfig: {
         apiKey: process.env.OPENAI_API_KEY,
-        // gpt-5.4 only. The generator hardcodes this too, but we pass it
-        // explicitly so env drift is impossible.
-        model: 'gpt-5.4',
+        model: process.env.OPENAI_MODEL || 'gpt-4.1-mini',
         fallbackOnFailure: genOptions.strictAIGeneration !== true,
         enforceValidation: true,
         syntaxValidationMode: 'fail-open',
         strictAIGeneration: genOptions.strictAIGeneration === true,
-        // Sync path is gated by `export const maxDuration = 60` on Vercel —
-        // OpenAI must fail inside ~55s so we still have a moment to emit a
-        // fallback response before the function is killed. Outside Vercel
-        // (localhost / self-hosted) there is no such cap, and slower agents
-        // (frontend especially) legitimately need minutes, so we lift the
-        // ceiling. Async (Inngest) path sets its own timeout and does not
-        // touch this route.
-        timeout: process.env.VERCEL ? 55_000 : 540_000,
+        // Localhost-first: generation legitimately runs for minutes under
+        // gpt-5.4-mini high-reasoning, especially for the frontend and error
+        // agents. HEALIX_OPENAI_TIMEOUT_MS lets operators tighten this
+        // when running behind a reverse proxy with its own budget.
+        timeout: Number(process.env.HEALIX_OPENAI_TIMEOUT_MS) || 540_000,
       },
       onAgentComplete: async (record) => {
         agentTelemetry.push(record)

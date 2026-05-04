@@ -17,10 +17,10 @@ export class OpenAIClient {
         ? Number(config.timeout)
         : Number.isFinite(envTimeout) && envTimeout > 0
           ? envTimeout
-          : 540_000 // 9 min — gpt-5.4 can take minutes per call at reasoning:high
+          : 540_000 // 9 min — gpt-5.4-mini can take minutes per call at reasoning:high
 
     const envEffort = String(process.env.OPENAI_REASONING_EFFORT || '').toLowerCase()
-    // Default 'medium' for gpt-5.4: 2–3× faster than 'high' and 'high' occasionally
+    // Default 'medium' for gpt-5.4-mini: 2–3× faster than 'high' and 'high' occasionally
     // emits only a reasoning block with no message (→ tests:[] → pipeline failure).
     // Medium returns a message reliably in ~2s. Override via OPENAI_REASONING_EFFORT
     // or the per-client config option.
@@ -30,14 +30,12 @@ export class OpenAIClient {
         ? (envEffort as 'low' | 'medium' | 'high')
         : 'medium')
 
-    // gpt-5.4 only. No chat-fallback, no model alternates.
-    // gpt-5.4 runs on the Responses API (/v1/responses) with `input` +
-    // `reasoning`, per https://developers.openai.com/api/docs/quickstart.
+    const resolvedModel = config.model || process.env.OPENAI_MODEL || 'gpt-4.1-mini'
     this.config = {
       apiKey: config.apiKey,
-      model: 'gpt-5.4',
-      chatFallbackModel: 'gpt-5.4',
-      latestGPTModel: 'gpt-5.4',
+      model: resolvedModel,
+      chatFallbackModel: resolvedModel,
+      latestGPTModel: resolvedModel,
       modelFallbacks: [],
       maxTokens:
         config.maxTokens || parseInt(process.env.OPENAI_MAX_TOKENS || '4000') || 4000,
@@ -48,17 +46,25 @@ export class OpenAIClient {
   }
 
   async callOpenAI(messages: OpenAIMessage[], _options: { model?: string } = {}): Promise<OpenAICallResult> {
-    // Single model, single endpoint. No silent failover.
-    const result = await this.callResponsesAPI(messages, 'gpt-5.4')
-    return { text: result.text, usage: result.usage, modelUsed: 'gpt-5.4' }
+    const model = this.config.model
+    try {
+      const result = await this.callResponsesAPI(messages, model)
+      return { text: result.text, usage: result.usage, modelUsed: model }
+    } catch (err) {
+      // Responses API failed (model not found, format unsupported, etc.) —
+      // fall back to Chat Completions so the pipeline keeps working.
+      const msg = err instanceof Error ? err.message : String(err)
+      console.warn(`[openai-client] Responses API failed (${msg}), falling back to Chat Completions`)
+      const result = await this.callChatCompletionsAPI(messages, model)
+      return { text: result.text, usage: result.usage, modelUsed: model }
+    }
   }
 
   buildPreferredModelList(_requestedModel: string): string[] {
-    return ['gpt-5.4']
+    return [this.config.model]
   }
 
   isLikelyCodexModel(_model: string): boolean {
-    // All our calls go through gpt-5.4 on the Responses API.
     return true
   }
 
@@ -192,7 +198,7 @@ export class OpenAIClient {
           model,
           messages,
           temperature: this.config.temperature,
-          max_tokens: this.config.maxTokens,
+          max_completion_tokens: this.config.maxTokens,
         }),
         signal: controller.signal,
       })

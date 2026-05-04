@@ -79,11 +79,34 @@ interface QualityWarning {
   missingCategories?: string[];
 }
 
+interface AgentGenerationQuality {
+  valid?: boolean;
+  errorCode?: string;
+  errors?: string[];
+  totalTests?: number;
+  minGeneratedTests?: number;
+  coverageProfile?: string;
+  requiredCategories?: string[];
+  missingCategories?: string[];
+  categories?: Record<string, number>;
+}
+
+interface AgentMetaEntry {
+  agent: string;
+  generationMeta?: {
+    provider?: string;
+    startedAt?: string;
+    finishedAt?: string;
+    generationQuality?: AgentGenerationQuality;
+  };
+}
+
 interface GenerationMetaShape {
   chunkingStrategy?: string;
   agentsRequested?: string[];
   agentsCompleted?: string[];
   agentFailures?: AgentFailure[];
+  agentMeta?: AgentMetaEntry[];
   partialsWrittenCount?: number;
   partialGenerationWarning?: PartialGenerationWarning;
   qualityWarning?: QualityWarning;
@@ -1704,6 +1727,86 @@ function QualityWarningBanner({ warning }: { warning: QualityWarning }) {
   );
 }
 
+function AgentCoveragePanel({ agentMeta }: { agentMeta: AgentMetaEntry[] }) {
+  const rows = agentMeta
+    .map((entry) => {
+      const q = entry.generationMeta?.generationQuality ?? {};
+      const categories = q.categories ?? {};
+      const total = Number(q.totalTests ?? 0);
+      const required = Array.isArray(q.requiredCategories) ? q.requiredCategories : [];
+      const missing = Array.isArray(q.missingCategories) ? q.missingCategories : [];
+      const met = required.filter((c) => !missing.includes(c)).length;
+      return {
+        agent: entry.agent,
+        total,
+        valid: q.valid !== false,
+        errorCode: q.errorCode ?? null,
+        missing,
+        met,
+        totalRequired: required.length,
+        categories,
+      };
+    })
+    .sort((a, b) => a.agent.localeCompare(b.agent));
+
+  if (rows.length === 0) return null;
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 8 }}
+      animate={{ opacity: 1, y: 0 }}
+      className="glass-card rounded-2xl border border-white/8 p-5"
+    >
+      <div className="flex items-center justify-between gap-3 mb-3">
+        <div>
+          <div className="text-sm font-semibold text-[#F5F8FF]">Generation coverage by agent</div>
+          <div className="text-xs text-[#D8E8FF]/60">Per-agent test counts and missing required categories from this run.</div>
+        </div>
+      </div>
+      <div className="overflow-x-auto">
+        <table className="w-full text-xs">
+          <thead>
+            <tr className="text-left text-[#D8E8FF]/60">
+              <th className="py-2 pr-4 font-medium">Agent</th>
+              <th className="py-2 pr-4 font-medium">Tests</th>
+              <th className="py-2 pr-4 font-medium">Categories met</th>
+              <th className="py-2 pr-4 font-medium">Missing</th>
+              <th className="py-2 pr-4 font-medium">Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((row) => (
+              <tr key={row.agent} className="border-t border-white/5">
+                <td className="py-2 pr-4 font-mono text-[#F5F8FF]">{row.agent}</td>
+                <td className="py-2 pr-4 font-mono text-[#F5F8FF]">{row.total}</td>
+                <td className="py-2 pr-4 font-mono text-[#D8E8FF]/80">
+                  {row.totalRequired > 0 ? `${row.met}/${row.totalRequired}` : '—'}
+                </td>
+                <td className="py-2 pr-4 text-[#D8E8FF]/80">
+                  {row.missing.length === 0 ? (
+                    <span className="text-emerald-300/90">none</span>
+                  ) : (
+                    <span className="font-mono text-[11px]">{row.missing.join(', ')}</span>
+                  )}
+                </td>
+                <td className="py-2 pr-4">
+                  {row.valid ? (
+                    <span className="px-2 py-0.5 rounded bg-emerald-500/10 border border-emerald-500/30 text-emerald-300/90 text-[11px]">ok</span>
+                  ) : (
+                    <span className="px-2 py-0.5 rounded bg-amber-500/10 border border-amber-500/30 text-[#FCD34D] text-[11px] font-mono">
+                      {row.errorCode ?? 'shortfall'}
+                    </span>
+                  )}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </motion.div>
+  );
+}
+
 function PartialGenerationBanner({
   warning,
   agentFailures,
@@ -2211,7 +2314,19 @@ export default function TestRunDetailPage() {
           }
           if (data.eventType === 'test_result' && (data.metadata as Record<string, unknown>)?.test) {
             const t = (data.metadata as Record<string, unknown>).test as LiveTestResult;
-            setLiveTestResults(prev => [...prev, t]);
+            // Playwright emits one test_result per attempt; with retries=2 a single
+            // failing test fires up to 3 events. Key on (suite, name, file) and keep
+            // the latest outcome so counts reflect distinct tests, not attempts.
+            setLiveTestResults(prev => {
+              const key = `${t.su ?? ''}::${t.n ?? ''}::${t.f ?? ''}`;
+              const idx = prev.findIndex(x => `${x.su ?? ''}::${x.n ?? ''}::${x.f ?? ''}` === key);
+              if (idx >= 0) {
+                const next = prev.slice();
+                next[idx] = t;
+                return next;
+              }
+              return [...prev, t];
+            });
           }
           if (data.eventType === 'test_results' && Array.isArray((data.metadata as Record<string, unknown>)?.tests)) {
             const batch = (data.metadata as Record<string, unknown>).tests as LiveTestResult[];
@@ -2499,9 +2614,16 @@ export default function TestRunDetailPage() {
   const liveFailed = liveTestResults.filter(t => t.s === 'failed').length;
   const liveSkipped = liveTestResults.filter(t => t.s === 'skipped').length;
   const liveTotal = liveTestResults.length;
-  const hasLiveStats = liveTotal > 0;
+  // Only treat live as the primary source while the pipeline is still running.
+  // Once pipelineEnded fires, the ingested report (testRun.* / report.stats) is
+  // authoritative — preferring live here caused mismatches like All(17)/Passed(14)/Failed(61)
+  // because "All" is driven off displayTests while the other pills were driven off
+  // liveTotal, which accumulates retry attempts.
+  const reportTotal = testRun.total_tests || report?.summary?.total || report?.stats?.total || 0;
+  const hasIngestedStats = reportTotal > 0;
+  const hasLiveStats = liveTotal > 0 && !(pipelineEnded && hasIngestedStats);
 
-  // Priority: pipeline_error (zero real tests ran) > live > DB stats > generated > real
+  // Priority: pipeline_error (zero real tests ran) > live (mid-run only) > DB stats > generated > real
   //
   // When the pipeline errored before any test reported, the ingest payload
   // still carries the fake synthetic row in testRun.total_tests / failed_tests.
@@ -2512,7 +2634,7 @@ export default function TestRunDetailPage() {
     ? 0
     : (hasLiveStats
         ? liveTotal
-        : (testRun.total_tests || report?.summary?.total || report?.stats?.total || generatedTestCount || realTestsCount));
+        : (reportTotal || generatedTestCount || realTestsCount));
   const passedTests = pipelineError ? 0 : (hasLiveStats ? livePassed : (testRun.passed_tests || report?.summary?.passed || report?.stats?.passed || displayTests.filter(t => ['passed', 'pass'].includes(t.status.toLowerCase())).length));
   const failedTests = pipelineError ? 0 : (hasLiveStats ? liveFailed : (testRun.failed_tests || report?.summary?.failed || report?.stats?.failed || displayTests.filter(t => ['failed', 'fail'].includes(t.status.toLowerCase())).length));
   const skippedTests = pipelineError ? 0 : (hasLiveStats ? liveSkipped : (testRun.skipped_tests || report?.summary?.skipped || report?.stats?.skipped || displayTests.filter(t => ['skipped', 'skip', 'pending'].includes(t.status.toLowerCase())).length));
@@ -2648,6 +2770,10 @@ export default function TestRunDetailPage() {
 
       {!pipelineError && qualityWarning && qualityWarning.suggestions?.length > 0 && (
         <QualityWarningBanner warning={qualityWarning} />
+      )}
+
+      {Array.isArray(generationMeta?.agentMeta) && generationMeta!.agentMeta!.length > 0 && (
+        <AgentCoveragePanel agentMeta={generationMeta!.agentMeta!} />
       )}
 
       {(testRun.is_live || !!liveMeta || !!testRun.current_phase || !!testRun.error_code || liveEvents.length > 0) && (
@@ -2981,7 +3107,7 @@ export default function TestRunDetailPage() {
                       : 'bg-white/5 text-[#4A6280] border border-transparent hover:border-white/10'
                   }`}
                 >
-                  {f === 'all' ? `All (${displayTests.length})` : f === 'passed' ? `Passed (${passedTests})` : f === 'failed' ? `Failed (${failedTests})` : `Skipped (${skippedTests})`}
+                  {f === 'all' ? `All (${totalTests})` : f === 'passed' ? `Passed (${passedTests})` : f === 'failed' ? `Failed (${failedTests})` : `Skipped (${skippedTests})`}
                 </button>
               ))}
               <div className="w-px h-4 bg-white/10 mx-1" />

@@ -66,7 +66,7 @@ export async function runPlannerAgent(_input: PlannerInput): Promise<AgentPlan |
 // ────────────────────────────────────────────────────────────────────────────
 // P1.5 — Frontend / Backend planner pass
 //
-// One gpt-5.4 call per axis (frontend, backend) BEFORE the per-agent fan-out.
+// One gpt-5.4-mini call per axis (frontend, backend) BEFORE the per-agent fan-out.
 // The MCP pipeline-worker calls this via /api/generate-tests/plan so every
 // subsequent per-agent call ships with a scoped slice ("ONLY these targets"),
 // eliminating duplicate "what's worth testing" reasoning.
@@ -77,7 +77,7 @@ export async function runPlannerAgent(_input: PlannerInput): Promise<AgentPlan |
 // pushing a `dropped_hallucination` warning so the dashboard can surface it.
 // ────────────────────────────────────────────────────────────────────────────
 
-const PLANNER_TIMEOUT_MS = 30_000
+const PLANNER_TIMEOUT_MS = Number(process.env.HEALIX_PLANNER_TIMEOUT_MS) || 300_000
 const PAGE_CAP = 60
 const ENDPOINT_CAP = 80
 
@@ -114,7 +114,7 @@ function buildClient(): OpenAIClient | null {
   if (!apiKey) return null
   return new OpenAIClient({
     apiKey,
-    model: 'gpt-5.4',
+    model: process.env.OPENAI_MODEL || 'gpt-4.1-mini',
     temperature: 0.1,
     timeout: PLANNER_TIMEOUT_MS,
   })
@@ -262,7 +262,7 @@ function hasEmptyContext(ctx: PlanContext): boolean {
 }
 
 /**
- * Ask gpt-5.4 for a structured frontend plan. The response MUST be a JSON
+ * Ask gpt-5.4-mini for a structured frontend plan. The response MUST be a JSON
  * object — we instruct "no prose, no code" and strip any ```json fences
  * defensively. Hallucinated page paths (not in ctx.context.pages) are
  * dropped with a `dropped_hallucination` warning.
@@ -396,7 +396,7 @@ export async function planFrontend(ctx: PlanContext): Promise<FrontendPlanResult
 }
 
 /**
- * Ask gpt-5.4 for a structured backend plan. Hallucinated endpoint paths
+ * Ask gpt-5.4-mini for a structured backend plan. Hallucinated endpoint paths
  * (method+path not present in ctx.context.apiEndpoints) are dropped.
  */
 export async function planBackend(ctx: PlanContext): Promise<BackendPlanResult> {

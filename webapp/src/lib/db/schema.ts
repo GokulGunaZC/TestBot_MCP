@@ -171,31 +171,65 @@ export const mcpTelemetryEvents = pgTable(
   ]
 )
 
-export const testLists = pgTable('test_lists', {
-  id: uuid('id').primaryKey().defaultRandom(),
-  userId: uuid('user_id')
-    .notNull()
-    .references(() => profiles.id, { onDelete: 'cascade' }),
-  name: text('name').notNull(),
-  description: text('description'),
-  testCount: integer('test_count').default(0),
-  lastRunAt: timestamp('last_run_at', { withTimezone: true }),
-  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
-  updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow(),
-})
+export const importSessions = pgTable(
+  'import_sessions',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => profiles.id, { onDelete: 'cascade' }),
+    name: text('name').notNull(),
+    description: text('description'),
+    originalFilename: text('original_filename').notNull(),
+    fileStoragePath: text('file_storage_path'),
+    status: text('status').notNull().default('pending'), // pending | processing | completed | failed
+    testCaseCount: integer('test_case_count').default(0),
+    groovyFileCount: integer('groovy_file_count').default(0),
+    errorMessage: text('error_message'),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow(),
+  },
+  (table) => [index('import_sessions_user_id_idx').on(table.userId)]
+)
 
-export const testListItems = pgTable('test_list_items', {
-  id: uuid('id').primaryKey().defaultRandom(),
-  listId: uuid('list_id')
-    .notNull()
-    .references(() => testLists.id, { onDelete: 'cascade' }),
-  testRunId: uuid('test_run_id').references(() => testRuns.id, {
-    onDelete: 'set null',
-  }),
-  testName: text('test_name').notNull(),
-  testConfig: jsonb('test_config'),
-  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
-})
+export const importedTestCases = pgTable(
+  'imported_test_cases',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    importId: uuid('import_id')
+      .notNull()
+      .references(() => importSessions.id, { onDelete: 'cascade' }),
+    tcId: text('tc_id').notNull(),
+    active: text('active'),
+    functionalArea: text('functional_area'),
+    scenario: text('scenario'),
+    description: text('description'),
+    environmentName: text('environment_name'),
+    ndcVersion: text('ndc_version'),
+    pcc: text('pcc'),
+    rawData: jsonb('raw_data'),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
+  },
+  (table) => [index('imported_test_cases_import_id_idx').on(table.importId)]
+)
+
+export const generatedGroovyFiles = pgTable(
+  'generated_groovy_files',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    importId: uuid('import_id')
+      .notNull()
+      .references(() => importSessions.id, { onDelete: 'cascade' }),
+    fileName: text('file_name').notNull(),
+    className: text('class_name').notNull(),
+    apiType: text('api_type').notNull(),
+    groovyContent: text('groovy_content').notNull(),
+    status: text('status').notNull().default('generated'), // generated | failed
+    errorMessage: text('error_message'),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
+  },
+  (table) => [index('generated_groovy_files_import_id_idx').on(table.importId)]
+)
 
 export const testArtifacts = pgTable(
   'test_artifacts',
@@ -278,7 +312,7 @@ export const projectUsage = pgTable(
 /**
  * P1.5 planner-pass cache. Each user's (prd + parsedPRD + contextDigest +
  * projectInfoDigest + roles) hash maps to a single cached GenerationPlan
- * for 24h. Skipping the planner on a cache hit eliminates two gpt-5.4 calls
+ * for 24h. Skipping the planner on a cache hit eliminates two gpt-5.4-mini calls
  * per pipeline run for repeat generations against the same repo snapshot.
  */
 export const generationPlans = pgTable(

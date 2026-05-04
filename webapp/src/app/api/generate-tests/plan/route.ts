@@ -29,10 +29,9 @@ import { logBlockedRequest } from '@/lib/security-logger'
 
 const ENDPOINT = '/api/generate-tests/plan'
 
-// Matches the sibling generate-tests route — 60s Vercel Hobby ceiling. The
-// planner itself uses a 30s timeout per call, so two parallel planners plus
-// bookkeeping comfortably fit under 60s.
-export const maxDuration = 60
+// Raised from 60 (Vercel Hobby) to 600 to match vercel.json and give
+// gpt-5.4-mini enough runway on complex PRDs. Local Next.js ignores this.
+export const maxDuration = 600
 
 function canonicalJSON(value: unknown): string {
   // Stable stringify: sort object keys recursively so the hash is
@@ -361,7 +360,18 @@ export async function POST(request: NextRequest) {
       console.warn('[generate-tests/plan] cache insert failed (non-fatal)', insertErr)
     }
 
+<<<<<<< bugfix/tokens-gating
     const responseBody = { success: true, plan, cache: 'miss' as const, plannerTokens }
+=======
+    // Deduct a flat token cost per planner run (one gpt-5.4-mini call per axis).
+    try {
+      await deductTokens({ userId, tokensUsed: PLANNER_TOKEN_COST })
+    } catch (deductErr) {
+      console.warn('[generate-tests/plan] token deduction failed (non-fatal)', deductErr)
+    }
+
+    const responseBody = { success: true, plan, cache: 'miss' as const }
+>>>>>>> capillary/sabre
 
     if (idempotencyKey) {
       await storeIdempotencyResult({

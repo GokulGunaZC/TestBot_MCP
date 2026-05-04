@@ -22,11 +22,8 @@ import {
 const ENDPOINT = '/api/analyze-failures'
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY
-// gpt-5.4 is the only model we run. It uses the Responses API (not
-// chat/completions) — see https://developers.openai.com/api/docs/quickstart.
-// No silent fallback: if gpt-5.4 fails, surface the error.
-const OPENAI_MODEL = 'gpt-5.4'
-// gpt-5.4 with reasoning:high can run 5+ minutes on evidence-heavy triage.
+const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4.1-mini'
+// gpt-5.4-mini with reasoning:high can run 5+ minutes on evidence-heavy triage.
 const OPENAI_TIMEOUT = 540_000 // 9 minutes
 
 const MAX_FAILURES = 8

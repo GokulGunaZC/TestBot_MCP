@@ -270,7 +270,7 @@ module.exports = defineConfig({
   testDir: ${JSON.stringify(testDir)},
   fullyParallel: true,
   forbidOnly: !!process.env.CI,
-  retries: 0,
+  retries: 1,
   workers: 2,
   reporter: [
     ['list'],
@@ -591,8 +591,16 @@ module.exports = defineConfig({
       args.push('--reporter', 'json');
     }
 
-    if (!configPath && Number.isInteger(this.config.playwrightRetries)) {
-      args.push('--retries', String(Math.max(0, this.config.playwrightRetries)));
+    if (!configPath) {
+      // Default to 1 retry when MCP synthesises the Playwright invocation so
+      // transient flakes (port races on cold dev servers, network blips) don't
+      // masquerade as real failures — but retries-as-success is still surfaced
+      // by the results parser (isFlaky → results.flaky) so we don't launder
+      // real failures. End-user projects with their own playwright.config.*
+      // are untouched.
+      const retriesRaw = this.config.playwrightRetries;
+      const retries = Number.isInteger(retriesRaw) ? Math.max(0, retriesRaw) : 1;
+      args.push('--retries', String(retries));
     }
 
     if (!configPath && Number.isFinite(Number(this.config.testTimeoutMs))) {
@@ -680,8 +688,10 @@ module.exports = defineConfig({
 
       // Test name: everything after the status icon (and optional test-number)
       // Typical: "  ✓  1 login.spec.ts › should log in (234ms)"
+      // Multi-project output includes a "[Project Name] \u203a " prefix per test;
+      // strip it so the same test across Tier A/B/C isn't counted N times.
       const nameMatch = stripped.match(/[\u2713\u2714\u2717\u00d7\u2715\u2718\u25cb]\s+(?:\d+\s+)?(.+?)(?:\s+\(\d+(?:\.\d+)?(?:ms|s)\))?\s*$/);
-      const name = nameMatch ? nameMatch[1].trim() : '';
+      const name = nameMatch ? nameMatch[1].trim().replace(/^\[[^\]]*\]\s*[\u203a>]\s*/, '') : '';
 
       if (name) {
         onProgress({ status, name, durationMs });
@@ -1094,7 +1104,7 @@ test.describe('${this.sanitizeString(scenario.name)}', () => {
    * Run Playwright tests
    */
   async runTests() {
-    if (this.config.startCommand) {
+    if (this.config.startCommand && !this.config._primaryAppPreStarted) {
       await this.startServer();
     }
 
@@ -1662,6 +1672,14 @@ test.describe('${this.sanitizeString(scenario.name)}', () => {
       const fetchFn = global.fetch || ((url) => import('node-fetch').then((module) => module.default(url)));
       const startedAt = Date.now();
 
+      const emitReadyTelemetry = (probeUrl) => {
+        if (typeof this.config.onServerReady === 'function') {
+          try {
+            this.config.onServerReady({ elapsedMs: Date.now() - startedAt, url: probeUrl });
+          } catch { /* non-fatal telemetry */ }
+        }
+      };
+
       const checkServer = async () => {
         while (Date.now() - startedAt < startupTimeoutMs) {
           if (serverExited) {
@@ -1680,6 +1698,7 @@ test.describe('${this.sanitizeString(scenario.name)}', () => {
               if (response.ok || response.status < 500) {
                 Logger.info('PlaywrightIntegration', 'Server is ready', { probeUrl });
                 updateRuntimeBaseURL(probeUrl);
+                emitReadyTelemetry(probeUrl);
                 finish();
                 return;
               }
@@ -1701,6 +1720,7 @@ test.describe('${this.sanitizeString(scenario.name)}', () => {
                 if (tcpReady) {
                   Logger.info('PlaywrightIntegration', 'Server is ready (TCP fallback)', { probeUrl, sawLogHint: sawReadinessLogHint, elapsedMs });
                   updateRuntimeBaseURL(lastDetectedProbeUrl || probeUrl);
+                  emitReadyTelemetry(lastDetectedProbeUrl || probeUrl);
                   finish();
                   return;
                 }
