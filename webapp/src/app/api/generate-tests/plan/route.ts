@@ -22,6 +22,7 @@ import {
 } from '@/lib/test-generation/plan-schema'
 import { checkRateLimit } from '@/lib/rate-limit'
 import { checkTokenBalance, recordTokenUsage, MIN_TOKENS_PLAN, REC_TOKENS_PLAN } from '@/lib/tokens'
+import { resolveModel } from '@/lib/pricing'
 import { checkAiGuard, recordAiCall } from '@/lib/ai-guard'
 import { checkConcurrencyLimit } from '@/lib/concurrency-limit'
 import { checkIdempotency, storeIdempotencyResult } from '@/lib/idempotency'
@@ -311,7 +312,10 @@ export async function POST(request: NextRequest) {
             userId,
             endpoint: ENDPOINT,
             agent: 'planner',
-            model: 'gpt-5.4-mini',
+            // PlannerTokenUsage doesn't surface modelUsed today — falls
+            // through to OPENAI_MODEL via resolveModel(), which is the same
+            // env the planner-agent reads when it makes the call.
+            model: resolveModel(null),
             tokensInput:  plannerPrompt,
             tokensOutput: plannerCompletion,
             referenceType: 'plan',
@@ -321,7 +325,7 @@ export async function POST(request: NextRequest) {
             userId,
             apiKeyId: apiKeyRecord.id,
             endpoint: ENDPOINT,
-            modelUsed: 'gpt-5.4-mini',
+            modelUsed: resolveModel(null),
             tokensPrompt: plannerPrompt,
             tokensCompletion: plannerCompletion,
             tokensTotal: plannerTotal,

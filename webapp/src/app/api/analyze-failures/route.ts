@@ -5,6 +5,7 @@ import { eq, and } from 'drizzle-orm'
 import { hashApiKey } from '@/lib/utils/api-keys'
 import { checkRateLimit } from '@/lib/rate-limit'
 import { checkTokenBalance, recordTokenUsage, MIN_TOKENS_ANALYZE, REC_TOKENS_ANALYZE } from '@/lib/tokens'
+import { resolveModel } from '@/lib/pricing'
 import { checkIdempotency, storeIdempotencyResult } from '@/lib/idempotency'
 import { validateAnalyzeFailures } from '@/lib/validation'
 import { checkAiGuard, recordAiCall } from '@/lib/ai-guard'
@@ -493,7 +494,7 @@ export async function POST(request: NextRequest) {
         userId,
         endpoint: ENDPOINT,
         agent: 'analyze_failures',
-        model: lastModelUsed || 'gpt-5.4',
+        model: resolveModel(lastModelUsed),
         tokensInput:  totalPromptTokens,
         tokensOutput: totalCompletionTokens,
         referenceType: 'analyze_failures',

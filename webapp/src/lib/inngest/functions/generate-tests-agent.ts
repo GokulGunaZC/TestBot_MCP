@@ -40,6 +40,7 @@ import { eq, sql } from 'drizzle-orm'
 import { dispatchAgents } from '@/lib/test-generation/agent-dispatcher'
 import type { AgentName, GenerateTestsParams, AgentRunRecord } from '@/lib/test-generation/types'
 import { recordTokenUsage } from '@/lib/tokens'
+import { resolveModel } from '@/lib/pricing'
 import { profiles } from '@/lib/db/schema'
 import { recordAiCall } from '@/lib/ai-guard'
 
@@ -147,7 +148,7 @@ export const generateTestsAgent = inngest.createFunction(
                 userId: job.userId,
                 endpoint: '/api/generate-tests',
                 agent: record.agent,
-                model: record.modelUsed || 'gpt-5.4',
+                model: resolveModel(record.modelUsed),
                 tokensInput:  record.tokensPrompt ?? 0,
                 tokensOutput: record.tokensCompletion ?? 0,
                 referenceType: 'test_run',

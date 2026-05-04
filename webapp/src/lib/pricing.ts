@@ -107,7 +107,33 @@ export const MODEL_RATES: Record<string, ModelRate> = {
   },
 }
 
-const FALLBACK_MODEL = 'gpt-5.4'
+// Last-resort model name when neither the OpenAI response nor OPENAI_MODEL
+// is available. Kept here so changing the codebase default is a one-file
+// edit, not a grep-and-replace across every recordTokenUsage call site.
+const FALLBACK_MODEL = 'gpt-5.4-mini'
+
+/**
+ * Resolve which model string to record on a token-ledger entry.
+ *
+ *   1. The model the API call actually returned (`claimedModel`) — most
+ *      accurate. OpenAI echoes the resolved model on every response.
+ *   2. The configured default (`process.env.OPENAI_MODEL`) — what we asked
+ *      for, when the response didn't carry it (errors, fallbacks).
+ *   3. `FALLBACK_MODEL` — only when env is unset. Should never normally
+ *      reach the ledger; kept as a safety net so cost rows don't have NULL
+ *      models.
+ *
+ * Use this everywhere you'd otherwise write
+ *   `model: claimed || 'gpt-X.Y'`
+ * — that pattern lies in two ways: it ignores OPENAI_MODEL and bakes the
+ * default into many files at once.
+ */
+export function resolveModel(claimedModel: string | null | undefined): string {
+  if (claimedModel && claimedModel.trim()) return claimedModel
+  const envModel = process.env.OPENAI_MODEL?.trim()
+  if (envModel) return envModel
+  return FALLBACK_MODEL
+}
 
 /**
  * Resolve the per-token rate tier for a model. Picks the long-context tier

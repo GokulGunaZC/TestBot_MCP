@@ -18,6 +18,7 @@ import type {
 import { CURRENT_PLAN_VERSION } from '@/lib/test-generation/plan-schema'
 import { checkRateLimit } from '@/lib/rate-limit'
 import { checkTokenBalance, recordTokenUsage, MIN_TOKENS_GENERATE, REC_TOKENS_GENERATE } from '@/lib/tokens'
+import { resolveModel } from '@/lib/pricing'
 import { checkConcurrencyLimit } from '@/lib/concurrency-limit'
 import { checkIdempotency, storeIdempotencyResult } from '@/lib/idempotency'
 import { validateGenerateTests } from '@/lib/validation'
@@ -429,7 +430,7 @@ export async function POST(request: NextRequest) {
             userId,
             endpoint: ENDPOINT,
             agent: record.agent,
-            model: record.modelUsed || 'gpt-5.4',
+            model: resolveModel(record.modelUsed),
             tokensInput:  record.tokensPrompt ?? 0,
             tokensOutput: record.tokensCompletion ?? 0,
             referenceType: 'test_run',
