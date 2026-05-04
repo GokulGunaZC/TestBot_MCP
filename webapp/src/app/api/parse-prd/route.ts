@@ -5,7 +5,7 @@ import { eq, and } from 'drizzle-orm'
 import { hashApiKey } from '@/lib/utils/api-keys'
 import { parsePRD, hashPRD } from '@/lib/prd-parser'
 import { checkRateLimit } from '@/lib/rate-limit'
-import { checkTokenBalance, deductTokens } from '@/lib/tokens'
+import { checkTokenBalance, recordTokenUsage, MIN_TOKENS_PARSE_PRD, REC_TOKENS_PARSE_PRD } from '@/lib/tokens'
 import { checkConcurrencyLimit } from '@/lib/concurrency-limit'
 import { checkAiGuard, recordAiCall } from '@/lib/ai-guard'
 import { logBlockedRequest } from '@/lib/security-logger'
@@ -124,9 +124,9 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'RATE_LIMIT_EXCEEDED' }, { status: 429 })
     }
 
-    const tokenCheck = await checkTokenBalance({ userId, endpoint: ENDPOINT })
+    const tokenCheck = await checkTokenBalance({ userId, endpoint: ENDPOINT, minRequired: MIN_TOKENS_PARSE_PRD, recommended: REC_TOKENS_PARSE_PRD })
     if (!tokenCheck.allowed) {
-      return NextResponse.json({ error: 'No tokens remaining. Please renew your plan.' }, { status: 402 })
+      return NextResponse.json({ error: tokenCheck.reason }, { status: 402 })
     }
 
     await db
@@ -140,7 +140,16 @@ export async function POST(request: NextRequest) {
     })
 
     if (tokenUsage.totalTokens > 0) {
-      await deductTokens({ userId, tokensUsed: tokenUsage.totalTokens })
+      await recordTokenUsage({
+        userId,
+        endpoint: ENDPOINT,
+        agent: 'parse_prd',
+        model: tokenUsage.modelUsed,
+        tokensInput:  tokenUsage.promptTokens,
+        tokensOutput: tokenUsage.completionTokens,
+        referenceType: 'parse_prd',
+        referenceId: prdHash,
+      })
       await recordAiCall({
         userId,
         apiKeyId: apiKeyRecord.id,
@@ -149,6 +158,7 @@ export async function POST(request: NextRequest) {
         tokensPrompt: tokenUsage.promptTokens,
         tokensCompletion: tokenUsage.completionTokens,
         tokensTotal: tokenUsage.totalTokens,
+        agent: 'parse_prd',
       })
     }
 

@@ -2086,6 +2086,45 @@ function SuggestedFixBlock({ error }: { error: PipelineErrorShape }) {
   );
 }
 
+function OutOfCreditsBanner({ runId }: { runId: string }) {
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: -6 }}
+      animate={{ opacity: 1, y: 0 }}
+      className="glass-card rounded-2xl overflow-hidden border border-amber-500/25 bg-amber-500/[0.04]"
+      id={`pipeline-error-${runId}`}
+    >
+      <div className="px-5 py-5 flex items-start gap-4">
+        <div className="w-10 h-10 rounded-lg bg-amber-500/15 border border-amber-500/30 flex items-center justify-center flex-shrink-0">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#FBBF24" strokeWidth="2.2">
+            <circle cx="12" cy="12" r="10" /><path d="M12 8v4M12 16h.01" />
+          </svg>
+        </div>
+        <div className="flex-1 min-w-0">
+          <div className="text-[#FDE68A] font-semibold text-[15px]">You&apos;ve run out of credits</div>
+          <div className="text-[#F0F6FF]/85 text-sm mt-1 leading-relaxed">
+            Your account doesn&apos;t have enough credits to run a full test generation. Upgrade your plan or wait for the next billing cycle to continue.
+          </div>
+          <div className="mt-3 flex items-center gap-2">
+            <Link
+              href="/plan-billing"
+              className="px-3.5 py-1.5 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 border border-amber-500/40 text-[#FDE68A] text-xs font-semibold transition-colors"
+            >
+              Upgrade Plan →
+            </Link>
+            <Link
+              href="/all-tests"
+              className="px-3.5 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 text-[#D8E8FF]/80 text-xs font-semibold transition-colors"
+            >
+              Back to All Tests
+            </Link>
+          </div>
+        </div>
+      </div>
+    </motion.div>
+  );
+}
+
 function PipelineErrorBanner({ error, runId }: { error: PipelineErrorShape; runId: string }) {
   const [stderrOpen, setStderrOpen] = useState(true);
   const [specOpen, setSpecOpen] = useState(false);
@@ -2094,6 +2133,12 @@ function PipelineErrorBanner({ error, runId }: { error: PipelineErrorShape; runI
   const stage = error.stage || 'unknown';
   const reason = error.reason || 'unknown_reason';
   const code = error.errorCode || null;
+
+  const errorBlob = `${code ?? ''} ${error.userFacingMessage ?? ''} ${error.stderr ?? ''} ${reason}`;
+  const isCreditsError = /INSUFFICIENT_CREDITS|No credits remaining|Insufficient credits/i.test(errorBlob);
+  if (isCreditsError) {
+    return <OutOfCreditsBanner runId={runId} />;
+  }
 
   const stageLabel =
     stage === 'validation' ? 'Generated tests failed Playwright validation' :

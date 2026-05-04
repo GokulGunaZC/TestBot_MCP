@@ -380,3 +380,109 @@ export const generationJobs = pgTable(
     ),
   ]
 )
+
+/**
+ * Append-only audit log of every token movement. Replaces the implicit
+ * accounting that used to live only as a single row in `profiles`. Two kinds
+ * of rows:
+ *
+ *   - debit  → an AI call consumed tokens (tokensDelta is negative)
+ *   - credit → a top-up event (tokensDelta is positive). Credits come from
+ *              stripe payments, plan upgrades, or manual grants.
+ *
+ * `balanceAfter` is the user's running balance immediately after this row was
+ * inserted, so the latest row's balance is the source of truth for
+ * "tokens remaining" (and `profiles.tokensRemaining` becomes a cache).
+ *
+ * Cost columns are SNAPSHOTTED at write time. OpenAI changes prices; old
+ * rows must remain reproducible. `inputRateUsd`/`outputRateUsd` capture the
+ * rate that was in effect when the row was written.
+ */
+export const tokenLedger = pgTable(
+  'token_ledger',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => profiles.id, { onDelete: 'cascade' }),
+    entryType: text('entry_type').notNull(), // 'debit' | 'credit'
+    endpoint: text('endpoint'),              // '/api/generate-tests' etc.; null on credits
+    agent: text('agent'),                    // 'smoke'|'frontend'|'api'|...; null on credits
+    model: text('model'),                    // 'gpt-5.4' etc.; null on credits
+    tokensInput: bigint('tokens_input', { mode: 'number' }).default(0).notNull(),
+    tokensOutput: bigint('tokens_output', { mode: 'number' }).default(0).notNull(),
+    tokensTotal: bigint('tokens_total', { mode: 'number' }).default(0).notNull(),
+    tokensDelta: bigint('tokens_delta', { mode: 'number' }).notNull(), // signed: debit<0, credit>0
+    balanceAfter: bigint('balance_after', { mode: 'number' }).notNull(),
+    inputRateUsd: numeric('input_rate_usd', { precision: 16, scale: 12 }),
+    outputRateUsd: numeric('output_rate_usd', { precision: 16, scale: 12 }),
+    costInputUsd: numeric('cost_input_usd', { precision: 12, scale: 8 }),
+    costOutputUsd: numeric('cost_output_usd', { precision: 12, scale: 8 }),
+    costUsd: numeric('cost_usd', { precision: 12, scale: 8 }),
+    referenceType: text('reference_type'),   // 'test_run' | 'plan' | 'stripe_payment' | 'manual'
+    referenceId: text('reference_id'),
+    metadata: jsonb('metadata'),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    index('token_ledger_user_created_idx').on(table.userId, table.createdAt.desc()),
+    index('token_ledger_user_agent_idx').on(table.userId, table.agent),
+    index('token_ledger_reference_idx').on(table.referenceType, table.referenceId),
+    check(
+      'token_ledger_entry_type_check',
+      sql`entry_type IN ('debit','credit')`
+    ),
+    check(
+      'token_ledger_agent_check',
+      sql`agent IS NULL OR agent IN ('smoke','frontend','api','workflow','error','expansion','planner','parse_prd','analyze_failures')`
+    ),
+  ]
+)
+
+/**
+ * One row per Stripe payment event (or manual grant). The token grant for a
+ * payment lives as a `credit` entry in `token_ledger` with
+ * `referenceType='stripe_payment'` and `referenceId=payments.id`.
+ *
+ * `rawEvent` keeps the full Stripe payload so we can replay a webhook locally
+ * without scraping the dashboard.
+ */
+export const payments = pgTable(
+  'payments',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => profiles.id, { onDelete: 'cascade' }),
+    provider: text('provider').notNull().default('stripe'), // 'stripe' | 'manual'
+    providerPaymentId: text('provider_payment_id'),         // payment_intent / charge id
+    providerCustomerId: text('provider_customer_id'),
+    providerSessionId: text('provider_session_id'),         // checkout.session id
+    amountCents: integer('amount_cents').notNull(),
+    currency: text('currency').notNull().default('usd'),
+    status: text('status').notNull(),                       // pending|succeeded|failed|refunded
+    plan: text('plan'),                                     // 'starter' | 'team' | …
+    tokensGranted: bigint('tokens_granted', { mode: 'number' }).default(0).notNull(),
+    billingPeriodStart: timestamp('billing_period_start', { withTimezone: true }),
+    billingPeriodEnd: timestamp('billing_period_end', { withTimezone: true }),
+    invoiceUrl: text('invoice_url'),
+    rawEvent: jsonb('raw_event'),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    index('payments_user_created_idx').on(table.userId, table.createdAt.desc()),
+    uniqueIndex('payments_provider_payment_id_idx')
+      .on(table.providerPaymentId)
+      .where(sql`provider_payment_id IS NOT NULL`),
+    index('payments_status_idx').on(table.status),
+    check(
+      'payments_provider_check',
+      sql`provider IN ('stripe','manual')`
+    ),
+    check(
+      'payments_status_check',
+      sql`status IN ('pending','succeeded','failed','refunded')`
+    ),
+  ]
+)

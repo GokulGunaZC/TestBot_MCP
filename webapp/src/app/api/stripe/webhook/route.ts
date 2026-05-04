@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import Stripe from 'stripe'
 import { db } from '@/lib/db'
-import { profiles } from '@/lib/db/schema'
+import { profiles, payments, tokenLedger } from '@/lib/db/schema'
 import { eq } from 'drizzle-orm'
 import { getStripe } from '@/lib/stripe'
 import { PLAN_TOKEN_TOTALS } from '@/lib/plans'
@@ -60,12 +60,14 @@ function invoiceSubscriptionId(invoice: Stripe.Invoice): string | null {
  *   'unpaid'  → bank payment, pending settlement  → store IDs + plan only,
  *               tokens granted later by invoice.paid (subscription_create)
  */
-async function handleCheckoutCompleted(session: Stripe.Checkout.Session) {
+async function handleCheckoutCompleted(session: Stripe.Checkout.Session, event: Stripe.Event) {
   const plan = session.metadata?.plan
   const userId = session.metadata?.userId ?? session.client_reference_id
   const customerId = typeof session.customer === 'string' ? session.customer : null
   const subscriptionId = typeof session.subscription === 'string' ? session.subscription : null
   const isPaid = session.payment_status === 'paid'
+  const paymentIntentId =
+    typeof session.payment_intent === 'string' ? session.payment_intent : session.payment_intent?.id ?? null
 
   if (!plan || !userId) {
     console.error('[STRIPE] checkout.session.completed: missing plan or userId', session.id)
@@ -93,19 +95,63 @@ async function handleCheckoutCompleted(session: Stripe.Checkout.Session) {
   // then re-upgraded to Starter (500/mo) — they should keep their 1000.
   const tokensToGrant = Math.max(existing?.tokensRemaining ?? 0, tokenTotal)
 
-  await db
-    .update(profiles)
-    .set({
-      plan,
-      // Grant tokens immediately for card payments only.
-      // Bank payments stay at 0 until invoice.paid confirms settlement.
-      ...(isPaid ? { tokensTotal: tokenTotal, tokensRemaining: tokensToGrant } : {}),
-      stripeCustomerId: customerId ?? undefined,
-      stripeSubscriptionId: subscriptionId ?? undefined,
-      subscriptionStatus: isPaid ? 'active' : 'pending_payment',
-      updatedAt: new Date(),
-    })
-    .where(eq(profiles.id, userId))
+  // Single transaction: profile update + payment row + (paid path only) ledger
+  // credit. Pending bank payments record the payment row in 'pending' state but
+  // skip the ledger entry until invoice.paid confirms settlement.
+  await db.transaction(async (tx) => {
+    const [updated] = await tx
+      .update(profiles)
+      .set({
+        plan,
+        ...(isPaid ? { tokensTotal: tokenTotal, tokensRemaining: tokensToGrant } : {}),
+        stripeCustomerId: customerId ?? undefined,
+        stripeSubscriptionId: subscriptionId ?? undefined,
+        subscriptionStatus: isPaid ? 'active' : 'pending_payment',
+        updatedAt: new Date(),
+      })
+      .where(eq(profiles.id, userId))
+      .returning({ tokensRemaining: profiles.tokensRemaining })
+
+    const [payment] = await tx
+      .insert(payments)
+      .values({
+        userId,
+        provider: 'stripe',
+        providerPaymentId: paymentIntentId,
+        providerCustomerId: customerId,
+        providerSessionId: session.id,
+        amountCents: session.amount_total ?? 0,
+        currency: (session.currency ?? 'usd').toLowerCase(),
+        status: isPaid ? 'succeeded' : 'pending',
+        plan,
+        tokensGranted: isPaid ? tokenTotal : 0,
+        rawEvent: event as unknown as Record<string, unknown>,
+      })
+      .returning({ id: payments.id })
+
+    if (isPaid) {
+      await tx.insert(tokenLedger).values({
+        userId,
+        entryType: 'credit',
+        endpoint: null,
+        agent: null,
+        model: null,
+        tokensInput: 0,
+        tokensOutput: 0,
+        tokensTotal: tokenTotal,
+        tokensDelta: tokenTotal,
+        balanceAfter: updated?.tokensRemaining ?? tokenTotal,
+        inputRateUsd: null,
+        outputRateUsd: null,
+        costInputUsd: null,
+        costOutputUsd: null,
+        costUsd: null,
+        referenceType: 'stripe_payment',
+        referenceId: payment.id,
+        metadata: { plan, sessionId: session.id, paymentIntentId, subscriptionId },
+      })
+    }
+  })
 
   console.log(
     `[STRIPE] checkout.session.completed: userId=${userId} → plan=${plan} payment_status=${session.payment_status}`
@@ -150,7 +196,7 @@ async function handleCheckoutCompleted(session: Stripe.Checkout.Session) {
  * as subscription_create too — the idempotency guard (stripeLastInvoiceId)
  * prevents a double token grant if both events fire for the same invoice.
  */
-async function handleInvoicePaid(invoice: Stripe.Invoice) {
+async function handleInvoicePaid(invoice: Stripe.Invoice, event: Stripe.Event) {
   const billingReason = invoice.billing_reason
   if (billingReason !== 'subscription_cycle' && billingReason !== 'subscription_create') return
 
@@ -176,19 +222,67 @@ async function handleInvoicePaid(invoice: Stripe.Invoice) {
   const isInitialPayment = billingReason === 'subscription_create'
   const subscriptionId = invoiceSubscriptionId(invoice)
 
-  await db
-    .update(profiles)
-    .set({
+  // Single transaction: profile update + payment row + ledger credit. This is
+  // the actual "money received" event for renewals (subscription_cycle) and
+  // for ACH bank payments that settle days after checkout.
+  await db.transaction(async (tx) => {
+    const [updated] = await tx
+      .update(profiles)
+      .set({
+        tokensTotal: tokenTotal,
+        tokensRemaining: tokenTotal,
+        subscriptionStatus: 'active',
+        stripeLastInvoiceId: invoice.id,
+        ...(isInitialPayment && subscriptionId ? { stripeSubscriptionId: subscriptionId } : {}),
+        updatedAt: new Date(),
+      })
+      .where(eq(profiles.id, profile.id))
+      .returning({ tokensRemaining: profiles.tokensRemaining })
+
+    const [payment] = await tx
+      .insert(payments)
+      .values({
+        userId: profile.id,
+        provider: 'stripe',
+        // Stripe 2026-03-25.dahlia removed invoice.payment_intent. Use the
+        // invoice id itself as the provider payment id for renewals — it is
+        // unique per billing event and links back to the same Stripe object.
+        providerPaymentId: invoice.id ?? null,
+        providerCustomerId: customerId,
+        providerSessionId: null,
+        amountCents: invoice.amount_paid ?? 0,
+        currency: (invoice.currency ?? 'usd').toLowerCase(),
+        status: 'succeeded',
+        plan,
+        tokensGranted: tokenTotal,
+        billingPeriodStart: invoice.period_start ? new Date(invoice.period_start * 1000) : null,
+        billingPeriodEnd:   invoice.period_end   ? new Date(invoice.period_end   * 1000) : null,
+        invoiceUrl: invoice.hosted_invoice_url ?? null,
+        rawEvent: event as unknown as Record<string, unknown>,
+      })
+      .returning({ id: payments.id })
+
+    await tx.insert(tokenLedger).values({
+      userId: profile.id,
+      entryType: 'credit',
+      endpoint: null,
+      agent: null,
+      model: null,
+      tokensInput: 0,
+      tokensOutput: 0,
       tokensTotal: tokenTotal,
-      tokensRemaining: tokenTotal,
-      subscriptionStatus: 'active',
-      stripeLastInvoiceId: invoice.id,
-      // Ensure subscription ID is stored for bank payments where checkout
-      // may have completed before the subscription was fully provisioned.
-      ...(isInitialPayment && subscriptionId ? { stripeSubscriptionId: subscriptionId } : {}),
-      updatedAt: new Date(),
+      tokensDelta: tokenTotal,
+      balanceAfter: updated?.tokensRemaining ?? tokenTotal,
+      inputRateUsd: null,
+      outputRateUsd: null,
+      costInputUsd: null,
+      costOutputUsd: null,
+      costUsd: null,
+      referenceType: 'stripe_payment',
+      referenceId: payment.id,
+      metadata: { plan, billingReason, invoiceId: invoice.id, subscriptionId },
     })
-    .where(eq(profiles.id, profile.id))
+  })
 
   console.log(
     `[STRIPE] invoice.paid: userId=${profile.id} plan=${plan} reason=${billingReason}`
@@ -290,7 +384,7 @@ async function handlePaymentFailed(invoice: Stripe.Invoice) {
  * current subscription. If it doesn't, the user has already upgraded to a
  * new subscription and we must not downgrade them.
  */
-async function handleSubscriptionDeleted(subscription: Stripe.Subscription) {
+async function handleSubscriptionDeleted(subscription: Stripe.Subscription, event: Stripe.Event) {
   const customerId = typeof subscription.customer === 'string' ? subscription.customer : null
   if (!customerId) return
 
@@ -307,17 +401,60 @@ async function handleSubscriptionDeleted(subscription: Stripe.Subscription) {
     return
   }
 
-  await db
-    .update(profiles)
-    .set({
-      plan: 'free',
+  // Single transaction: reset profile + record cancellation as a $0 payment row
+  // (provenance) + ledger credit reflecting the new free-tier balance.
+  await db.transaction(async (tx) => {
+    const [updated] = await tx
+      .update(profiles)
+      .set({
+        plan: 'free',
+        tokensTotal: PLAN_TOKEN_TOTALS.free,
+        tokensRemaining: PLAN_TOKEN_TOTALS.free,
+        stripeSubscriptionId: null,
+        subscriptionStatus: 'cancelled',
+        updatedAt: new Date(),
+      })
+      .where(eq(profiles.id, profile.id))
+      .returning({ tokensRemaining: profiles.tokensRemaining })
+
+    const [payment] = await tx
+      .insert(payments)
+      .values({
+        userId: profile.id,
+        provider: 'stripe',
+        providerPaymentId: null,
+        providerCustomerId: customerId,
+        providerSessionId: null,
+        amountCents: 0,
+        currency: 'usd',
+        status: 'refunded',
+        plan: 'free',
+        tokensGranted: PLAN_TOKEN_TOTALS.free,
+        rawEvent: event as unknown as Record<string, unknown>,
+      })
+      .returning({ id: payments.id })
+
+    await tx.insert(tokenLedger).values({
+      userId: profile.id,
+      entryType: 'credit',
+      endpoint: null,
+      agent: null,
+      model: null,
+      tokensInput: 0,
+      tokensOutput: 0,
       tokensTotal: PLAN_TOKEN_TOTALS.free,
-      tokensRemaining: PLAN_TOKEN_TOTALS.free,
-      stripeSubscriptionId: null,
-      subscriptionStatus: 'cancelled',
-      updatedAt: new Date(),
+      tokensDelta: PLAN_TOKEN_TOTALS.free,
+      balanceAfter: updated?.tokensRemaining ?? PLAN_TOKEN_TOTALS.free,
+      inputRateUsd: null,
+      outputRateUsd: null,
+      costInputUsd: null,
+      costOutputUsd: null,
+      costUsd: null,
+      referenceType: 'stripe_payment',
+      referenceId: payment.id,
+      metadata: { event: 'subscription_cancelled', subscriptionId: subscription.id },
     })
-    .where(eq(profiles.id, profile.id))
+  })
 
   console.log(`[STRIPE] customer.subscription.deleted: userId=${profile.id} → reverted to free`)
 }
@@ -355,7 +492,7 @@ export async function POST(request: NextRequest) {
   try {
     switch (event.type) {
       case 'checkout.session.completed':
-        await handleCheckoutCompleted(event.data.object as Stripe.Checkout.Session)
+        await handleCheckoutCompleted(event.data.object as Stripe.Checkout.Session, event)
         break
 
       case 'invoice.created':
@@ -363,7 +500,7 @@ export async function POST(request: NextRequest) {
         break
 
       case 'invoice.paid':
-        await handleInvoicePaid(event.data.object as Stripe.Invoice)
+        await handleInvoicePaid(event.data.object as Stripe.Invoice, event)
         break
 
       case 'invoice.payment_failed':
@@ -371,7 +508,7 @@ export async function POST(request: NextRequest) {
         break
 
       case 'customer.subscription.deleted':
-        await handleSubscriptionDeleted(event.data.object as Stripe.Subscription)
+        await handleSubscriptionDeleted(event.data.object as Stripe.Subscription, event)
         break
 
       default:

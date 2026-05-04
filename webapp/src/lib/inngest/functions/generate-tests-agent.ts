@@ -39,7 +39,7 @@ import { generationJobs } from '@/lib/db/schema'
 import { eq, sql } from 'drizzle-orm'
 import { dispatchAgents } from '@/lib/test-generation/agent-dispatcher'
 import type { AgentName, GenerateTestsParams, AgentRunRecord } from '@/lib/test-generation/types'
-import { deductTokens } from '@/lib/tokens'
+import { recordTokenUsage } from '@/lib/tokens'
 import { recordAiCall } from '@/lib/ai-guard'
 
 interface AgentRequestedEventData {
@@ -114,6 +114,21 @@ export const generateTestsAgent = inngest.createFunction(
           },
           onAgentComplete: async (record) => {
             agentTelemetry.push(record)
+            // Per-agent ledger entry — same shape as the sync path so
+            // agent-level token analytics work regardless of which path
+            // generated the run.
+            if (record.success && (record.tokensTotal ?? 0) > 0) {
+              await recordTokenUsage({
+                userId: job.userId,
+                endpoint: '/api/generate-tests',
+                agent: record.agent,
+                model: record.modelUsed || 'gpt-5.4',
+                tokensInput:  record.tokensPrompt ?? 0,
+                tokensOutput: record.tokensCompletion ?? 0,
+                referenceType: 'test_run',
+                referenceId: job.testRunId ?? null,
+              })
+            }
             await recordAiCall({
               userId: job.userId,
               apiKeyId: job.apiKeyId ?? '',
@@ -129,11 +144,6 @@ export const generateTestsAgent = inngest.createFunction(
             })
           },
         })
-
-        const tokensConsumed = dispatchResult.summary?.tokenUsage?.totalTokens ?? 0
-        if (tokensConsumed > 0) {
-          await deductTokens({ userId: job.userId, tokensUsed: tokensConsumed })
-        }
         return {
           ok: true as const,
           files: dispatchResult.files ?? [],

@@ -21,7 +21,7 @@ import {
   type PlanWarning,
 } from '@/lib/test-generation/plan-schema'
 import { checkRateLimit } from '@/lib/rate-limit'
-import { checkTokenBalance, deductTokens } from '@/lib/tokens'
+import { checkTokenBalance, recordTokenUsage, MIN_TOKENS_PLAN, REC_TOKENS_PLAN } from '@/lib/tokens'
 import { checkAiGuard, recordAiCall } from '@/lib/ai-guard'
 import { checkConcurrencyLimit } from '@/lib/concurrency-limit'
 import { checkIdempotency, storeIdempotencyResult } from '@/lib/idempotency'
@@ -188,12 +188,9 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'RATE_LIMIT_EXCEEDED' }, { status: 429 })
     }
 
-    const tokenCheck = await checkTokenBalance({ userId, endpoint: ENDPOINT })
+    const tokenCheck = await checkTokenBalance({ userId, endpoint: ENDPOINT, minRequired: MIN_TOKENS_PLAN, recommended: REC_TOKENS_PLAN })
     if (!tokenCheck.allowed) {
-      return NextResponse.json(
-        { error: 'No tokens remaining. Please renew your plan.' },
-        { status: 402 },
-      )
+      return NextResponse.json({ error: tokenCheck.reason }, { status: 402 })
     }
 
     await db
@@ -310,15 +307,25 @@ export async function POST(request: NextRequest) {
       plannerTokens = { promptTokens: plannerPrompt, completionTokens: plannerCompletion, totalTokens: plannerTotal }
       if (plannerTotal > 0) {
         try {
-          await deductTokens({ userId, tokensUsed: plannerTotal })
+          await recordTokenUsage({
+            userId,
+            endpoint: ENDPOINT,
+            agent: 'planner',
+            model: 'gpt-5.4-mini',
+            tokensInput:  plannerPrompt,
+            tokensOutput: plannerCompletion,
+            referenceType: 'plan',
+            referenceId: planHash,
+          })
           await recordAiCall({
             userId,
             apiKeyId: apiKeyRecord.id,
             endpoint: ENDPOINT,
-            modelUsed: 'gpt-5.4',
+            modelUsed: 'gpt-5.4-mini',
             tokensPrompt: plannerPrompt,
             tokensCompletion: plannerCompletion,
             tokensTotal: plannerTotal,
+            agent: 'planner',
           })
         } catch (deductErr) {
           console.warn('[generate-tests/plan] token deduction failed (non-fatal)', deductErr)
@@ -360,18 +367,7 @@ export async function POST(request: NextRequest) {
       console.warn('[generate-tests/plan] cache insert failed (non-fatal)', insertErr)
     }
 
-<<<<<<< bugfix/tokens-gating
     const responseBody = { success: true, plan, cache: 'miss' as const, plannerTokens }
-=======
-    // Deduct a flat token cost per planner run (one gpt-5.4-mini call per axis).
-    try {
-      await deductTokens({ userId, tokensUsed: PLANNER_TOKEN_COST })
-    } catch (deductErr) {
-      console.warn('[generate-tests/plan] token deduction failed (non-fatal)', deductErr)
-    }
-
-    const responseBody = { success: true, plan, cache: 'miss' as const }
->>>>>>> capillary/sabre
 
     if (idempotencyKey) {
       await storeIdempotencyResult({

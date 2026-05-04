@@ -17,7 +17,7 @@ import type {
 } from '@/lib/test-generation/types'
 import { CURRENT_PLAN_VERSION } from '@/lib/test-generation/plan-schema'
 import { checkRateLimit } from '@/lib/rate-limit'
-import { checkTokenBalance, deductTokens } from '@/lib/tokens'
+import { checkTokenBalance, recordTokenUsage, MIN_TOKENS_GENERATE, REC_TOKENS_GENERATE } from '@/lib/tokens'
 import { checkConcurrencyLimit } from '@/lib/concurrency-limit'
 import { checkIdempotency, storeIdempotencyResult } from '@/lib/idempotency'
 import { validateGenerateTests } from '@/lib/validation'
@@ -170,9 +170,9 @@ export async function POST(request: NextRequest) {
     }
 
     // 8. Token balance gate — check before making AI calls
-    const tokenCheck = await checkTokenBalance({ userId, endpoint: ENDPOINT })
+    const tokenCheck = await checkTokenBalance({ userId, endpoint: ENDPOINT, minRequired: MIN_TOKENS_GENERATE, recommended: REC_TOKENS_GENERATE })
     if (!tokenCheck.allowed) {
-      return NextResponse.json({ error: 'No tokens remaining. Please renew your plan.' }, { status: 402 })
+      return NextResponse.json({ error: tokenCheck.reason }, { status: 402 })
     }
 
     // Update last_used_at
@@ -414,6 +414,21 @@ export async function POST(request: NextRequest) {
       },
       onAgentComplete: async (record) => {
         agentTelemetry.push(record)
+        // Per-agent ledger entry — gives `SELECT agent, SUM(tokens_total) FROM
+        // token_ledger GROUP BY agent` for free, with input/output split and
+        // snapshotted rates. Telemetry row stays for ops dashboards.
+        if (record.success && (record.tokensTotal ?? 0) > 0) {
+          await recordTokenUsage({
+            userId,
+            endpoint: ENDPOINT,
+            agent: record.agent,
+            model: record.modelUsed || 'gpt-5.4',
+            tokensInput:  record.tokensPrompt ?? 0,
+            tokensOutput: record.tokensCompletion ?? 0,
+            referenceType: 'test_run',
+            referenceId: runId,
+          })
+        }
         await recordAiCall({
           userId,
           apiKeyId: apiKeyRecord.id,
@@ -430,11 +445,6 @@ export async function POST(request: NextRequest) {
         })
       },
     })
-
-    const tokensConsumed = summary.tokenUsage.totalTokens
-    if (tokensConsumed > 0) {
-      await deductTokens({ userId, tokensUsed: tokensConsumed })
-    }
 
     const responseBody = {
       success: true,
