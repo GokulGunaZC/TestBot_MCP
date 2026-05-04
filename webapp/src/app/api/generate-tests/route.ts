@@ -388,6 +388,12 @@ export async function POST(request: NextRequest) {
     // (SELECT agent, AVG(latency_ms), SUM(tokens_total) FROM ... GROUP BY agent).
     const agentTelemetry: AgentRunRecord[] = []
     const runId = request.headers.get('x-healix-run-id') || null
+    // Cooperative cancellation across the parallel fan-out. The moment any
+    // agent's debit lands and zeroes the user's balance we abort the
+    // remaining agents — they stop streaming OpenAI tokens we cannot bill
+    // for. Margin protection without a pre-flight buffer that would reject
+    // users who have just enough to start.
+    const generationAbort = new AbortController()
     const { files: generatedFiles, summary, plan } = await dispatchAgents({
       context: ctx,
       prd: prdContent,
@@ -399,6 +405,7 @@ export async function POST(request: NextRequest) {
       options: genOptions,
       agentsAllowlist: agentsAllowlist ?? undefined,
       agentPlanSlice,
+      abortSignal: generationAbort.signal,
       generatorConfig: {
         apiKey: process.env.OPENAI_API_KEY,
         model: process.env.OPENAI_MODEL || 'gpt-4.1-mini',
@@ -418,7 +425,7 @@ export async function POST(request: NextRequest) {
         // token_ledger GROUP BY agent` for free, with input/output split and
         // snapshotted rates. Telemetry row stays for ops dashboards.
         if (record.success && (record.tokensTotal ?? 0) > 0) {
-          await recordTokenUsage({
+          const usage = await recordTokenUsage({
             userId,
             endpoint: ENDPOINT,
             agent: record.agent,
@@ -428,6 +435,10 @@ export async function POST(request: NextRequest) {
             referenceType: 'test_run',
             referenceId: runId,
           })
+          // Balance just hit 0 — abort siblings still talking to OpenAI.
+          if (usage && usage.balanceAfter <= 0 && !generationAbort.signal.aborted) {
+            generationAbort.abort(new Error('CREDITS_EXHAUSTED'))
+          }
         }
         await recordAiCall({
           userId,

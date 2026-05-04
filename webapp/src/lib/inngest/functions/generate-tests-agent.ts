@@ -40,6 +40,7 @@ import { eq, sql } from 'drizzle-orm'
 import { dispatchAgents } from '@/lib/test-generation/agent-dispatcher'
 import type { AgentName, GenerateTestsParams, AgentRunRecord } from '@/lib/test-generation/types'
 import { recordTokenUsage } from '@/lib/tokens'
+import { profiles } from '@/lib/db/schema'
 import { recordAiCall } from '@/lib/ai-guard'
 
 interface AgentRequestedEventData {
@@ -100,11 +101,35 @@ export const generateTestsAgent = inngest.createFunction(
     const runResult = await step.run(`agent-${agent}`, async () => {
       const t0 = Date.now()
       try {
+        // Pre-flight balance check. With 5 Inngest agents fanned out across
+        // the 5-event orchestrator, by the time the 4th or 5th event fires
+        // earlier agents may have already drained the balance. Skip the
+        // OpenAI call if there's nothing left to bill against.
+        const [profile] = await db
+          .select({ tokensRemaining: profiles.tokensRemaining })
+          .from(profiles)
+          .where(eq(profiles.id, job.userId))
+        if ((profile?.tokensRemaining ?? 0) <= 0) {
+          return {
+            ok: false as const,
+            errorCode: 'CREDITS_EXHAUSTED',
+            message: 'Out of credits — agent skipped to protect the user from further charges.',
+            durationMs: Date.now() - t0,
+          }
+        }
+
         const payload = job.payload as GenerateTestsParams
         const agentTelemetry: AgentRunRecord[] = []
+        // Per-agent abort signal. The dispatcher will fire it from
+        // onAgentComplete the moment this agent's debit zeroes the balance —
+        // which only matters for paths that fan out multiple agents inside a
+        // single dispatch. In the Inngest path each invocation runs one
+        // agent, so this is mostly belt-and-braces.
+        const generationAbort = new AbortController()
         const dispatchResult = await dispatchAgents({
           ...payload,
           agentsAllowlist: new Set<AgentName>([agent]),
+          abortSignal: generationAbort.signal,
           // Inngest has no Vercel 60s cap — let OpenAI run its natural
           // latency. Without this, the dispatcher inherits the sync-path
           // 55s cap (or worse, the old 90s hardcode) and Phase 2 is moot.
@@ -118,7 +143,7 @@ export const generateTestsAgent = inngest.createFunction(
             // agent-level token analytics work regardless of which path
             // generated the run.
             if (record.success && (record.tokensTotal ?? 0) > 0) {
-              await recordTokenUsage({
+              const usage = await recordTokenUsage({
                 userId: job.userId,
                 endpoint: '/api/generate-tests',
                 agent: record.agent,
@@ -128,6 +153,9 @@ export const generateTestsAgent = inngest.createFunction(
                 referenceType: 'test_run',
                 referenceId: job.testRunId ?? null,
               })
+              if (usage && usage.balanceAfter <= 0 && !generationAbort.signal.aborted) {
+                generationAbort.abort(new Error('CREDITS_EXHAUSTED'))
+              }
             }
             await recordAiCall({
               userId: job.userId,

@@ -86,6 +86,14 @@ export class OpenAITestGenerator {
   // `recordAiCall` with `agent` attribution — drives the per-agent dashboards.
   agentRuns: import('./types').AgentRunRecord[] = []
   private onAgentComplete: import('./types').AgentCompleteHook | null = null
+  // Caller-supplied abort signal. When fired (e.g. user balance hit 0
+  // mid-fan-out), every in-flight OpenAI fetch dies and any agents that
+  // haven't started yet skip their OpenAI call entirely.
+  private abortSignal: AbortSignal | null = null
+
+  setAbortSignal(signal: AbortSignal | undefined): void {
+    this.abortSignal = signal ?? null
+  }
   // P1.5 — per-agent plan slice supplied by the planner pass. When non-null,
   // each generate*Tests method prepends an "ONLY generate tests for these
   // targets" preamble to its user prompt so the output stays scoped to what
@@ -1288,7 +1296,14 @@ Return only the JSON array of generated files.`
             messages.push({ role: 'user', content: correctionPrompt })
           }
 
-          const callResult = await this.openaiClient.callOpenAI(messages)
+          // Hard cancel-at-the-door check. If the parent already aborted
+          // (sibling agent zeroed the balance), don't even open the socket.
+          if (this.abortSignal?.aborted) {
+            throw new Error('OpenAI request aborted by caller')
+          }
+          const callResult = await this.openaiClient.callOpenAI(messages, {
+            signal: this.abortSignal ?? undefined,
+          })
           this.totalPromptTokens += callResult.usage.promptTokens
           this.totalCompletionTokens += callResult.usage.completionTokens
           this.totalTokensUsed += callResult.usage.totalTokens
@@ -1319,6 +1334,17 @@ Return only the JSON array of generated files.`
           throw new Error('No valid test files after schema and syntax validation')
         } catch (error) {
           lastError = error instanceof Error ? error : new Error(String(error))
+          // Caller-initiated abort short-circuits the retry loop — no point
+          // burning OpenAI dollars on retries we've explicitly cancelled.
+          if (this.abortSignal?.aborted || /aborted by caller/i.test(lastError.message)) {
+            this.generationMeta?.attempts.push({
+              prefix,
+              attempt: attemptNumber,
+              status: 'failed',
+              reason: 'aborted',
+            })
+            break
+          }
           const remainingAttempts = maxAttempts - attempt - 1
           this.generationMeta?.attempts.push({
             prefix,
@@ -1338,6 +1364,8 @@ Return only the JSON array of generated files.`
       this.openaiClient.config.maxTokens = previousMaxTokens
       this.openaiClient.config.temperature = previousTemperature
 
+      const aborted = this.abortSignal?.aborted ||
+        (lastError ? /aborted by caller/i.test(lastError.message) : false)
       const record: import('./types').AgentRunRecord = {
         agent: prefix as import('./types').AgentName,
         startedAt: agentStartedAt.toISOString(),
@@ -1349,7 +1377,7 @@ Return only the JSON array of generated files.`
         tokensPrompt: agentPromptTokens,
         tokensCompletion: agentCompletionTokens,
         tokensTotal: agentTotalTokens,
-        errorCode: agentSuccess ? null : 'AGENT_RUN_FAILED',
+        errorCode: agentSuccess ? null : aborted ? 'AGENT_ABORTED' : 'AGENT_RUN_FAILED',
         errorMessage: agentSuccess ? null : lastError?.message || null,
       }
       this.agentRuns.push(record)
