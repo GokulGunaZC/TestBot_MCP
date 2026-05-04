@@ -366,6 +366,95 @@ async function exploreWithPlaywright({ baseURL, credentials, storageStatePaths =
   }
 }
 
+const ENRICH_GOTO_TIMEOUT_MS = 8_000;
+const MAX_ENRICH_ROUTES = 8;
+
+async function _enrichRouteDOM(page) {
+  return page.evaluate(() => {
+    const safeText = (el) => (el?.textContent || '').trim().slice(0, 120);
+
+    const labels = Array.from(document.querySelectorAll('label')).map((l) => ({
+      text: safeText(l),
+      for: l.htmlFor || null,
+    })).filter((l) => l.text).slice(0, 30);
+
+    const selectOptions = Array.from(document.querySelectorAll('select')).map((sel) => ({
+      name: sel.getAttribute('name') || sel.getAttribute('id') || sel.getAttribute('aria-label') || '',
+      options: Array.from(sel.options).map((o) => ({
+        text: o.text.trim(),
+        value: o.value,
+      })).slice(0, 20),
+    })).filter((s) => s.options.length > 0).slice(0, 10);
+
+    const buttons = Array.from(
+      document.querySelectorAll('button, [role="button"], input[type="submit"]')
+    ).slice(0, 20).map((el) => ({
+      text: safeText(el),
+      disabled: el.disabled || el.getAttribute('aria-disabled') === 'true',
+      ariaLabel: el.getAttribute('aria-label') || null,
+    })).filter((b) => b.text || b.ariaLabel);
+
+    const headings = Array.from(document.querySelectorAll('h1, h2, h3')).map((h) => ({
+      level: parseInt(h.tagName[1], 10),
+      text: safeText(h),
+    })).filter((h) => h.text).slice(0, 8);
+
+    return { labels, selectOptions, buttons, headings };
+  });
+}
+
+async function enrichRoutesWithDOM({ baseURL, routes = [], storageStatePaths = [], onHeartbeat } = {}) {
+  let chromium;
+  try { ({ chromium } = require('playwright')); } catch { return { enrichments: {}, errorProbe: null }; }
+
+  const validState = (storageStatePaths || []).find(
+    (s) => s?.storageStatePath && fs.existsSync(s.storageStatePath)
+  );
+  const contextOptions = validState ? { storageState: validState.storageStatePath } : {};
+
+  const browser = await chromium.launch({ headless: true });
+  const enrichments = {};
+  let errorProbe = null;
+
+  try {
+    const context = await browser.newContext(contextOptions);
+    const page = await context.newPage();
+
+    for (const route of routes.slice(0, MAX_ENRICH_ROUTES)) {
+      const url = `${baseURL.replace(/\/$/, '')}${route.path}`;
+      try {
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: ENRICH_GOTO_TIMEOUT_MS });
+        await page.waitForTimeout(SETTLE_WAIT_MS);
+        await _scrollToReveal(page);
+        if (typeof onHeartbeat === 'function') {
+          try { onHeartbeat({ type: 'heartbeat', path: route.path }); } catch { /* ignore */ }
+        }
+        const dom = await _enrichRouteDOM(page).catch(() => null);
+        if (dom) enrichments[route.path] = dom;
+      } catch { /* non-fatal — skip route */ }
+    }
+
+    try {
+      await page.goto(
+        `${baseURL.replace(/\/$/, '')}/healix-probe-404-check`,
+        { waitUntil: 'domcontentloaded', timeout: ENRICH_GOTO_TIMEOUT_MS }
+      );
+      await page.waitForTimeout(400);
+      errorProbe = await page.evaluate(() => {
+        const txt = (s) => { const e = document.querySelector(s); return e ? (e.textContent || '').trim().slice(0, 200) : null; };
+        return { h1: txt('h1'), firstP: txt('main p, p') };
+      }).catch(() => null);
+    } catch { /* non-fatal */ }
+
+    await context.close();
+  } finally {
+    try { await browser.close(); } catch { /* ignore */ }
+  }
+
+  return { enrichments, errorProbe };
+}
+
 module.exports = {
   exploreWithPlaywright,
+  enrichRoutesWithDOM,
 };

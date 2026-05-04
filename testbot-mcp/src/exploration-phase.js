@@ -21,7 +21,7 @@ const fs = require('fs');
 const path = require('path');
 const Logger = require('./logger');
 const { driveExploration } = require('./browser-use-driver');
-const { exploreWithPlaywright } = require('./playwright-explorer');
+const { exploreWithPlaywright, enrichRoutesWithDOM } = require('./playwright-explorer');
 const { injectCredentials } = require('./credentials-injector');
 
 const EMPTY_ARTIFACT = Object.freeze({
@@ -31,6 +31,29 @@ const EMPTY_ARTIFACT = Object.freeze({
   keyFlows: [],
   observedErrors: [],
 });
+
+async function _applyDOMEnrichment(artifact, { baseURL, preAuthRoles }) {
+  if (!artifact.routes || artifact.routes.length === 0) return artifact;
+  Logger.info('ExplorationPhase', 'Running Playwright DOM enrichment pass', {
+    routeCount: artifact.routes.length,
+  });
+  try {
+    const { enrichments, errorProbe } = await enrichRoutesWithDOM({
+      baseURL,
+      routes: artifact.routes,
+      storageStatePaths: preAuthRoles || [],
+      onHeartbeat: () => {},
+    });
+    const enrichedRoutes = artifact.routes.map((r) => ({
+      ...r,
+      ...(enrichments[r.path] || {}),
+    }));
+    return { ...artifact, routes: enrichedRoutes, errorProbe: errorProbe || null };
+  } catch (err) {
+    Logger.warn('ExplorationPhase', 'DOM enrichment pass failed (non-fatal)', { reason: err.message });
+    return artifact;
+  }
+}
 
 function primaryCredential(credentials) {
   if (!credentials) return null;
@@ -101,7 +124,15 @@ async function runExplorationPhase({
   });
   let source = 'browser-use';
 
-  if (!result.available) {
+  if (result.available) {
+    // Playwright DOM enrichment runs after browser-use to capture labels,
+    // select options, button disabled state, headings, and error probe text.
+    result = {
+      ...result,
+      artifact: await _applyDOMEnrichment(result.artifact, { baseURL, preAuthRoles }),
+    };
+    source = 'browser-use+playwright-enrichment';
+  } else {
     Logger.info('ExplorationPhase', 'browser-use unavailable — falling back to Playwright heuristic', {
       reason: result.reason,
     });
@@ -112,8 +143,11 @@ async function runExplorationPhase({
       onHeartbeat: () => { /* noop */ },
     });
     if (fallback.available) {
-      result = fallback;
-      source = 'playwright-heuristic';
+      result = {
+        ...fallback,
+        artifact: await _applyDOMEnrichment(fallback.artifact, { baseURL, preAuthRoles }),
+      };
+      source = 'playwright-heuristic+enrichment';
     } else {
       Logger.warn('ExplorationPhase', 'No exploration available — degrading to empty artifact', {
         browserUseReason: result.reason,
@@ -133,6 +167,7 @@ async function runExplorationPhase({
     authFlow: result.artifact?.authFlow || null,
     keyFlows: Array.isArray(result.artifact?.keyFlows) ? result.artifact.keyFlows : [],
     observedErrors: Array.isArray(result.artifact?.observedErrors) ? result.artifact.observedErrors : [],
+    errorProbe: result.artifact?.errorProbe || null,
   };
 
   if (statusDir) {

@@ -1369,6 +1369,9 @@ const PHASE_LABELS: Record<string, string> = {
   context: 'Gathering Context',
   context_enrichment: 'Enriching Context',
   generating: 'Generating Tests',
+  plan_generated: 'Plan Generated',
+  generating_tests: 'Generating Tests',
+  generation_partial: 'Generating Tests',
   running: 'Running Tests',
   tests_complete: 'Tests Complete',
   analyzing: 'Analyzing Failures',
@@ -1381,6 +1384,13 @@ const PHASE_LABELS: Record<string, string> = {
   completed: 'Healix run Complete',
   error: 'Healix Error',
   error_reported: 'Error Reported',
+  // stage:* budget markers emitted after each pipeline stage completes
+  'stage:prdparse': 'Parsing PRD',
+  'stage:generation': 'Generating Tests',
+  'stage:execution': 'Running Tests',
+  'stage:aitriage': 'Analyzing Failures',
+  'stage:reporting': 'Generating Report',
+  'stage:dashboard': 'Opening Dashboard',
 };
 
 const TERMINAL_PHASES = new Set(['completed', 'error', 'error_reported']);
@@ -2621,7 +2631,14 @@ export default function TestRunDetailPage() {
   // liveTotal, which accumulates retry attempts.
   const reportTotal = testRun.total_tests || report?.summary?.total || report?.stats?.total || 0;
   const hasIngestedStats = reportTotal > 0;
-  const hasLiveStats = liveTotal > 0 && !(pipelineEnded && hasIngestedStats);
+  // Treat the pipeline as ended when we already have confirmed ingested results,
+  // even if the terminal 'completed' event was missed due to the fire-and-forget
+  // race at process exit. This prevents stage:reporting (or any last phase) from
+  // staying stuck as a spinning step indefinitely.
+  const effectivePipelineEnded = pipelineEnded || (
+    isLiveDetailId && Boolean(testRun) && testRun?.is_live === false && hasIngestedStats
+  );
+  const hasLiveStats = liveTotal > 0 && !(effectivePipelineEnded && hasIngestedStats);
 
   // Priority: pipeline_error (zero real tests ran) > live (mid-run only) > DB stats > generated > real
   //
@@ -2640,7 +2657,7 @@ export default function TestRunDetailPage() {
   const skippedTests = pipelineError ? 0 : (hasLiveStats ? liveSkipped : (testRun.skipped_tests || report?.summary?.skipped || report?.stats?.skipped || displayTests.filter(t => ['skipped', 'skip', 'pending'].includes(t.status.toLowerCase())).length));
   const passRate = totalTests > 0 ? Math.round((passedTests / totalTests) * 100) : 0;
   // True while Playwright is executing but no individual results have streamed in yet
-  const isRunningPhase = !pipelineEnded && liveEvents.some(e => (e.phase || '').toLowerCase() === 'running');
+  const isRunningPhase = !effectivePipelineEnded && liveEvents.some(e => (e.phase || '').toLowerCase() === 'running');
   const filteredTests = filterStatus === 'all'
     ? displayTests
     : displayTests.filter(t => {
@@ -2789,11 +2806,11 @@ export default function TestRunDetailPage() {
           >
             <div className="flex items-center gap-2.5">
               <div className={`w-7 h-7 rounded-lg flex items-center justify-center flex-shrink-0 ${
-                pipelineEnded
+                effectivePipelineEnded
                   ? 'bg-emerald-500/10 border border-emerald-500/30'
                   : 'bg-blue-500/10 border border-blue-500/20'
               }`}>
-                {pipelineEnded ? (
+                {effectivePipelineEnded ? (
                   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#34D399" strokeWidth="3"><polyline points="20 6 9 17 4 12" /></svg>
                 ) : (
                   <span className="w-2.5 h-2.5 rounded-full bg-blue-400 animate-pulse" />
@@ -2802,7 +2819,7 @@ export default function TestRunDetailPage() {
               <div>
                 <div className="text-[#D8E8FF] font-semibold text-sm">Healix Activity</div>
                 <div className="text-[#4A6280] text-[11px] font-mono">
-                  {pipelineEnded ? 'completed' : (testRun.current_phase || liveMeta?.phase || testRun.status)}
+                  {effectivePipelineEnded ? 'completed' : (testRun.current_phase || liveMeta?.phase || testRun.status)}
                   {testRun.error_code || liveMeta?.errorCode ? ` · error: ${testRun.error_code || liveMeta?.errorCode}` : ''}
                   {liveRunId ? ` · run: ${liveRunId}` : ''}
                 </div>
@@ -2854,7 +2871,7 @@ export default function TestRunDetailPage() {
                 {/* SSE timeline */}
                 {liveEvents.length > 0 ? (
                   <div className="px-5 py-4">
-                    <LiveTimeline events={liveEvents} liveFiles={liveFiles} pipelineEnded={pipelineEnded} />
+                    <LiveTimeline events={liveEvents} liveFiles={liveFiles} pipelineEnded={effectivePipelineEnded} />
                   </div>
                 ) : (
                   (liveMeta?.message || liveMeta?.reason) && (
@@ -2887,7 +2904,7 @@ export default function TestRunDetailPage() {
                 )}
 
                 {/* End-of-testing banner */}
-                {pipelineEnded && (
+                {effectivePipelineEnded && (
                   <div className="border-t border-white/8 px-5 py-3 flex items-center gap-2">
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#34D399" strokeWidth="3"><polyline points="20 6 9 17 4 12" /></svg>
                     <span className="text-emerald-400 text-xs font-semibold">Healix run complete</span>

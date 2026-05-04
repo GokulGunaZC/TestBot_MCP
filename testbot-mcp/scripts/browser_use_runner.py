@@ -214,6 +214,17 @@ async def _drive_agent(target_url, username, password, timeout_s):
         # Allow several browser actions per LLM call — fewer round-trips = faster.
         if "max_actions_per_step" in sig_params:
             agent_kwargs["max_actions_per_step"] = 5
+
+        # Headless mode: default true so exploration runs silently in the background.
+        # Set HEALIX_BROWSER_HEADLESS=false to show the browser window (debug only).
+        headless_raw = os.environ.get("HEALIX_BROWSER_HEADLESS", "true").strip().lower()
+        headless = headless_raw not in ("false", "0", "no")
+        if "browser_profile" in sig_params:
+            try:
+                from browser_use.browser.profile import BrowserProfile  # type: ignore
+                agent_kwargs["browser_profile"] = BrowserProfile(headless=headless)
+            except Exception:
+                pass  # older version without BrowserProfile — leave default
     except Exception:
         pass  # version doesn't expose these params; proceed with defaults
 

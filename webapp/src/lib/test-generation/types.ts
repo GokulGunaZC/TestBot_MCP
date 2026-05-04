@@ -259,10 +259,45 @@ export interface Role {
   loginVerified?: boolean
 }
 
+export interface ObservedLabel {
+  text: string
+  for: string | null
+}
+
+export interface ObservedSelectOption {
+  text: string
+  value: string
+}
+
+export interface ObservedSelect {
+  name: string
+  options: ObservedSelectOption[]
+}
+
+export interface ObservedButton {
+  text: string
+  disabled: boolean
+  ariaLabel: string | null
+}
+
+export interface ObservedHeading {
+  level: number
+  text: string
+}
+
+export interface ErrorProbe {
+  h1: string | null
+  firstP: string | null
+}
+
 export interface ObservedRoute {
   path: string
   requiresAuth: boolean
   elements: Array<{ role: string; name: string; selector: string }>
+  labels?: ObservedLabel[]
+  selectOptions?: ObservedSelect[]
+  buttons?: ObservedButton[]
+  headings?: ObservedHeading[]
 }
 
 export interface ObservedForm {
@@ -290,6 +325,7 @@ export interface ExplorationArtifact {
   authFlow: ObservedAuthFlow | null
   keyFlows: ObservedKeyFlow[]
   observedErrors: string[]
+  errorProbe?: ErrorProbe | null
 }
 
 export type AgentName = 'smoke' | 'frontend' | 'api' | 'workflow' | 'error' | 'expansion'

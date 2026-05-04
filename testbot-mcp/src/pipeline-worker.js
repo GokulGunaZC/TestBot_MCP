@@ -1300,7 +1300,7 @@ function detectSplashScreenStorageKeys(projectPath) {
   return results;
 }
 
-function getCursorFixtureContent(serializedInitScript, moduleType = 'commonjs', splashStorageKeys = []) {
+function getCursorFixtureContent(serializedInitScript, moduleType = 'commonjs', splashStorageKeys = [], roles = []) {
   // Splash-screen bypass: set sessionStorage keys before the page loads so
   // headless Playwright never sees an empty-session splash (the user's browser
   // always has these keys set after their first visit; Playwright starts fresh).
@@ -1312,18 +1312,66 @@ function getCursorFixtureContent(serializedInitScript, moduleType = 'commonjs', 
     ? `    await page.addInitScript(() => {\n${splashLines.join('\n')}\n    });\n`
     : '';
 
-  // The page fixture runs both the splash bypass (if any) and the cursor
-  // overlay in a single extend block.
+  // Auth injection block: for tests running under a tierB-auth-<role> project,
+  // explicitly load the role's storageState from disk and inject cookies +
+  // localStorage into the page context. This is belt-and-suspenders on top of
+  // the project-level `use.storageState` — it reads the file at test time so
+  // it always picks up the freshest tokens (including those written by the
+  // pre-execution refresh pass).
+  const verifiedRoles = (roles || []).filter((r) => r && r.loginVerified && r.storageStatePath);
+  let authPreamble = '';
+  let authPreambleCjs = '';
+  let authBlock = '';
+  if (verifiedRoles.length > 0) {
+    const stateMapEntries = verifiedRoles
+      .map((r) => `  ${JSON.stringify(String(r.role))}: ${JSON.stringify(r.storageStatePath)}`)
+      .join(',\n');
+    // ESM/TS: top-level import + named reference in helper
+    authPreamble =
+      `import { readFileSync as _healixReadFileSync } from 'fs';\n\n` +
+      `const _HEALIX_ROLE_STATES: Record<string, string> = {\n${stateMapEntries},\n};\n\n` +
+      `function _healixLoadState(p: string): any {\n` +
+      `  try { return JSON.parse(_healixReadFileSync(p, 'utf-8')); } catch { return null; }\n` +
+      `}\n\n`;
+    // CJS: inline require in helper, no top-level import needed
+    authPreambleCjs =
+      `const _HEALIX_ROLE_STATES = {\n${stateMapEntries},\n};\n\n` +
+      `function _healixLoadState(p) {\n` +
+      `  try { return JSON.parse(require('fs').readFileSync(p, 'utf-8')); } catch { return null; }\n` +
+      `}\n\n`;
+    authBlock =
+      `    const _roleMatch = testInfo.project.name.match(/^tierB-auth-(.+)$/);\n` +
+      `    if (_roleMatch) {\n` +
+      `      const _statePath = _HEALIX_ROLE_STATES[_roleMatch[1]];\n` +
+      `      if (_statePath) {\n` +
+      `        const _state = _healixLoadState(_statePath);\n` +
+      `        if (_state && Array.isArray(_state.cookies) && _state.cookies.length > 0) {\n` +
+      `          await page.context().addCookies(_state.cookies);\n` +
+      `        }\n` +
+      `        for (const _origin of (_state && _state.origins) || []) {\n` +
+      `          if (Array.isArray(_origin.localStorage) && _origin.localStorage.length > 0) {\n` +
+      `            await page.addInitScript((items) => {\n` +
+      `              items.forEach(function(item) { localStorage.setItem(item.name, item.value); });\n` +
+      `            }, _origin.localStorage);\n` +
+      `          }\n` +
+      `        }\n` +
+      `      }\n` +
+      `    }\n`;
+  }
+
+  // The page fixture runs splash bypass, auth injection (if any), and the
+  // cursor overlay in a single extend block.
   const pageFixtureBody =
-    `async ({ page }, use) => {\n` +
+    `async ({ page }, use, testInfo) => {\n` +
     splashBlock +
+    authBlock +
     `    await page.addInitScript(${serializedInitScript});\n` +
     `    await use(page);\n` +
     `  }`;
 
   const ts = `import { test as base, expect, request } from '@playwright/test';
 
-const test = base.extend({
+${authPreamble}const test = base.extend({
   page: ${pageFixtureBody},
 });
 
@@ -1335,7 +1383,7 @@ export { test, expect, request };
   // CJS projects: `module.exports = { ... }`, our historical default.
   const jsEsm = `import { test as base, expect, request } from '@playwright/test';
 
-const test = base.extend({
+${authPreamble}const test = base.extend({
   page: ${pageFixtureBody},
 });
 
@@ -1344,7 +1392,7 @@ export { test, expect, request };
 
   const jsCjs = `const { test: base, expect, request } = require('@playwright/test');
 
-const test = base.extend({
+${authPreambleCjs}const test = base.extend({
   page: ${pageFixtureBody},
 });
 
@@ -1355,7 +1403,7 @@ module.exports = { test, expect, request };
   return { ts, js, moduleType };
 }
 
-function ensureCursorFixtureFiles(generatedDir, projectPath = null) {
+function ensureCursorFixtureFiles(generatedDir, projectPath = null, roles = []) {
   const serializedInitScript = JSON.stringify(CURSOR_OVERLAY_INIT_SCRIPT);
   // projectPath can be omitted only in tests; in production the caller passes
   // it so we emit the correct module-system body for this project.
@@ -1365,7 +1413,7 @@ function ensureCursorFixtureFiles(generatedDir, projectPath = null) {
   if (splashKeys.length > 0) {
     Logger.info('PipelineWorker', `Splash screen detected — injecting sessionStorage bypass for keys: ${splashKeys.map(k => k.key).join(', ')}`);
   }
-  const { ts, js } = getCursorFixtureContent(serializedInitScript, moduleType, splashKeys);
+  const { ts, js } = getCursorFixtureContent(serializedInitScript, moduleType, splashKeys, roles);
 
   const fixtureTs = path.join(generatedDir, `${CURSOR_FIXTURE_BASENAME}.ts`);
   const fixtureJs = path.join(generatedDir, `${CURSOR_FIXTURE_BASENAME}.js`);
@@ -1391,7 +1439,7 @@ function rewritePlaywrightImportToFixture(content, fixtureImportPath) {
 // and storageState auto-load that auth-gated SPAs need — without it, every UI
 // test redirects to '/' and fails on `url.toContain('/dashboard')`. The cursor
 // overlay is a separate, optional concern; see applyMouseCursorOverlayToGeneratedTests.
-function ensureHealixFixtureImports({ projectPath }) {
+function ensureHealixFixtureImports({ projectPath, roles = [] }) {
   const generatedDir = path.join(projectPath, 'tests', 'generated');
   if (!fs.existsSync(generatedDir)) {
     return { applied: false, reason: 'generated_dir_missing' };
@@ -1405,7 +1453,7 @@ function ensureHealixFixtureImports({ projectPath }) {
     return { applied: false, reason: 'no_generated_test_files' };
   }
 
-  const fixtureFiles = ensureCursorFixtureFiles(generatedDir, projectPath);
+  const fixtureFiles = ensureCursorFixtureFiles(generatedDir, projectPath, roles);
   let patchedFiles = 0;
   let alreadyUsingFixture = 0;
 
@@ -1597,6 +1645,7 @@ import { defineConfig, devices } from '@playwright/test';
 
 export default defineConfig({
   testDir: './tests/generated',
+  timeout: 60000,
   fullyParallel: true,
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 2 : 0,
@@ -1734,6 +1783,8 @@ function ensurePlaywrightConfig(projectPath, projectInfo = {}, roles = []) {
 
 export default defineConfig({
   testDir: './tests/generated',
+  // 60 s per test — Supabase auth + Next.js SSR can easily push past 30 s on cold starts.
+  timeout: 60000,
   fullyParallel: true,
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 2 : 0,
@@ -2590,18 +2641,22 @@ async function runPhase1FanOut({
   const allTokenRuns = [];
   let doneCount = 0;
 
-  // One HTTP call per agent, all in flight simultaneously. Each call fits
-  // under the 55 s timeout in webapp-client.js (5 s margin under Vercel's
-  // 60 s hard cap).
-  const settled = await Promise.allSettled(
-    agents.map(async (agent) => {
-      try {
-        const agentSlice = planSliceFor(agent);
-        const agentPayload = { agent, ...sharedPayload };
-        if (plan && agentSlice) {
-          agentPayload.plan = { slice: agentSlice, planVersion: 1 };
-        }
-        const payload = await client.generateTestsForAgent(agentPayload);
+  // Dispatch agents in batches of 2 to prevent connection starvation.
+  // Firing all 5 simultaneously causes the webapp to queue the 3rd+ requests
+  // while holding the HTTP connection open — after ~5 minutes the Next.js dev
+  // server closes the idle connection → "fetch failed" TypeError for smoke and
+  // workflow agents. Two concurrent agents saturate the webapp's AI pipeline
+  // without leaving any connection idle long enough to be dropped.
+  const AGENT_CONCURRENCY = 2;
+
+  async function runAgent(agent) {
+    try {
+      const agentSlice = planSliceFor(agent);
+      const agentPayload = { agent, ...sharedPayload };
+      if (plan && agentSlice) {
+        agentPayload.plan = { slice: agentSlice, planVersion: 1 };
+      }
+      const payload = await client.generateTestsForAgent(agentPayload);
 
         // ── Token usage logging ──────────────────────────────────────────
         const REAL_TOKENS_PER_DISPLAY_UNIT = 4800;
@@ -2615,58 +2670,66 @@ async function runPhase1FanOut({
           Logger.info('PipelineWorker', `[TOKEN USAGE] agent=${agent} — no agentRuns in response (token data unavailable)`);
         }
 
-        const tests = Array.isArray(payload?.tests) ? payload.tests : [];
-        // Write this agent's tests to disk the moment the call returns —
-        // makes partials durable even if a later agent blows up the run.
-        tests.forEach((test) => {
-          try {
-            const written = safeWriteGeneratedTest(
-              testsDir,
-              test,
-              files.length,
-              `${agent}-saas`,
-              used,
-            );
-            files.push({ ...written, type: test.type || 'generated', agent });
-          } catch (writeErr) {
-            // Single-file write failures shouldn't discard an agent's whole
-            // result — log and skip this file only.
-            Logger.warn('PipelineWorker', 'safeWriteGeneratedTest failed for one test', {
-              agent,
-              filename: test?.filename,
-              reason: writeErr?.message,
-            });
-          }
-        });
-        agentsCompleted.push(agent);
-        if (payload?.generationMeta) {
-          agentMeta.push({ agent, generationMeta: payload.generationMeta });
+      const tests = Array.isArray(payload?.tests) ? payload.tests : [];
+      // Write this agent's tests to disk the moment the call returns —
+      // makes partials durable even if a later agent blows up the run.
+      tests.forEach((test) => {
+        try {
+          const written = safeWriteGeneratedTest(
+            testsDir,
+            test,
+            files.length,
+            `${agent}-saas`,
+            used,
+          );
+          files.push({ ...written, type: test.type || 'generated', agent });
+        } catch (writeErr) {
+          // Single-file write failures shouldn't discard an agent's whole
+          // result — log and skip this file only.
+          Logger.warn('PipelineWorker', 'safeWriteGeneratedTest failed for one test', {
+            agent,
+            filename: test?.filename,
+            reason: writeErr?.message,
+          });
         }
-        doneCount += 1;
-        if (statusDir) {
-          try {
-            updateStatus(statusDir, 'generation_partial', {
-              runId,
-              agent,
-              agentsCompleted: doneCount,
-              totalAgents: agents.length,
-              generatedCount: files.length,
-            });
-          } catch {
-            // status-writes are best-effort; never break the generator
-          }
-        }
-        return { agent, count: tests.length };
-      } catch (err) {
-        agentFailures.push({
-          agent,
-          code: err?.code || 'AGENT_FAILED',
-          message: err?.message || String(err),
-        });
-        throw err;
+      });
+      agentsCompleted.push(agent);
+      if (payload?.generationMeta) {
+        agentMeta.push({ agent, generationMeta: payload.generationMeta });
       }
-    }),
-  );
+      doneCount += 1;
+      if (statusDir) {
+        try {
+          updateStatus(statusDir, 'generating_tests', {
+            runId,
+            agent,
+            agentsCompleted: doneCount,
+            totalAgents: agents.length,
+            generatedCount: files.length,
+          });
+        } catch {
+          // status-writes are best-effort; never break the generator
+        }
+      }
+      return { agent, count: tests.length };
+    } catch (err) {
+      agentFailures.push({
+        agent,
+        code: err?.code || 'AGENT_FAILED',
+        message: err?.message || String(err),
+      });
+      throw err;
+    }
+  }
+
+  // Process agents in batches of AGENT_CONCURRENCY; collect settled results
+  // across all batches so the caller sees the same shape as before.
+  const settled = [];
+  for (let i = 0; i < agents.length; i += AGENT_CONCURRENCY) {
+    const batch = agents.slice(i, i + AGENT_CONCURRENCY);
+    const batchSettled = await Promise.allSettled(batch.map(runAgent));
+    settled.push(...batchSettled);
+  }
 
   const fulfilled = settled.filter((s) => s.status === 'fulfilled').length;
   const rejected = settled.length - fulfilled;
@@ -3101,7 +3164,8 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
   const applyFixtureWiring = (generatorName) => {
     if (!config.generateTests) return null;
     try {
-      const fixtureResult = ensureHealixFixtureImports({ projectPath: config.projectPath });
+      const verifiedRoles = (roles || []).filter((r) => r && r.loginVerified && r.storageStatePath);
+      const fixtureResult = ensureHealixFixtureImports({ projectPath: config.projectPath, roles: verifiedRoles });
       if (fixtureResult.applied && fixtureResult.patchedFiles > 0) {
         Logger.info('PipelineWorker', 'Rewrote @playwright/test imports to __healix-fixture', {
           generator: generatorName,
@@ -3660,7 +3724,17 @@ async function runPipeline(config, runId) {
       }
     }
 
-    const combinedPrdContent = prdContents.length > 0 ? prdContents.join('\n\n---\n\n') : null;
+    // Webapp Zod schema caps `prd` at MAX_PROMPT_CHARS (default 40 000). Truncate
+    // here so both /api/parse-prd and /api/generate-tests accept the payload.
+    // 38 000 gives a 2 000-char safety margin for multi-file join separators.
+    const PRD_CHAR_CAP = 38_000;
+    const rawCombinedPrdContent = prdContents.length > 0 ? prdContents.join('\n\n---\n\n') : null;
+    const combinedPrdContent = rawCombinedPrdContent && rawCombinedPrdContent.length > PRD_CHAR_CAP
+      ? rawCombinedPrdContent.slice(0, PRD_CHAR_CAP)
+      : rawCombinedPrdContent;
+    if (rawCombinedPrdContent && rawCombinedPrdContent.length > PRD_CHAR_CAP) {
+      Logger.warn('PipelineWorker', `PRD truncated from ${rawCombinedPrdContent.length} to ${PRD_CHAR_CAP} chars to stay under webapp limit`);
+    }
 
     // -------------------------------------------------------
     // 3a. Parse PRD into structured acceptance criteria (Phase B).
@@ -4229,6 +4303,40 @@ async function runPipeline(config, runId) {
       process.env.PLAYWRIGHT_MCP_PARALLEL === 'true' ||
       process.env.PLAYWRIGHT_MCP_ENABLED === 'true';
 
+    // Re-inject credentials just before execution so storageState tokens are
+    // always fresh. Generation can take >13 min and Supabase access tokens
+    // expire in 1h — stale tokens cause middleware to reject the session and
+    // redirect tests to /login or /signup.
+    if (Array.isArray(config.testCredentials) && config.testCredentials.length > 0) {
+      try {
+        updateStatus(statusDir, 'auth_refreshing', {
+          runId,
+          message: `Refreshing auth tokens before execution for ${config.testCredentials.length} role(s)...`,
+        }, telemetryReporter);
+        const freshRoles = await injectCredentials({
+          projectPath: config.projectPath,
+          baseURL: config.baseURL,
+          credentials: config.testCredentials,
+          authFlow: explorationArtifact?.authFlow || null,
+        });
+        const verifiedFresh = freshRoles.filter((r) => r.loginVerified);
+        if (verifiedFresh.length > 0) {
+          roles = freshRoles;
+          // Rewrite the fixture file so it embeds the freshest storageState paths
+          // (paths don't change but this ensures the file exists post-generation).
+          ensureHealixFixtureImports({ projectPath: config.projectPath, roles: verifiedFresh });
+        }
+        Logger.info('PipelineWorker', 'Pre-execution auth refresh complete', {
+          verified: verifiedFresh.length,
+          total: freshRoles.length,
+        });
+      } catch (refreshErr) {
+        Logger.warn('PipelineWorker', 'Pre-execution auth refresh failed — using existing storageState', {
+          reason: refreshErr.message,
+        });
+      }
+    }
+
     let testResults;
 
     testResults = await withStageBudget(runBudget, 'execution', async () => {
@@ -4581,6 +4689,12 @@ async function runPipeline(config, runId) {
     // cleanup below when _primaryAppPreStarted is set).
     try { stopSecondaryServices(config.projectPath); } catch { /* ignore */ }
     killPreStartedProc(preStartedProc);
+
+    // Give fire-and-forget reportPhase('completed') time to reach the webapp
+    // before process.exit(0) kills in-flight HTTP requests. Without this the
+    // SSE stream never receives the terminal event and the live page stays
+    // stuck on the last non-terminal phase (e.g. stage:reporting) indefinitely.
+    await new Promise((resolve) => setTimeout(resolve, 1500));
   } catch (error) {
     // Ensure the dev server is killed immediately even when the budget timeout
     // races ahead of playwright.runTests()'s own finally{stopServer()} block.
@@ -4732,6 +4846,9 @@ async function runPipeline(config, runId) {
         requirementsCoverage,
         phaseResults,
       }, telemetryReporter);
+      // Same flush grace as the success path — let fire-and-forget phase
+      // report reach the webapp before process exit kills the socket.
+      await new Promise((resolve) => setTimeout(resolve, 1500));
     } catch (reportError) {
       Logger.warn('PipelineWorker', 'Failed to generate/sync error report', {
         runId,

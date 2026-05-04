@@ -113,6 +113,10 @@ function driveExploration({
       // HEALIX_API_KEY is already in process.env; include it explicitly so it
       // is never accidentally shadowed by a dotenv override.
       HEALIX_API_KEY: process.env.HEALIX_API_KEY || '',
+      // Run headless by default so exploration is silent in the background.
+      // Set HEALIX_BROWSER_HEADLESS=false in the environment to open a visible
+      // browser window (useful when debugging exploration failures locally).
+      HEALIX_BROWSER_HEADLESS: process.env.HEALIX_BROWSER_HEADLESS ?? 'true',
     };
 
     let settled = false;

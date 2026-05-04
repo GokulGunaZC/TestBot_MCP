@@ -138,7 +138,8 @@ class WebappClient {
     // show up as generic TypeError — retry those up to 3× with backoff. We do
     // NOT retry AbortError (timeout) or HTTP-level errors; the caller handles
     // those by surfacing a proper error code.
-    const RETRY_DELAYS_MS = [0, 750, 2250];
+    // 5 attempts: immediate, 1s, 3s, 8s, 15s — enough for a Next.js cold-start restart.
+    const RETRY_DELAYS_MS = [0, 1000, 3000, 8000, 15000];
     let lastNetworkErr = null;
     let response;
     for (let attempt = 0; attempt < RETRY_DELAYS_MS.length; attempt++) {
@@ -204,6 +205,9 @@ class WebappClient {
         Logger.warn('WebappClient', `[RATE GATE] ⚠️  RATE_LIMITED — ${path} returned 429`, { endpoint: path, detail });
       } else if (response.status >= 500) {
         Logger.error('WebappClient', `[WEBAPP ERROR] ${path} returned ${response.status}`, null, { endpoint: path, detail });
+      } else {
+        // 4xx other than 401/402/429 — log so we can diagnose validation failures
+        Logger.warn('WebappClient', `[WEBAPP 4xx] ${path} returned ${response.status}`, { endpoint: path, status: response.status, detail });
       }
 
       const err = new Error(`Healix webapp ${path} failed (${response.status}): ${detail}`);

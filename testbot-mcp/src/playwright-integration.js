@@ -603,7 +603,10 @@ module.exports = defineConfig({
       args.push('--retries', String(retries));
     }
 
-    if (!configPath && Number.isFinite(Number(this.config.testTimeoutMs))) {
+    // Always pass --timeout so auth-heavy Supabase/Next.js flows aren't killed
+    // by Playwright's 30s default. The CLI flag overrides whatever the config file
+    // says, so user configs with no explicit timeout are safely upgraded.
+    if (Number.isFinite(Number(this.config.testTimeoutMs))) {
       args.push('--timeout', String(Math.max(1000, Number(this.config.testTimeoutMs))));
     }
 
@@ -699,11 +702,11 @@ module.exports = defineConfig({
     }
   }
 
-  async executePlaywright({ project, lastFailed = false, grep, grepInvert, outputDir } = {}) {
+  async executePlaywright({ project, lastFailed = false, grep, grepInvert, outputDir, configPath: configPathOverride } = {}) {
     this.ensurePlaywrightInstalled();
     this.ensurePlaywrightBrowsersInstalled();
 
-    const configPath = this.resolvePlaywrightConfig();
+    const configPath = configPathOverride || this.resolvePlaywrightConfig();
     const timeoutMs = Math.max(1000, this.config.timeout || 300000);
     const forceJsonReporter = !configPath;
     const args = this.buildPlaywrightArgs({
@@ -919,15 +922,20 @@ module.exports = defineConfig({
     return combined;
   }
 
-  async runTwoPhaseExecution() {
+  async runTwoPhaseExecution({ excludeAuthTests = false } = {}) {
     const gatePattern = '@phase2|@deep|@stress|@matrix|@load|@api-stress|@api-negative|@api-auth|@api-contract';
-    
+    // When a supplemental playwright.auth.config.ts is present, skip @auth|@tierB
+    // here so those tests run under the right storageState (auth pass), not twice.
+    const phase1GrepInvert = excludeAuthTests
+      ? `${gatePattern}|@auth|@tierB`
+      : gatePattern;
+
     // Use separate output directories to prevent artifact overwriting
     const phase1OutputDir = path.join(this.config.projectPath, 'healix-reports', 'results', 'phase1');
     const phase2OutputDir = path.join(this.config.projectPath, 'healix-reports', 'results', 'phase2');
-    
-    const phaseOne = await this.executePlaywright({ 
-      grepInvert: gatePattern,
+
+    const phaseOne = await this.executePlaywright({
+      grepInvert: phase1GrepInvert,
       outputDir: phase1OutputDir
     });
 
@@ -1103,16 +1111,53 @@ test.describe('${this.sanitizeString(scenario.name)}', () => {
   /**
    * Run Playwright tests
    */
+  _mergeTestRuns(base, overlay) {
+    base.passed = Number(base.passed || 0) + Number(overlay.passed || 0);
+    base.failed = Number(base.failed || 0) + Number(overlay.failed || 0);
+    base.skipped = Number(base.skipped || 0) + Number(overlay.skipped || 0);
+    base.total = Number(base.total || 0) + Number(overlay.total || 0);
+    base.duration = Math.max(Number(base.duration || 0), Number(overlay.duration || 0));
+    base.tests = [...(base.tests || []), ...(overlay.tests || [])];
+    base.failures = [...(base.failures || []), ...(overlay.failures || [])];
+    return base;
+  }
+
   async runTests() {
     if (this.config.startCommand && !this.config._primaryAppPreStarted) {
       await this.startServer();
     }
 
+    // When the user has their own playwright.config.* Healix writes a supplemental
+    // playwright.auth.config.ts that carries storageState for each verified role.
+    // The main config has no storageState, so @auth tests would redirect to /login
+    // and timeout. Detect the supplemental config and run it as a separate pass.
+    const authConfigPath = path.join(this.config.projectPath, 'playwright.auth.config.ts');
+    const hasSupplementalAuthConfig = fs.existsSync(authConfigPath);
+
     try {
       const phaseMode = String(this.config.phaseMode || 'two-phase').toLowerCase();
       const primary = phaseMode === 'two-phase'
-        ? await this.runTwoPhaseExecution()
-        : await this.executePlaywright();
+        ? await this.runTwoPhaseExecution({ excludeAuthTests: hasSupplementalAuthConfig })
+        : await this.executePlaywright({
+          grepInvert: hasSupplementalAuthConfig ? '@auth|@tierB' : undefined,
+        });
+
+      if (hasSupplementalAuthConfig) {
+        Logger.info('PlaywrightIntegration', 'Running supplemental auth pass', { config: authConfigPath });
+        try {
+          const authResults = await this.executePlaywright({
+            configPath: authConfigPath,
+            outputDir: path.join(this.config.projectPath, 'healix-reports', 'results', 'auth'),
+          });
+          this._mergeTestRuns(primary, authResults);
+          Logger.info('PlaywrightIntegration', 'Auth pass merged', {
+            passed: authResults.passed, failed: authResults.failed, total: authResults.total,
+          });
+        } catch (err) {
+          Logger.warn('PlaywrightIntegration', 'Supplemental auth pass failed (non-fatal)', { reason: err.message });
+        }
+      }
+
       const secondary = await this.runSecondaryBrowserReruns(primary);
 
       if (secondary.length > 0) {
