@@ -111,8 +111,7 @@ export default function HomePage() {
   // runtime, so rendering it would drift from actual billing.
   const tokensRemaining = toDisplayUnits(profile?.tokens_remaining);
   const tokensTotal = toDisplayUnits(profile?.tokens_total);
-  const tokensUsed = Math.max(0, tokensTotal - tokensRemaining);
-  const tokensUsedPct = tokensTotal > 0 ? Math.min(100, (tokensUsed / tokensTotal) * 100) : 0;
+  const tokensRemainingPct = tokensTotal > 0 ? Math.min(100, (tokensRemaining / tokensTotal) * 100) : 0;
   const plan = profile?.plan ?? 'free';
 
   // Determine the next upgrade target so the CTA always reflects reality.
@@ -381,13 +380,13 @@ export default function HomePage() {
 
                   <div className="mb-2">
                     <div className="flex items-center justify-between mb-1.5">
-                      <span className="text-[#8BA4C8] text-xs">Tokens used</span>
-                      <span className="text-[#F0F6FF] text-xs font-semibold">{tokensUsed.toLocaleString()}/{tokensTotal.toLocaleString()}</span>
+                      <span className="text-[#8BA4C8] text-xs">Credits remaining</span>
+                      <span className="text-[#F0F6FF] text-xs font-semibold">{tokensRemaining.toLocaleString()}/{tokensTotal.toLocaleString()}</span>
                     </div>
                     <div className="h-2 bg-white/5 rounded-full overflow-hidden">
                       <motion.div
                         initial={{ width: 0 }}
-                        animate={{ width: `${tokensUsedPct.toFixed(1)}%` }}
+                        animate={{ width: `${tokensRemainingPct.toFixed(1)}%` }}
                         transition={{ duration: 1, delay: 0.5 }}
                         className="h-full rounded-full bg-gradient-to-r from-blue-500 to-cyan-500"
                       />
