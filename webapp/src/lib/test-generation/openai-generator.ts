@@ -372,7 +372,8 @@ export class OpenAITestGenerator {
 
         while (
           expansionAttempt < maxExpansionAttempts &&
-          generationQuality.totalTests < perAgentFloor
+          generationQuality.totalTests < perAgentFloor &&
+          !this.abortSignal?.aborted
         ) {
           expansionAttempt += 1
           const testsNeeded = Math.max(0, perAgentFloor - generationQuality.totalTests)
@@ -657,6 +658,7 @@ export class OpenAITestGenerator {
     quality: GenerationQuality
     testsNeeded: number
   }) {
+    if (this.abortSignal?.aborted) return
     const missingCategories = Array.isArray(quality?.missingCategories)
       ? quality.missingCategories
       : []
