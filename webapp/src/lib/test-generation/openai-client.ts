@@ -45,19 +45,56 @@ export class OpenAIClient {
     }
   }
 
-  async callOpenAI(messages: OpenAIMessage[], _options: { model?: string } = {}): Promise<OpenAICallResult> {
+  async callOpenAI(
+    messages: OpenAIMessage[],
+    options: {
+      model?: string
+      // External abort — when fired, the in-flight OpenAI fetch dies. Used by
+      // dispatchAgents to cancel parallel fan-out the moment the user's
+      // balance hits 0, so we don't keep paying OpenAI for tokens the user
+      // can't be charged for.
+      signal?: AbortSignal
+    } = {},
+  ): Promise<OpenAICallResult> {
     const model = this.config.model
     try {
-      const result = await this.callResponsesAPI(messages, model)
+      const result = await this.callResponsesAPI(messages, model, options.signal)
       return { text: result.text, usage: result.usage, modelUsed: model }
     } catch (err) {
+      // Bubble user-initiated aborts — never fall back to Chat Completions on
+      // an abort, that would defeat the whole point of cancelling.
+      if (err instanceof Error && (err.name === 'AbortError' || /aborted/i.test(err.message))) {
+        throw err
+      }
       // Responses API failed (model not found, format unsupported, etc.) —
       // fall back to Chat Completions so the pipeline keeps working.
       const msg = err instanceof Error ? err.message : String(err)
       console.warn(`[openai-client] Responses API failed (${msg}), falling back to Chat Completions`)
-      const result = await this.callChatCompletionsAPI(messages, model)
+      const result = await this.callChatCompletionsAPI(messages, model, options.signal)
       return { text: result.text, usage: result.usage, modelUsed: model }
     }
+  }
+
+  // Combine our internal timeout controller with an optional external signal.
+  // Returns the composite signal plus a cleanup that clears the timeout.
+  private composeAbortSignal(externalSignal?: AbortSignal): {
+    signal: AbortSignal
+    cleanup: () => void
+  } {
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(new Error('TIMEOUT')), this.config.timeout)
+    if (externalSignal) {
+      if (externalSignal.aborted) {
+        controller.abort(externalSignal.reason ?? new Error('ABORTED'))
+      } else {
+        externalSignal.addEventListener(
+          'abort',
+          () => controller.abort(externalSignal.reason ?? new Error('ABORTED')),
+          { once: true },
+        )
+      }
+    }
+    return { signal: controller.signal, cleanup: () => clearTimeout(timeout) }
   }
 
   buildPreferredModelList(_requestedModel: string): string[] {
@@ -121,7 +158,11 @@ export class OpenAIClient {
     return null
   }
 
-  async callResponsesAPI(messages: OpenAIMessage[], model: string): Promise<{ text: string; usage: OpenAIUsage }> {
+  async callResponsesAPI(
+    messages: OpenAIMessage[],
+    model: string,
+    externalSignal?: AbortSignal,
+  ): Promise<{ text: string; usage: OpenAIUsage }> {
     const RETRYABLE = new Set([502, 503, 504])
     const MAX_ATTEMPTS = 3
     const RETRY_DELAYS_MS = [0, 3000, 6000]
@@ -131,8 +172,12 @@ export class OpenAIClient {
         await new Promise((r) => setTimeout(r, RETRY_DELAYS_MS[attempt]))
       }
 
-      const controller = new AbortController()
-      const timeout = setTimeout(() => controller.abort(), this.config.timeout)
+      // External abort early-out before paying for setup overhead.
+      if (externalSignal?.aborted) {
+        throw new Error('OpenAI request aborted by caller')
+      }
+
+      const { signal, cleanup } = this.composeAbortSignal(externalSignal)
 
       try {
         const response = await fetch(`${this.baseUrl}/responses`, {
@@ -145,13 +190,20 @@ export class OpenAIClient {
             model,
             input: this.buildResponsesInput(messages),
             reasoning: { effort: this.config.reasoningEffort || 'high' },
+            // Hard ceiling on output tokens. Output is 6× the price of input
+            // on gpt-5.4-mini, so a runaway agent (we saw 47K out on the
+            // workflow agent during demo) can blow $0.20+ per call. Cap is
+            // sourced from this.config.maxTokens (env: OPENAI_MAX_TOKENS;
+            // default 12K — see constructor) so it can be tuned without code
+            // changes.
+            max_output_tokens: this.config.maxTokens,
           }),
-          signal: controller.signal,
+          signal,
         })
 
         if (!response.ok) {
           if (RETRYABLE.has(response.status) && attempt < MAX_ATTEMPTS - 1) {
-            clearTimeout(timeout)
+            cleanup()
             continue
           }
           const errorData = await response.json().catch(() => ({}))
@@ -170,22 +222,33 @@ export class OpenAIClient {
         }
         return { text, usage }
       } catch (error) {
-        clearTimeout(timeout)
+        cleanup()
+        // Distinguish caller-initiated abort from our own timeout so the
+        // dispatcher can mark agents 'cancelled' instead of 'failed'.
+        if (externalSignal?.aborted) {
+          throw new Error('OpenAI request aborted by caller')
+        }
         if (error instanceof Error && error.name === 'AbortError') {
           throw new Error(`OpenAI responses API request timeout (${Math.ceil(this.config.timeout / 1000)}s)`)
         }
         throw error
       } finally {
-        clearTimeout(timeout)
+        cleanup()
       }
     }
 
     throw new Error('OpenAI responses API failed after retries')
   }
 
-  async callChatCompletionsAPI(messages: OpenAIMessage[], model: string): Promise<{ text: string; usage: OpenAIUsage }> {
-    const controller = new AbortController()
-    const timeout = setTimeout(() => controller.abort(), this.config.timeout)
+  async callChatCompletionsAPI(
+    messages: OpenAIMessage[],
+    model: string,
+    externalSignal?: AbortSignal,
+  ): Promise<{ text: string; usage: OpenAIUsage }> {
+    if (externalSignal?.aborted) {
+      throw new Error('OpenAI request aborted by caller')
+    }
+    const { signal, cleanup } = this.composeAbortSignal(externalSignal)
 
     try {
       const response = await fetch(`${this.baseUrl}/chat/completions`, {
@@ -198,9 +261,10 @@ export class OpenAIClient {
           model,
           messages,
           temperature: this.config.temperature,
+          // Same hard ceiling as the Responses API path — see comment above.
           max_completion_tokens: this.config.maxTokens,
         }),
-        signal: controller.signal,
+        signal,
       })
 
       if (!response.ok) {
@@ -220,12 +284,15 @@ export class OpenAIClient {
       }
       return { text, usage }
     } catch (error) {
+      if (externalSignal?.aborted) {
+        throw new Error('OpenAI request aborted by caller')
+      }
       if (error instanceof Error && error.name === 'AbortError') {
         throw new Error(`OpenAI chat API request timeout (${Math.ceil(this.config.timeout / 1000)}s)`)
       }
       throw error
     } finally {
-      clearTimeout(timeout)
+      cleanup()
     }
   }
 }

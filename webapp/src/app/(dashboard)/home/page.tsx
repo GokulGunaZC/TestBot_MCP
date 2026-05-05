@@ -111,9 +111,16 @@ export default function HomePage() {
   // runtime, so rendering it would drift from actual billing.
   const tokensRemaining = toDisplayUnits(profile?.tokens_remaining);
   const tokensTotal = toDisplayUnits(profile?.tokens_total);
-  const tokensUsed = Math.max(0, tokensTotal - tokensRemaining);
-  const tokensUsedPct = tokensTotal > 0 ? Math.min(100, (tokensUsed / tokensTotal) * 100) : 0;
-  const plan = profile?.plan ?? 'Free';
+  const tokensRemainingPct = tokensTotal > 0 ? Math.min(100, (tokensRemaining / tokensTotal) * 100) : 0;
+  const plan = profile?.plan ?? 'free';
+
+  // Determine the next upgrade target so the CTA always reflects reality.
+  const nextPlan: { id: string; label: string; description: string } | null =
+    plan === 'free'
+      ? { id: 'starter', label: 'Starter', description: 'Get 2,500 credits/mo + advanced AI models + Jira integration.' }
+      : plan === 'starter'
+      ? { id: 'team', label: 'Team', description: 'Get 10,000 credits/mo + CI/CD integration + priority support.' }
+      : null // team / enterprise — already on top plan
 
   const containerVariants = {
     hidden: {},
@@ -373,29 +380,39 @@ export default function HomePage() {
 
                   <div className="mb-2">
                     <div className="flex items-center justify-between mb-1.5">
-                      <span className="text-[#8BA4C8] text-xs">Tokens used</span>
-                      <span className="text-[#F0F6FF] text-xs font-semibold">{tokensUsed.toLocaleString()}/{tokensTotal.toLocaleString()}</span>
+                      <span className="text-[#8BA4C8] text-xs">Credits remaining</span>
+                      <span className="text-[#F0F6FF] text-xs font-semibold">{tokensRemaining.toLocaleString()}/{tokensTotal.toLocaleString()}</span>
                     </div>
                     <div className="h-2 bg-white/5 rounded-full overflow-hidden">
                       <motion.div
                         initial={{ width: 0 }}
-                        animate={{ width: `${tokensUsedPct.toFixed(1)}%` }}
+                        animate={{ width: `${tokensRemainingPct.toFixed(1)}%` }}
                         transition={{ duration: 1, delay: 0.5 }}
                         className="h-full rounded-full bg-gradient-to-r from-blue-500 to-cyan-500"
                       />
                     </div>
                   </div>
 
-                  <p className="text-[#4A6280] text-xs mt-3">
-                    Upgrade to Pro for more tokens + Jira integration + all AI providers.
-                  </p>
-
-                  <Link
-                    href="/plan-billing"
-                    className="mt-4 block w-full py-2.5 rounded-xl btn-gradient text-black font-semibold text-sm text-center"
-                  >
-                    Upgrade to Pro
-                  </Link>
+                  {nextPlan ? (
+                    <>
+                      <p className="text-[#4A6280] text-xs mt-3">
+                        {nextPlan.description}
+                      </p>
+                      <Link
+                        href="/plan-billing"
+                        className="mt-4 block w-full py-2.5 rounded-xl btn-gradient text-black font-semibold text-sm text-center"
+                      >
+                        Upgrade to {nextPlan.label}
+                      </Link>
+                    </>
+                  ) : (
+                    <Link
+                      href="/plan-billing"
+                      className="mt-4 block w-full py-2.5 rounded-xl border border-white/10 text-[#8BA4C8] font-semibold text-sm text-center hover:bg-white/5 transition-colors"
+                    >
+                      Manage Plan →
+                    </Link>
+                  )}
                 </>
               )}
             </div>

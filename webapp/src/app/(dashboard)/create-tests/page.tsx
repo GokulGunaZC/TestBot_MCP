@@ -4,18 +4,24 @@ import { motion } from 'framer-motion';
 import Link from 'next/link';
 import { useEffect, useState } from 'react';
 
+const MIN_TOKENS_GENERATE = 40_000;   // p50 — block below this
+const REC_TOKENS_GENERATE = 120_000;  // p95 — warn between min and rec
+
 export default function CreateTestsPage() {
-  const [outOfTokens, setOutOfTokens] = useState(false);
+  const [tokensRemaining, setTokensRemaining] = useState<number | null>(null);
 
   useEffect(() => {
     fetch('/api/profile')
       .then(r => r.ok ? r.json() : null)
       .then(json => {
-        const remaining = json?.data?.tokens_remaining ?? json?.tokens_remaining ?? 1;
-        setOutOfTokens(Number(remaining) === 0);
+        const remaining = json?.data?.tokens_remaining ?? json?.tokens_remaining ?? null;
+        if (remaining != null) setTokensRemaining(Number(remaining));
       })
       .catch(() => {});
   }, []);
+
+  const outOfTokens = tokensRemaining != null && tokensRemaining < MIN_TOKENS_GENERATE;
+  const lowTokens   = tokensRemaining != null && tokensRemaining >= MIN_TOKENS_GENERATE && tokensRemaining < REC_TOKENS_GENERATE;
 
   return (
     <motion.div
@@ -38,12 +44,38 @@ export default function CreateTestsPage() {
             <path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>
           </svg>
           <div className="flex-1">
-            <p className="text-red-400 text-sm font-semibold">You&apos;ve run out of tokens</p>
-            <p className="text-red-300/70 text-xs mt-0.5">Test generation is blocked until you upgrade your plan.</p>
+            <p className="text-red-400 text-sm font-semibold">Not enough tokens to start a test run</p>
+            <p className="text-red-300/70 text-xs mt-0.5">
+              You have {tokensRemaining?.toLocaleString() ?? 0} tokens. A typical run needs at least {MIN_TOKENS_GENERATE.toLocaleString()}.
+            </p>
           </div>
           <Link
             href="/plan-billing"
             className="flex-shrink-0 px-3 py-1.5 rounded-lg bg-red-500/20 border border-red-500/30 text-red-300 text-xs font-semibold hover:bg-red-500/30 transition-colors"
+          >
+            Upgrade Plan
+          </Link>
+        </motion.div>
+      )}
+
+      {lowTokens && (
+        <motion.div
+          initial={{ opacity: 0, y: -8 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="mb-6 flex items-start gap-3 px-4 py-3.5 rounded-xl bg-amber-500/10 border border-amber-500/25"
+        >
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#FBBF24" strokeWidth="2" className="mt-0.5 flex-shrink-0">
+            <circle cx="12" cy="12" r="10" /><path d="M12 8v4M12 16h.01" />
+          </svg>
+          <div className="flex-1">
+            <p className="text-amber-300 text-sm font-semibold">Low token balance</p>
+            <p className="text-amber-200/70 text-xs mt-0.5">
+              You have {tokensRemaining?.toLocaleString()} tokens. A typical run uses ~40K, but larger runs can use up to {REC_TOKENS_GENERATE.toLocaleString()}. Your run may stop early if it exceeds your balance.
+            </p>
+          </div>
+          <Link
+            href="/plan-billing"
+            className="flex-shrink-0 px-3 py-1.5 rounded-lg bg-amber-500/20 border border-amber-500/30 text-amber-200 text-xs font-semibold hover:bg-amber-500/30 transition-colors"
           >
             Upgrade Plan
           </Link>

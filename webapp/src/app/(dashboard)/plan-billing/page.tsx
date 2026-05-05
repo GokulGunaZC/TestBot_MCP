@@ -33,7 +33,7 @@ const PLANS: {
     priceNote: 'forever',
     description: 'Start free. No credit card required.',
     tokens: 240_000,
-    tokenLabel: '50 credits / month',
+    tokenLabel: '500 credits / month',
     features: ['1 user · 1 project', 'Basic AI models', 'Basic test types', 'Community support'],
     cta: 'Downgrade to Trial',
     highlighted: false,
@@ -44,8 +44,8 @@ const PLANS: {
     price: '$15',
     priceNote: '/month',
     description: 'Advanced AI for growing teams.',
-    tokens: 2_400_000,
-    tokenLabel: '500 credits / month',
+    tokens: 12_000_000,
+    tokenLabel: '2,500 credits / month',
     features: ['Advanced AI models', 'All test types · self healing', 'Jira / ADO integration', 'Priority support'],
     cta: 'Upgrade to Starter',
     highlighted: false,
@@ -56,8 +56,8 @@ const PLANS: {
     price: '$30',
     priceNote: '/month',
     description: 'Scalable testing for engineering teams.',
-    tokens: 4_800_000,
-    tokenLabel: '1,000 credits / month',
+    tokens: 48_000_000,
+    tokenLabel: '10,000 credits / month',
     features: [
       'Advanced models + priority queue',
       'Custom integrations (10 hrs onboarding)',
@@ -120,6 +120,7 @@ export default function PlanBillingPage() {
   const [profile, setProfile] = useState<Profile | null>(null)
   const [loading, setLoading] = useState(true)
   const [checkingOut, setCheckingOut] = useState<PlanId | null>(null)
+  const [openingPortal, setOpeningPortal] = useState(false)
   const [banner, setBanner] = useState<{ type: 'success' | 'error' | 'cancelled'; message: string } | null>(null)
   const [downgradeTarget, setDowngradeTarget] = useState<typeof PLANS[number] | null>(null)
 
@@ -145,10 +146,27 @@ export default function PlanBillingPage() {
   useEffect(() => {
     const payment = searchParams.get('payment')
     const plan = searchParams.get('plan')
+    const sessionId = searchParams.get('session_id')
     if (payment === 'success' && plan) {
       setBanner({ type: 'success', message: `You're now on the ${plan.charAt(0).toUpperCase() + plan.slice(1)} plan! Your credits have been refreshed.` })
-      loadProfile().then(() => window.dispatchEvent(new Event('healix:profile-updated')))
-      router.replace('/plan-billing')
+      const confirmAndRefresh = async () => {
+        if (sessionId) {
+          try {
+            await fetch('/api/stripe/checkout/confirm', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ sessionId }),
+            })
+          } catch { /* best-effort — loadProfile will still refresh the UI */ }
+        }
+        await loadProfile()
+        window.dispatchEvent(new Event('healix:profile-updated'))
+        // Clean up URL only after profile is refreshed so the effect cleanup
+        // does not cancel loadProfile() mid-flight (router.replace changes
+        // searchParams, which re-runs this effect and sets alive=false).
+        router.replace('/plan-billing')
+      }
+      void confirmAndRefresh()
     } else if (payment === 'cancelled') {
       setBanner({ type: 'cancelled', message: 'Payment was cancelled. Your plan has not changed.' })
       router.replace('/plan-billing')
@@ -199,6 +217,25 @@ export default function PlanBillingPage() {
       setBanner({ type: 'error', message: 'An unexpected error occurred. Please try again.' })
     } finally {
       setCheckingOut(null)
+    }
+  }
+
+  const openPortal = async () => {
+    setOpeningPortal(true)
+    setBanner(null)
+    try {
+      const res = await fetch('/api/stripe/portal', { method: 'POST' })
+      if (!res.ok) {
+        const { error } = await res.json()
+        setBanner({ type: 'error', message: error ?? 'Could not open billing portal.' })
+        return
+      }
+      const { url } = await res.json()
+      window.location.href = url
+    } catch {
+      setBanner({ type: 'error', message: 'An unexpected error occurred. Please try again.' })
+    } finally {
+      setOpeningPortal(false)
     }
   }
 
@@ -274,12 +311,48 @@ export default function PlanBillingPage() {
                   <p className="text-text-muted text-sm mb-1">Current plan</p>
                   <div className="flex items-center gap-2">
                     <h2 className="text-xl font-bold text-text-primary capitalize">{currentPlan === 'free' ? 'Trial' : currentPlan}</h2>
-                    <Badge variant={currentPlan === 'enterprise' ? 'info' : currentPlan === 'team' || currentPlan === 'starter' ? 'success' : 'neutral'}>
-                      Active
+                    <Badge
+                      variant={
+                        profile?.subscription_status === 'past_due'
+                          ? 'warning'
+                          : profile?.subscription_status === 'cancelled'
+                          ? 'neutral'
+                          : currentPlan === 'enterprise'
+                          ? 'info'
+                          : currentPlan === 'team' || currentPlan === 'starter'
+                          ? 'success'
+                          : 'neutral'
+                      }
+                    >
+                      {profile?.subscription_status === 'past_due'
+                        ? 'Past Due'
+                        : profile?.subscription_status === 'cancelled'
+                        ? 'Cancelled'
+                        : 'Active'}
                     </Badge>
                   </div>
                 </div>
+                {profile?.stripe_customer_id && currentPlan !== 'free' && (
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    loading={openingPortal}
+                    disabled={openingPortal}
+                    onClick={openPortal}
+                  >
+                    Manage Billing
+                  </Button>
+                )}
               </div>
+              {profile?.subscription_status === 'past_due' && (
+                <div className="flex items-center gap-2 px-3 py-2 rounded-none border border-amber-500/30 bg-amber-500/10 text-amber-400 text-xs">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" className="shrink-0">
+                    <path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" />
+                    <line x1="12" y1="9" x2="12" y2="13" /><line x1="12" y1="17" x2="12.01" y2="17" />
+                  </svg>
+                  Payment failed. Please update your payment method to avoid service interruption.
+                </div>
+              )}
               <TokenMeter
                 remaining={profile?.tokens_remaining ?? 0}
                 total={profile?.tokens_total ?? 1_000_000}
@@ -302,13 +375,6 @@ export default function PlanBillingPage() {
                 gradient={plan.highlighted}
                 className={`p-6 flex flex-col ${plan.highlighted ? 'border-blue-500/30 shadow-[0_0_40px_rgba(59,130,246,0.15)]' : ''}`}
               >
-                {plan.highlighted && (
-                  <div className="absolute top-0 left-1/2 -translate-x-1/2 -translate-y-1/2">
-                    <span className="px-3 py-1 rounded-full text-xs font-semibold bg-gradient-to-r from-blue-500 to-cyan-400 text-white shadow-lg">
-                      Most Popular
-                    </span>
-                  </div>
-                )}
 
                 <div className="mb-5">
                   <h3 className="text-text-primary font-semibold text-base mb-1">{plan.name}</h3>

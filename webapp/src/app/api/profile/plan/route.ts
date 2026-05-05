@@ -3,9 +3,7 @@ import { db } from '@/lib/db'
 import { profiles } from '@/lib/db/schema'
 import { eq } from 'drizzle-orm'
 import { getCurrentProfile } from '@/lib/auth/session'
-
-const PLAN_RANK: Record<string, number> = { free: 0, starter: 1, team: 2, enterprise: 3 }
-const PLAN_TOKEN_TOTALS: Record<string, number> = { free: 240_000, starter: 2_400_000, team: 4_800_000 }
+import { PLAN_RANK, PLAN_TOKEN_TOTALS } from '@/lib/plans'
 
 export async function POST(request: NextRequest) {
   try {

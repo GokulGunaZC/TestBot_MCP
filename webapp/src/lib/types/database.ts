@@ -17,6 +17,9 @@ export interface Profile {
   tokens_remaining: number
   tokens_total: number
   onboarding_completed: boolean
+  stripe_customer_id: string | null
+  stripe_subscription_id: string | null
+  subscription_status: string | null
   created_at: string
   updated_at: string
 }

@@ -115,6 +115,10 @@ export interface DispatchParams extends GenerateTestsParams {
   // targets" preamble. When absent, the generator falls back to its
   // open-ended prompt (existing behavior).
   agentPlanSlice?: Record<string, unknown>
+  // Caller-supplied abort signal. The /api/generate-tests route fires this
+  // the moment the user's balance hits 0 (after any agent's debit lands), so
+  // in-flight OpenAI calls die instead of running for free on our dime.
+  abortSignal?: AbortSignal
 }
 
 export interface DispatchResult {
@@ -161,6 +165,7 @@ export async function dispatchAgents(params: DispatchParams): Promise<DispatchRe
   const plan = llmPlan ?? rulePlan
 
   const generator = new OpenAITestGenerator(params.generatorConfig)
+  generator.setAbortSignal(params.abortSignal)
   const files = await generator.generateTests({
     context: params.context,
     prd: params.prd,

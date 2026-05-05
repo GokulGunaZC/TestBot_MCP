@@ -17,7 +17,8 @@ import type {
 } from '@/lib/test-generation/types'
 import { CURRENT_PLAN_VERSION } from '@/lib/test-generation/plan-schema'
 import { checkRateLimit } from '@/lib/rate-limit'
-import { checkTokenBalance, deductTokens } from '@/lib/tokens'
+import { checkTokenBalance, recordTokenUsage, MIN_TOKENS_GENERATE, REC_TOKENS_GENERATE } from '@/lib/tokens'
+import { resolveModel } from '@/lib/pricing'
 import { checkConcurrencyLimit } from '@/lib/concurrency-limit'
 import { checkIdempotency, storeIdempotencyResult } from '@/lib/idempotency'
 import { validateGenerateTests } from '@/lib/validation'
@@ -170,9 +171,9 @@ export async function POST(request: NextRequest) {
     }
 
     // 8. Token balance gate — check before making AI calls
-    const tokenCheck = await checkTokenBalance({ userId, endpoint: ENDPOINT })
+    const tokenCheck = await checkTokenBalance({ userId, endpoint: ENDPOINT, minRequired: MIN_TOKENS_GENERATE, recommended: REC_TOKENS_GENERATE })
     if (!tokenCheck.allowed) {
-      return NextResponse.json({ error: 'No tokens remaining. Please renew your plan.' }, { status: 402 })
+      return NextResponse.json({ error: tokenCheck.reason }, { status: 402 })
     }
 
     // Update last_used_at
@@ -388,6 +389,12 @@ export async function POST(request: NextRequest) {
     // (SELECT agent, AVG(latency_ms), SUM(tokens_total) FROM ... GROUP BY agent).
     const agentTelemetry: AgentRunRecord[] = []
     const runId = request.headers.get('x-healix-run-id') || null
+    // Cooperative cancellation across the parallel fan-out. The moment any
+    // agent's debit lands and zeroes the user's balance we abort the
+    // remaining agents — they stop streaming OpenAI tokens we cannot bill
+    // for. Margin protection without a pre-flight buffer that would reject
+    // users who have just enough to start.
+    const generationAbort = new AbortController()
     const { files: generatedFiles, summary, plan } = await dispatchAgents({
       context: ctx,
       prd: prdContent,
@@ -399,6 +406,7 @@ export async function POST(request: NextRequest) {
       options: genOptions,
       agentsAllowlist: agentsAllowlist ?? undefined,
       agentPlanSlice,
+      abortSignal: generationAbort.signal,
       generatorConfig: {
         apiKey: process.env.OPENAI_API_KEY,
         model: process.env.OPENAI_MODEL || 'gpt-4.1-mini',
@@ -414,13 +422,32 @@ export async function POST(request: NextRequest) {
       },
       onAgentComplete: async (record) => {
         agentTelemetry.push(record)
+        // Per-agent ledger entry — gives `SELECT agent, SUM(tokens_total) FROM
+        // token_ledger GROUP BY agent` for free, with input/output split and
+        // snapshotted rates. Telemetry row stays for ops dashboards.
+        if (record.success && (record.tokensTotal ?? 0) > 0) {
+          const usage = await recordTokenUsage({
+            userId,
+            endpoint: ENDPOINT,
+            agent: record.agent,
+            model: resolveModel(record.modelUsed),
+            tokensInput:  record.tokensPrompt ?? 0,
+            tokensOutput: record.tokensCompletion ?? 0,
+            referenceType: 'test_run',
+            referenceId: runId,
+          })
+          // Balance just hit 0 — abort siblings still talking to OpenAI.
+          if (usage && usage.balanceAfter <= 0 && !generationAbort.signal.aborted) {
+            generationAbort.abort(new Error('CREDITS_EXHAUSTED'))
+          }
+        }
         await recordAiCall({
           userId,
           apiKeyId: apiKeyRecord.id,
           endpoint: ENDPOINT,
           agent: record.agent,
           latencyMs: record.latencyMs,
-          modelUsed: record.modelUsed ?? undefined,
+          modelUsed: resolveModel(record.modelUsed),
           tokensPrompt: record.tokensPrompt,
           tokensCompletion: record.tokensCompletion,
           tokensTotal: record.tokensTotal,
@@ -430,11 +457,6 @@ export async function POST(request: NextRequest) {
         })
       },
     })
-
-    const tokensConsumed = summary.tokenUsage.totalTokens
-    if (tokensConsumed > 0) {
-      await deductTokens({ userId, tokensUsed: tokensConsumed })
-    }
 
     const responseBody = {
       success: true,

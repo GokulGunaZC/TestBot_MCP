@@ -4,7 +4,8 @@ import { apiKeys } from '@/lib/db/schema'
 import { eq, and } from 'drizzle-orm'
 import { hashApiKey } from '@/lib/utils/api-keys'
 import { checkRateLimit } from '@/lib/rate-limit'
-import { checkTokenBalance, deductTokens } from '@/lib/tokens'
+import { checkTokenBalance, recordTokenUsage, MIN_TOKENS_ANALYZE, REC_TOKENS_ANALYZE } from '@/lib/tokens'
+import { resolveModel } from '@/lib/pricing'
 import { checkIdempotency, storeIdempotencyResult } from '@/lib/idempotency'
 import { validateAnalyzeFailures } from '@/lib/validation'
 import { checkAiGuard, recordAiCall } from '@/lib/ai-guard'
@@ -373,9 +374,9 @@ export async function POST(request: NextRequest) {
     }
 
     // 8. Token balance gate — check before making AI calls
-    const tokenCheck = await checkTokenBalance({ userId, endpoint: ENDPOINT })
+    const tokenCheck = await checkTokenBalance({ userId, endpoint: ENDPOINT, minRequired: MIN_TOKENS_ANALYZE, recommended: REC_TOKENS_ANALYZE })
     if (!tokenCheck.allowed) {
-      return NextResponse.json({ error: 'No tokens remaining. Please renew your plan.' }, { status: 402 })
+      return NextResponse.json({ error: tokenCheck.reason }, { status: 402 })
     }
 
     // Update last_used_at
@@ -489,15 +490,25 @@ export async function POST(request: NextRequest) {
 
     // Deduct actual tokens consumed and record AI call
     if (totalTokensConsumed > 0) {
-      await deductTokens({ userId, tokensUsed: totalTokensConsumed })
+      await recordTokenUsage({
+        userId,
+        endpoint: ENDPOINT,
+        agent: 'analyze_failures',
+        model: resolveModel(lastModelUsed),
+        tokensInput:  totalPromptTokens,
+        tokensOutput: totalCompletionTokens,
+        referenceType: 'analyze_failures',
+        referenceId: null,
+      })
       await recordAiCall({
         userId,
         apiKeyId: apiKeyRecord.id,
         endpoint: ENDPOINT,
-        modelUsed: lastModelUsed,
+        modelUsed: resolveModel(lastModelUsed),
         tokensPrompt: totalPromptTokens,
         tokensCompletion: totalCompletionTokens,
         tokensTotal: totalTokensConsumed,
+        agent: 'analyze_failures',
       })
     }
 

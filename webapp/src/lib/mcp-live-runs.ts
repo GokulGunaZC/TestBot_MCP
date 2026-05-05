@@ -127,16 +127,22 @@ function buildSyntheticLiveReport(snapshot: LiveRunSnapshot) {
       attachments: { screenshots: [], videos: [], traces: [], other: [] },
     }))
   } else if (snapshot.runStatus === 'failed') {
+    const errorBlob = `${snapshot.errorCode ?? ''} ${snapshot.reason ?? ''} ${baseMessage}`
+    const isCreditsError = /INSUFFICIENT_CREDITS|No credits remaining|Insufficient credits/i.test(errorBlob)
     tests = [{
       id: `live-${snapshot.runId}-healix-error`,
-      title: `[HEALIX_ERROR:${snapshot.errorCode || 'HEALIX_FAILED'}] ${baseMessage}`,
+      title: isCreditsError
+        ? 'Out of credits — upgrade your plan to run tests'
+        : `[HEALIX_ERROR:${snapshot.errorCode || 'HEALIX_FAILED'}] ${baseMessage}`,
       suite: 'Healix',
       file: 'healix',
       status: 'failed',
       duration,
       retries: 0,
       error: {
-        message: snapshot.reason || baseMessage,
+        message: isCreditsError
+          ? 'Your account has run out of credits. Please upgrade your plan or wait for the next billing cycle.'
+          : (snapshot.reason || baseMessage),
         stack: null,
       },
       attachments: { screenshots: [], videos: [], traces: [], other: [] },
