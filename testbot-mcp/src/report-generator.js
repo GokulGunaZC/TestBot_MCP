@@ -433,6 +433,7 @@ class ReportGenerator {
     generationMeta,
     generationQuality,
     requirementsCoverage,
+    routeAccessSummary,
     phaseResults,
     tierResults,
     pipelineError,
@@ -480,12 +481,14 @@ class ReportGenerator {
         runId: this.stripAnsiAndNormalize(runId || null),
         generationMeta: generationMeta || null,
         fallbackUsed: Boolean(fallbackUsed),
+        routeAccessSummary: this.stripAnsiAndNormalize(routeAccessSummary || generationMeta?.routeAccessSummary || null),
       },
       stats: {
         total: Number(testResults.total || 0),
         passed: Number(testResults.passed || 0),
         failed: Number(testResults.failed || 0),
         skipped: Number(testResults.skipped || 0),
+        runnable: Math.max(0, Number(testResults.total || 0) - Number(testResults.skipped || 0)),
         flaky: Number(flakyCount ?? testResults.flaky ?? 0),
         duration: Number(testResults.duration || 0),
         passRate: testResults.total > 0
@@ -500,7 +503,9 @@ class ReportGenerator {
       phaseResults: this.stripAnsiAndNormalize(phaseResults || testResults.phaseResults || null),
       tierResults: tierResults || testResults.tierResults || null,
       pipelineError: pipelineError ? this.stripAnsiAndNormalize(pipelineError) : null,
-      failures: Array.isArray(failures) ? failures : [],
+      failures: Array.isArray(failures)
+        ? failures
+        : this.stripAnsiAndNormalize(testResults.failures || []),
       classifierVerdicts: Array.isArray(classifierVerdicts) ? classifierVerdicts : [],
       failureClusters: Array.isArray(failureClusters) ? failureClusters : [],
     };

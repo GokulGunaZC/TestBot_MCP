@@ -30,15 +30,36 @@ export interface ProjectInfo {
 
 export interface PageInfo {
   path: string
+  sourceFile?: string
+  routeComponent?: string | null
   description?: string
   components?: string[]
   interactions?: string[]
   selectorHints?: string[]
 }
 
+export interface SourceContextFile {
+  file: string
+  kind?: 'page' | 'router' | 'component' | 'data' | 'source' | string
+  routePaths?: string[]
+  components?: string[]
+  testIds?: string[]
+  assertableText?: string[]
+}
+
+export interface SourceContext {
+  files?: SourceContextFile[]
+  assertableText?: string[]
+  routePaths?: string[]
+  testIds?: string[]
+  sourceFilesAnalyzed?: number
+}
+
 export interface ApiEndpoint {
   method: string
   path: string
+  synthetic?: boolean
+  source?: string
   requiresAuth?: boolean
   authRequired?: boolean
   auth?: string
@@ -130,12 +151,28 @@ export interface CapturedContext {
   mockableApiContracts?: MockableApiContract[]
   dataModels?: unknown[]
   fileContents?: Record<string, string>
+  sourceContext?: SourceContext
   envVariables?: string[]
   dependencies?: Record<string, unknown>
   errorScenarios?: Array<{ scenario: string; trigger: string; expectedError: string }>
   criticalBusinessLogic?: unknown[]
   frontendInteractions?: unknown[]
   testDataSuggestions?: unknown
+  generationFeedback?: {
+    attempt?: number
+    previousFailureCode?: string | null
+    previousFailureMessage?: string | null
+    quality?: {
+      totalTests?: number
+      skippedTests?: number
+      runnableTests?: number
+      runnableRatio?: number
+      missingCategories?: string[]
+      errors?: string[]
+    }
+    routeAccessSummary?: unknown
+    instructions?: string[]
+  }
   projectStructure?: {
     framework?: string
     hasTypeScript?: boolean
@@ -147,6 +184,7 @@ export interface GenerationOptions {
   includeSmoke?: boolean
   includeWorkflows?: boolean
   includeErrorStates?: boolean
+  allowSyntheticErrorScenarios?: boolean
   strictAIGeneration?: boolean
   minGeneratedTests?: number
   coverageProfile?: 'balanced' | 'qa-max' | 'exhaustive'
@@ -178,7 +216,11 @@ export interface GenerationQuality {
   errorCode: string | null
   errors: string[]
   totalTests: number
+  skippedTests?: number
+  runnableTests?: number
+  runnableRatio?: number
   minGeneratedTests: number
+  minRunnableRatio?: number
   coverageProfile: string
   minCategoryHits: number
   requiredCategories: string[]

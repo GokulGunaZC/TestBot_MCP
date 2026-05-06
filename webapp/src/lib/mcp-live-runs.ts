@@ -353,8 +353,9 @@ export async function getLiveRunSnapshotsForUser(userId: string, options?: {
     if (existing.liveTests === null && eventType === 'test_results' && Array.isArray(meta.tests)) {
       existing.liveTests = meta.tests as LiveTest[]
     }
-    if (existing.generatedFiles === null && eventType === 'tests_generated' && Array.isArray(meta.files)) {
-      existing.generatedFiles = meta.files as string[]
+    if (eventType === 'tests_generated' && Array.isArray(meta.files)) {
+      const current = Array.isArray(existing.generatedFiles) ? existing.generatedFiles : []
+      existing.generatedFiles = [...new Set([...current, ...(meta.files as string[])])]
     }
   }
 

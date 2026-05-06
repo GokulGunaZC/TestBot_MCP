@@ -35,6 +35,24 @@ export interface AgentPlan {
   apiOnly: boolean
 }
 
+function hasBackendService(projectInfo: ProjectInfo = {}): boolean {
+  return (projectInfo.services || []).some((service) =>
+    service?.role === 'backend' || service?.role === 'fullstack'
+  )
+}
+
+function isSyntheticHealthEndpoint(endpoint: { method?: string; path?: string; synthetic?: boolean; source?: string } | null | undefined): boolean {
+  return String(endpoint?.method || 'GET').toUpperCase() === 'GET'
+    && endpoint?.path === '/api/health'
+    && (endpoint.synthetic === true || endpoint.source === 'healix_fallback' || !endpoint.source)
+}
+
+function hasApiSurface(context: CapturedContext = {}, projectInfo: ProjectInfo = {}): boolean {
+  return (context.apiEndpoints || []).filter((endpoint) => !isSyntheticHealthEndpoint(endpoint)).length > 0
+    || (context.mockableApiContracts || []).filter((contract) => !isSyntheticHealthEndpoint(contract)).length > 0
+    || hasBackendService(projectInfo)
+}
+
 export function planAgents(input: {
   testType: 'frontend' | 'backend' | 'both'
   projectInfo?: ProjectInfo
@@ -48,6 +66,8 @@ export function planAgents(input: {
   const options = input.options || {}
   const apiOnly = projectInfo.apiOnly === true
   const testType = apiOnly ? 'backend' : input.testType
+  const explicitBackend = testType === 'backend'
+  const apiSurface = hasApiSurface(context, projectInfo)
 
   const agents: AgentName[] = []
   const why: string[] = []
@@ -78,9 +98,11 @@ export function planAgents(input: {
   }
 
   if (testType === 'backend' || testType === 'both') {
-    if ((context.apiEndpoints?.length ?? 0) > 0 || input.parsedPRD) {
+    if (explicitBackend || apiSurface) {
       agents.push('api')
-      why.push('api endpoints or PRD present')
+      why.push(explicitBackend ? 'backend explicitly requested' : 'API/backend surface detected')
+    } else if (testType === 'both') {
+      why.push('no API/backend surface detected → skip API agent')
     }
   }
 
@@ -163,6 +185,8 @@ export async function dispatchAgents(params: DispatchParams): Promise<DispatchRe
       })
     : null
   const plan = llmPlan ?? rulePlan
+  const effectiveAgentsAllowlist =
+    params.agentsAllowlist ?? new Set<AgentName>(plan.agents)
 
   const generator = new OpenAITestGenerator(params.generatorConfig)
   generator.setAbortSignal(params.abortSignal)
@@ -176,7 +200,7 @@ export async function dispatchAgents(params: DispatchParams): Promise<DispatchRe
     projectInfo: params.projectInfo,
     options: params.options,
     onAgentComplete: params.onAgentComplete,
-    agentsAllowlist: params.agentsAllowlist,
+    agentsAllowlist: effectiveAgentsAllowlist,
     agentPlanSlice: params.agentPlanSlice,
   })
 

@@ -235,6 +235,38 @@ function normalizePath(p: string): string {
   return p.trim().toLowerCase()
 }
 
+function getRouteAccess(ctx: CapturedContext): {
+  authMode?: string
+  publicRoutes: string[]
+  protectedRoutes: string[]
+} {
+  const meta = (ctx as unknown as { meta?: Record<string, unknown> }).meta || {}
+  const routeAccess = (meta.routeAccess || (ctx as unknown as { routeAccess?: unknown }).routeAccess) as Record<string, unknown> | undefined
+  return {
+    authMode: typeof routeAccess?.authMode === 'string' ? routeAccess.authMode : undefined,
+    publicRoutes: Array.isArray(routeAccess?.publicRoutes)
+      ? routeAccess.publicRoutes.filter((p): p is string => typeof p === 'string')
+      : [],
+    protectedRoutes: Array.isArray(routeAccess?.protectedRoutes)
+      ? routeAccess.protectedRoutes.filter((p): p is string => typeof p === 'string')
+      : [],
+  }
+}
+
+function applyRouteAccessRole(ctx: CapturedContext, plan: PageTestPlan): PageTestPlan {
+  const access = getRouteAccess(ctx)
+  const normalizedPath = normalizePath(plan.path)
+  const isPublic = access.publicRoutes.some((p) => normalizePath(p) === normalizedPath)
+  const isProtected = access.protectedRoutes.some((p) => normalizePath(p) === normalizedPath)
+  if (isPublic || (access.authMode === 'public_app' && !isProtected)) {
+    return { ...plan, role: 'public' }
+  }
+  if (isProtected && plan.role === 'public') {
+    return { ...plan, role: 'authed' }
+  }
+  return plan
+}
+
 function countFrontendTests(plan: FrontendPlan): number {
   // Rough heuristic: one test per criticalFlow, plus one per smokeTarget,
   // plus one per workflow. Agents may produce more or fewer, but this gives
@@ -283,6 +315,7 @@ export async function planFrontend(ctx: PlanContext): Promise<FrontendPlanResult
 
   const capturedContext = ctx.context || {}
   const sliced = sliceContextForPrompt(capturedContext)
+  const routeAccess = getRouteAccess(capturedContext)
   if ((capturedContext.pages?.length ?? 0) > PAGE_CAP) {
     warnings.push({
       kind: 'truncated',
@@ -308,6 +341,7 @@ export async function planFrontend(ctx: PlanContext): Promise<FrontendPlanResult
     '  PageTestPlan = { path: string, role: "public"|"authed"|"admin"|null, criticalFlows: string[], assertions: string[], acIds: string[] }',
     '  WorkflowTestPlan = { name: string, steps: string[], acIds: string[] }',
     'Only use `path` values that exist in the provided `pages` list. Never invent paths.',
+    'ROUTE_ACCESS is authoritative for role. If ROUTE_ACCESS.authMode is public_app, every listed public route must be role:"public" even when the PRD uses admin/dashboard wording.',
     'Keep acIds scoped to the AC ids present in the parsedPRD when provided; otherwise [].',
   ].join('\n')
 
@@ -320,6 +354,9 @@ export async function planFrontend(ctx: PlanContext): Promise<FrontendPlanResult
     '',
     'WORKFLOWS (observed):',
     JSON.stringify(sliced.workflows),
+    '',
+    'ROUTE_ACCESS (authoritative):',
+    JSON.stringify(routeAccess),
     '',
     'PRD (truncated):',
     (ctx.prdContent || '').slice(0, 4000),
@@ -372,7 +409,7 @@ export async function planFrontend(ctx: PlanContext): Promise<FrontendPlanResult
       })
       continue
     }
-    normalizedPages.push(norm)
+    normalizedPages.push(applyRouteAccessRole(capturedContext, norm))
   }
 
   const normalizedWorkflows: WorkflowTestPlan[] = []
