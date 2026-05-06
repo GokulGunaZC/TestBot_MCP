@@ -2,8 +2,8 @@ import { NextRequest, NextResponse } from 'next/server'
 import { getCurrentUser } from '@/lib/auth/session'
 import { db } from '@/lib/db'
 import { testRuns } from '@/lib/db/schema'
-import { eq, and, desc, asc, count } from 'drizzle-orm'
-import { extractRunIdFromReport, getLiveRunsForUser } from '@/lib/mcp-live-runs'
+import { eq, and, desc, asc, count, sql } from 'drizzle-orm'
+import { getLiveRunsForUser } from '@/lib/mcp-live-runs'
 
 function compareRows(
   a: Record<string, unknown>,
@@ -62,9 +62,26 @@ export async function GET(request: NextRequest) {
       .from(testRuns)
       .where(whereClause)
 
-    // Get paginated data
+    // Get paginated data — exclude heavy JSONB blobs (reportJson, aiAnalysis) not needed for list view
     const data = await db
-      .select()
+      .select({
+        id: testRuns.id,
+        userId: testRuns.userId,
+        creationName: testRuns.creationName,
+        status: testRuns.status,
+        totalTests: testRuns.totalTests,
+        passedTests: testRuns.passedTests,
+        failedTests: testRuns.failedTests,
+        skippedTests: testRuns.skippedTests,
+        backendPassRate: testRuns.backendPassRate,
+        frontendPassRate: testRuns.frontendPassRate,
+        durationMs: testRuns.durationMs,
+        framework: testRuns.framework,
+        source: testRuns.source,
+        createdAt: testRuns.createdAt,
+        updatedAt: testRuns.updatedAt,
+        runIdFromReport: sql<string | null>`${testRuns.reportJson}->'metadata'->>'runId'`,
+      })
       .from(testRuns)
       .where(whereClause)
       .orderBy(orderFn(sortField))
@@ -84,13 +101,13 @@ export async function GET(request: NextRequest) {
       backend_pass_rate: row.backendPassRate ? Number(row.backendPassRate) : null,
       frontend_pass_rate: row.frontendPassRate ? Number(row.frontendPassRate) : null,
       duration_ms: row.durationMs,
-      report_json: row.reportJson,
-      ai_analysis: row.aiAnalysis,
+      report_json: null,
+      ai_analysis: null,
       framework: row.framework,
       source: row.source,
       created_at: row.createdAt?.toISOString() ?? null,
       updated_at: row.updatedAt?.toISOString() ?? null,
-      run_id: extractRunIdFromReport(row.reportJson),
+      run_id: row.runIdFromReport ?? null,
       current_phase: null,
       error_code: null,
       is_live: false,
@@ -110,6 +127,7 @@ export async function GET(request: NextRequest) {
       const filteredLiveRuns = liveRuns
         .filter((row) => !existingRunIds.has(String(row.run_id || '')))
         .filter((row) => (status ? row.status === status : true))
+        .map((row) => ({ ...row, report_json: null, ai_analysis: null }))
 
       if (filteredLiveRuns.length > 0) {
         mergedTotal += filteredLiveRuns.length

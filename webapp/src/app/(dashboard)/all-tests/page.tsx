@@ -110,6 +110,7 @@ export default function AllTestsPage() {
   const [loading, setLoading] = useState(true);
   const [activeRunsPresent, setActiveRunsPresent] = useState(false);
   const payloadSignatureRef = useRef<string | null>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
 
   const [search, setSearch] = useState('');
   const [debouncedSearch, setDebouncedSearch] = useState('');
@@ -131,6 +132,18 @@ export default function AllTestsPage() {
 
   const fetchTests = useCallback(async (options: { showLoading?: boolean } = {}) => {
     const showLoading = options.showLoading === true;
+
+    // Background polls skip if a request is already in flight
+    if (!showLoading && abortControllerRef.current) return;
+
+    // User-triggered fetches abort any stale in-flight request
+    if (showLoading && abortControllerRef.current) {
+      abortControllerRef.current.abort();
+    }
+
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+
     if (showLoading) setLoading(true);
     try {
       const params = new URLSearchParams({
@@ -144,7 +157,7 @@ export default function AllTestsPage() {
         params.set('status', statusFilter);
       }
 
-      const res = await fetch(`/api/test-runs?${params.toString()}`);
+      const res = await fetch(`/api/test-runs?${params.toString()}`, { signal: controller.signal });
       if (!res.ok) throw new Error('Failed to fetch');
       const json = await res.json();
 
@@ -182,6 +195,7 @@ export default function AllTestsPage() {
       }
       setActiveRunsPresent(nextActive);
     } catch (err) {
+      if (err instanceof Error && err.name === 'AbortError') return;
       console.error('Failed to fetch test runs:', err);
       if (showLoading) {
         setTests([]);
@@ -189,7 +203,10 @@ export default function AllTestsPage() {
         setTotalPages(1);
       }
     } finally {
-      if (showLoading) setLoading(false);
+      if (abortControllerRef.current === controller) {
+        abortControllerRef.current = null;
+      }
+      if (showLoading && !controller.signal.aborted) setLoading(false);
     }
   }, [page, pageSize, sortBy, statusFilter, debouncedSearch]);
 
