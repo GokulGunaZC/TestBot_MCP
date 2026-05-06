@@ -535,6 +535,171 @@ function extractQualityFailureFileNames(qualityAudit = {}) {
   return [...names];
 }
 
+function findGeneratedTestBlocks(content) {
+  const text = String(content || '');
+  const blocks = [];
+  const pattern = /\btest(?:\.(?:only|fixme|fail|slow))?\s*\(/g;
+  let match;
+
+  const findCallEnd = (openIndex) => {
+    let depth = 0;
+    let quote = null;
+    let escaped = false;
+    let lineComment = false;
+    let blockComment = false;
+
+    for (let i = openIndex; i < text.length; i += 1) {
+      const ch = text[i];
+      const next = text[i + 1];
+
+      if (lineComment) {
+        if (ch === '\n') lineComment = false;
+        continue;
+      }
+      if (blockComment) {
+        if (ch === '*' && next === '/') {
+          blockComment = false;
+          i += 1;
+        }
+        continue;
+      }
+      if (quote) {
+        if (escaped) {
+          escaped = false;
+        } else if (ch === '\\') {
+          escaped = true;
+        } else if (ch === quote) {
+          quote = null;
+        }
+        continue;
+      }
+      if (ch === '/' && next === '/') {
+        lineComment = true;
+        i += 1;
+        continue;
+      }
+      if (ch === '/' && next === '*') {
+        blockComment = true;
+        i += 1;
+        continue;
+      }
+      if (ch === '"' || ch === "'" || ch === '`') {
+        quote = ch;
+        continue;
+      }
+      if (ch === '(') {
+        depth += 1;
+      } else if (ch === ')') {
+        depth -= 1;
+        if (depth === 0) {
+          let end = i + 1;
+          while (/\s/.test(text[end] || '')) end += 1;
+          if (text[end] === ';') end += 1;
+          return end;
+        }
+      }
+    }
+    return -1;
+  };
+
+  while ((match = pattern.exec(text)) !== null) {
+    const start = match.index;
+    const openIndex = text.indexOf('(', pattern.lastIndex - 1);
+    if (openIndex < 0) continue;
+    const end = findCallEnd(openIndex);
+    if (end <= start) continue;
+    blocks.push({ start, end, content: text.slice(start, end) });
+    pattern.lastIndex = end;
+  }
+
+  return blocks;
+}
+
+function looksLikeConcatenatedGeneratedName(value) {
+  const text = String(value || '').replace(/\\['"`]/g, '').trim();
+  if (/[a-z][A-Z]/.test(text)) return true;
+  if (text.length < 45) return false;
+  if (text.length >= 80) return true;
+  return /(Priority:\s*\w+.*Due:|Assignee:|Update[A-Z]|Validation[A-Z]|Integration[A-Z])/i.test(text);
+}
+
+function isBrittleGeneratedTestBlock(blockContent) {
+  const text = String(blockContent || '');
+  const brittlePatterns = [
+    /\.checkValidity\(/i,
+    /getComputedStyle\s*\(/i,
+    /\.toContainText\s*\(\s*\[/i,
+    /getByRole\(\s*['"`]button['"`]\s*,\s*\{[^}]*name\s*:\s*['"`]New Project['"`][^}]*\}\s*\)\.click\(\)[\s\S]{0,1200}getByRole\(\s*['"`]dialog['"`]\s*\)/i,
+    /selectOption\([\s\S]{0,500}getByText\(\s*(?:label|teamLabel|optionLabel)\s*\)[\s\S]{0,160}\.toBeVisible\(/i,
+    /getByRole\(\s*['"`]button['"`]\s*,\s*\{[^}]*name\s*:\s*['"`]Next Month['"`][^}]*\}\s*\)\.click\(\)[\s\S]{0,1200}getByRole\(\s*['"`]button['"`]\s*,\s*\{[^}]*name\s*:\s*['"`](?:Standup|Planning|Review)['"`][^}]*\}\s*\)/i,
+    /getByRole\(\s*['"`]button['"`]\s*,\s*\{[^}]*name\s*:\s*['"`](?:Next Month|Previous Month)['"`][^}]*\}\s*\)\.click\(\)[\s\S]{0,1400}(?:getByRole\(\s*['"`]heading['"`][\s\S]{0,300}name\s*:\s*['"`](?:May 2026|Showing May 2026|May 2026\s*—\s*Monthly View)['"`]|toHaveText\(\s*['"`](?:May 2026|Showing May 2026|May 2026\s*—\s*Monthly View)['"`])/i,
+    /getByRole\(\s*['"`]button['"`]\s*,\s*\{[^}]*name\s*:\s*['"`]Reset Layout['"`][^}]*\}\s*\)\.click\(\)[\s\S]{0,800}getByRole\(\s*['"`]button['"`]\s*,\s*\{[^}]*name\s*:\s*['"`]Add widget['"`][^}]*\}\s*\)/i,
+    /getByText\(\s*['"`]Due:\s*(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\b[^'"`]*['"`]/i,
+    /getByText\(\s*['"`](?:Standup|Planning|Review)['"`]\s*\)/i,
+  ];
+  if (brittlePatterns.some((pattern) => pattern.test(text))) return true;
+
+  for (const match of text.matchAll(/getByRole\(\s*['"`][^'"`]+['"`]\s*,\s*\{[\s\S]{0,320}?\bname\s*:\s*(['"`])([\s\S]*?)\1/gi)) {
+    if (looksLikeConcatenatedGeneratedName(match[2])) return true;
+  }
+  for (const match of text.matchAll(/getByRole\(\s*['"`][^'"`]+['"`]\s*,\s*\{[\s\S]{0,320}?\bname\s*:\s*\/([^/\n]{12,220})\/[a-z]*/gi)) {
+    if (looksLikeConcatenatedGeneratedName(match[1])) return true;
+  }
+
+  return false;
+}
+
+function pruneGeneratedTestsByQuality({ projectPath, qualityAudit = {}, reason = 'quality_audit' } = {}) {
+  const generatedDir = path.join(projectPath, 'tests', 'generated');
+  if (!fs.existsSync(generatedDir)) {
+    return { applied: false, reason: 'generated_dir_missing', prunedFiles: [] };
+  }
+
+  const candidates = extractQualityFailureFileNames(qualityAudit);
+  if (candidates.length === 0) {
+    return { applied: false, reason: 'no_file_specific_failures', prunedFiles: [] };
+  }
+
+  const safeReason = String(reason || 'quality_audit').replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 80);
+  const quarantineDir = path.join(projectPath, 'tests', '.healix-quarantine', `${Date.now()}-${safeReason}-pruned-tests`);
+  const prunedFiles = [];
+
+  for (const filename of candidates) {
+    const filePath = path.join(generatedDir, path.basename(filename));
+    if (!fs.existsSync(filePath)) continue;
+    const content = fs.readFileSync(filePath, 'utf-8');
+    const blocks = findGeneratedTestBlocks(content);
+    if (blocks.length <= 1) continue;
+    const badBlocks = blocks.filter((block) => isBrittleGeneratedTestBlock(block.content));
+    if (badBlocks.length === 0 || badBlocks.length >= blocks.length) continue;
+
+    ensureDir(quarantineDir);
+    fs.writeFileSync(
+      path.join(quarantineDir, `${path.basename(filename)}.removed.txt`),
+      badBlocks.map((block) => block.content).join('\n\n/* ---- removed brittle generated test ---- */\n\n'),
+      'utf-8',
+    );
+
+    let nextContent = content;
+    for (const block of badBlocks.sort((a, b) => b.start - a.start)) {
+      nextContent = `${nextContent.slice(0, block.start)}\n${nextContent.slice(block.end)}`;
+    }
+    fs.writeFileSync(filePath, nextContent, 'utf-8');
+    prunedFiles.push({
+      filename: path.basename(filename),
+      removedTests: badBlocks.length,
+      remainingTests: blocks.length - badBlocks.length,
+    });
+  }
+
+  return {
+    applied: prunedFiles.length > 0,
+    reason,
+    quarantineDir: prunedFiles.length > 0 ? quarantineDir : null,
+    prunedFiles,
+  };
+}
+
 function quarantineGeneratedSpecFiles({ projectPath, qualityAudit = {}, reason = 'quality_audit' } = {}) {
   const generatedDir = path.join(projectPath, 'tests', 'generated');
   if (!fs.existsSync(generatedDir)) {
@@ -4335,6 +4500,74 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
     });
 
     if (!qualityAudit.valid) {
+      const pruning = pruneGeneratedTestsByQuality({
+        projectPath: config.projectPath,
+        qualityAudit,
+        reason: `${generator}_quality_audit`,
+      });
+      if (pruning.applied) {
+        qualityRecoveryEvents.push(pruning);
+        Logger.warn('PipelineWorker', 'Pruned brittle generated test blocks and re-validating remaining tests', {
+          generator,
+          prunedFiles: pruning.prunedFiles,
+          quarantineDir: pruning.quarantineDir,
+        });
+        if (statusDir) {
+          updateStatus(statusDir, 'generation_quality_recovered', {
+            runId,
+            message: `Removed ${pruning.prunedFiles.reduce((sum, file) => sum + file.removedTests, 0)} brittle generated test(s); validating remaining suite...`,
+            prunedFiles: pruning.prunedFiles,
+          }, telemetryReporter);
+        }
+
+        validation = await validateGeneratedTestsWithList({
+          projectPath: config.projectPath,
+          validateGeneratedTests,
+          timeoutMs: Math.min(getBudgetRemainingMs(runBudget), runBudget.stageCaps.validation),
+        });
+        if (!validation.valid) {
+          const error = new Error(`${generator} generation failed validation after brittle-test pruning: ${validation.reason || 'unknown'}`);
+          error.code = 'GENERATION_VALIDATION_FAILED';
+          error.validation = {
+            ...validation,
+            qualityAudit,
+            qualityRecovery: pruning,
+          };
+          error.diagnostics = buildPipelineDiagnostics({
+            projectPath: config.projectPath,
+            stage: 'validation_after_quality_pruning',
+            reason: validation.reason,
+            stderr: validation.stderr,
+            stdout: validation.stdout,
+            qualityAudit,
+          });
+          throw error;
+        }
+
+        qualityAudit = auditGeneratedTestQuality({
+          projectPath: config.projectPath,
+          testType: config.testType,
+          context,
+          explorationArtifact,
+        });
+        qualityAudit.qualityRecovery = pruning;
+        Logger.info('PipelineWorker', '[QUALITY GATE] post-pruning auditGeneratedTestQuality result', {
+          valid: qualityAudit.valid,
+          errors: qualityAudit.errors,
+          warnings: qualityAudit.warnings,
+          totalFiles: qualityAudit.totalFiles,
+          totalTests: qualityAudit.totalTests,
+          runnableTests: qualityAudit.runnableTests,
+        });
+        if (qualityAudit.valid) {
+          return {
+            ...validation,
+            qualityAudit,
+            qualityRecovery: pruning,
+          };
+        }
+      }
+
       const quarantine = quarantineGeneratedSpecFiles({
         projectPath: config.projectPath,
         qualityAudit,
@@ -6352,6 +6585,9 @@ module.exports = {
   buildRequirementsCoverage,
   auditGeneratedTestQuality,
   extractQualityFailureFileNames,
+  findGeneratedTestBlocks,
+  isBrittleGeneratedTestBlock,
+  pruneGeneratedTestsByQuality,
   quarantineGeneratedSpecFiles,
   strictAIEnabled,
   classifyErrorCode,

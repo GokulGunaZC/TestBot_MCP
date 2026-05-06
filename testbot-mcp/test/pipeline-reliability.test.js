@@ -17,10 +17,13 @@ const {
   computeGenerationAgentTimeoutMs,
   estimateGenerationComplexity,
   extractQualityFailureFileNames,
+  findGeneratedTestBlocks,
   maybeExpandGenerationStageBudget,
   isRepairableGenerationFailure,
+  isBrittleGeneratedTestBlock,
   isSyntheticHealthEndpoint,
   pickAgentsForRun,
+  pruneGeneratedTestsByQuality,
   quarantineGeneratedSpecFiles,
   resolveGenerationAgentConcurrency,
   rewriteStartCommandForPort,
@@ -379,6 +382,57 @@ test('quality quarantine removes only file-specific bad generated specs', () => 
     assert.deepEqual(recovery.quarantinedFiles.map((file) => file.filename), ['bad.spec.ts']);
     assert.equal(fs.existsSync(path.join(generatedDir, 'good.spec.ts')), true);
     assert.equal(fs.existsSync(path.join(generatedDir, 'bad.spec.ts')), false);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('quality pruning removes only brittle generated test blocks inside a mixed file', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'healix-quality-prune-'));
+  try {
+    const generatedDir = path.join(root, 'tests', 'generated');
+    fs.mkdirSync(generatedDir, { recursive: true });
+    const content = `
+      import { test, expect } from '@playwright/test';
+
+      test('good public dashboard assertion', async ({ page }) => {
+        await page.goto('/');
+        await expect(page.getByRole('heading', { name: 'Project Insights' })).toBeVisible();
+      });
+
+      test('bad generated card assertion', async ({ page }) => {
+        await page.goto('/projects');
+        await expect(page.getByRole('button', { name: /Priority: MediumAPI Schema Validation/ })).toBeVisible();
+      });
+
+      test('good public calendar assertion', async ({ page }) => {
+        await page.goto('/calendar');
+        await expect(page.getByRole('heading', { name: 'May 2026 —Monthly View' })).toBeVisible();
+      });
+    `;
+    fs.writeFileSync(path.join(generatedDir, 'mixed.spec.ts'), content);
+
+    const blocks = findGeneratedTestBlocks(content);
+    assert.equal(blocks.length, 3);
+    assert.equal(isBrittleGeneratedTestBlock(blocks[1].content), true);
+
+    const recovery = pruneGeneratedTestsByQuality({
+      projectPath: root,
+      qualityAudit: { errors: ['brittle_concatenated_accessible_name_regex:mixed.spec.ts'] },
+      reason: 'test',
+    });
+    assert.equal(recovery.applied, true);
+    assert.deepEqual(recovery.prunedFiles.map((file) => ({
+      filename: file.filename,
+      removedTests: file.removedTests,
+      remainingTests: file.remainingTests,
+    })), [{ filename: 'mixed.spec.ts', removedTests: 1, remainingTests: 2 }]);
+
+    const nextContent = fs.readFileSync(path.join(generatedDir, 'mixed.spec.ts'), 'utf-8');
+    assert.equal(countTestsInContent(nextContent), 2);
+    assert.equal(nextContent.includes('Priority: MediumAPI Schema Validation'), false);
+    assert.equal(nextContent.includes('good public dashboard assertion'), true);
+    assert.equal(nextContent.includes('good public calendar assertion'), true);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
