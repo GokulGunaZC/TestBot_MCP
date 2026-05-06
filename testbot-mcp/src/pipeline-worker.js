@@ -5945,6 +5945,18 @@ async function runPipeline(config, runId) {
           role: 'primary',
         }, telemetryReporter);
       },
+      onExecutionRecovery: ({ nextAttempt, maxAttempts, reason, exitCode, signal, timedOut }) => {
+        updateStatus(statusDir, 'playwright_recovering', {
+          runId,
+          message: `Playwright runner crashed during execution; retrying in safe mode (${nextAttempt}/${maxAttempts})...`,
+          reason,
+          exitCode,
+          signal,
+          timedOut,
+          nextAttempt,
+          maxAttempts,
+        }, telemetryReporter);
+      },
     });
 
     const mcpParallelEnabled =
