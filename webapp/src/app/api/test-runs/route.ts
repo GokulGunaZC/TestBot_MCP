@@ -117,7 +117,7 @@ export async function GET(request: NextRequest) {
     let mergedTotal = total ?? 0
 
     if (includeLive && page === 1) {
-      const liveRuns = await getLiveRunsForUser(user.id, { windowHours: 24, limit: 1500 })
+      const liveRuns = await getLiveRunsForUser(user.id, { windowHours: 6, limit: 300 })
       const existingRunIds = new Set(
         mappedData
           .map((row) => String(row.run_id || '').trim())

@@ -250,10 +250,158 @@ function getBudgetRemainingMs(budget) {
   return Math.max(0, budget.totalMs - getBudgetElapsedMs(budget));
 }
 
+function getStageBudgetRemainingMs(budget, stage) {
+  if (!budget) return null;
+  const deadline = budget.stageDeadlines?.[stage];
+  if (Number.isFinite(Number(deadline)) && Number(deadline) > 0) {
+    return Math.max(0, Number(deadline) - Date.now());
+  }
+  const capMs = Number(budget.stageCaps?.[stage]);
+  if (Number.isFinite(capMs) && capMs > 0) {
+    return Math.max(0, Math.min(getBudgetRemainingMs(budget), capMs));
+  }
+  return getBudgetRemainingMs(budget);
+}
+
 function createBudgetError(message, code = 'TIME_BUDGET_EXCEEDED') {
   const error = new Error(message);
   error.code = code;
   return error;
+}
+
+function hasExplicitGenerationStageCap(config = {}) {
+  return Boolean(config.stageCaps?.generation)
+    || Boolean(process.env.HEALIX_STAGE_GENERATION_MS)
+    || Boolean(process.env.HEALIX_GEN_BUDGET_MS);
+}
+
+function countParsedAcceptanceCriteria(parsedPRD = {}) {
+  let count = 0;
+  for (const feature of parsedPRD?.features || []) {
+    for (const story of feature?.userStories || []) {
+      count += Array.isArray(story?.acceptanceCriteria) ? story.acceptanceCriteria.length : 0;
+    }
+  }
+  return count;
+}
+
+function estimateGenerationComplexity({ context = {}, parsedPRD = {}, projectInfo = {}, minGeneratedTests = 50 } = {}) {
+  const pages = (context.pages || []).length + (context.routes || []).length;
+  const forms = (context.forms || []).length;
+  const workflows = (context.workflows || []).length + (context.keyFlows || []).length;
+  const endpoints = effectiveApiEndpoints(context).length;
+  const acceptanceCriteria = countParsedAcceptanceCriteria(parsedPRD);
+  const services = Array.isArray(projectInfo.services) ? projectInfo.services.length : 0;
+  const requestedTests = toFiniteNumber(minGeneratedTests, 50);
+  const score =
+    (pages * 3) +
+    (forms * 4) +
+    (workflows * 5) +
+    (endpoints * 5) +
+    (acceptanceCriteria * 3) +
+    (services * 4) +
+    Math.ceil(requestedTests / 3);
+
+  const tier = score >= 140 || endpoints >= 25 || pages >= 35 || requestedTests >= 100
+    ? 'xlarge'
+    : score >= 80 || endpoints >= 12 || pages >= 18 || requestedTests >= 75
+      ? 'large'
+      : score >= 35 || pages >= 8 || workflows >= 8 || requestedTests >= 50
+        ? 'medium'
+        : 'small';
+
+  return { score, tier, pages, forms, workflows, endpoints, acceptanceCriteria, services, requestedTests };
+}
+
+function maybeExpandGenerationStageBudget({ runBudget, config = {}, context = {}, parsedPRD = {}, projectInfo = {} } = {}) {
+  if (!runBudget?.stageCaps || hasExplicitGenerationStageCap(config)) {
+    return null;
+  }
+
+  const minGeneratedTests = toFiniteNumber(config.minGeneratedTests, 50);
+  const complexity = estimateGenerationComplexity({ context, parsedPRD, projectInfo, minGeneratedTests });
+  const desiredByTier = {
+    small: DEFAULT_STAGE_CAPS_MS.generation,
+    medium: DEFAULT_STAGE_CAPS_MS.generation,
+    large: 45 * 60 * 1000,
+    xlarge: 60 * 60 * 1000,
+  };
+  const desired = desiredByTier[complexity.tier] || DEFAULT_STAGE_CAPS_MS.generation;
+  const maxReasonable = Math.max(DEFAULT_STAGE_CAPS_MS.generation, Math.floor(runBudget.totalMs * 0.65));
+  const expanded = Math.min(desired, maxReasonable);
+
+  if (expanded > Number(runBudget.stageCaps.generation || 0)) {
+    const previous = runBudget.stageCaps.generation;
+    runBudget.stageCaps.generation = expanded;
+    Logger.info('PipelineWorker', 'Expanded generation stage budget from project complexity', {
+      previous,
+      expanded,
+      complexity,
+    });
+  }
+
+  return complexity;
+}
+
+function resolveGenerationAgentConcurrency(config = {}, agents = []) {
+  const configuredConcurrency = Number(config.generationAgentConcurrency || process.env.HEALIX_GENERATION_AGENT_CONCURRENCY);
+  const requested = Number.isFinite(configuredConcurrency) && configuredConcurrency > 0
+    ? Math.floor(configuredConcurrency)
+    : 3;
+  return Math.max(1, Math.min(requested, Math.max(1, agents.length || 1)));
+}
+
+function computeGenerationAgentTimeoutMs({ config = {}, runBudget = null, agents = [], concurrency = 1, context = {}, parsedPRD = {}, projectInfo = {} } = {}) {
+  const explicit = toFiniteNumber(
+    config.generationAgentTimeoutMs
+      || process.env.HEALIX_GENERATION_AGENT_TIMEOUT_MS
+      || process.env.HEALIX_WEBAPP_AGENT_TIMEOUT_MS,
+    null
+  );
+  if (explicit !== null) {
+    return Math.max(60_000, Math.floor(explicit));
+  }
+
+  const stageRemaining = getStageBudgetRemainingMs(runBudget, 'generation')
+    || toFiniteNumber(config.stageCaps?.generation || process.env.HEALIX_GEN_BUDGET_MS || DEFAULT_STAGE_CAPS_MS.generation, DEFAULT_STAGE_CAPS_MS.generation);
+  const agentCount = Math.max(1, agents.length || 1);
+  const workerCount = Math.max(1, Math.min(Math.floor(concurrency || 1), agentCount));
+  const waves = Math.max(1, Math.ceil(agentCount / workerCount));
+  const complexity = estimateGenerationComplexity({
+    context,
+    parsedPRD,
+    projectInfo,
+    minGeneratedTests: config.minGeneratedTests,
+  });
+
+  const reserveMs = Math.min(
+    5 * 60 * 1000,
+    Math.max(90_000, Math.floor(stageRemaining * 0.12)),
+  );
+  const usableStageMs = Math.max(60_000, stageRemaining - reserveMs);
+  const waveBudgetMs = Math.max(60_000, Math.floor(usableStageMs / waves));
+  const remoteDashboard = (() => {
+    try {
+      const url = new URL(String(config.dashboardUrl || config.webappUrl || process.env.HEALIX_DASHBOARD_URL || ''));
+      return !['localhost', '127.0.0.1', '0.0.0.0', '::1'].includes(url.hostname);
+    } catch {
+      return false;
+    }
+  })();
+
+  const tierFloorMs = {
+    small: 4 * 60 * 1000,
+    medium: 7 * 60 * 1000,
+    large: 10 * 60 * 1000,
+    xlarge: 14 * 60 * 1000,
+  }[complexity.tier] || (7 * 60 * 1000);
+  const endpointCapMs = remoteDashboard
+    ? 13 * 60 * 1000
+    : Math.max(60_000, stageRemaining - 30_000);
+  const budgetAlignedMs = Math.max(60_000, Math.floor(waveBudgetMs * 0.92));
+  const timeoutMs = Math.min(endpointCapMs, Math.max(tierFloorMs, budgetAlignedMs));
+
+  return Math.max(60_000, Math.floor(timeoutMs));
 }
 
 function computePassRatePercent(results) {
@@ -270,8 +418,81 @@ function strictAIEnabled(config = {}) {
 
 function countTestsInContent(content) {
   if (!content) return 0;
-  const matches = String(content).match(/\b(?:test|it)(?:\.(?:only|skip|fixme|fail|slow|todo))?\s*\(\s*(['"`])/g);
-  return matches ? matches.length : 0;
+  const text = String(content);
+  const normalDeclarations = text.match(/\b(?:test|it)(?:\.(?:only|fixme|fail|slow|todo))?\s*\(\s*(['"`])/g) || [];
+  const skipDeclarations = text.match(/\b(?:test|it)\.skip\s*\(\s*(['"`])[\s\S]*?\1\s*,\s*(?:async\s*)?(?:\(|function\b)/g) || [];
+  return normalDeclarations.length + skipDeclarations.length;
+}
+
+function countSkippedTestsInContent(content) {
+  if (!content) return 0;
+  const text = String(content);
+  const skipDeclarationPattern = /\b(?:test|it)\.skip\s*\(\s*(['"`])[\s\S]*?\1\s*,\s*(?:async\s*)?(?:\(|function\b)/g;
+  const skipDeclarationAtStart = /^\b(?:test|it)\.skip\s*\(\s*(['"`])[\s\S]*?\1\s*,\s*(?:async\s*)?(?:\(|function\b)/;
+  const declarationMatches = text.match(skipDeclarationPattern) || [];
+  let runtimeSkips = 0;
+  const callPattern = /\b(?:test|it)\.skip\s*\(\s*([^,\n)]*)/g;
+  let match;
+  while ((match = callPattern.exec(text)) !== null) {
+    const snippet = text.slice(match.index, match.index + 400);
+    if (skipDeclarationAtStart.test(snippet)) {
+      continue;
+    }
+    const firstArg = String(match[1] || '').trim();
+    if (/^false\b/.test(firstArg)) {
+      continue;
+    }
+    runtimeSkips += 1;
+  }
+  return declarationMatches.length + runtimeSkips;
+}
+
+function buildRouteAccessSummary(explorationArtifact) {
+  const routes = Array.isArray(explorationArtifact?.routes) ? explorationArtifact.routes : [];
+  const publicRoutes = routes
+    .filter((route) => route && route.requiresAuth === false)
+    .map((route) => String(route.path || '/'));
+  const protectedRoutes = routes
+    .filter((route) => route && route.requiresAuth === true)
+    .map((route) => String(route.path || '/'));
+  return {
+    authMode: explorationArtifact?.authFlow
+      ? 'auth_flow_detected'
+      : (publicRoutes.length > 0 ? 'public_app' : 'unknown'),
+    authFlowDetected: !!explorationArtifact?.authFlow,
+    publicRoutes: [...new Set(publicRoutes)],
+    protectedRoutes: [...new Set(protectedRoutes)],
+    totalObservedRoutes: routes.length,
+  };
+}
+
+function hasBackendService(projectInfo = {}) {
+  return (projectInfo.services || []).some((service) =>
+    service && (service.role === 'backend' || service.role === 'fullstack')
+  );
+}
+
+function isSyntheticHealthEndpoint(endpoint) {
+  if (!endpoint) return false;
+  const method = String(endpoint.method || 'GET').toUpperCase();
+  const endpointPath = String(endpoint.path || '');
+  return method === 'GET'
+    && endpointPath === '/api/health'
+    && (endpoint.synthetic === true || endpoint.source === 'healix_fallback' || !endpoint.source);
+}
+
+function effectiveApiEndpoints(context = {}) {
+  return (context.apiEndpoints || []).filter((endpoint) => !isSyntheticHealthEndpoint(endpoint));
+}
+
+function effectiveApiContracts(context = {}) {
+  return (context.mockableApiContracts || []).filter((contract) => !isSyntheticHealthEndpoint(contract));
+}
+
+function hasApiSurfaceForGeneration(context = {}, projectInfo = {}) {
+  return effectiveApiEndpoints(context).length > 0
+    || effectiveApiContracts(context).length > 0
+    || hasBackendService(projectInfo);
 }
 
 function listGeneratedTestFiles(projectPath) {
@@ -283,6 +504,251 @@ function listGeneratedTestFiles(projectPath) {
   return fs.readdirSync(generatedDir)
     .filter((name) => /\.spec\.(ts|js)$/i.test(name))
     .map((name) => path.join(generatedDir, name));
+}
+
+function extractQualityFailureFileNames(qualityAudit = {}) {
+  const names = new Set();
+  const add = (value) => {
+    if (!value) return;
+    const matches = String(value).match(/[A-Za-z0-9_.-]+\.spec\.(?:ts|js)\b/g) || [];
+    for (const match of matches) {
+      names.add(path.basename(match));
+    }
+  };
+
+  for (const value of qualityAudit.missingSourceReferenceFiles || []) add(value);
+  for (const value of qualityAudit.invalidSourceReferenceFiles || []) add(value);
+  for (const value of qualityAudit.ungroundedUiFiles || []) add(value);
+  for (const value of qualityAudit.brittlePatternFiles || []) add(value);
+  for (const value of qualityAudit.riskyFiles || []) add(value);
+
+  for (const item of qualityAudit.ungroundedSelectorFiles || []) {
+    add(typeof item === 'string' ? item : item?.file);
+  }
+  for (const item of qualityAudit.ungroundedRouteFiles || []) {
+    add(typeof item === 'string' ? item : item?.file);
+  }
+  for (const error of qualityAudit.errors || []) {
+    add(error);
+  }
+
+  return [...names];
+}
+
+function findGeneratedTestBlocks(content) {
+  const text = String(content || '');
+  const blocks = [];
+  const pattern = /\btest(?:\.(?:only|fixme|fail|slow))?\s*\(/g;
+  let match;
+
+  const findCallEnd = (openIndex) => {
+    let depth = 0;
+    let quote = null;
+    let escaped = false;
+    let lineComment = false;
+    let blockComment = false;
+
+    for (let i = openIndex; i < text.length; i += 1) {
+      const ch = text[i];
+      const next = text[i + 1];
+
+      if (lineComment) {
+        if (ch === '\n') lineComment = false;
+        continue;
+      }
+      if (blockComment) {
+        if (ch === '*' && next === '/') {
+          blockComment = false;
+          i += 1;
+        }
+        continue;
+      }
+      if (quote) {
+        if (escaped) {
+          escaped = false;
+        } else if (ch === '\\') {
+          escaped = true;
+        } else if (ch === quote) {
+          quote = null;
+        }
+        continue;
+      }
+      if (ch === '/' && next === '/') {
+        lineComment = true;
+        i += 1;
+        continue;
+      }
+      if (ch === '/' && next === '*') {
+        blockComment = true;
+        i += 1;
+        continue;
+      }
+      if (ch === '"' || ch === "'" || ch === '`') {
+        quote = ch;
+        continue;
+      }
+      if (ch === '(') {
+        depth += 1;
+      } else if (ch === ')') {
+        depth -= 1;
+        if (depth === 0) {
+          let end = i + 1;
+          while (/\s/.test(text[end] || '')) end += 1;
+          if (text[end] === ';') end += 1;
+          return end;
+        }
+      }
+    }
+    return -1;
+  };
+
+  while ((match = pattern.exec(text)) !== null) {
+    const start = match.index;
+    const openIndex = text.indexOf('(', pattern.lastIndex - 1);
+    if (openIndex < 0) continue;
+    const end = findCallEnd(openIndex);
+    if (end <= start) continue;
+    blocks.push({ start, end, content: text.slice(start, end) });
+    pattern.lastIndex = end;
+  }
+
+  return blocks;
+}
+
+function looksLikeConcatenatedGeneratedName(value) {
+  const text = String(value || '').replace(/\\['"`]/g, '').trim();
+  if (/[a-z][A-Z]/.test(text)) return true;
+  if (text.length < 45) return false;
+  if (text.length >= 80) return true;
+  return /(Priority:\s*\w+.*Due:|Assignee:|Update[A-Z]|Validation[A-Z]|Integration[A-Z])/i.test(text);
+}
+
+function isBrittleGeneratedTestBlock(blockContent) {
+  const text = String(blockContent || '');
+  const brittlePatterns = [
+    /\.checkValidity\(/i,
+    /getComputedStyle\s*\(/i,
+    /\.toContainText\s*\(\s*\[/i,
+    /getByRole\(\s*['"`]button['"`]\s*,\s*\{[^}]*name\s*:\s*['"`]New Project['"`][^}]*\}\s*\)\.click\(\)[\s\S]{0,1200}getByRole\(\s*['"`]dialog['"`]\s*\)/i,
+    /selectOption\([\s\S]{0,500}getByText\(\s*(?:label|teamLabel|optionLabel)\s*\)[\s\S]{0,160}\.toBeVisible\(/i,
+    /getByRole\(\s*['"`]button['"`]\s*,\s*\{[^}]*name\s*:\s*['"`]Next Month['"`][^}]*\}\s*\)\.click\(\)[\s\S]{0,1200}getByRole\(\s*['"`]button['"`]\s*,\s*\{[^}]*name\s*:\s*['"`](?:Standup|Planning|Review)['"`][^}]*\}\s*\)/i,
+    /getByRole\(\s*['"`]button['"`]\s*,\s*\{[^}]*name\s*:\s*['"`](?:Next Month|Previous Month)['"`][^}]*\}\s*\)\.click\(\)[\s\S]{0,1400}(?:getByRole\(\s*['"`]heading['"`][\s\S]{0,300}name\s*:\s*['"`](?:May 2026|Showing May 2026|May 2026\s*—\s*Monthly View)['"`]|toHaveText\(\s*['"`](?:May 2026|Showing May 2026|May 2026\s*—\s*Monthly View)['"`])/i,
+    /getByRole\(\s*['"`]button['"`]\s*,\s*\{[^}]*name\s*:\s*['"`]Reset Layout['"`][^}]*\}\s*\)\.click\(\)[\s\S]{0,800}getByRole\(\s*['"`]button['"`]\s*,\s*\{[^}]*name\s*:\s*['"`]Add widget['"`][^}]*\}\s*\)/i,
+    /getByText\(\s*['"`]Due:\s*(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\b[^'"`]*['"`]/i,
+    /getByText\(\s*['"`](?:Standup|Planning|Review)['"`]\s*\)/i,
+  ];
+  if (brittlePatterns.some((pattern) => pattern.test(text))) return true;
+
+  for (const match of text.matchAll(/getByRole\(\s*['"`][^'"`]+['"`]\s*,\s*\{[\s\S]{0,320}?\bname\s*:\s*(['"`])([\s\S]*?)\1/gi)) {
+    if (looksLikeConcatenatedGeneratedName(match[2])) return true;
+  }
+  for (const match of text.matchAll(/getByRole\(\s*['"`][^'"`]+['"`]\s*,\s*\{[\s\S]{0,320}?\bname\s*:\s*\/([^/\n]{12,220})\/[a-z]*/gi)) {
+    if (looksLikeConcatenatedGeneratedName(match[1])) return true;
+  }
+
+  return false;
+}
+
+function pruneGeneratedTestsByQuality({ projectPath, qualityAudit = {}, reason = 'quality_audit' } = {}) {
+  const generatedDir = path.join(projectPath, 'tests', 'generated');
+  if (!fs.existsSync(generatedDir)) {
+    return { applied: false, reason: 'generated_dir_missing', prunedFiles: [] };
+  }
+
+  const candidates = extractQualityFailureFileNames(qualityAudit);
+  if (candidates.length === 0) {
+    return { applied: false, reason: 'no_file_specific_failures', prunedFiles: [] };
+  }
+
+  const safeReason = String(reason || 'quality_audit').replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 80);
+  const quarantineDir = path.join(projectPath, 'tests', '.healix-quarantine', `${Date.now()}-${safeReason}-pruned-tests`);
+  const prunedFiles = [];
+
+  for (const filename of candidates) {
+    const filePath = path.join(generatedDir, path.basename(filename));
+    if (!fs.existsSync(filePath)) continue;
+    const content = fs.readFileSync(filePath, 'utf-8');
+    const blocks = findGeneratedTestBlocks(content);
+    if (blocks.length <= 1) continue;
+    const badBlocks = blocks.filter((block) => isBrittleGeneratedTestBlock(block.content));
+    if (badBlocks.length === 0 || badBlocks.length >= blocks.length) continue;
+
+    ensureDir(quarantineDir);
+    fs.writeFileSync(
+      path.join(quarantineDir, `${path.basename(filename)}.removed.txt`),
+      badBlocks.map((block) => block.content).join('\n\n/* ---- removed brittle generated test ---- */\n\n'),
+      'utf-8',
+    );
+
+    let nextContent = content;
+    for (const block of badBlocks.sort((a, b) => b.start - a.start)) {
+      nextContent = `${nextContent.slice(0, block.start)}\n${nextContent.slice(block.end)}`;
+    }
+    fs.writeFileSync(filePath, nextContent, 'utf-8');
+    prunedFiles.push({
+      filename: path.basename(filename),
+      removedTests: badBlocks.length,
+      remainingTests: blocks.length - badBlocks.length,
+    });
+  }
+
+  return {
+    applied: prunedFiles.length > 0,
+    reason,
+    quarantineDir: prunedFiles.length > 0 ? quarantineDir : null,
+    prunedFiles,
+  };
+}
+
+function quarantineGeneratedSpecFiles({ projectPath, qualityAudit = {}, reason = 'quality_audit' } = {}) {
+  const generatedDir = path.join(projectPath, 'tests', 'generated');
+  if (!fs.existsSync(generatedDir)) {
+    return { applied: false, reason: 'generated_dir_missing', quarantinedFiles: [] };
+  }
+
+  const allFiles = fs.readdirSync(generatedDir)
+    .filter((name) => /\.spec\.(ts|js)$/i.test(name));
+  const candidates = extractQualityFailureFileNames(qualityAudit)
+    .filter((name) => allFiles.includes(name));
+
+  if (candidates.length === 0) {
+    return { applied: false, reason: 'no_file_specific_failures', quarantinedFiles: [] };
+  }
+  if (candidates.length >= allFiles.length) {
+    return {
+      applied: false,
+      reason: 'would_quarantine_entire_suite',
+      candidateFiles: candidates,
+      totalFiles: allFiles.length,
+      quarantinedFiles: [],
+    };
+  }
+
+  const safeReason = String(reason || 'quality_audit').replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 80);
+  const quarantineDir = path.join(projectPath, 'tests', '.healix-quarantine', `${Date.now()}-${safeReason}`);
+  ensureDir(quarantineDir);
+
+  const quarantinedFiles = [];
+  for (const name of candidates) {
+    const source = path.join(generatedDir, name);
+    if (!fs.existsSync(source)) continue;
+    let target = path.join(quarantineDir, name);
+    let suffix = 1;
+    while (fs.existsSync(target)) {
+      target = path.join(quarantineDir, name.replace(/\.spec\.(ts|js)$/i, `-${suffix}.spec.ts`));
+      suffix += 1;
+    }
+    fs.renameSync(source, target);
+    quarantinedFiles.push({ filename: name, path: target });
+  }
+
+  return {
+    applied: quarantinedFiles.length > 0,
+    reason,
+    quarantineDir,
+    quarantinedFiles,
+    remainingFiles: Math.max(0, allFiles.length - quarantinedFiles.length),
+  };
 }
 
 /**
@@ -428,6 +894,57 @@ function detectPlaywrightWebServerConflict(projectPath, healixBaseURL) {
   return null;
 }
 
+function detectProjectStartFramework(projectPath) {
+  try {
+    const pkgPath = path.join(projectPath, 'package.json');
+    if (!fs.existsSync(pkgPath)) return 'unknown';
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8'));
+    const deps = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) };
+    if (deps.vite) return 'vite';
+    if (deps.next) return 'next';
+    if (deps['react-scripts']) return 'cra';
+    if (deps.nuxt || deps.nuxt3) return 'nuxt';
+    if (deps['@sveltejs/kit']) return 'sveltekit';
+    if (deps['@remix-run/dev']) return 'remix';
+  } catch { /* best effort */ }
+  return 'unknown';
+}
+
+function rewriteStartCommandForPort(startCommand, port, projectPath) {
+  const command = String(startCommand || '').trim();
+  const nextPort = Number(port);
+  if (!command || !Number.isFinite(nextPort) || nextPort <= 0) return command;
+
+  if (/--port(?:=|\s+)\d+/i.test(command)) {
+    return command.replace(/--port(?:=|\s+)\d+/i, (match) =>
+      match.includes('=') ? `--port=${nextPort}` : `--port ${nextPort}`
+    );
+  }
+  if (/(^|\s)-p\s+\d+/i.test(command)) {
+    return command.replace(/(^|\s)-p\s+\d+/i, `$1-p ${nextPort}`);
+  }
+  if (/\bPORT\s*=\s*\d+/i.test(command)) {
+    return command.replace(/\bPORT\s*=\s*\d+/i, `PORT=${nextPort}`);
+  }
+
+  const framework = detectProjectStartFramework(projectPath);
+  const usesPackageScript = /^(?:npm|pnpm|yarn|bun)(?:\s+run)?\s+\S+/i.test(command);
+  if (framework === 'cra') {
+    return `PORT=${nextPort} ${command}`;
+  }
+
+  const flag = framework === 'next' || framework === 'remix'
+    ? `-p ${nextPort}`
+    : `--port ${nextPort}`;
+
+  if (usesPackageScript) {
+    return command.includes(' -- ')
+      ? `${command} ${flag}`
+      : `${command} -- ${flag}`;
+  }
+  return `${command} ${flag}`;
+}
+
 function toCoverageProfile(value) {
   const normalized = String(value || 'qa-max').toLowerCase();
   if (normalized === 'balanced' || normalized === 'exhaustive') {
@@ -528,12 +1045,23 @@ function detectCoverageCategoriesFromContent(content, filename) {
   return categories;
 }
 
-function collectGenerationQuality(projectPath) {
+function originFromUrl(value) {
+  try {
+    return new URL(String(value)).origin;
+  } catch {
+    return null;
+  }
+}
+
+function collectGenerationQuality(projectPath, options = {}) {
   const files = listGeneratedTestFiles(projectPath);
   const categories = Object.fromEntries(STRICT_AI_REQUIRED_CATEGORIES.map((name) => [name, 0]));
   let totalTests = 0;
+  let skippedTests = 0;
   let filesWithPreferredSelectors = 0;
   let uiFiles = 0;
+  const expectedOrigin = originFromUrl(options.baseURL);
+  const hardcodedBaseUrlMismatches = [];
 
   for (const filePath of files) {
     let content = '';
@@ -544,6 +1072,7 @@ function collectGenerationQuality(projectPath) {
     }
 
     totalTests += countTestsInContent(content);
+    skippedTests += countSkippedTestsInContent(content);
     const detected = detectCoverageCategoriesFromContent(content, path.basename(filePath));
     for (const category of detected) {
       categories[category] = (categories[category] || 0) + 1;
@@ -556,17 +1085,45 @@ function collectGenerationQuality(projectPath) {
         filesWithPreferredSelectors += 1;
       }
     }
+
+    if (expectedOrigin) {
+      const hardcodedUrlMatches = content.matchAll(/(['"`])(https?:\/\/[^'"`\s]+)\1/g);
+      const seenUrls = new Set();
+      for (const match of hardcodedUrlMatches) {
+        const url = match[2];
+        if (seenUrls.has(url)) continue;
+        seenUrls.add(url);
+        const actualOrigin = originFromUrl(url);
+        if (actualOrigin && actualOrigin !== expectedOrigin) {
+          hardcodedBaseUrlMismatches.push({
+            file: path.basename(filePath),
+            url,
+            expectedOrigin,
+            actualOrigin,
+          });
+        }
+      }
+    }
   }
 
   const selectorQuality = uiFiles > 0
     ? Number((filesWithPreferredSelectors / uiFiles).toFixed(2))
     : 1;
+  skippedTests = Math.min(skippedTests, totalTests);
+  const runnableTests = Math.max(0, totalTests - skippedTests);
+  const runnableRatio = totalTests > 0
+    ? Number((runnableTests / totalTests).toFixed(2))
+    : 0;
 
   return {
     totalFiles: files.length,
     totalTests,
+    skippedTests,
+    runnableTests,
+    runnableRatio,
     categories,
     selectorQuality,
+    hardcodedBaseUrlMismatches,
   };
 }
 
@@ -629,10 +1186,13 @@ function requiredCategoriesForRun({ testType, context = {} }) {
   const pageCount = (context.pages || []).length;
   const formCount = (context.forms || []).length;
   const workflowCount = (context.workflows || []).length;
-  const navEdgeCount = (context.navigationGraph || []).length;
-  const apiCount = (context.apiEndpoints || []).length;
+  const navEdgeCount = Array.isArray(context.navigationGraph?.edges)
+    ? context.navigationGraph.edges.length
+    : 0;
+  const apiEndpoints = effectiveApiEndpoints(context);
+  const apiCount = apiEndpoints.length;
   const authPatternCount = (context.authPatterns || []).length;
-  const apiAuthSignals = (context.apiEndpoints || []).filter((endpoint) =>
+  const apiAuthSignals = apiEndpoints.filter((endpoint) =>
     endpoint?.authRequired === true ||
     /auth|token|login|logout|session|bearer/i.test(String(endpoint?.path || ''))
   ).length;
@@ -771,7 +1331,7 @@ function computeQualityScoreAndSuggestions({
 
   // Exploration thinness: fewer pages/endpoints = thinner coverage.
   const pageCount = (context?.pages || []).length;
-  const endpointCount = (context?.apiEndpoints || []).length;
+  const endpointCount = effectiveApiEndpoints(context).length;
   if (pageCount + endpointCount < 3) {
     score -= 8;
     suggestions.push({
@@ -805,6 +1365,56 @@ function evaluateGenerationQualityGates({ config, context, quality, prdContent, 
 
   const minGeneratedTests = toFiniteNumber(config.minGeneratedTests, 50);
   const minSelectorQuality = profile === 'balanced' ? 0.35 : (profile === 'exhaustive' ? 0.6 : 0.5);
+  const minRunnableRatio = profile === 'balanced' ? 0.25 : 0.5;
+
+  if (quality.totalTests > 0 && quality.runnableTests === 0) {
+    const error = new Error(`Generated suite has zero runnable tests (${quality.skippedTests}/${quality.totalTests} skipped).`);
+    error.code = 'ZERO_RUNNABLE_TESTS';
+    error.generationQuality = {
+      ...quality,
+      minGeneratedTests,
+      requiredCategories,
+      missingCategories,
+      minSelectorQuality,
+      minRunnableRatio,
+      coverageProfile: profile,
+    };
+    return { ok: false, error };
+  }
+
+  if (Array.isArray(quality.hardcodedBaseUrlMismatches) && quality.hardcodedBaseUrlMismatches.length > 0) {
+    const sample = quality.hardcodedBaseUrlMismatches
+      .slice(0, 5)
+      .map((item) => `${item.file}:${item.url}`)
+      .join(', ');
+    const error = new Error(`Generated suite hardcoded a different app origin than baseURL (${sample}).`);
+    error.code = 'HARDCODED_BASE_URL_MISMATCH';
+    error.generationQuality = {
+      ...quality,
+      minGeneratedTests,
+      requiredCategories,
+      missingCategories,
+      minSelectorQuality,
+      minRunnableRatio,
+      coverageProfile: profile,
+    };
+    return { ok: false, error };
+  }
+
+  if (quality.totalTests > 0 && quality.runnableRatio < minRunnableRatio) {
+    const error = new Error(`Generated suite runnable coverage too low (${quality.runnableTests}/${quality.totalTests} runnable, minimum ratio ${minRunnableRatio}).`);
+    error.code = 'RUNNABLE_COVERAGE_TOO_LOW';
+    error.generationQuality = {
+      ...quality,
+      minGeneratedTests,
+      requiredCategories,
+      missingCategories,
+      minSelectorQuality,
+      minRunnableRatio,
+      coverageProfile: profile,
+    };
+    return { ok: false, error };
+  }
 
   // Hard-fail when running under a strict coverage profile (qa-max / exhaustive)
   // with strictAIGeneration enabled. Non-strict profiles (balanced) retain the
@@ -823,6 +1433,7 @@ function evaluateGenerationQualityGates({ config, context, quality, prdContent, 
         requiredCategories,
         missingCategories,
         minSelectorQuality,
+        minRunnableRatio,
         coverageProfile: profile,
       };
       return { ok: false, error };
@@ -853,6 +1464,7 @@ function evaluateGenerationQualityGates({ config, context, quality, prdContent, 
       requiredCategories,
       missingCategories,
       minSelectorQuality,
+      minRunnableRatio,
       coverageProfile: profile,
     };
     return { ok: false, error };
@@ -884,11 +1496,118 @@ function evaluateGenerationQualityGates({ config, context, quality, prdContent, 
       requiredCategories,
       missingCategories,
       minSelectorQuality,
+      minRunnableRatio,
       coverageProfile: profile,
       warnings,
       qualityScore: scoreBundle.qualityScore,
       potentialImprovement: scoreBundle.totalPotentialImprovement,
       improvementSuggestions: scoreBundle.suggestions,
+    },
+  };
+}
+
+function isRepairableGenerationFailure(error) {
+  const code = error?.code || classifyErrorCode(error);
+  return [
+    'ZERO_RUNNABLE_TESTS',
+    'RUNNABLE_COVERAGE_TOO_LOW',
+    'MIN_TEST_COUNT_NOT_MET',
+    'COVERAGE_GATES_FAILED',
+    'GENERATION_VALIDATION_FAILED',
+    'AI_GENERATION_INSUFFICIENT',
+    'HARDCODED_BASE_URL_MISMATCH',
+  ].includes(code);
+}
+
+function extractGenerationFailureQuality(error) {
+  return error?.generationQuality
+    || error?.validation?.qualityAudit
+    || error?.primaryFailure?.validation?.qualityAudit
+    || error?.primaryFailure?.validation?.generationQuality
+    || null;
+}
+
+function buildGenerationRepairContext({
+  context,
+  error,
+  quality,
+  routeAccessSummary,
+  attempt,
+  testType,
+}) {
+  const base = context && typeof context === 'object' ? { ...context } : {};
+  const code = error?.code || classifyErrorCode(error);
+  const publicRoutes = Array.isArray(routeAccessSummary?.publicRoutes)
+    ? routeAccessSummary.publicRoutes
+    : [];
+  const protectedRoutes = Array.isArray(routeAccessSummary?.protectedRoutes)
+    ? routeAccessSummary.protectedRoutes
+    : [];
+  const missingCategories = Array.isArray(quality?.missingCategories)
+    ? quality.missingCategories
+    : [];
+  const errors = Array.isArray(quality?.errors)
+    ? quality.errors
+    : (Array.isArray(quality?.qualityAuditErrors) ? quality.qualityAuditErrors : []);
+
+  const instructions = [
+    'Use the previous generation failure as feedback and generate a materially different suite.',
+    'Every runnable test must assert real target-app behavior, not just page load or status code.',
+  ];
+  if (publicRoutes.length > 0) {
+    instructions.push(`Generate runnable public-route tests for: ${publicRoutes.slice(0, 12).join(', ')}.`);
+    instructions.push('Do not add credential-driven skips to public routes; only protected routes may be skipped.');
+  }
+  if (protectedRoutes.length > 0) {
+    instructions.push(`Protected routes may be blocked/skipped only when credentials are unavailable: ${protectedRoutes.slice(0, 8).join(', ')}.`);
+  }
+  if (missingCategories.length > 0) {
+    instructions.push(`Close missing coverage categories: ${missingCategories.join(', ')}.`);
+  }
+  if (code === 'HARDCODED_BASE_URL_MISMATCH') {
+    const mismatches = Array.isArray(quality?.hardcodedBaseUrlMismatches)
+      ? quality.hardcodedBaseUrlMismatches
+      : [];
+    const expectedOrigin = mismatches.find((item) => item?.expectedOrigin)?.expectedOrigin;
+    instructions.push(
+      expectedOrigin
+        ? `Use only the configured baseURL origin ${expectedOrigin}; remove all page.goto() calls to other localhost ports or origins.`
+        : 'Use only the configured baseURL; remove all page.goto() calls to other localhost ports or origins.'
+    );
+    instructions.push('Prefer relative page.goto("/route") calls or construct URLs from CONTEXT_JSON.project.baseURL instead of guessing Vite/localhost ports.');
+  }
+  if (errors.some((item) => String(item).startsWith('brittle_'))) {
+    instructions.push('Remove brittle generated assertions: no DOM checkValidity(), no raw getComputedStyle assertions, no exact concatenated card accessible names, and no toContainText([...]) on a single container. Replace them with user-visible behavior assertions grounded in source text.');
+    instructions.push('For cards with multiple text nodes, locate by the stable title text and assert metadata with toContainText() inside the card/container.');
+    instructions.push('Do not assert dialogs, month-specific event chips, selected option labels, or invented formatted labels unless the exact behavior/text is proven by route/source context.');
+  }
+  if (errors.some((item) => /source_reference|ungrounded_selector_text|ungrounded_route|ungrounded_ui_files/.test(String(item)))) {
+    instructions.push('Regenerate from source evidence: every UI test must include a // [SRC:<relative-source-file>] comment naming a file from context.sourceContext.files.');
+    instructions.push('Use only routes, headings, buttons, labels, test ids, and visible data present in routeAccess.observedRoutes or context.sourceContext; remove invented selector text and unknown page.goto() routes.');
+  }
+  if (String(testType || '').toLowerCase() !== 'backend') {
+    instructions.push('Prefer frontend assertions against observed headings, buttons, forms, route transitions, and error states.');
+  }
+  if (String(testType || '').toLowerCase() !== 'frontend') {
+    instructions.push('Generate backend/API tests only for endpoints or contracts present in context; do not invent API paths.');
+  }
+
+  return {
+    ...base,
+    generationFeedback: {
+      attempt,
+      previousFailureCode: code,
+      previousFailureMessage: normalizeErrorText(error?.message),
+      quality: {
+        totalTests: quality?.totalTests ?? null,
+        skippedTests: quality?.skippedTests ?? null,
+        runnableTests: quality?.runnableTests ?? null,
+        runnableRatio: quality?.runnableRatio ?? null,
+        missingCategories,
+        errors,
+      },
+      routeAccessSummary: routeAccessSummary || null,
+      instructions,
     },
   };
 }
@@ -914,6 +1633,11 @@ async function withStageBudget(budget, stage, workFn) {
 
   let timeoutRef;
   let success = false;
+  const previousDeadline = budget.stageDeadlines?.[stage];
+  if (!budget.stageDeadlines) {
+    budget.stageDeadlines = {};
+  }
+  budget.stageDeadlines[stage] = startedAt + timeoutMs;
   try {
     const result = await Promise.race([
       Promise.resolve().then(workFn),
@@ -926,6 +1650,11 @@ async function withStageBudget(budget, stage, workFn) {
     success = true;
     return result;
   } finally {
+    if (previousDeadline) {
+      budget.stageDeadlines[stage] = previousDeadline;
+    } else if (budget.stageDeadlines) {
+      delete budget.stageDeadlines[stage];
+    }
     if (timeoutRef) {
       clearTimeout(timeoutRef);
     }
@@ -980,6 +1709,13 @@ function emitPipelineTelemetry(reporter, payload) {
       skipped: payload?.results?.skipped,
       passRate: payload?.results?.passRate,
       generationProvider: payload?.generationMeta?.selectedGenerator || payload?.generationMeta?.provider || null,
+      agent: payload.agent || null,
+      agentsCompleted: payload.agentsCompleted,
+      totalAgents: payload.totalAgents,
+      generatedCount: payload.generatedCount,
+      generationBudgetMs: payload.generationBudgetMs,
+      generationComplexity: payload.generationComplexity,
+      stageBudget: payload.stageBudget || null,
     },
   });
 }
@@ -1084,6 +1820,15 @@ function classifyErrorCode(error) {
   if (message.includes('minimum') && message.includes('generated')) {
     return 'MIN_TEST_COUNT_NOT_MET';
   }
+  if (message.includes('zero runnable') || message.includes('all were skipped')) {
+    return 'ZERO_RUNNABLE_TESTS';
+  }
+  if (message.includes('runnable coverage too low')) {
+    return 'RUNNABLE_COVERAGE_TOO_LOW';
+  }
+  if (message.includes('all observed routes require authentication')) {
+    return 'AUTH_REQUIRED_NO_CREDENTIALS';
+  }
   if (message.includes('coverage gates')) {
     return 'COVERAGE_GATES_FAILED';
   }
@@ -1173,6 +1918,18 @@ function buildUserFacingPipelineError(errorCode, error) {
   if (errorCode === 'WEBAPP_UNREACHABLE') {
     const dashboardUrl = process.env.HEALIX_DASHBOARD_URL || 'http://localhost:3000';
     return `Healix could not reach the webapp at ${dashboardUrl}. Start it locally with \`cd webapp && npm run dev\` (default http://localhost:3000), or point HEALIX_DASHBOARD_URL at your deployed instance in the MCP config, then re-run.`;
+  }
+
+  if (errorCode === 'ZERO_RUNNABLE_TESTS') {
+    return 'Healix generated or executed a suite with zero runnable tests. Public routes must produce runnable tests; only proven protected/auth-only routes may be skipped.';
+  }
+
+  if (errorCode === 'RUNNABLE_COVERAGE_TOO_LOW') {
+    return `Healix generated too many skipped tests for the available app surface. ${normalizedMessage}`;
+  }
+
+  if (errorCode === 'AUTH_REQUIRED_NO_CREDENTIALS') {
+    return 'All observed app routes require authentication, but no verified credentials were available. Provide working role credentials or expose a public health/smoke route before running Healix.';
   }
 
   return normalizedMessage;
@@ -2103,19 +2860,253 @@ function buildPipelineDiagnostics({ projectPath, stage, reason, stderr, stdout, 
   };
 }
 
-function auditGeneratedTestQuality({ projectPath, testType, context }) {
+function normalizeGroundingText(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function extractSourceLiteralCorpus(projectPath) {
+  const roots = ['src', 'app', 'pages', 'components']
+    .map((dir) => path.join(projectPath, dir))
+    .filter((dir) => fs.existsSync(dir));
+  const corpus = new Set();
+  const maxFiles = 400;
+  let filesRead = 0;
+
+  const collect = (raw) => {
+    const normalized = normalizeGroundingText(raw);
+    if (
+      normalized.length < 3 ||
+      normalized.length > 80 ||
+      /^https?\s/.test(normalized) ||
+      /^api(\s|$)/.test(normalized) ||
+      /^[a-z0-9_-]+$/.test(normalized)
+    ) {
+      return;
+    }
+    corpus.add(normalized);
+  };
+
+  const visit = (dir) => {
+    if (filesRead >= maxFiles) return;
+    let entries = [];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (filesRead >= maxFiles) return;
+      if (entry.name === 'node_modules' || entry.name.startsWith('.')) continue;
+      const fullPath = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        visit(fullPath);
+        continue;
+      }
+      if (!/\.(tsx?|jsx?|vue|svelte)$/i.test(entry.name)) continue;
+      let text = '';
+      try {
+        text = fs.readFileSync(fullPath, 'utf-8');
+      } catch {
+        continue;
+      }
+      filesRead += 1;
+
+      for (const match of text.matchAll(/(['"`])([^'"`{}<>]{3,120})\1/g)) {
+        collect(match[2]);
+      }
+      for (const match of text.matchAll(/>\s*([^<>{}]{3,120})\s*</g)) {
+        collect(match[1]);
+      }
+    }
+  };
+
+  for (const root of roots) visit(root);
+  return corpus;
+}
+
+function addKnownUiText(corpus, value) {
+  const normalized = normalizeGroundingText(value);
+  if (!normalized || normalized.length < 2 || normalized.length > 140) return;
+  if (/^https?\s/.test(normalized)) return;
+  corpus.add(normalized);
+}
+
+function buildKnownUiCorpus({ projectPath, context = {}, explorationArtifact = null } = {}) {
+  const corpus = new Set();
+  const sourceFiles = new Set();
+
+  const addRoute = (route) => {
+    addKnownUiText(corpus, route?.path);
+    for (const heading of route?.headings || []) {
+      addKnownUiText(corpus, heading?.text || heading);
+    }
+    for (const button of route?.buttons || []) {
+      addKnownUiText(corpus, button?.text || button?.ariaLabel || button?.name || button);
+    }
+    for (const element of route?.elements || []) {
+      addKnownUiText(corpus, element?.name || element?.text || element);
+    }
+    for (const label of route?.labels || []) {
+      addKnownUiText(corpus, label?.text || label?.name || label);
+    }
+    for (const select of route?.selectOptions || []) {
+      addKnownUiText(corpus, select?.name);
+      for (const option of select?.options || []) {
+        addKnownUiText(corpus, option?.text || option?.label || option?.value);
+      }
+    }
+  };
+
+  for (const route of explorationArtifact?.routes || context?.routes || []) {
+    addRoute(route);
+  }
+
+  for (const page of context?.pages || []) {
+    addKnownUiText(corpus, page.path);
+    addKnownUiText(corpus, page.description);
+    if (page.sourceFile) sourceFiles.add(page.sourceFile);
+    (page.components || []).forEach((item) => addKnownUiText(corpus, item));
+    (page.interactions || []).forEach((item) => addKnownUiText(corpus, item));
+    (page.selectorHints || []).forEach((item) => addKnownUiText(corpus, item));
+  }
+
+  for (const form of context?.forms || []) {
+    if (form.file) sourceFiles.add(form.file);
+    (form.validationPatterns || []).forEach((item) => addKnownUiText(corpus, item));
+    (form.submitButtons || []).forEach((item) => addKnownUiText(corpus, item?.text || item?.ariaLabel || item));
+    (form.selectorHints || []).forEach((item) => addKnownUiText(corpus, item));
+    for (const field of form.fields || []) {
+      addKnownUiText(corpus, field.label);
+      addKnownUiText(corpus, field.placeholder);
+      addKnownUiText(corpus, field.name);
+      addKnownUiText(corpus, field.testId);
+    }
+  }
+
+  const sourceContext = context?.sourceContext || {};
+  (sourceContext.assertableText || []).forEach((item) => addKnownUiText(corpus, item));
+  (sourceContext.routePaths || []).forEach((item) => addKnownUiText(corpus, item));
+  (sourceContext.testIds || []).forEach((item) => addKnownUiText(corpus, item));
+  for (const file of sourceContext.files || []) {
+    if (file?.file) sourceFiles.add(file.file);
+    (file?.assertableText || []).forEach((item) => addKnownUiText(corpus, item));
+    (file?.routePaths || []).forEach((item) => addKnownUiText(corpus, item));
+    (file?.testIds || []).forEach((item) => addKnownUiText(corpus, item));
+    (file?.components || []).forEach((item) => addKnownUiText(corpus, item));
+  }
+
+  for (const term of extractSourceLiteralCorpus(projectPath)) {
+    addKnownUiText(corpus, term);
+  }
+
+  return { corpus, sourceFiles };
+}
+
+function stripEscapes(value) {
+  return String(value || '').replace(/\\(['"`])/g, '$1').trim();
+}
+
+function extractGroundedUiStrings(content) {
+  const strings = [];
+  const text = String(content || '');
+  const add = (value, source) => {
+    const raw = stripEscapes(value);
+    const normalized = normalizeGroundingText(raw);
+    if (!normalized || normalized.length < 2 || normalized.length > 120) return;
+    if (/^(button|link|heading|textbox|navigation|main|form|dialog|region|list|listitem)$/i.test(raw)) return;
+    strings.push({ text: raw, normalized, source });
+  };
+
+  for (const match of text.matchAll(/\bgetBy(?:Text|Label|Placeholder|TestId)\(\s*(['"`])([^'"`]{2,120})\1/g)) {
+    add(match[2], 'locator_text');
+  }
+
+  for (const match of text.matchAll(/\bgetByRole\(\s*['"`][^'"`]+['"`]\s*,\s*\{[\s\S]{0,260}?\bname\s*:\s*(['"`])([^'"`]{2,120})\1/g)) {
+    add(match[2], 'role_name');
+  }
+
+  for (const match of text.matchAll(/\bto(?:ContainText|HaveText)\(\s*(['"`])([^'"`]{2,120})\1/g)) {
+    add(match[2], 'assertion_text');
+  }
+
+  return strings;
+}
+
+function isKnownUiString(normalized, corpus) {
+  if (!normalized) return true;
+  if (corpus.has(normalized)) return true;
+  if (normalized.length <= 2) return true;
+
+  for (const known of corpus) {
+    if (!known) continue;
+    if (known === normalized) return true;
+    if (normalized.length >= 4 && known.includes(normalized)) return true;
+    if (known.length >= 4 && normalized.includes(known)) return true;
+  }
+  return false;
+}
+
+function extractSourceReferences(content) {
+  const refs = [];
+  for (const match of String(content || '').matchAll(/\[SRC:([^\]\r\n]+)\]/g)) {
+    refs.push(String(match[1] || '').trim());
+  }
+  return refs.filter(Boolean);
+}
+
+function extractGotoRoutes(content) {
+  const routes = [];
+  for (const match of String(content || '').matchAll(/\bpage\.goto\(\s*(['"`])([^'"`]+)\1/g)) {
+    routes.push(String(match[2] || '').trim());
+  }
+  return routes.filter(Boolean);
+}
+
+function normalizeRouteForAudit(route) {
+  if (!route) return null;
+  try {
+    const parsed = new URL(route);
+    return parsed.pathname || '/';
+  } catch {
+    const text = String(route).trim();
+    if (!text.startsWith('/')) return null;
+    return text.split(/[?#]/)[0] || '/';
+  }
+}
+
+function isIntentionalUnknownRouteTest(content, fileName) {
+  const text = `${fileName}\n${content}`.toLowerCase();
+  return /\b(not[- ]?found|404|invalid route|unknown route|error state|cat:error)\b/.test(text);
+}
+
+function auditGeneratedTestQuality({ projectPath, testType, context, explorationArtifact = null }) {
   const generatedDir = path.join(projectPath, 'tests', 'generated');
-  const apiEndpointCount = (context?.apiEndpoints || []).length;
+  const apiEndpointCount = effectiveApiEndpoints(context).length;
   Logger.info('PipelineWorker', `[QUALITY AUDIT] Starting audit — testType=${testType} apiEndpoints=${apiEndpointCount} dir=${generatedDir}`);
 
   const summary = {
     totalFiles: 0,
     apiFiles: 0,
     uiFiles: 0,
+    totalTests: 0,
+    skippedTests: 0,
+    runnableTests: 0,
+    runnableRatio: 0,
     hasApiBurstCoverage: false,
     selectorCoverageRatio: 0,
     riskyPatternHits: 0,
     riskyFiles: [],
+    contextGroundingRatio: 1,
+    ungroundedUiFiles: [],
+    missingSourceReferenceFiles: [],
+    invalidSourceReferenceFiles: [],
+    ungroundedSelectorFiles: [],
+    ungroundedRouteFiles: [],
+    brittlePatternFiles: [],
     errors: [],
     warnings: [],
   };
@@ -2139,10 +3130,53 @@ function auditGeneratedTestQuality({ projectPath, testType, context }) {
   const preferredSelectorPattern = /getByRole|getByLabel|getByPlaceholder|getByTestId|getByText|getByAltText/;
   const routeMockPattern = /page\.route\(/i;
   const checkValidityPattern = /\.checkValidity\(/i;
+  const computedStylePattern = /getComputedStyle\s*\(/i;
+  const arrayToContainTextPattern = /\.toContainText\s*\(\s*\[/i;
+  const exactCountPattern = /\.toHaveCount\s*\(\s*(\d+)\s*\)/gi;
+  const roleNameStringPattern = /getByRole\(\s*['"`][^'"`]+['"`]\s*,\s*\{[\s\S]*?\bname\s*:\s*(['"`])([\s\S]*?)\1/gi;
+  const unprovenNewProjectDialogPattern = /getByRole\(\s*['"`]button['"`]\s*,\s*\{[^}]*name\s*:\s*['"`]New Project['"`][^}]*\}\s*\)\.click\(\)[\s\S]{0,1200}getByRole\(\s*['"`]dialog['"`]\s*\)/i;
+  const selectOptionVisibleLabelPattern = /selectOption\([\s\S]{0,500}getByText\(\s*(?:label|teamLabel|optionLabel)\s*\)[\s\S]{0,160}\.toBeVisible\(/i;
+  const crossMonthEventAssertionPattern = /getByRole\(\s*['"`]button['"`]\s*,\s*\{[^}]*name\s*:\s*['"`]Next Month['"`][^}]*\}\s*\)\.click\(\)[\s\S]{0,1200}getByRole\(\s*['"`]button['"`]\s*,\s*\{[^}]*name\s*:\s*['"`](?:Standup|Planning|Review)['"`][^}]*\}\s*\)/i;
+  const staleMonthAfterNavigationPattern = /getByRole\(\s*['"`]button['"`]\s*,\s*\{[^}]*name\s*:\s*['"`](?:Next Month|Previous Month)['"`][^}]*\}\s*\)\.click\(\)[\s\S]{0,1400}(?:getByRole\(\s*['"`]heading['"`][\s\S]{0,300}name\s*:\s*['"`](?:May 2026|Showing May 2026|May 2026\s*—\s*Monthly View)['"`]|toHaveText\(\s*['"`](?:May 2026|Showing May 2026|May 2026\s*—\s*Monthly View)['"`])/i;
+  const resetThenAddWidgetPattern = /getByRole\(\s*['"`]button['"`]\s*,\s*\{[^}]*name\s*:\s*['"`]Reset Layout['"`][^}]*\}\s*\)\.click\(\)[\s\S]{0,800}getByRole\(\s*['"`]button['"`]\s*,\s*\{[^}]*name\s*:\s*['"`]Add widget['"`][^}]*\}\s*\)/i;
+  const inventedDueLabelPattern = /getByText\(\s*['"`]Due:\s*(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\b[^'"`]*['"`]/i;
+  const ambiguousSingleWordTextPattern = /getByText\(\s*['"`](?:Standup|Planning|Review)['"`]\s*\)/i;
+  const roleNameRegexPattern = /getByRole\(\s*['"`][^'"`]+['"`]\s*,\s*\{[\s\S]{0,320}?\bname\s*:\s*\/([^/\n]{12,220})\/[a-z]*/gi;
   const riskyUiPattern = /page\.pause\(/i;
   const riskyPhrasesPattern = /(invalid credentials|email is required|password is required|network error|try again|not found|does not exist|cannot find)/gi;
   const enforcePhraseRiskGates = String(process.env.HEALIX_ENFORCE_PHRASE_RISK_GATES || '').toLowerCase() === 'true';
   const knownCorpus = new Set();
+  const sourceCorpus = extractSourceLiteralCorpus(projectPath);
+  const { corpus: knownUiCorpus, sourceFiles } = buildKnownUiCorpus({ projectPath, context, explorationArtifact });
+  const knownRoutes = new Set(['/']);
+  for (const route of explorationArtifact?.routes || context?.routes || []) {
+    const normalizedRoute = normalizeRouteForAudit(route?.path);
+    if (normalizedRoute) knownRoutes.add(normalizedRoute);
+  }
+  for (const page of context?.pages || []) {
+    const normalizedRoute = normalizeRouteForAudit(page?.path);
+    if (normalizedRoute) knownRoutes.add(normalizedRoute);
+  }
+  for (const routePath of context?.sourceContext?.routePaths || []) {
+    const normalizedRoute = normalizeRouteForAudit(routePath);
+    if (normalizedRoute) knownRoutes.add(normalizedRoute);
+  }
+
+  const recordBrittlePattern = (type, name) => {
+    summary.brittlePatternFiles.push(name);
+    const error = `${type}:${name}`;
+    if (!summary.errors.includes(error)) {
+      summary.errors.push(error);
+    }
+  };
+
+  const looksLikeConcatenatedAccessibleName = (value) => {
+    const text = String(value || '').replace(/\\['"`]/g, '').trim();
+    if (/[a-z][A-Z]/.test(text)) return true;
+    if (text.length < 45) return false;
+    if (text.length >= 80) return true;
+    return /(Priority:\s*\w+.*Due:|Assignee:|Update[A-Z]|Validation[A-Z]|Integration[A-Z])/i.test(text);
+  };
 
   const collectKnownText = (value) => {
     if (!value) return;
@@ -2198,6 +3232,11 @@ function auditGeneratedTestQuality({ projectPath, testType, context }) {
       continue;
     }
 
+    const fileTests = countTestsInContent(content);
+    const fileSkippedTests = Math.min(countSkippedTestsInContent(content), fileTests);
+    summary.totalTests += fileTests;
+    summary.skippedTests += fileSkippedTests;
+
     const isApiFile = /request\.(get|post|put|patch|delete|fetch)\(/i.test(content) || /api/i.test(name);
     if (isApiFile) {
       summary.apiFiles += 1;
@@ -2214,12 +3253,122 @@ function auditGeneratedTestQuality({ projectPath, testType, context }) {
         uiFilesWithPreferredSelectors += 1;
       }
 
+      if (sourceCorpus.size > 0) {
+        const normalizedContent = normalizeGroundingText(content);
+        let sourceHits = 0;
+        for (const term of sourceCorpus) {
+          if (normalizedContent.includes(term)) {
+            sourceHits += 1;
+            if (sourceHits >= 2) break;
+          }
+        }
+        if (sourceHits === 0 && fileTests > 0) {
+          summary.ungroundedUiFiles.push(name);
+        }
+      }
+
+      if (sourceFiles.size > 0 && fileTests > 0) {
+        const sourceRefs = extractSourceReferences(content);
+        if (sourceRefs.length === 0) {
+          summary.missingSourceReferenceFiles.push(name);
+          summary.errors.push(`missing_source_reference:${name}`);
+        } else {
+          const invalidRefs = sourceRefs.filter((ref) => {
+            if (sourceFiles.has(ref)) return false;
+            const absolute = path.join(projectPath, ref);
+            return !fs.existsSync(absolute) || absolute.includes(`${path.sep}tests${path.sep}`);
+          });
+          if (invalidRefs.length > 0) {
+            summary.invalidSourceReferenceFiles.push(name);
+            summary.errors.push(`invalid_source_reference:${name}:${invalidRefs.slice(0, 3).join('|')}`);
+          }
+        }
+      }
+
+      if (knownUiCorpus.size > 0 && fileTests > 0) {
+        const ungroundedStrings = extractGroundedUiStrings(content)
+          .filter((entry) => !isKnownUiString(entry.normalized, knownUiCorpus));
+        if (ungroundedStrings.length > 0) {
+          summary.ungroundedSelectorFiles.push({
+            file: name,
+            strings: ungroundedStrings.slice(0, 5).map((entry) => entry.text),
+          });
+          summary.errors.push(`ungrounded_selector_text:${name}:${ungroundedStrings.slice(0, 3).map((entry) => entry.text).join('|')}`);
+        }
+      }
+
+      const unknownRoutes = extractGotoRoutes(content)
+        .map(normalizeRouteForAudit)
+        .filter(Boolean)
+        .filter((route) => !knownRoutes.has(route));
+      if (unknownRoutes.length > 0 && !isIntentionalUnknownRouteTest(content, name)) {
+        summary.ungroundedRouteFiles.push({
+          file: name,
+          routes: [...new Set(unknownRoutes)].slice(0, 5),
+        });
+        summary.errors.push(`ungrounded_route:${name}:${[...new Set(unknownRoutes)].slice(0, 3).join('|')}`);
+      }
+
       if (routeMockPattern.test(content)) {
         summary.warnings.push(`uses_route_mocking:${name}`);
       }
 
       if (checkValidityPattern.test(content)) {
-        summary.warnings.push(`uses_check_validity:${name}`);
+        recordBrittlePattern('brittle_check_validity_assertion', name);
+      }
+
+      if (computedStylePattern.test(content)) {
+        recordBrittlePattern('brittle_computed_style_assertion', name);
+      }
+
+      if (arrayToContainTextPattern.test(content)) {
+        recordBrittlePattern('brittle_array_to_contain_text', name);
+      }
+
+      if (unprovenNewProjectDialogPattern.test(content)) {
+        recordBrittlePattern('brittle_unproven_dialog_after_new_project', name);
+      }
+
+      if (selectOptionVisibleLabelPattern.test(content)) {
+        recordBrittlePattern('brittle_select_option_label_visibility', name);
+      }
+
+      if (crossMonthEventAssertionPattern.test(content)) {
+        recordBrittlePattern('brittle_cross_month_event_assertion', name);
+      }
+
+      if (staleMonthAfterNavigationPattern.test(content)) {
+        recordBrittlePattern('brittle_stale_month_after_navigation', name);
+      }
+
+      if (resetThenAddWidgetPattern.test(content)) {
+        recordBrittlePattern('brittle_reset_then_add_widget_assertion', name);
+      }
+
+      if (inventedDueLabelPattern.test(content)) {
+        recordBrittlePattern('brittle_invented_due_label', name);
+      }
+
+      if (ambiguousSingleWordTextPattern.test(content)) {
+        recordBrittlePattern('brittle_ambiguous_single_word_text', name);
+      }
+
+      const exactCountMatches = [...content.matchAll(exactCountPattern)];
+      if (exactCountMatches.some((match) => Number(match[1]) > 1)) {
+        summary.warnings.push(`uses_exact_count_assertion:${name}`);
+      }
+
+      for (const match of content.matchAll(roleNameStringPattern)) {
+        if (looksLikeConcatenatedAccessibleName(match[2])) {
+          recordBrittlePattern('brittle_concatenated_accessible_name', name);
+          break;
+        }
+      }
+      for (const match of content.matchAll(roleNameRegexPattern)) {
+        if (looksLikeConcatenatedAccessibleName(match[1])) {
+          recordBrittlePattern('brittle_concatenated_accessible_name_regex', name);
+          break;
+        }
       }
 
       if (riskyUiPattern.test(content)) {
@@ -2253,6 +3402,20 @@ function auditGeneratedTestQuality({ projectPath, testType, context }) {
   summary.selectorCoverageRatio = summary.uiFiles > 0
     ? Number((uiFilesWithPreferredSelectors / summary.uiFiles).toFixed(2))
     : 1;
+  summary.contextGroundingRatio = summary.uiFiles > 0
+    ? Number(((summary.uiFiles - summary.ungroundedUiFiles.length) / summary.uiFiles).toFixed(2))
+    : 1;
+  summary.skippedTests = Math.min(summary.skippedTests, summary.totalTests);
+  summary.runnableTests = Math.max(0, summary.totalTests - summary.skippedTests);
+  summary.runnableRatio = summary.totalTests > 0
+    ? Number((summary.runnableTests / summary.totalTests).toFixed(2))
+    : 0;
+
+  if (summary.totalTests > 0 && summary.runnableTests === 0) {
+    summary.errors.push('zero_runnable_tests');
+  } else if (summary.totalTests > 0 && summary.runnableRatio < 0.25) {
+    summary.errors.push('runnable_coverage_too_low');
+  }
 
   // Full-stack frameworks (Next.js, Nuxt, Remix) expose server-side logic
   // through UI flows and server actions rather than standalone REST clients.
@@ -2268,7 +3431,7 @@ function auditGeneratedTestQuality({ projectPath, testType, context }) {
   // there will legitimately be zero request.get/post() API test files.
   // The context-gatherer also injects a synthetic /api/health endpoint when no
   // real ones are found, so apiEndpoints.length > 0 is not a reliable signal.
-  if (testType === 'backend' && !isFullStackFramework && (context?.apiEndpoints || []).length > 1) {
+  if (testType === 'backend' && !isFullStackFramework && effectiveApiEndpoints(context).length > 1) {
     if (summary.apiFiles === 0) {
       Logger.warn('PipelineWorker', `[QUALITY AUDIT] ❌ GATE FAIL: missing_api_test_files — no files matched API pattern despite ${apiEndpointCount} detected endpoint(s)`);
       summary.errors.push('missing_api_test_files');
@@ -2276,7 +3439,7 @@ function auditGeneratedTestQuality({ projectPath, testType, context }) {
     if (!summary.hasApiBurstCoverage) {
       summary.warnings.push('missing_api_burst_coverage');
     }
-  } else if ((testType === 'backend' || testType === 'both') && (context?.apiEndpoints || []).length > 0) {
+  } else if ((testType === 'backend' || testType === 'both') && effectiveApiEndpoints(context).length > 0) {
     if (summary.apiFiles === 0) {
       summary.warnings.push('missing_api_test_files');
     }
@@ -2291,7 +3454,15 @@ function auditGeneratedTestQuality({ projectPath, testType, context }) {
     summary.warnings.push('low_preferred_selector_coverage');
   }
 
+  if ((testType === 'frontend' || testType === 'both') && sourceCorpus.size > 0 && summary.ungroundedUiFiles.length > 0) {
+    summary.errors.push(`ungrounded_ui_files:${summary.ungroundedUiFiles.slice(0, 5).join(',')}`);
+  }
+
   summary.riskyFiles = [...new Set(summary.riskyFiles)];
+  summary.ungroundedUiFiles = [...new Set(summary.ungroundedUiFiles)];
+  summary.missingSourceReferenceFiles = [...new Set(summary.missingSourceReferenceFiles)];
+  summary.invalidSourceReferenceFiles = [...new Set(summary.invalidSourceReferenceFiles)];
+  summary.brittlePatternFiles = [...new Set(summary.brittlePatternFiles)];
 
   const auditValid = summary.errors.length === 0;
   if (auditValid) {
@@ -2364,23 +3535,38 @@ function installMissingDependencies(projectPath, testsDir) {
  * backend still gets `smoke` because the existing smoke generator emits
  * backend smokes too when applicable.
  */
-function pickAgentsForRun(testType, projectInfo = {}) {
+function pickAgentsForRun(testType, projectInfo = {}, context = {}) {
   const apiOnly = projectInfo && projectInfo.apiOnly === true;
   if (apiOnly) return ['api'];
 
+  const normalizedType = String(testType || 'both').toLowerCase();
+  const explicitBackend = normalizedType === 'backend';
+  const explicitFrontend = normalizedType === 'frontend';
+  const apiSurface = hasApiSurfaceForGeneration(context, projectInfo);
+  const hasUiSurface = (context.pages || []).length > 0
+    || (context.forms || []).length > 0
+    || (context.workflows || []).length > 0
+    || (Array.isArray(context.navigationGraph?.edges) && context.navigationGraph.edges.length > 0);
+  const hasWorkflowSurface = (context.workflows || []).length > 0
+    || (Array.isArray(context.navigationGraph?.edges) && context.navigationGraph.edges.length > 1);
+  const hasErrorSurface = (context.errorScenarios || []).length > 0;
+
   const agents = ['smoke'];
-  if (testType === 'frontend' || testType === 'both' || !testType) {
+  if (explicitFrontend || normalizedType === 'both' || !testType) {
     agents.push('frontend');
   }
-  if (testType === 'backend' || testType === 'both' || !testType) {
+  if (explicitBackend || (!explicitFrontend && apiSurface)) {
     agents.push('api');
   }
-  // workflow + error are UI-driven (skipped under apiOnly above); they still
-  // run for backend testType because they exercise end-to-end flows that
-  // may hit a UI. The webapp does its own membership check — if the
-  // project has no workflows/errorScenarios, its branch is skipped and it
-  // returns [] fast.
-  agents.push('workflow', 'error');
+  // Broad coverage is still the default, but only for surfaces proven by
+  // exploration/source context. This avoids spending minutes on agents that
+  // can only invent workflows or error states for a simple frontend app.
+  if (!explicitBackend && hasUiSurface && hasWorkflowSurface) {
+    agents.push('workflow');
+  }
+  if (!explicitBackend && hasUiSurface && hasErrorSurface) {
+    agents.push('error');
+  }
   return agents;
 }
 
@@ -2396,6 +3582,7 @@ async function maybeGenerateViaSaaS({
   statusDir = null,
   runId = null,
   runBudget = null,
+  telemetryReporter = null,
 }) {
   const healixApiKey = process.env.HEALIX_API_KEY;
   if (!healixApiKey) {
@@ -2454,13 +3641,21 @@ async function maybeGenerateViaSaaS({
       includeSmoke: true,
       includeWorkflows: true,
       includeErrorStates: true,
+      allowSyntheticErrorScenarios: false,
       strictAIGeneration: strictAI,
       coverageProfile: config.coverageProfile || 'qa-max',
       minGeneratedTests: toFiniteNumber(config.minGeneratedTests, 50),
+      maxExpansionAttempts: Number.isFinite(Number(config.maxExpansionAttempts))
+        ? Math.max(0, Math.floor(Number(config.maxExpansionAttempts)))
+        : 0,
     },
   };
 
-  const agents = pickAgentsForRun(config.testType, projectInfo);
+  const agents = pickAgentsForRun(config.testType, projectInfo, context);
+  const backendGenerationSkippedReason =
+    String(config.testType || '').toLowerCase() === 'both' && !agents.includes('api')
+      ? 'no_api_or_backend_surface_detected'
+      : null;
 
   // ── P1.5 planner pre-pass ────────────────────────────────────────────────
   // One HTTP call to /api/generate-tests/plan BEFORE the fan-out. The plan
@@ -2584,6 +3779,7 @@ async function maybeGenerateViaSaaS({
       runId,
       statusDir,
       runBudget,
+      telemetryReporter,
       plan,
       planMeta,
       config,
@@ -2595,6 +3791,7 @@ async function maybeGenerateViaSaaS({
       explorationArtifact,
       roles,
       planSliceFor,
+      backendGenerationSkippedReason,
     });
   }
 
@@ -2606,9 +3803,12 @@ async function maybeGenerateViaSaaS({
     runId,
     statusDir,
     config,
+    runBudget,
+    telemetryReporter,
     plan,
     planMeta,
     planSliceFor,
+    backendGenerationSkippedReason,
   });
 }
 
@@ -2629,9 +3829,12 @@ async function runPhase1FanOut({
   runId,
   statusDir,
   config,
+  runBudget = null,
+  telemetryReporter = null,
   plan,
   planMeta,
   planSliceFor,
+  backendGenerationSkippedReason = null,
 }) {
   const used = new Set();
   const files = [];
@@ -2641,22 +3844,89 @@ async function runPhase1FanOut({
   const allTokenRuns = [];
   let doneCount = 0;
 
-  // Dispatch agents in batches of 2 to prevent connection starvation.
-  // Firing all 5 simultaneously causes the webapp to queue the 3rd+ requests
-  // while holding the HTTP connection open — after ~5 minutes the Next.js dev
-  // server closes the idle connection → "fetch failed" TypeError for smoke and
-  // workflow agents. Two concurrent agents saturate the webapp's AI pipeline
-  // without leaving any connection idle long enough to be dropped.
-  const AGENT_CONCURRENCY = 2;
+  // Dispatch agents through a bounded pool. The per-agent transport timeout is
+  // derived from the remaining generation-stage deadline and number of waves,
+  // so large repos can use a larger stage budget without a hardcoded 5-minute
+  // ceiling, while one slow local webapp request still cannot black-hole the run.
+  const AGENT_CONCURRENCY = resolveGenerationAgentConcurrency(config, agents);
+  const agentTransportTimeoutMs = computeGenerationAgentTimeoutMs({
+    config,
+    runBudget,
+    agents,
+    concurrency: AGENT_CONCURRENCY,
+    context: sharedPayload.context,
+    parsedPRD: sharedPayload.parsedPRD,
+    projectInfo: sharedPayload.projectInfo,
+  });
+  Logger.info('PipelineWorker', 'Generation agent transport policy resolved', {
+    totalAgents: agents.length,
+    concurrency: AGENT_CONCURRENCY,
+    timeoutMs: agentTransportTimeoutMs,
+    generationStageRemainingMs: getStageBudgetRemainingMs(runBudget, 'generation'),
+  });
+  if (statusDir) {
+    updateStatus(statusDir, 'generating_tests', {
+      runId,
+      message: 'Generation agents running...',
+      agentsStarted: 0,
+      agentsCompleted: 0,
+      totalAgents: agents.length,
+      activeAgents: Math.min(AGENT_CONCURRENCY, agents.length),
+      generatedCount: 0,
+      generationAgentConcurrency: AGENT_CONCURRENCY,
+      generationAgentTimeoutMs: agentTransportTimeoutMs,
+    }, telemetryReporter);
+  }
+  if (telemetryReporter && telemetryReporter.isEnabled()) {
+    telemetryReporter.emitBackground({
+      toolName: 'healix_test_my_app',
+      eventType: 'generation_progress',
+      runId,
+      phase: 'generating_tests',
+      status: 'info',
+      success: true,
+      message: `Started ${agents.length} generation agent${agents.length === 1 ? '' : 's'} with concurrency ${AGENT_CONCURRENCY}`,
+      metadata: {
+        agents,
+        agentsStarted: 0,
+        agentsCompleted: 0,
+        totalAgents: agents.length,
+        activeAgents: Math.min(AGENT_CONCURRENCY, agents.length),
+        generatedCount: 0,
+        generationAgentConcurrency: AGENT_CONCURRENCY,
+        generationAgentTimeoutMs: agentTransportTimeoutMs,
+      },
+    });
+  }
+  const globalMinGeneratedTests = toFiniteNumber(sharedPayload?.options?.minGeneratedTests, 50);
+  const perAgentMinGeneratedTests = Math.max(
+    5,
+    Math.min(12, Math.ceil(globalMinGeneratedTests / Math.max(1, agents.length))),
+  );
 
   async function runAgent(agent) {
     try {
       const agentSlice = planSliceFor(agent);
-      const agentPayload = { agent, ...sharedPayload };
+      const agentPayload = {
+        agent,
+        ...sharedPayload,
+        transportTimeoutMs: agentTransportTimeoutMs,
+        options: {
+          ...(sharedPayload.options || {}),
+          // The aggregate MCP quality gate enforces the full run minimum after
+          // every agent has landed. Per-agent calls should target their slice,
+          // not each attempt to generate the entire suite by itself.
+          minGeneratedTests: perAgentMinGeneratedTests,
+          maxExpansionAttempts: Number.isFinite(Number(sharedPayload.options?.maxExpansionAttempts))
+            ? Number(sharedPayload.options.maxExpansionAttempts)
+            : 0,
+        },
+      };
       if (plan && agentSlice) {
         agentPayload.plan = { slice: agentSlice, planVersion: 1 };
       }
       const payload = await client.generateTestsForAgent(agentPayload);
+      const beforeWriteCount = files.length;
 
         // ── Token usage logging ──────────────────────────────────────────
         const REAL_TOKENS_PER_DISPLAY_UNIT = 4800;
@@ -2698,6 +3968,7 @@ async function runPhase1FanOut({
         agentMeta.push({ agent, generationMeta: payload.generationMeta });
       }
       doneCount += 1;
+      const agentFiles = files.slice(beforeWriteCount).map((file) => file.filename).filter(Boolean);
       if (statusDir) {
         try {
           updateStatus(statusDir, 'generating_tests', {
@@ -2706,10 +3977,29 @@ async function runPhase1FanOut({
             agentsCompleted: doneCount,
             totalAgents: agents.length,
             generatedCount: files.length,
-          });
+          }, telemetryReporter);
         } catch {
           // status-writes are best-effort; never break the generator
         }
+      }
+      if (telemetryReporter && telemetryReporter.isEnabled() && agentFiles.length > 0) {
+        telemetryReporter.emitBackground({
+          toolName: 'healix_test_my_app',
+          eventType: 'tests_generated',
+          runId,
+          phase: 'generating_tests',
+          status: 'info',
+          success: true,
+          message: `${agent} generated ${agentFiles.length} spec file${agentFiles.length === 1 ? '' : 's'}`,
+          metadata: {
+            agent,
+            files: agentFiles,
+            generatedCount: files.length,
+            agentGeneratedCount: agentFiles.length,
+            agentsCompleted: doneCount,
+            totalAgents: agents.length,
+          },
+        });
       }
       return { agent, count: tests.length };
     } catch (err) {
@@ -2722,17 +4012,67 @@ async function runPhase1FanOut({
     }
   }
 
-  // Process agents in batches of AGENT_CONCURRENCY; collect settled results
-  // across all batches so the caller sees the same shape as before.
-  const settled = [];
-  for (let i = 0; i < agents.length; i += AGENT_CONCURRENCY) {
-    const batch = agents.slice(i, i + AGENT_CONCURRENCY);
-    const batchSettled = await Promise.allSettled(batch.map(runAgent));
-    settled.push(...batchSettled);
+  // Process agents with a small worker pool rather than fixed batches. If one
+  // agent is slow, the other slot keeps draining the queue instead of waiting
+  // for the slow request before starting the next agent.
+  const settled = new Array(agents.length);
+  let nextAgentIndex = 0;
+  let startedCount = 0;
+  async function agentWorker() {
+    while (nextAgentIndex < agents.length) {
+      const index = nextAgentIndex;
+      nextAgentIndex += 1;
+      const agent = agents[index];
+      startedCount += 1;
+      if (statusDir) {
+        updateStatus(statusDir, 'generating_tests', {
+          runId,
+          message: `Generation agent started: ${agent}`,
+          agent,
+          agentsStarted: startedCount,
+          agentsCompleted: doneCount,
+          totalAgents: agents.length,
+          activeAgents: Math.min(AGENT_CONCURRENCY, agents.length - doneCount),
+          generatedCount: files.length,
+        }, telemetryReporter);
+      }
+      if (telemetryReporter && telemetryReporter.isEnabled()) {
+        telemetryReporter.emitBackground({
+          toolName: 'healix_test_my_app',
+          eventType: 'generation_progress',
+          runId,
+          phase: 'generating_tests',
+          status: 'info',
+          success: true,
+          message: `Generation agent started: ${agent}`,
+          metadata: {
+            agent,
+            agentsStarted: startedCount,
+            agentsCompleted: doneCount,
+            totalAgents: agents.length,
+            generatedCount: files.length,
+          },
+        });
+      }
+      try {
+        const value = await runAgent(agent);
+        settled[index] = { status: 'fulfilled', value };
+      } catch (reason) {
+        settled[index] = { status: 'rejected', reason };
+      }
+    }
   }
 
-  const fulfilled = settled.filter((s) => s.status === 'fulfilled').length;
-  const rejected = settled.length - fulfilled;
+  await Promise.all(
+    Array.from(
+      { length: Math.min(AGENT_CONCURRENCY, agents.length) },
+      () => agentWorker(),
+    ),
+  );
+
+  const settledResults = settled.filter(Boolean);
+  const fulfilled = settledResults.filter((s) => s.status === 'fulfilled').length;
+  const rejected = settledResults.length - fulfilled;
 
   // ── Aggregated token summary ─────────────────────────────────────────────
   {
@@ -2806,6 +4146,9 @@ async function runPhase1FanOut({
       partialsWrittenCount: files.length,
       plannedTests: plan?.totalPlannedTests ?? 0,
       planStatus: planMeta?.status || null,
+      backendGenerationSkippedReason,
+      agentConcurrency: AGENT_CONCURRENCY,
+      agentTransportTimeoutMs,
       agentMeta,
     },
   };
@@ -2833,10 +4176,12 @@ async function runAsyncGenerationPath({
   runId,
   statusDir,
   runBudget,
+  telemetryReporter = null,
   plan,
   planMeta,
   config,
   planSliceFor,
+  backendGenerationSkippedReason = null,
 }) {
   // Build a whole-plan slice for the orchestrator (it fans out internally).
   const planArg = plan
@@ -2909,6 +4254,7 @@ async function runAsyncGenerationPath({
           partialsWrittenCount: files.length,
           plannedTests: plan?.totalPlannedTests ?? 0,
           planStatus: planMeta?.status || null,
+          backendGenerationSkippedReason,
           ...(syncPayload.generationMeta || {}),
         },
       };
@@ -2923,9 +4269,12 @@ async function runAsyncGenerationPath({
       runId,
       statusDir,
       config,
+      runBudget,
+      telemetryReporter,
       plan,
       planMeta,
       planSliceFor,
+      backendGenerationSkippedReason,
     });
   }
 
@@ -2940,7 +4289,7 @@ async function runAsyncGenerationPath({
         runId,
         jobId,
         agentsRequested: agentsRequestedList,
-      });
+      }, telemetryReporter);
     } catch { /* status writes are best-effort */ }
   }
 
@@ -2966,6 +4315,7 @@ async function runAsyncGenerationPath({
 
   const writeNewTests = (incoming, sourceTag) => {
     let newlyWritten = 0;
+    const writtenNames = [];
     for (const t of incoming || []) {
       if (!t?.filename || seenFilenames.has(t.filename)) continue;
       seenFilenames.add(t.filename);
@@ -2979,6 +4329,7 @@ async function runAsyncGenerationPath({
         );
         files.push({ ...written, type: t.type || 'generated', agent: t.agent || null });
         newlyWritten += 1;
+        writtenNames.push(written.filename);
       } catch (writeErr) {
         Logger.warn('PipelineWorker', 'safeWriteGeneratedTest failed (async path)', {
           filename: t?.filename,
@@ -2986,7 +4337,7 @@ async function runAsyncGenerationPath({
         });
       }
     }
-    return newlyWritten;
+    return { newlyWritten, writtenNames };
   };
 
   const finalResp = await client.pollGenerationJob({
@@ -2995,7 +4346,7 @@ async function runAsyncGenerationPath({
     timeoutMs: pollTimeoutMs,
     signal: abortController.signal,
     onProgress: ({ status, agentsCompleted, tests }) => {
-      const newlyWritten = writeNewTests(tests, 'saas-async');
+      const { newlyWritten, writtenNames } = writeNewTests(tests, 'saas-async');
       if (statusDir) {
         try {
           const completedCount = Array.isArray(agentsCompleted)
@@ -3009,8 +4360,27 @@ async function runAsyncGenerationPath({
             agentsRequested: agentsRequestedList.length,
             generatedCount: files.length,
             newlyWritten,
-          });
+          }, telemetryReporter);
         } catch { /* status writes are best-effort */ }
+      }
+      if (telemetryReporter && telemetryReporter.isEnabled() && writtenNames.length > 0) {
+        telemetryReporter.emitBackground({
+          toolName: 'healix_test_my_app',
+          eventType: 'tests_generated',
+          runId,
+          phase: 'generation_async_progress',
+          status: 'info',
+          success: true,
+          message: `Generated ${writtenNames.length} spec file${writtenNames.length === 1 ? '' : 's'}`,
+          metadata: {
+            files: writtenNames,
+            generatedCount: files.length,
+            newlyWritten,
+            agentsCompleted,
+            totalAgents: agentsRequestedList.length,
+            jobId,
+          },
+        });
       }
     },
   });
@@ -3069,12 +4439,13 @@ async function runAsyncGenerationPath({
       partialsWrittenCount: files.length,
       plannedTests: plan?.totalPlannedTests ?? 0,
       planStatus: planMeta?.status || null,
+      backendGenerationSkippedReason,
       ...(finalResp?.generationMeta || {}),
     },
   };
 }
 
-async function generateWithFallbackChain({ config, context, prdContent, runBudget, projectInfo, parsedPRD, explorationArtifact, roles, statusDir = null, runId = null }) {
+async function generateWithFallbackChain({ config, context, prdContent, runBudget, projectInfo, parsedPRD, explorationArtifact, roles, statusDir = null, runId = null, telemetryReporter = null }) {
   const generationMeta = {
     provider: null,
     selectedGenerator: null,
@@ -3087,9 +4458,10 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
   };
 
   const validateGeneratedTests = config.validateGeneratedTests !== false;
+  const qualityRecoveryEvents = [];
 
   const runValidation = async (generator) => withStageBudget(runBudget, 'validation', async () => {
-    const validation = await validateGeneratedTestsWithList({
+    let validation = await validateGeneratedTestsWithList({
       projectPath: config.projectPath,
       validateGeneratedTests,
       timeoutMs: Math.min(getBudgetRemainingMs(runBudget), runBudget.stageCaps.validation),
@@ -3109,10 +4481,11 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
       throw error;
     }
 
-    const qualityAudit = auditGeneratedTestQuality({
+    let qualityAudit = auditGeneratedTestQuality({
       projectPath: config.projectPath,
       testType: config.testType,
       context,
+      explorationArtifact,
     });
 
     Logger.info('PipelineWorker', '[QUALITY GATE] auditGeneratedTestQuality result', {
@@ -3127,18 +4500,161 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
     });
 
     if (!qualityAudit.valid) {
+      const pruning = pruneGeneratedTestsByQuality({
+        projectPath: config.projectPath,
+        qualityAudit,
+        reason: `${generator}_quality_audit`,
+      });
+      if (pruning.applied) {
+        qualityRecoveryEvents.push(pruning);
+        Logger.warn('PipelineWorker', 'Pruned brittle generated test blocks and re-validating remaining tests', {
+          generator,
+          prunedFiles: pruning.prunedFiles,
+          quarantineDir: pruning.quarantineDir,
+        });
+        if (statusDir) {
+          updateStatus(statusDir, 'generation_quality_recovered', {
+            runId,
+            message: `Removed ${pruning.prunedFiles.reduce((sum, file) => sum + file.removedTests, 0)} brittle generated test(s); validating remaining suite...`,
+            prunedFiles: pruning.prunedFiles,
+          }, telemetryReporter);
+        }
+
+        validation = await validateGeneratedTestsWithList({
+          projectPath: config.projectPath,
+          validateGeneratedTests,
+          timeoutMs: Math.min(getBudgetRemainingMs(runBudget), runBudget.stageCaps.validation),
+        });
+        if (!validation.valid) {
+          const error = new Error(`${generator} generation failed validation after brittle-test pruning: ${validation.reason || 'unknown'}`);
+          error.code = 'GENERATION_VALIDATION_FAILED';
+          error.validation = {
+            ...validation,
+            qualityAudit,
+            qualityRecovery: pruning,
+          };
+          error.diagnostics = buildPipelineDiagnostics({
+            projectPath: config.projectPath,
+            stage: 'validation_after_quality_pruning',
+            reason: validation.reason,
+            stderr: validation.stderr,
+            stdout: validation.stdout,
+            qualityAudit,
+          });
+          throw error;
+        }
+
+        qualityAudit = auditGeneratedTestQuality({
+          projectPath: config.projectPath,
+          testType: config.testType,
+          context,
+          explorationArtifact,
+        });
+        qualityAudit.qualityRecovery = pruning;
+        Logger.info('PipelineWorker', '[QUALITY GATE] post-pruning auditGeneratedTestQuality result', {
+          valid: qualityAudit.valid,
+          errors: qualityAudit.errors,
+          warnings: qualityAudit.warnings,
+          totalFiles: qualityAudit.totalFiles,
+          totalTests: qualityAudit.totalTests,
+          runnableTests: qualityAudit.runnableTests,
+        });
+        if (qualityAudit.valid) {
+          return {
+            ...validation,
+            qualityAudit,
+            qualityRecovery: pruning,
+          };
+        }
+      }
+
+      const quarantine = quarantineGeneratedSpecFiles({
+        projectPath: config.projectPath,
+        qualityAudit,
+        reason: `${generator}_quality_audit`,
+      });
+      if (quarantine.applied) {
+        qualityRecoveryEvents.push(quarantine);
+        Logger.warn('PipelineWorker', 'Quarantined file-specific generated-test quality failures and re-validating remaining suite', {
+          generator,
+          quarantinedFiles: quarantine.quarantinedFiles.map((file) => file.filename),
+          remainingFiles: quarantine.remainingFiles,
+          quarantineDir: quarantine.quarantineDir,
+        });
+        if (statusDir) {
+          updateStatus(statusDir, 'generation_quality_recovered', {
+            runId,
+            message: `Removed ${quarantine.quarantinedFiles.length} low-quality generated spec file(s); validating remaining suite...`,
+            quarantinedFiles: quarantine.quarantinedFiles.map((file) => file.filename),
+            remainingFiles: quarantine.remainingFiles,
+          }, telemetryReporter);
+        }
+
+        validation = await validateGeneratedTestsWithList({
+          projectPath: config.projectPath,
+          validateGeneratedTests,
+          timeoutMs: Math.min(getBudgetRemainingMs(runBudget), runBudget.stageCaps.validation),
+        });
+        if (!validation.valid) {
+          const error = new Error(`${generator} generation failed validation after quality quarantine: ${validation.reason || 'unknown'}`);
+          error.code = 'GENERATION_VALIDATION_FAILED';
+          error.validation = {
+            ...validation,
+            qualityAudit,
+            qualityRecovery: quarantine,
+          };
+          error.diagnostics = buildPipelineDiagnostics({
+            projectPath: config.projectPath,
+            stage: 'validation_after_quality_quarantine',
+            reason: validation.reason,
+            stderr: validation.stderr,
+            stdout: validation.stdout,
+            qualityAudit,
+          });
+          throw error;
+        }
+
+        qualityAudit = auditGeneratedTestQuality({
+          projectPath: config.projectPath,
+          testType: config.testType,
+          context,
+          explorationArtifact,
+        });
+        qualityAudit.qualityRecovery = quarantine;
+
+        Logger.info('PipelineWorker', '[QUALITY GATE] post-quarantine auditGeneratedTestQuality result', {
+          valid: qualityAudit.valid,
+          errors: qualityAudit.errors,
+          warnings: qualityAudit.warnings,
+          totalFiles: qualityAudit.totalFiles,
+          totalTests: qualityAudit.totalTests,
+          runnableTests: qualityAudit.runnableTests,
+        });
+
+        if (qualityAudit.valid) {
+          return {
+            ...validation,
+            qualityAudit,
+            qualityRecovery: quarantine,
+          };
+        }
+      }
+
       Logger.error('PipelineWorker', `[QUALITY GATE] ❌ Quality audit FAILED for generator="${generator}" — errors: ${qualityAudit.errors.join(', ')}`, null, {
         generator,
         errors: qualityAudit.errors,
         apiFiles: qualityAudit.apiFiles,
         hasApiBurstCoverage: qualityAudit.hasApiBurstCoverage,
         hint: 'If missing_api_burst_coverage: the generated API spec files need at least one burst/stress test using Promise.all, burst, p95, or percentile patterns.',
+        quarantineReason: quarantine.reason,
+        quarantineCandidates: quarantine.candidateFiles || quarantine.quarantinedFiles?.map((file) => file.filename) || [],
       });
       const error = new Error(`${generator} generation failed quality audit: ${qualityAudit.errors.join(',')}`);
       error.code = 'GENERATION_VALIDATION_FAILED';
       error.validation = {
         ...validation,
         qualityAudit,
+        qualityRecovery: quarantine.applied ? quarantine : null,
       };
       error.diagnostics = buildPipelineDiagnostics({
         projectPath: config.projectPath,
@@ -3210,6 +4726,9 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
       }
       const validation = await runValidation(generatorName);
       generationMeta.fixtureWiring = fixtureWiring;
+      if (qualityRecoveryEvents.length > 0) {
+        generationMeta.qualityRecovery = qualityRecoveryEvents;
+      }
 
       generationMeta.provider = generatorName;
       generationMeta.selectedGenerator = generatorName;
@@ -3259,6 +4778,9 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
             const rescueFixtureWiring = applyFixtureWiring(`${generatorName}-partial`);
             generationMeta.fixtureWiring = rescueFixtureWiring;
             const validation = await runValidation(`${generatorName}-partial`);
+            if (qualityRecoveryEvents.length > 0) {
+              generationMeta.qualityRecovery = qualityRecoveryEvents;
+            }
             generationMeta.provider = generatorName;
             generationMeta.selectedGenerator = generatorName;
             generationMeta.fallbackUsed = false;
@@ -3320,6 +4842,7 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
       statusDir,
       runId,
       runBudget,
+      telemetryReporter,
     });
 
     if (!saasResult.generated) {
@@ -3514,6 +5037,7 @@ async function runPipeline(config, runId) {
   let preStartedProc = null; // declared here so catch can kill it on pipeline failure
   let requirementsCoverage = null;
   let phaseResults = null;
+  let routeAccessSummary = null;
   const aiOnlyEnforced = strictAIEnabled(config);
 
   updateStatus(statusDir, 'started', {
@@ -3559,12 +5083,13 @@ async function runPipeline(config, runId) {
           } catch {
             // non-fatal — best effort
           }
+          const rewrittenStartCommand = rewriteStartCommandForPort(config.startCommand, freePort, config.projectPath);
           try {
             const parsedBase = new URL(config.baseURL);
             parsedBase.port = String(freePort);
-            config = { ...config, port: freePort, baseURL: parsedBase.toString().replace(/\/$/, '') };
+            config = { ...config, port: freePort, baseURL: parsedBase.toString().replace(/\/$/, ''), startCommand: rewrittenStartCommand };
           } catch {
-            config = { ...config, port: freePort, baseURL: `http://localhost:${freePort}` };
+            config = { ...config, port: freePort, baseURL: `http://localhost:${freePort}`, startCommand: rewrittenStartCommand };
           }
           updateStatus(statusDir, 'port_conflict', {
             runId,
@@ -3572,6 +5097,7 @@ async function runPipeline(config, runId) {
             project: config.projectName,
             originalPort: configuredPort,
             newPort: freePort,
+            startCommand: rewrittenStartCommand,
             aiOnlyEnforced,
           }, telemetryReporter);
         }
@@ -3624,7 +5150,7 @@ async function runPipeline(config, runId) {
         workflows: codebaseContext.workflows?.length || 0,
       });
 
-      if (config.ideContextMode !== 'off') {
+      if (config.ideContextMode === 'on' || config.ideContextMode === 'required') {
         updateStatus(statusDir, 'context_enrichment', {
           runId,
           message: 'Requesting optional IDE context enrichment...',
@@ -3900,6 +5426,7 @@ async function runPipeline(config, runId) {
           totalTimeoutMs: 120_000,
         });
         explorationArtifact = result.artifact;
+        routeAccessSummary = buildRouteAccessSummary(explorationArtifact);
         // preAuthRoles carries the storageState files written during the
         // exploration pre-auth pass — used in step 3c to skip redundant logins.
         if (Array.isArray(result.preAuthRoles)) {
@@ -3912,6 +5439,7 @@ async function runPipeline(config, runId) {
           reason: result.reason || null,
           routeCount: (result.artifact?.routes || []).length,
           keyFlowCount: (result.artifact?.keyFlows || []).length,
+          routeAccessSummary,
         }, telemetryReporter);
       } catch (explErr) {
         Logger.warn('PipelineWorker', 'Exploration phase failed (best-effort)', { reason: explErr.message });
@@ -3983,59 +5511,172 @@ async function runPipeline(config, runId) {
       }
     }
 
+    routeAccessSummary = routeAccessSummary || buildRouteAccessSummary(explorationArtifact);
+    const verifiedRoleCount = roles.filter((r) => r && r.loginVerified && r.storageStatePath).length;
+    if (
+      routeAccessSummary.totalObservedRoutes > 0 &&
+      routeAccessSummary.publicRoutes.length === 0 &&
+      routeAccessSummary.protectedRoutes.length > 0 &&
+      verifiedRoleCount === 0
+    ) {
+      const authErr = new Error('All observed routes require authentication, but no verified credentials are available.');
+      authErr.code = 'AUTH_REQUIRED_NO_CREDENTIALS';
+      authErr.diagnostics = {
+        stage: 'auth',
+        reason: 'all_observed_routes_protected_no_verified_credentials',
+        routeAccessSummary,
+      };
+      throw authErr;
+    }
+
     // -------------------------------------------------------
     // 4. Generate tests
     // -------------------------------------------------------
     if (config.generateTests) {
+      const generationComplexity = maybeExpandGenerationStageBudget({
+        runBudget,
+        config,
+        context: codebaseContext || {},
+        parsedPRD,
+        projectInfo,
+      });
       updateStatus(statusDir, 'generating', {
         runId,
         message: 'Generating tests...',
         aiOnlyEnforced,
+        generationBudgetMs: runBudget.stageCaps.generation,
+        generationComplexity,
       }, telemetryReporter);
 
-      const generationResult = await generateWithFallbackChain({
-        config,
-        context: codebaseContext,
-        prdContent: combinedPrdContent,
-        parsedPRD,
-        explorationArtifact,
-        roles,
-        runBudget,
-        projectInfo,
-        statusDir,
-        runId,
-      });
+      const maxGenerationRepairAttempts = Math.max(
+        0,
+        Math.min(2, toFiniteNumber(config.maxGenerationRepairAttempts ?? process.env.HEALIX_GENERATION_REPAIR_ATTEMPTS, 0))
+      );
+      let activeGenerationContext = codebaseContext || {};
+      let generationResult = null;
+      const generationRepairHistory = [];
+      let generationAttempt = 0;
 
-      generationMeta = generationResult.generationMeta;
-      fallbackUsed = !!generationMeta?.fallbackUsed;
+      while (true) {
+        try {
+          generationResult = await generateWithFallbackChain({
+            config,
+            context: activeGenerationContext,
+            prdContent: combinedPrdContent,
+            parsedPRD,
+            explorationArtifact,
+            roles,
+            runBudget,
+            projectInfo,
+            statusDir,
+            runId,
+            telemetryReporter,
+          });
 
-      // Ensure playwright.config.ts exists after test generation
-      const playwrightConfigResult = ensurePlaywrightConfig(config.projectPath, projectInfo, roles);
-      if (generationMeta && playwrightConfigResult) {
-        generationMeta.playwrightConfig = playwrightConfigResult;
+          generationMeta = generationResult.generationMeta;
+          fallbackUsed = !!generationMeta?.fallbackUsed;
+          if (generationMeta && routeAccessSummary) {
+            generationMeta.routeAccessSummary = routeAccessSummary;
+            generationMeta.blockedAuthRoles = roles
+              .filter((r) => r && r.loginVerified === false)
+              .map((r) => ({ role: r.role || r.name || 'user', reason: r.reason || null }));
+          }
+
+          // Ensure playwright.config.ts exists after test generation
+          const playwrightConfigResult = ensurePlaywrightConfig(config.projectPath, projectInfo, roles);
+          if (generationMeta && playwrightConfigResult) {
+            generationMeta.playwrightConfig = playwrightConfigResult;
+          }
+
+          const qualityScan = collectGenerationQuality(config.projectPath, {
+            baseURL: config.baseURL || projectInfo.baseURL,
+          });
+          // Build requirements coverage FIRST so the gate can feed the BRD-trace
+          // signal into the quality score + suggestions block.
+          requirementsCoverage = buildRequirementsCoverage({
+            prdContent: combinedPrdContent,
+            prdContents,
+            projectPath: config.projectPath,
+          });
+          const qualityGate = evaluateGenerationQualityGates({
+            config,
+            context: activeGenerationContext || {},
+            quality: qualityScan,
+            prdContent: combinedPrdContent,
+            parsedPRD,
+            requirementsCoverage,
+          });
+          if (!qualityGate.ok) {
+            qualityGate.error.generationMeta = generationMeta;
+            throw qualityGate.error;
+          }
+          generationQuality = qualityGate.result;
+          codebaseContext = activeGenerationContext;
+          if (generationMeta && generationRepairHistory.length > 0) {
+            generationMeta.repairAttempts = generationRepairHistory;
+            generationMeta.generationRepairApplied = true;
+          }
+          break;
+        } catch (generationError) {
+          const errorCode = generationError?.code || classifyErrorCode(generationError);
+          if (
+            generationAttempt >= maxGenerationRepairAttempts ||
+            !isRepairableGenerationFailure(generationError)
+          ) {
+            throw generationError;
+          }
+
+          generationAttempt += 1;
+          const failureQuality = extractGenerationFailureQuality(generationError) || collectGenerationQuality(config.projectPath, {
+            baseURL: config.baseURL || projectInfo.baseURL,
+          });
+          const repairRecord = {
+            attempt: generationAttempt,
+            errorCode,
+            reason: normalizeErrorText(generationError?.message),
+            quality: failureQuality ? {
+              totalTests: failureQuality.totalTests ?? null,
+              skippedTests: failureQuality.skippedTests ?? null,
+              runnableTests: failureQuality.runnableTests ?? null,
+              runnableRatio: failureQuality.runnableRatio ?? null,
+              missingCategories: failureQuality.missingCategories || [],
+              errors: failureQuality.errors || [],
+            } : null,
+          };
+          generationRepairHistory.push(repairRecord);
+
+          activeGenerationContext = buildGenerationRepairContext({
+            context: activeGenerationContext,
+            error: generationError,
+            quality: failureQuality,
+            routeAccessSummary,
+            attempt: generationAttempt,
+            testType: config.testType,
+          });
+
+          Logger.warn('PipelineWorker', 'Generation quality failed; requesting richer context and retrying generation', {
+            runId,
+            attempt: generationAttempt,
+            maxGenerationRepairAttempts,
+            errorCode,
+            runnableTests: failureQuality?.runnableTests ?? null,
+            skippedTests: failureQuality?.skippedTests ?? null,
+            publicRoutes: routeAccessSummary?.publicRoutes || [],
+          });
+          updateStatus(statusDir, 'generation_repair', {
+            runId,
+            message: `Generation quality failed (${errorCode}); retrying with feedback context (${generationAttempt}/${maxGenerationRepairAttempts})...`,
+            errorCode,
+            repairAttempt: generationAttempt,
+            maxGenerationRepairAttempts,
+            routeAccessSummary,
+            generationFeedback: activeGenerationContext.generationFeedback,
+          }, telemetryReporter);
+        }
       }
-
-      const qualityScan = collectGenerationQuality(config.projectPath);
-      // Build requirements coverage FIRST so the gate can feed the BRD-trace
-      // signal into the quality score + suggestions block.
-      requirementsCoverage = buildRequirementsCoverage({
-        prdContent: combinedPrdContent,
-        prdContents,
-        projectPath: config.projectPath,
-      });
-      const qualityGate = evaluateGenerationQualityGates({
-        config,
-        context: codebaseContext || {},
-        quality: qualityScan,
-        prdContent: combinedPrdContent,
-        parsedPRD,
-        requirementsCoverage,
-      });
-      if (!qualityGate.ok) {
-        qualityGate.error.generationMeta = generationMeta;
-        throw qualityGate.error;
+      if (generationQuality && routeAccessSummary) {
+        generationQuality.routeAccessSummary = routeAccessSummary;
       }
-      generationQuality = qualityGate.result;
 
       // Plumb a non-fatal qualityWarning onto generationMeta so the dashboard
       // can render a yellow "quality = X%, add PRD/testids to improve by Y%"
@@ -4141,26 +5782,33 @@ async function runPipeline(config, runId) {
 
     const executionTimeout = Math.max(1000, Math.min(getBudgetRemainingMs(runBudget), runBudget.stageCaps.execution));
 
-    // Throttled real-time test progress: buffer results and flush every 1.5s
-    // so each completed test emits a telemetry event without flooding the API.
+    // Throttled real-time test progress: buffer results and flush one compact
+    // batch every 1.5s. Per-test POSTs hit local/prod telemetry rate limits on
+    // normal suites with retries, which makes the dashboard look less live.
     const pendingProgress = [];
     let progressFlushTimer = null;
     const flushProgress = () => {
       progressFlushTimer = null;
       const batch = pendingProgress.splice(0);
       if (!batch.length || !telemetryReporter || !telemetryReporter.isEnabled()) return;
-      for (const t of batch) {
-        telemetryReporter.emitBackground({
-          toolName: 'healix_test_my_app',
-          eventType: 'test_result',
-          runId,
-          phase: 'running',
-          status: t.status === 'failed' ? 'error' : 'info',
-          success: t.status !== 'failed',
-          message: t.name,
-          metadata: { test: { n: t.name, su: '', f: '', s: t.status, d: t.durationMs } },
-        });
-      }
+      const tests = batch.map((t) => ({
+        n: String(t.name || ''),
+        su: '',
+        f: '',
+        s: String(t.status || 'unknown'),
+        d: Number(t.durationMs || 0),
+      }));
+      const failed = tests.filter((t) => t.s === 'failed').length;
+      telemetryReporter.emitBackground({
+        toolName: 'healix_test_my_app',
+        eventType: 'test_results',
+        runId,
+        phase: 'running',
+        status: failed > 0 ? 'error' : 'info',
+        success: failed === 0,
+        message: `Live test progress: ${tests.length} update${tests.length === 1 ? '' : 's'}`,
+        metadata: { tests, batchSize: tests.length },
+      });
     };
     const onTestProgress = (t) => {
       pendingProgress.push(t);
@@ -4297,6 +5945,18 @@ async function runPipeline(config, runId) {
           role: 'primary',
         }, telemetryReporter);
       },
+      onExecutionRecovery: ({ nextAttempt, maxAttempts, reason, exitCode, signal, timedOut }) => {
+        updateStatus(statusDir, 'playwright_recovering', {
+          runId,
+          message: `Playwright runner crashed during execution; retrying in safe mode (${nextAttempt}/${maxAttempts})...`,
+          reason,
+          exitCode,
+          signal,
+          timedOut,
+          nextAttempt,
+          maxAttempts,
+        }, telemetryReporter);
+      },
     });
 
     const mcpParallelEnabled =
@@ -4382,6 +6042,11 @@ async function runPipeline(config, runId) {
       });
       return mcpOutcome.value;
     });
+    if (progressFlushTimer) {
+      clearTimeout(progressFlushTimer);
+      progressFlushTimer = null;
+    }
+    flushProgress();
 
     Logger.info('PipelineWorker', 'Tests completed', {
       total: testResults.total,
@@ -4397,6 +6062,28 @@ async function runPipeline(config, runId) {
       testResults.tierResults = tierResults;
     } catch (tierErr) {
       Logger.warn('PipelineWorker', 'Failed to compute tier results', { reason: tierErr.message });
+    }
+
+    if (testResults.total > 0 && testResults.skipped === testResults.total) {
+      const allSkippedError = new Error(`Playwright reported ${testResults.total} tests, but all were skipped. Healix requires runnable tests for public/reachable surfaces.`);
+      allSkippedError.code = 'ZERO_RUNNABLE_TESTS';
+      allSkippedError.generationMeta = generationMeta;
+      allSkippedError.generationQuality = {
+        ...(generationQuality || {}),
+        totalTests: generationQuality?.totalTests || testResults.total,
+        skippedTests: testResults.skipped,
+        runnableTests: 0,
+        runnableRatio: 0,
+        routeAccessSummary,
+      };
+      allSkippedError.diagnostics = {
+        stage: 'execution',
+        reason: 'playwright_all_tests_skipped',
+        generatedSpecCount: listGeneratedTestFiles(config.projectPath).length,
+        qualityAuditErrors: ['zero_runnable_tests'],
+        routeAccessSummary,
+      };
+      throw allSkippedError;
     }
 
     updateStatus(statusDir, 'tests_complete', {
@@ -4415,6 +6102,7 @@ async function runPipeline(config, runId) {
       generationQuality,
       requirementsCoverage,
       phaseResults,
+      routeAccessSummary,
     }, telemetryReporter);
 
     if (telemetryReporter && telemetryReporter.isEnabled() && Array.isArray(testResults.tests) && testResults.tests.length > 0) {
@@ -4425,26 +6113,6 @@ async function runPipeline(config, runId) {
         s: String(t.status || 'unknown'),
         d: Number(t.duration || 0),
       }));
-
-      for (const t of simplifiedTests) {
-        telemetryReporter.emitBackground({
-          toolName: 'healix_test_my_app',
-          eventType: 'test_result',
-          runId,
-          phase: 'tests_complete',
-          status: t.s === 'failed' ? 'error' : 'info',
-          success: t.s !== 'failed',
-          message: t.n,
-          metadata: {
-            project: config.projectName,
-            test: t,
-            total: testResults.total,
-            passed: testResults.passed,
-            failed: testResults.failed,
-            skipped: testResults.skipped,
-          },
-        });
-      }
 
       telemetryReporter.emitBackground({
         toolName: 'healix_test_my_app',
@@ -4503,6 +6171,7 @@ async function runPipeline(config, runId) {
       generationQuality,
       requirementsCoverage,
       phaseResults,
+      routeAccessSummary,
     }, telemetryReporter);
 
     const report = await withStageBudget(runBudget, 'reporting', async () => {
@@ -4520,6 +6189,7 @@ async function runPipeline(config, runId) {
         generationMeta,
         generationQuality,
         requirementsCoverage,
+        routeAccessSummary,
         phaseResults,
         tierResults,
         fallbackUsed,
@@ -4671,6 +6341,7 @@ async function runPipeline(config, runId) {
       generationQuality,
       requirementsCoverage,
       phaseResults,
+      routeAccessSummary,
       budget: {
         totalMs: runBudget.totalMs,
         consumedMs: getBudgetElapsedMs(runBudget),
@@ -4694,7 +6365,11 @@ async function runPipeline(config, runId) {
     // before process.exit(0) kills in-flight HTTP requests. Without this the
     // SSE stream never receives the terminal event and the live page stays
     // stuck on the last non-terminal phase (e.g. stage:reporting) indefinitely.
-    await new Promise((resolve) => setTimeout(resolve, 1500));
+    if (telemetryReporter && telemetryReporter.isEnabled() && typeof telemetryReporter.drain === 'function') {
+      await telemetryReporter.drain(8000);
+    } else {
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+    }
   } catch (error) {
     // Ensure the dev server is killed immediately even when the budget timeout
     // races ahead of playwright.runTests()'s own finally{stopServer()} block.
@@ -4733,6 +6408,7 @@ async function runPipeline(config, runId) {
       generationQuality: errorGenerationQuality,
       requirementsCoverage,
       phaseResults,
+      routeAccessSummary,
       budget: {
         totalMs: runBudget.totalMs,
         consumedMs: getBudgetElapsedMs(runBudget),
@@ -4828,6 +6504,7 @@ async function runPipeline(config, runId) {
         generationMeta: errorGenerationMeta,
         generationQuality: errorGenerationQuality,
         requirementsCoverage,
+        routeAccessSummary,
         phaseResults,
         fallbackUsed,
         pipelineError,
@@ -4848,7 +6525,11 @@ async function runPipeline(config, runId) {
       }, telemetryReporter);
       // Same flush grace as the success path — let fire-and-forget phase
       // report reach the webapp before process exit kills the socket.
-      await new Promise((resolve) => setTimeout(resolve, 1500));
+      if (telemetryReporter && telemetryReporter.isEnabled() && typeof telemetryReporter.drain === 'function') {
+        await telemetryReporter.drain(8000);
+      } else {
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+      }
     } catch (reportError) {
       Logger.warn('PipelineWorker', 'Failed to generate/sync error report', {
         runId,
@@ -4903,10 +6584,23 @@ if (require.main === module) {
 module.exports = {
   runPipeline,
   generateWithFallbackChain,
+  countTestsInContent,
+  countSkippedTestsInContent,
+  buildRouteAccessSummary,
+  hasApiSurfaceForGeneration,
+  effectiveApiEndpoints,
+  isSyntheticHealthEndpoint,
+  buildGenerationRepairContext,
+  isRepairableGenerationFailure,
   collectGenerationQuality,
   evaluateGenerationQualityGates,
   buildRequirementsCoverage,
   auditGeneratedTestQuality,
+  extractQualityFailureFileNames,
+  findGeneratedTestBlocks,
+  isBrittleGeneratedTestBlock,
+  pruneGeneratedTestsByQuality,
+  quarantineGeneratedSpecFiles,
   strictAIEnabled,
   classifyErrorCode,
   buildUserFacingPipelineError,
@@ -4917,6 +6611,12 @@ module.exports = {
   ensurePlaywrightConfig,
   writeSupplementalAuthConfig,
   createRunBudget,
+  getStageBudgetRemainingMs,
+  estimateGenerationComplexity,
+  computeGenerationAgentTimeoutMs,
+  maybeExpandGenerationStageBudget,
+  resolveGenerationAgentConcurrency,
+  rewriteStartCommandForPort,
   DEFAULT_STAGE_CAPS_MS,
   DEFAULT_TOTAL_BUDGET_MS,
   maybeGenerateViaSaaS,

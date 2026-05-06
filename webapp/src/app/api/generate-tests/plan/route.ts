@@ -269,9 +269,20 @@ export async function POST(request: NextRequest) {
       console.warn('[generate-tests/plan] cache lookup failed', cacheErr)
     }
 
+    const hasBackendService = Array.isArray(info.services)
+      && info.services.some((service: { role?: string } | null) =>
+        service?.role === 'backend' || service?.role === 'fullstack'
+      )
+    const isSyntheticHealthEndpoint = (endpoint: { method?: string; path?: string; synthetic?: boolean; source?: string } | null | undefined) =>
+      String(endpoint?.method || 'GET').toUpperCase() === 'GET'
+      && endpoint?.path === '/api/health'
+      && (endpoint.synthetic === true || endpoint.source === 'healix_fallback' || !endpoint.source)
+    const hasApiSurface = (ctx.apiEndpoints || []).filter((endpoint) => !isSyntheticHealthEndpoint(endpoint)).length > 0
+      || (ctx.mockableApiContracts || []).filter((contract) => !isSyntheticHealthEndpoint(contract)).length > 0
+      || hasBackendService
     const testType = getTestType(info) || (apiOnlyBody ? 'backend' : null)
     const runFrontend = !apiOnlyBody && testType !== 'backend'
-    const runBackend = apiOnlyBody || testType !== 'frontend'
+    const runBackend = apiOnlyBody || testType === 'backend' || (testType !== 'frontend' && hasApiSurface)
 
     const planCtx = {
       context: ctx,

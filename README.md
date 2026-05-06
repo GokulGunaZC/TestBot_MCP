@@ -76,8 +76,10 @@ Set these in the `env` block of your MCP client config (Cursor, Claude Code, Win
 |----------|----------|-------------|---------|
 | `HEALIX_API_KEY` | **Yes** | Authenticates MCP → webapp; meters token usage. | — |
 | `HEALIX_DASHBOARD_URL` | No | Webapp base URL. Used for all API calls and dashboard deep-links. | Production Vercel URL |
-| `HEALIX_RUN_BUDGET_MS` | No | Overall pipeline timeout (ms). | `3600000` (60 min) |
-| `HEALIX_GEN_BUDGET_MS` | No | Test-generation stage timeout (ms). Raise for large codebases. | `900000` (15 min) |
+| `HEALIX_RUN_BUDGET_MS` | No | Overall pipeline timeout (ms). | `7200000` (120 min) |
+| `HEALIX_GEN_BUDGET_MS` | No | Test-generation stage timeout (ms). Raise for large codebases; otherwise Healix expands it for large/xlarge discovered apps. | `1800000` (30 min) |
+| `HEALIX_GENERATION_AGENT_CONCURRENCY` | No | Number of generation agents to run at once. Lower for fragile local webapps, raise for stable production webapps. | `3` |
+| `HEALIX_GENERATION_AGENT_TIMEOUT_MS` | No | Explicit per-agent generation transport timeout. By default Healix derives this from the remaining generation budget and codebase complexity. | derived |
 | `HEALIX_SKIP_PLANNER` | No | Set `1` to bypass the pre-fan-out planner pass (emergency circuit breaker). | unset |
 
 ### Webapp environment variables

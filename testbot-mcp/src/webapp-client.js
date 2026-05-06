@@ -114,8 +114,19 @@ class WebappClient {
   // Returns the effective timeout for a given endpoint key, bumping the
   // Vercel-capped limits when the webapp is local.
   _timeout(key) {
+    if (key === 'generateTestsForAgent') {
+      const agentOverride = Number(process.env.HEALIX_WEBAPP_AGENT_TIMEOUT_MS);
+      if (Number.isFinite(agentOverride) && agentOverride > 0) {
+        return agentOverride;
+      }
+    }
     if (this._isLocal && (key === 'generateTestsForAgent' || key === 'planGeneration')) {
-      return 600_000; // 10 min — no Vercel cap for local webapp; frontend agent needs ~5–8 min
+      return key === 'generateTestsForAgent'
+        ? ENDPOINT_TIMEOUTS_MS.generateTestsForAgent
+        : 600_000; // no Vercel cap for local planner; per-agent generation is bounded by the pipeline when available
+    }
+    if (this._isLocal && key === 'phase') {
+      return Math.max(ENDPOINT_TIMEOUTS_MS.phase, Number(process.env.HEALIX_LOCAL_PHASE_TIMEOUT_MS || 15000));
     }
     return ENDPOINT_TIMEOUTS_MS[key];
   }
@@ -128,7 +139,7 @@ class WebappClient {
     }
   }
 
-  async _post(path, body, { timeoutMs } = {}) {
+  async _post(path, body, { timeoutMs, retryDelaysMs, retryMaxElapsedMs } = {}) {
     const url = `${this.dashboardUrl}${path}`;
     const fetchFn = getFetch();
     const limit = Number.isFinite(timeoutMs) ? timeoutMs : this.timeoutMs;
@@ -139,7 +150,9 @@ class WebappClient {
     // NOT retry AbortError (timeout) or HTTP-level errors; the caller handles
     // those by surfacing a proper error code.
     // 5 attempts: immediate, 1s, 3s, 8s, 15s — enough for a Next.js cold-start restart.
-    const RETRY_DELAYS_MS = [0, 1000, 3000, 8000, 15000];
+    const RETRY_DELAYS_MS = Array.isArray(retryDelaysMs) && retryDelaysMs.length > 0
+      ? retryDelaysMs
+      : [0, 1000, 3000, 8000, 15000];
     let lastNetworkErr = null;
     let response;
     for (let attempt = 0; attempt < RETRY_DELAYS_MS.length; attempt++) {
@@ -151,6 +164,7 @@ class WebappClient {
       }
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), limit);
+      const attemptStartedAt = Date.now();
       try {
         response = await fetchFn(url, {
           method: 'POST',
@@ -172,6 +186,14 @@ class WebappClient {
           throw err;
         }
         lastNetworkErr = networkErr;
+        const elapsedMs = Date.now() - attemptStartedAt;
+        if (
+          Number.isFinite(retryMaxElapsedMs) &&
+          retryMaxElapsedMs >= 0 &&
+          elapsedMs > retryMaxElapsedMs
+        ) {
+          break;
+        }
         // fall through to next retry
       }
     }
@@ -261,7 +283,7 @@ class WebappClient {
    * Same return shape as `generateTests` (tests[], generationMeta, agentRuns);
    * just narrower — typically a single agent's tests.
    */
-  async generateTestsForAgent({ agent, context, prd, parsedPRD, explorationArtifact, roles, testType, projectInfo, options }) {
+  async generateTestsForAgent({ agent, context, prd, parsedPRD, explorationArtifact, roles, testType, projectInfo, options, transportTimeoutMs }) {
     this._assertKey('/api/generate-tests');
     if (!KNOWN_AGENTS.includes(agent)) {
       const err = new Error(
@@ -270,6 +292,9 @@ class WebappClient {
       err.code = 'INVALID_AGENT';
       throw err;
     }
+    const effectiveTransportTimeoutMs = Number.isFinite(Number(transportTimeoutMs)) && Number(transportTimeoutMs) > 0
+      ? Number(transportTimeoutMs)
+      : this._timeout('generateTestsForAgent');
     return this._post(
       '/api/generate-tests',
       {
@@ -284,7 +309,15 @@ class WebappClient {
         projectInfo,
         options,
       },
-      { timeoutMs: this._timeout('generateTestsForAgent') }
+      {
+        timeoutMs: effectiveTransportTimeoutMs,
+        // Long-running generation POSTs are not idempotent at the transport
+        // layer. If the socket drops after minutes, retrying duplicates the
+        // whole agent and burns the pipeline budget. Retry only immediate
+        // connection flakes.
+        retryDelaysMs: [0, 1000],
+        retryMaxElapsedMs: 15_000,
+      }
     );
   }
 
@@ -856,7 +889,7 @@ class WebappClient {
           stage_budget: stageBudget || null,
           metadata: metadata || null,
         },
-        { timeoutMs: ENDPOINT_TIMEOUTS_MS.phase }
+        { timeoutMs: this._timeout('phase') }
       );
     } catch (err) {
       Logger.warn('WebappClient', 'reportPhase failed (non-blocking)', {

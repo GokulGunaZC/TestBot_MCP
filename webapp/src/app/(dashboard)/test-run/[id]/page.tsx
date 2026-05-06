@@ -2367,6 +2367,19 @@ export default function TestRunDetailPage() {
             const file = (data.metadata as Record<string, unknown>).file as string;
             setLiveFiles(prev => prev.includes(file) ? prev : [...prev, file]);
           }
+          if (data.eventType === 'tests_generated' && Array.isArray((data.metadata as Record<string, unknown>)?.files)) {
+            const files = ((data.metadata as Record<string, unknown>).files as unknown[])
+              .filter((file): file is string => typeof file === 'string' && file.length > 0);
+            if (files.length > 0) {
+              setLiveFiles(prev => {
+                const next = [...prev];
+                for (const file of files) {
+                  if (!next.includes(file)) next.push(file);
+                }
+                return next;
+              });
+            }
+          }
           if (data.eventType === 'test_result' && (data.metadata as Record<string, unknown>)?.test) {
             const t = (data.metadata as Record<string, unknown>).test as LiveTestResult;
             // Playwright emits one test_result per attempt; with retries=2 a single
@@ -2385,7 +2398,16 @@ export default function TestRunDetailPage() {
           }
           if (data.eventType === 'test_results' && Array.isArray((data.metadata as Record<string, unknown>)?.tests)) {
             const batch = (data.metadata as Record<string, unknown>).tests as LiveTestResult[];
-            setLiveTestResults(prev => prev.length === 0 ? batch : prev);
+            setLiveTestResults(prev => {
+              const next = prev.slice();
+              for (const t of batch) {
+                const key = `${t.su ?? ''}::${t.n ?? ''}::${t.f ?? ''}`;
+                const idx = next.findIndex(x => `${x.su ?? ''}::${x.n ?? ''}::${x.f ?? ''}` === key);
+                if (idx >= 0) next[idx] = t;
+                else next.push(t);
+              }
+              return next;
+            });
           }
         } else if (data.type === 'done') {
           evtSource.close();
