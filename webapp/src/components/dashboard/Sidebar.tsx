@@ -1,9 +1,10 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import { motion, AnimatePresence } from 'framer-motion';
+import { toDisplayUnits } from '@/lib/token-units';
 
 interface NavItem {
   href: string;
@@ -30,18 +31,18 @@ const NAV_SECTIONS: NavSection[] = [
           </svg>
         ),
       },
-      {
-        href: '/mcp-tests',
-        label: 'MCP Tests',
-        icon: (
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <rect x="2" y="2" width="20" height="8" rx="0" ry="0" />
-            <rect x="2" y="14" width="20" height="8" rx="0" ry="0" />
-            <line x1="6" y1="6" x2="6.01" y2="6" />
-            <line x1="6" y1="18" x2="6.01" y2="18" />
-          </svg>
-        ),
-      },
+      // {
+      //   href: '/mcp-tests',
+      //   label: 'MCP Tests',
+      //   icon: (
+      //     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      //       <rect x="2" y="2" width="20" height="8" rx="0" ry="0" />
+      //       <rect x="2" y="14" width="20" height="8" rx="0" ry="0" />
+      //       <line x1="6" y1="6" x2="6.01" y2="6" />
+      //       <line x1="6" y1="18" x2="6.01" y2="18" />
+      //     </svg>
+      //   ),
+      // },
     ],
   },
   {
@@ -73,23 +74,25 @@ const NAV_SECTIONS: NavSection[] = [
         ),
       },
       {
-        href: '/test-lists',
-        label: 'Test Lists',
+        href: '/import-tests',
+        label: 'Import Tests',
         icon: (
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z" />
+            <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4" />
+            <polyline points="7 10 12 15 17 10" />
+            <line x1="12" y1="15" x2="12" y2="3" />
           </svg>
         ),
       },
-      {
-        href: '/monitoring',
-        label: 'Monitoring',
-        icon: (
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <polyline points="22 12 18 12 15 21 9 3 6 12 2 12" />
-          </svg>
-        ),
-      },
+      // {
+      //   href: '/monitoring',
+      //   label: 'Monitoring',
+      //   icon: (
+      //     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      //       <polyline points="22 12 18 12 15 21 9 3 6 12 2 12" />
+      //     </svg>
+      //   ),
+      // },
     ],
   },
   {
@@ -107,7 +110,7 @@ const NAV_SECTIONS: NavSection[] = [
       },
       {
         href: '/plan-billing',
-        label: 'Plan & Billing',
+        label: 'Usage & Billing',
         icon: (
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
             <rect x="1" y="4" width="22" height="16" rx="0" ry="0" />
@@ -115,15 +118,15 @@ const NAV_SECTIONS: NavSection[] = [
           </svg>
         ),
       },
-      {
-        href: '/github-app',
-        label: 'GitHub App',
-        icon: (
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
-            <path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z" />
-          </svg>
-        ),
-      },
+      // {
+      //   href: '/github-app',
+      //   label: 'GitHub App',
+      //   icon: (
+      //     <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
+      //       <path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z" />
+      //     </svg>
+      //   ),
+      // },
       {
         href: '/api-keys',
         label: 'API Keys',
@@ -138,14 +141,40 @@ const NAV_SECTIONS: NavSection[] = [
 ];
 
 interface SidebarProps {
-  creditsRemaining?: number;
-  creditsTotal?: number;
+  tokensRemaining?: number;
+  tokensTotal?: number;
   plan?: string;
 }
 
-export default function Sidebar({ creditsRemaining = 130, creditsTotal = 500, plan = 'Free' }: SidebarProps) {
+export default function Sidebar({ tokensRemaining: initialRemaining = 0, tokensTotal: initialTotal = 0, plan: initialPlan = 'free' }: SidebarProps) {
   const pathname = usePathname();
   const [mobileOpen, setMobileOpen] = useState(false);
+  const [tokensRemaining, setTokensRemaining] = useState(initialRemaining);
+  const [tokensTotal, setTokensTotal] = useState(initialTotal);
+  const [plan, setPlan] = useState(initialPlan);
+
+  const fetchProfile = useCallback(async () => {
+    try {
+      const res = await fetch('/api/profile');
+      if (!res.ok) return;
+      const { data } = await res.json();
+      if (data) {
+        setTokensRemaining(toDisplayUnits(data.tokens_remaining));
+        setTokensTotal(toDisplayUnits(data.tokens_total));
+        setPlan(data.plan ?? 'free');
+      }
+    } catch { }
+  }, []);
+
+  useEffect(() => {
+    fetchProfile();
+    window.addEventListener('focus', fetchProfile);
+    window.addEventListener('healix:profile-updated', fetchProfile);
+    return () => {
+      window.removeEventListener('focus', fetchProfile);
+      window.removeEventListener('healix:profile-updated', fetchProfile);
+    };
+  }, [fetchProfile]);
 
   const isActive = (href: string) => pathname === href || pathname.startsWith(href + '/');
 
@@ -160,7 +189,7 @@ export default function Sidebar({ creditsRemaining = 130, creditsTotal = 500, pl
             </svg>
           </div>
           <span className="text-white font-black text-sm font-mono tracking-tight uppercase">
-            TESTBOT_MCP
+            HEALIX_MCP
           </span>
         </Link>
       </div>
@@ -213,20 +242,25 @@ export default function Sidebar({ creditsRemaining = 130, creditsTotal = 500, pl
         <div className="bg-[#0a0a0a] border-2 border-[#333] p-3">
           <div className="flex items-center justify-between mb-2">
             <span className="text-[#a0a0a0] text-xs font-mono uppercase tracking-wider">Credits</span>
-            <span className="y2k-badge">{plan}</span>
+            <span className="y2k-badge">{plan === 'free' ? 'trial' : plan}</span>
           </div>
-          <div className="text-white font-black text-lg font-mono mb-2">{creditsRemaining}</div>
+          <div className={`font-black text-lg font-mono mb-2 ${tokensRemaining === 0 ? 'text-red-400' : 'text-white'}`}>{tokensRemaining}</div>
           <div className="h-1.5 bg-[#222] overflow-hidden mb-3 border border-[#333]">
             <div
-              className="h-full bg-white transition-all duration-1000"
-              style={{ width: `${creditsTotal > 0 ? (creditsRemaining / creditsTotal) * 100 : 0}%` }}
+              className={`h-full transition-all duration-1000 ${tokensRemaining === 0 ? 'bg-red-500' : 'bg-white'}`}
+              style={{ width: `${tokensTotal > 0 ? (tokensRemaining / tokensTotal) * 100 : 0}%` }}
             />
           </div>
+          {tokensRemaining === 0 && (
+            <div className="text-[10px] text-red-400 font-mono mb-2 uppercase tracking-wider">
+              ⚠ Out of credits
+            </div>
+          )}
           <Link
             href="/plan-billing"
-            className="block text-center text-xs text-white hover:text-[#a0a0a0] font-mono font-bold uppercase tracking-widest transition-colors"
+            className={`block text-center text-xs font-mono font-bold uppercase tracking-widest transition-colors ${tokensRemaining === 0 ? 'text-red-400 hover:text-red-300' : 'text-white hover:text-[#a0a0a0]'}`}
           >
-            Manage Plan →
+            {tokensRemaining === 0 ? 'Upgrade Plan →' : 'Manage Plan →'}
           </Link>
         </div>
       </div>

@@ -210,7 +210,7 @@ class ReportGenerator {
     this.ensureDir(artifactsDir);
 
     const copiedMap = new Map();
-    const maxBytes = Number(process.env.TESTBOT_MAX_ARTIFACT_BYTES || 50 * 1024 * 1024);
+    const maxBytes = Number(process.env.HEALIX_MAX_ARTIFACT_BYTES || 50 * 1024 * 1024);
     const context = {
       artifactsDir,
       reportsDir,
@@ -254,6 +254,8 @@ class ReportGenerator {
   async copyPlaywrightHTMLReport(projectPath, reportsDir) {
     try {
       const possibleLocations = [
+        path.join(projectPath, 'healix-reports', 'html-report'),
+        path.join(projectPath, 'healix-report'),
         path.join(projectPath, 'playwright-report'),
         path.join(projectPath, 'test-results', 'playwright-report'),
       ];
@@ -266,7 +268,12 @@ class ReportGenerator {
         return;
       }
 
-      const destReportDir = path.join(reportsDir, 'playwright-report');
+      const destReportDir = path.join(reportsDir, 'html-report');
+
+      if (path.resolve(sourceReportDir) === path.resolve(destReportDir)) {
+        return;
+      }
+
       if (fs.existsSync(destReportDir)) {
         fs.rmSync(destReportDir, { recursive: true, force: true });
       }
@@ -346,8 +353,8 @@ class ReportGenerator {
             confidence: analysis.confidence,
             affectedFiles: this.stripAnsiAndNormalize(analysis.affectedFiles),
             testingRecommendations: this.stripAnsiAndNormalize(analysis.testingRecommendations),
-            aiProvider: 'testbot',
-            model: analysis.model || 'sarvam-m',
+            aiProvider: 'healix',
+            model: analysis.model || 'healix-ai',
           };
         }
       }
@@ -426,13 +433,20 @@ class ReportGenerator {
     generationMeta,
     generationQuality,
     requirementsCoverage,
+    routeAccessSummary,
     phaseResults,
+    tierResults,
+    pipelineError,
     fallbackUsed,
+    failures,
+    flakyCount,
+    classifierVerdicts,
+    failureClusters,
     api_key,
     dashboard_url,
   }) {
     const timestamp = new Date().toISOString();
-    const reportsDir = path.join(projectPath, 'testbot-reports');
+    const reportsDir = path.join(projectPath, 'healix-reports');
     this.ensureDir(reportsDir);
 
     if (!testResults) {
@@ -463,16 +477,19 @@ class ReportGenerator {
         projectName: this.stripAnsiAndNormalize(projectName || path.basename(projectPath)),
         projectPath: this.normalizePathForReport(projectPath),
         version: '1.0.0',
-        generator: 'testbot-mcp',
+        generator: 'healix-mcp',
         runId: this.stripAnsiAndNormalize(runId || null),
         generationMeta: generationMeta || null,
         fallbackUsed: Boolean(fallbackUsed),
+        routeAccessSummary: this.stripAnsiAndNormalize(routeAccessSummary || generationMeta?.routeAccessSummary || null),
       },
       stats: {
         total: Number(testResults.total || 0),
         passed: Number(testResults.passed || 0),
         failed: Number(testResults.failed || 0),
         skipped: Number(testResults.skipped || 0),
+        runnable: Math.max(0, Number(testResults.total || 0) - Number(testResults.skipped || 0)),
+        flaky: Number(flakyCount ?? testResults.flaky ?? 0),
         duration: Number(testResults.duration || 0),
         passRate: testResults.total > 0
           ? Math.round((testResults.passed / testResults.total) * 100)
@@ -484,6 +501,13 @@ class ReportGenerator {
       generationQuality: this.stripAnsiAndNormalize(generationQuality || null),
       requirementsCoverage: this.stripAnsiAndNormalize(requirementsCoverage || null),
       phaseResults: this.stripAnsiAndNormalize(phaseResults || testResults.phaseResults || null),
+      tierResults: tierResults || testResults.tierResults || null,
+      pipelineError: pipelineError ? this.stripAnsiAndNormalize(pipelineError) : null,
+      failures: Array.isArray(failures)
+        ? failures
+        : this.stripAnsiAndNormalize(testResults.failures || []),
+      classifierVerdicts: Array.isArray(classifierVerdicts) ? classifierVerdicts : [],
+      failureClusters: Array.isArray(failureClusters) ? failureClusters : [],
     };
 
     const reportFilename = `report-${timestamp.replace(/[:.]/g, '-')}.json`;
@@ -507,12 +531,24 @@ class ReportGenerator {
             creation_name: projectName || path.basename(projectPath),
             run_id: runId || null,
             report,
+            project_path: projectPath,
+            tier_results: report.tierResults || null,
+            pipeline_error: report.pipelineError || null,
+            failures: report.failures || [],
+            flaky_count: report.stats.flaky || 0,
+            classifier_verdicts: report.classifierVerdicts || [],
+            failure_clusters: report.failureClusters || [],
           }),
         });
 
         if (response.ok) {
           const payload = await response.json();
           dashboardLink = `${dashboard_url}${payload.dashboard_url}`;
+          // Store the actual test_run_id returned by the server
+          if (payload.test_run_id) {
+            report.metadata.actualRunId = payload.test_run_id;
+            Logger.info('ReportGenerator', `Test run ingested with ID: ${payload.test_run_id}`);
+          }
         } else {
           Logger.warn('ReportGenerator', 'Dashboard sync failed', { status: response.status });
         }
@@ -525,6 +561,7 @@ class ReportGenerator {
       path: reportPath,
       latestPath,
       url: dashboardLink,
+      actualRunId: report.metadata.actualRunId || runId,
     };
   }
 }

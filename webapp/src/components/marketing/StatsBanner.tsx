@@ -12,10 +12,10 @@ interface Stat {
 }
 
 const STATS: Stat[] = [
-  { value: 93, suffix: '%', desc: 'Average test pass rate', sub: 'Up from 42% without TestBot' },
+  { value: 93, suffix: '%', desc: 'Average test pass rate', sub: 'Up from 42% without Healix' },
   { value: 10, suffix: 'x', desc: 'Faster test generation', sub: 'Vs. writing tests manually' },
   { value: null, suffix: '', display: 'ZERO', desc: 'Configuration needed', sub: 'Auto-detects everything' },
-  { value: 500, suffix: '+', desc: 'Developers using TestBot', sub: 'And growing every day' },
+  { value: 500, suffix: '+', desc: 'Developers using Healix', sub: 'And growing every day' },
 ];
 
 function CountUp({ target, suffix }: { target: number; suffix: string }) {

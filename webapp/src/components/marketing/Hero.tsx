@@ -4,7 +4,7 @@ import { useEffect, useRef, useState } from 'react';
 import { motion } from 'framer-motion';
 import Link from 'next/link';
 
-const TERMINAL_MESSAGE = 'Test my app using testbot mcp';
+const TERMINAL_MESSAGE = 'Test this project using healix mcp';
 
 const OUTPUT_LINES = [
   { icon: '>', text: 'Auto-detecting project configuration...', cls: 'text-[#a0a0a0]', delay: 0 },
@@ -203,7 +203,7 @@ export default function Hero() {
             transition={{ delay: 0.4, duration: 0.5 }}
             className="text-[#a0a0a0] text-lg leading-relaxed max-w-xl font-mono"
           >
-            TestBot MCP is the missing verification layer of the agentic workflow. One command — auto-detect, generate, run, and analyze tests.
+            Healix MCP is the missing verification layer of the agentic workflow. One command — auto-detect, generate, run, and analyze tests.
           </motion.p>
 
           {/* CTAs */}
@@ -267,7 +267,7 @@ export default function Hero() {
                 <span className="w-3 h-3 border-2 border-[#555] bg-white" />
               </div>
               <span className="text-[#505050] text-xs font-mono mx-auto tracking-widest uppercase">
-                [ Cursor IDE — TestBot MCP ]
+                [ Cursor IDE — Healix MCP ]
               </span>
             </div>
 

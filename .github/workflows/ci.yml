@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  webapp:
+    name: Webapp lint + build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: webapp/package-lock.json
+      - name: Install
+        working-directory: webapp
+        run: npm ci
+      - name: Lint
+        working-directory: webapp
+        run: npm run lint
+      - name: Build
+        working-directory: webapp
+        env:
+          # Build-time stubs so Next.js doesn't fail on missing vars. Real values
+          # are injected at deploy time by Vercel.
+          DATABASE_URL: postgres://ci:ci@localhost:5432/ci
+          NEXT_PUBLIC_SUPABASE_URL: https://ci.supabase.co
+          NEXT_PUBLIC_SUPABASE_ANON_KEY: stub
+          SUPABASE_SERVICE_ROLE_KEY: stub
+          OPENAI_API_KEY: stub
+        run: npm run build
+
+  mcp:
+    name: MCP tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: testbot-mcp/package-lock.json
+      - name: Install
+        working-directory: testbot-mcp
+        run: npm ci
+      - name: Node test suite
+        working-directory: testbot-mcp
+        run: npm test --if-present

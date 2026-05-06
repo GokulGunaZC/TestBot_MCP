@@ -1,168 +1,272 @@
-# Testbot MCP
+# Healix
 
-**One-command testing with AI-powered analysis for any project.**
+**End-to-end AI test generation and QA automation, from your IDE.**
 
-Testbot MCP is a Model Context Protocol (MCP) server that enables seamless end-to-end testing with AI-powered failure analysis. Just say "test my app using testbot mcp" in Cursor or Windsurf, and Testbot handles everything automatically.
+Healix is a monorepo containing two packages:
 
-## Features
+- **`testbot-mcp/`** — `@healix/mcp` (v2.0.0), an MCP server installed in developer IDEs. It orchestrates the full testing pipeline: auto-detect → explore → generate → execute → analyze → dashboard.
+- **`webapp/`** — A Next.js 16 / React 19 webapp deployed on Vercel. Hosts all AI calls (OpenAI server-side), the Supabase-backed dashboard, artifact storage, and the Inngest async generation pipeline.
 
-- **One Command Testing**: Simply ask your AI assistant to test your app
-- **Playwright Integration**: Uses the official Playwright MCP for test generation and execution
-- **AI-Powered Analysis**: Automatically analyzes test failures using Sarvam, Cascade, or Windsurf AI
-- **Beautiful Dashboard**: Auto-opens a dashboard with screenshots, videos, traces, and AI analysis
-- **Zero Config**: Auto-detects project settings (port, base URL, start command)
-- **Optional Jira Integration**: Fetch stories, generate tests from acceptance criteria
+Users only need a `HEALIX_API_KEY`. All AI calls are proxied server-side through the webapp — no OpenAI key needed on user machines.
 
 ## Quick Start
 
-### 1. Install
+### 1. Install the MCP server
 
 ```bash
-npm install -g @testbot/mcp
+npm install -g @healix/mcp
 ```
 
-### 2. Configure MCP
+### 2. Configure your IDE
 
-Add to your MCP settings (`~/.cursor/mcp.json` or similar):
+Add to your MCP settings (`~/.cursor/mcp.json`, Claude Code, or Windsurf):
 
 ```json
 {
   "mcpServers": {
-    "testbot": {
+    "healix": {
       "command": "npx",
-      "args": ["@testbot/mcp"],
+      "args": ["@healix/mcp"],
       "env": {
-        "SARVAM_API_KEY": "your-api-key"
+        "HEALIX_API_KEY": "your-healix-api-key"
       }
     }
   }
 }
 ```
 
-### 3. Test Your App
+Get your API key from the Healix dashboard → API Keys.
 
-In Cursor or Windsurf:
+### 3. Run a test
 
-> "Test my app using testbot mcp"
+In your IDE prompt:
 
-That's it! Testbot will:
-1. Auto-detect your project settings
-2. Generate tests (from PRD or Jira stories if provided)
-3. Run the tests
-4. Analyze failures with AI
-5. Open a dashboard with results
+> "Test my app using the healix mcp"
 
-## Usage
+The pipeline runs automatically:
 
-### Basic Usage
+1. **Config UI** — local HTTP form collects test type, base URL, start command, PRD file (optional), and role credentials
+2. **Auto-detect** — port, framework, and start command inferred from the project when not supplied
+3. **Browser exploration** — browser-use (Python subprocess) discovers real flows; falls back to a zero-dependency Playwright heuristic explorer if browser-use is unavailable
+4. **PRD/AC parse** — structured acceptance-criteria extraction via `/api/parse-prd`; AC-less apps use exploration flows directly
+5. **Test generation** — GPT-powered multi-agent fan-out via `/api/generate-tests`; each test tagged `[REQ:F#.S#.AC#]`
+6. **Credential injection** — per-role Playwright `storageState` written to `.healix/auth-state-{role}.json`
+7. **Tiered execution** — three Playwright projects run in sequence:
+   - **Tier A** (`tierA-public`) — unauthenticated / public flows
+   - **Tier B** (`tierB-auth-{role}`) — one project per role; marked `blocked` if login fails (A + C still run)
+   - **Tier C** (`tierC-backend`) — API/backend contract tests
+8. **Artifact upload** — screenshots, videos, and Playwright traces uploaded to Supabase Storage
+9. **Ingest** — results POSTed to `/api/test-runs/ingest`
+10. **Dashboard deep-link** — opens the run page with tier pills, failure analysis, and artifacts
 
-```
-User: "test my app using testbot mcp"
-```
+## MCP Tools
 
-### With Options
-
-```
-User: "test my frontend using testbot mcp with sarvam AI analysis"
-```
-
-### With PRD File
-
-```
-User: "test my app using testbot mcp with the PRD at ./docs/requirements.md"
-```
-
-### With Jira Integration
-
-```
-User: "test my app using testbot mcp and fetch stories from Jira project MYAPP"
-```
+| Tool | Description |
+|------|-------------|
+| `healix_test_my_app` | Full end-to-end pipeline. Accepts `projectPath`, `baseURL`, `port`, `startCommand`, `testType` (`frontend`/`backend`/`both`), `prdFile`, `generateTests`, `openDashboard`, `credentials`, `codebaseContext`, `playwrightMcp`, and more. |
+| `healix_configure` | Opens the config UI and returns validated settings without running the pipeline. Useful for pre-flight checks. |
 
 ## Configuration
 
-### Environment Variables
+### MCP environment variables
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `SARVAM_API_KEY` | Sarvam AI API key for failure analysis | - |
-| `AI_PROVIDER` | AI provider: `sarvam`, `cascade`, `windsurf`, or `none` | `sarvam` |
-| `JIRA_BASE_URL` | Jira instance URL | - |
-| `JIRA_EMAIL` | Jira account email | - |
-| `JIRA_API_TOKEN` | Jira API token | - |
-| `JIRA_PROJECT_KEY` | Jira project key | - |
+Set these in the `env` block of your MCP client config (Cursor, Claude Code, Windsurf):
 
-### Tool Parameters
+| Variable | Required | Description | Default |
+|----------|----------|-------------|---------|
+| `HEALIX_API_KEY` | **Yes** | Authenticates MCP → webapp; meters token usage. | — |
+| `HEALIX_DASHBOARD_URL` | No | Webapp base URL. Used for all API calls and dashboard deep-links. | Production Vercel URL |
+| `HEALIX_RUN_BUDGET_MS` | No | Overall pipeline timeout (ms). | `7200000` (120 min) |
+| `HEALIX_GEN_BUDGET_MS` | No | Test-generation stage timeout (ms). Raise for large codebases; otherwise Healix expands it for large/xlarge discovered apps. | `1800000` (30 min) |
+| `HEALIX_GENERATION_AGENT_CONCURRENCY` | No | Number of generation agents to run at once. Lower for fragile local webapps, raise for stable production webapps. | `3` |
+| `HEALIX_GENERATION_AGENT_TIMEOUT_MS` | No | Explicit per-agent generation transport timeout. By default Healix derives this from the remaining generation budget and codebase complexity. | derived |
+| `HEALIX_SKIP_PLANNER` | No | Set `1` to bypass the pre-fan-out planner pass (emergency circuit breaker). | unset |
 
-The `testbot_test_my_app` tool accepts:
+### Webapp environment variables
 
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `projectPath` | string | Path to project (default: workspace root) |
-| `testType` | string | `frontend`, `backend`, or `both` |
-| `prdFile` | string | Path to PRD file for test generation |
-| `baseURL` | string | Application base URL |
-| `port` | number | Application port |
-| `startCommand` | string | Command to start the app |
-| `aiProvider` | string | AI provider for analysis |
-| `jira.enabled` | boolean | Enable Jira integration |
+Copy `.env.example` to `webapp/.env.local`:
 
-## Dashboard
+| Variable | Description |
+|----------|-------------|
+| `DATABASE_URL` | PostgreSQL connection string (Supabase pooler URI for production). |
+| `NEXT_PUBLIC_SUPABASE_URL` | Supabase project URL. |
+| `NEXT_PUBLIC_SUPABASE_ANON_KEY` | Supabase anon key (public). |
+| `SUPABASE_SERVICE_ROLE_KEY` | Supabase service role key (server-side only — never expose). |
+| `OPENAI_API_KEY` | OpenAI API key. Used only by webapp API routes — never by the MCP. |
+| `OPENAI_MODEL` | Model override (default: `gpt-4o`). |
+| `HEALIX_GEN_ASYNC` | `true` routes `/api/generate-tests` through Inngest background jobs. Default: `false`. |
+| `INNGEST_EVENT_KEY` | Inngest event key (required only when `HEALIX_GEN_ASYNC=true`). |
+| `INNGEST_SIGNING_KEY` | Inngest webhook signing key (required only when `HEALIX_GEN_ASYNC=true`). |
+| `INNGEST_DEV` | Set `1` when running against the local `inngest-cli`. |
+| `HEALIX_PLANNER_AGENT` | `1` to enable LLM-driven planner. Default: `0` (rule-based). |
+| `AI_MAX_REQUESTS_PER_MINUTE` | Per-user AI rate-limit ceiling. Default: `20`. |
 
-The dashboard displays:
+See `.env.example` for the full annotated reference.
 
-- **KPI Cards**: Total tests, passed, failed, skipped, pass rate, duration
-- **AI Analysis Summary**: Carousel of AI-powered failure analyses
-- **Suite Breakdown**: Results by test suite
-- **Charts**: Status distribution and suite results
-- **Test Table**: Filterable, sortable list of all tests
-- **Regression Comparison**: Compare with baseline results
+### Async generation (Inngest)
 
-### Screenshots and Artifacts
+The default sync generation path runs the full multi-agent fan-out inside the `/api/generate-tests` request. For very large codebases where a single agent call risks hitting Vercel's function timeout:
 
-Click any failed test to see:
-- Error details and stack trace
-- AI analysis with root cause and suggested fix
-- Screenshots at time of failure
-- Video recording of the test
-- Playwright trace files
+1. Set `HEALIX_GEN_ASYNC=true` on the webapp and configure `INNGEST_EVENT_KEY` + `INNGEST_SIGNING_KEY`.
+2. No MCP change needed — `@healix/mcp` auto-detects the `202` response and polls `/api/generate-tests/jobs/{jobId}`.
+
+**Do not enable `HEALIX_GEN_ASYNC=true` for local dev.** There is no function-timeout constraint on `localhost`; the async path adds Inngest setup and polling overhead for no benefit.
+
+## Development
+
+```bash
+# Start the webapp (Next.js dev server on port 3000)
+npm run dev:webapp
+
+# Start the MCP server (stdio transport)
+npm run start:testbot
+
+# Run MCP unit tests (26 test files via node --test)
+npm run test:testbot
+
+# Database — run from webapp/
+npm run db:generate   # generate Drizzle migration from schema changes
+npm run db:migrate    # apply pending migrations
+npm run db:studio     # open Drizzle Studio
+```
+
+## Architecture
+
+```
+User IDE (Cursor / Claude Code / Windsurf)
+         │  stdio (MCP protocol)
+         ▼
+ @healix/mcp  ─── thin client, HEALIX_API_KEY only ───────────────┐
+         │                                                         │
+         │  Pipeline (pipeline-worker.js):                         │
+         │  1. Config UI (local HTTP server)                       │
+         │  2. Auto-detect port/framework/start-cmd                │
+         │  3. Browser-use exploration (Python) or PW heuristic    │
+         │  4. Parse PRD/AC  ───── HTTPS ──────────────────────────┤
+         │  5. Generate tests ──── HTTPS ──────────────────────────┤
+         │  6. Inject credentials (storageState per role)          │
+         │  7. Run Playwright: Tier A / Tier B / Tier C            │
+         │  8. Upload artifacts ─── HTTPS ─────────────────────────┤
+         │  9. Ingest results ──── HTTPS ──────────────────────────┤
+         │ 10. Open dashboard deep-link                            │
+         │                                                         ▼
+         └──────────────────── Healix webapp (Vercel / localhost) ──
+                               │  Next.js 16 + React 19
+                               │  Supabase (Auth + DB + Storage)
+                               │  Drizzle ORM (PostgreSQL)
+                               │  Inngest (async generation jobs)
+                               └──────── OpenAI (server-side only)
+```
 
 ## Project Structure
 
 ```
-testbot-mcp/
-├── src/
-│   ├── index.js              # MCP server entry
-│   ├── auto-detector.js      # Project settings detection
-│   ├── playwright-integration.js
-│   ├── report-generator.js
-│   ├── dashboard-launcher.js
-│   ├── ai-providers/
-│   │   ├── sarvam.js
-│   │   ├── cascade.js
-│   │   └── windsurf.js
-│   └── jira/
-│       └── client.js
-├── package.json
-└── .env.example
-
-dashboard/
-├── public/
-│   └── index.html
-└── src/
-    ├── data-parser.js
-    ├── reporter.js
-    └── styles/
-        └── dashboard.css
+TestBot_MCP/
+├── testbot-mcp/                  # @healix/mcp — npm package (v2.0.0)
+│   ├── bin/healix-mcp.js         # CLI entry point
+│   ├── src/
+│   │   ├── index.js              # MCP server + tool registration
+│   │   ├── pipeline-worker.js    # End-to-end pipeline orchestration
+│   │   ├── auto-detector.js      # Port/framework/start-cmd detection
+│   │   ├── webapp-client.js      # All webapp API calls (HEALIX_API_KEY)
+│   │   ├── config-ui-launcher.js # Local HTTP config form
+│   │   ├── browser-use-driver.js # Python browser-use subprocess
+│   │   ├── playwright-explorer.js # Zero-dep Playwright heuristic fallback
+│   │   ├── playwright-integration.js # Tier A/B/C Playwright projects
+│   │   ├── playwright-mcp-client.js  # @playwright/mcp integration
+│   │   ├── credentials-injector.js   # Per-role storageState injection
+│   │   ├── artifact-uploader.js  # Supabase Storage upload
+│   │   ├── results-merger.js     # Merge tier results + blocked status
+│   │   ├── report-generator.js   # Build ingest payload
+│   │   ├── mcp-telemetry.js      # Background telemetry reporting
+│   │   ├── multi-service-starter.js  # App-under-test launcher
+│   │   ├── context-gatherer.js   # Codebase context extraction
+│   │   ├── dashboard-launcher.js # Open dashboard deep-link
+│   │   ├── logger.js
+│   │   ├── ai-providers/
+│   │   │   └── saas-client.js    # Proxy → Healix webapp
+│   │   └── failure-triage/
+│   │       ├── classifier.js           # Deterministic first-match rules
+│   │       ├── agent-response.js       # AI failure analysis parsing
+│   │       ├── error-remediations.js   # Patch suggestions
+│   │       ├── evidence-bundler.js     # Test source + AC + trace evidence
+│   │       ├── pipeline-error-classifier.js
+│   │       └── trace-parser.js         # Playwright trace.zip parser
+│   ├── scripts/
+│   │   ├── browser_use_runner.py # Pinned browser-use driver
+│   │   └── localhost-smoke.js    # Local smoke test helper
+│   └── test/                     # 26 test files (node --test)
+│
+└── webapp/                       # Next.js 16 webapp (Vercel)
+    ├── src/
+    │   ├── app/
+    │   │   ├── (auth)/           # Sign in / sign up / callback pages
+    │   │   ├── (dashboard)/      # Authenticated dashboard pages
+    │   │   │   ├── home/         # Overview + recent runs
+    │   │   │   ├── create-tests/ # Manual test run creation
+    │   │   │   ├── all-tests/    # Test run history
+    │   │   │   ├── mcp-tests/    # MCP-originated runs
+    │   │   │   ├── test-run/[id] # Live + historical run detail
+    │   │   │   ├── import-tests/ # Groovy test import from Excel/CSV
+    │   │   │   ├── monitoring/   # Live MCP telemetry + run monitoring
+    │   │   │   ├── api-keys/     # API key management
+    │   │   │   ├── plan-billing/ # Plan + credits
+    │   │   │   └── profile/
+    │   │   └── api/
+    │   │       ├── generate-tests/    # Multi-agent AC-traced generation
+    │   │       ├── parse-prd/         # PRD → structured AC extraction
+    │   │       ├── exploration/plan/  # Flow prioritization
+    │   │       ├── analyze-failures/  # AI failure triage
+    │   │       ├── test-runs/         # CRUD + ingest + phase + SSE stream
+    │   │       ├── import-tests/      # Excel/CSV → Groovy generation
+    │   │       ├── mcp-telemetry/     # Telemetry ingest + summary
+    │   │       ├── mcp-auth/validate/ # API key validation
+    │   │       ├── artifacts/         # Supabase Storage proxy
+    │   │       ├── upload-artifacts/  # Signed upload URLs
+    │   │       ├── api-keys/          # Key CRUD
+    │   │       ├── auth/              # Supabase Auth helpers
+    │   │       ├── inngest/           # Inngest function registry
+    │   │       └── profile/
+    │   └── lib/
+    │       ├── db/schema.ts           # Drizzle ORM schema (source of truth)
+    │       ├── test-generation/       # GPT orchestration: planner + agents
+    │       ├── inngest/functions/     # generate-tests-orchestrator + agent
+    │       ├── types/database.ts      # Shared TypeScript interfaces
+    │       ├── ai-guard.ts            # Per-user AI rate limiting
+    │       ├── credits.ts             # Token accounting
+    │       ├── mcp-live-runs.ts       # SSE live run state from telemetry
+    │       ├── groovy-generator.ts    # Groovy test file generation
+    │       └── excel-parser.ts        # Excel/CSV test case ingestion
+    └── drizzle/                  # SQL migrations
 ```
 
-## Documentation
+## Database Schema (key tables)
 
-- [Quick Start Guide](docs/QUICKSTART.md)
-- [User Guide](docs/USER_GUIDE.md)
-- [API Reference](docs/API_REFERENCE.md)
+| Table | Purpose |
+|-------|---------|
+| `profiles` | User accounts (plan, credits, tokens) |
+| `api_keys` | Hashed API keys per user |
+| `test_runs` | Execution results with tier results, pipeline errors, AI analysis |
+| `test_failures` | Per-test failure verdicts with evidence and user overrides |
+| `mcp_telemetry_events` | Pipeline event stream (powers live run monitoring) |
+| `generation_jobs` | Inngest async generation job lifecycle |
+| `generation_plans` | 24h cached planner output per repo snapshot |
+| `test_artifacts` | Screenshot / video / trace metadata + Supabase Storage paths |
+| `import_sessions` | Groovy import sessions (Excel/CSV → test cases) |
+| `imported_test_cases` | Parsed test cases from import |
+| `generated_groovy_files` | Generated Groovy API test files |
+
+## Migrating from `@testbot/mcp`
+
+See [`MIGRATION.md`](./MIGRATION.md) for the full upgrade guide. Summary:
+
+```bash
+npm uninstall -g @testbot/mcp
+npm install -g @healix/mcp
+```
+
+Remove `OPENAI_API_KEY`, `AI_PROVIDER`, and any other AI keys from your MCP config — they are ignored in v2.0.0. Only `HEALIX_API_KEY` is required.
 
 ## License
 
 MIT
-# TestBot_MCP
-# TestBot_MCP

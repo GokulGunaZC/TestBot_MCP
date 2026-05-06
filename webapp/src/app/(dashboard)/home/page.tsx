@@ -1,9 +1,11 @@
 'use client';
 
 import { useState, useEffect } from 'react';
+import { useRouter } from 'next/navigation';
 import Link from 'next/link';
 import { motion } from 'framer-motion';
-import type { TestRun, TestList, Profile } from '@/lib/types/database';
+import type { TestRun, ImportSession, Profile } from '@/lib/types/database';
+import { toDisplayUnits } from '@/lib/token-units';
 
 
 function formatDate(iso: string) {
@@ -67,30 +69,31 @@ function SkeletonListItem() {
 }
 
 export default function HomePage() {
+  const router = useRouter();
   const [loading, setLoading] = useState(true);
   const [recentTests, setRecentTests] = useState<TestRun[]>([]);
-  const [testLists, setTestLists] = useState<TestList[]>([]);
+  const [imports, setImports] = useState<ImportSession[]>([]);
   const [profile, setProfile] = useState<Profile | null>(null);
 
   useEffect(() => {
     async function fetchData() {
       setLoading(true);
       try {
-        const [runsRes, listsRes, profileRes] = await Promise.all([
+        const [runsRes, importsRes, profileRes] = await Promise.all([
           fetch('/api/test-runs?limit=5&sort_by=created_at&order=desc'),
-          fetch('/api/test-lists'),
+          fetch('/api/import-tests'),
           fetch('/api/profile'),
         ]);
 
         const runsJson = await runsRes.json();
-        const listsJson = await listsRes.json();
+        const importsJson = await importsRes.json();
         const profileJson = await profileRes.json();
 
         const runs: TestRun[] = runsJson.data ?? [];
-        const lists: TestList[] = listsJson.data ?? [];
+        const importsList: ImportSession[] = importsJson.data ?? [];
 
         setRecentTests(runs);
-        setTestLists(lists.slice(0, 5));
+        setImports(importsList.slice(0, 5));
         setProfile(profileJson.data ?? null);
       } catch (err) {
         console.error('Failed to fetch home data:', err);
@@ -102,9 +105,22 @@ export default function HomePage() {
     fetchData();
   }, []);
 
-  const credits = profile?.credits_remaining ?? 130;
-  const creditsTotal = profile?.credits_total ?? 500;
-  const plan = profile?.plan ?? 'Free';
+  // Plan card reads the SAME token fields the sidebar does — both surfaces
+  // derive from profile.tokens_remaining / tokens_total through toDisplayUnits.
+  // No `credits_*` fallbacks: that legacy column is never decremented by the
+  // runtime, so rendering it would drift from actual billing.
+  const tokensRemaining = toDisplayUnits(profile?.tokens_remaining);
+  const tokensTotal = toDisplayUnits(profile?.tokens_total);
+  const tokensRemainingPct = tokensTotal > 0 ? Math.min(100, (tokensRemaining / tokensTotal) * 100) : 0;
+  const plan = profile?.plan ?? 'free';
+
+  // Determine the next upgrade target so the CTA always reflects reality.
+  const nextPlan: { id: string; label: string; description: string } | null =
+    plan === 'free'
+      ? { id: 'starter', label: 'Starter', description: 'Get 2,500 credits/mo + advanced AI models + Jira integration.' }
+      : plan === 'starter'
+      ? { id: 'team', label: 'Team', description: 'Get 10,000 credits/mo + CI/CD integration + priority support.' }
+      : null // team / enterprise — already on top plan
 
   const containerVariants = {
     hidden: {},
@@ -135,7 +151,7 @@ export default function HomePage() {
         </div>
 
         <div className="relative p-8">
-          <h2 className="text-[#F0F6FF] font-bold text-2xl mb-2">Get Started with TestBot MCP</h2>
+          <h2 className="text-[#F0F6FF] font-bold text-2xl mb-2">Get Started with Healix MCP</h2>
           <p className="text-[#8BA4C8] text-sm mb-6 max-w-lg">
             Start your automated testing for free. Connect your IDE and generate comprehensive tests with a single command.
           </p>
@@ -150,13 +166,13 @@ export default function HomePage() {
               </svg>
               Test Locally (MCP)
             </Link>
-            <button className="flex items-center gap-2 text-[#8BA4C8] hover:text-[#F0F6FF] font-semibold px-5 py-2.5 rounded-xl text-sm border border-white/10 hover:border-blue-500/30 transition-all hover:bg-white/5">
+            {/* <button className="flex items-center gap-2 text-[#8BA4C8] hover:text-[#F0F6FF] font-semibold px-5 py-2.5 rounded-xl text-sm border border-white/10 hover:border-blue-500/30 transition-all hover:bg-white/5">
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                 <circle cx="12" cy="12" r="10" /><polygon points="10 8 16 12 10 16 10 8" />
               </svg>
               Test Deployed App
-            </button>
-            <a
+            </button> */}
+            {/* <a
               href="#"
               className="flex items-center gap-2 text-[#8BA4C8] hover:text-[#F0F6FF] font-semibold px-5 py-2.5 rounded-xl text-sm border border-white/10 hover:border-blue-500/30 transition-all hover:bg-white/5"
             >
@@ -164,7 +180,7 @@ export default function HomePage() {
                 <path d="M2 3h6a4 4 0 014 4v14a3 3 0 00-3-3H2z" /><path d="M22 3h-6a4 4 0 00-4 4v14a3 3 0 013-3h7z" />
               </svg>
               View Docs
-            </a>
+            </a> */}
           </div>
         </div>
       </motion.div>
@@ -220,6 +236,7 @@ export default function HomePage() {
                         initial={{ opacity: 0 }}
                         animate={{ opacity: 1 }}
                         transition={{ delay: i * 0.06 }}
+                        onClick={() => router.push(`/test-run/${test.id}`)}
                         className="border-b border-white/5 last:border-0 hover:bg-white/[0.02] hover:shadow-[inset_0_0_20px_rgba(59,130,246,0.05)] transition-all cursor-pointer group"
                       >
                         <td className="px-6 py-4">
@@ -268,16 +285,16 @@ export default function HomePage() {
 
         {/* Right column: Test Lists + Plan Card */}
         <div className="flex flex-col gap-5">
-          {/* Test Lists Panel */}
+          {/* Import Tests Panel */}
           <motion.div variants={itemVariants} className="glass-card rounded-2xl overflow-hidden">
             <div className="flex items-center justify-between px-5 py-4 border-b border-white/8">
-              <h3 className="text-[#F0F6FF] font-semibold text-sm">My Test Lists</h3>
+              <h3 className="text-[#F0F6FF] font-semibold text-sm">My Imports</h3>
               <div className="flex items-center gap-2">
-                <Link href="/test-lists" className="text-[#60A5FA] text-xs hover:text-[#93C5FD] transition-colors font-medium">
+                <Link href="/import-tests" className="text-[#60A5FA] text-xs hover:text-[#93C5FD] transition-colors font-medium">
                   View All →
                 </Link>
                 <Link
-                  href="/test-lists"
+                  href="/import-tests"
                   className="w-6 h-6 rounded-md bg-blue-500/20 border border-blue-500/30 flex items-center justify-center text-[#60A5FA] hover:bg-blue-500/30 transition-colors"
                 >
                   <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
@@ -295,20 +312,22 @@ export default function HomePage() {
                   <SkeletonListItem />
                 </>
               ) : (
-                testLists.map((list) => (
+                imports.map((imp) => (
                   <Link
-                    key={list.id}
-                    href="/test-lists"
+                    key={imp.id}
+                    href={`/import-tests/${imp.id}`}
                     className="flex items-center gap-3 px-3 py-2.5 rounded-xl hover:bg-white/5 transition-colors group"
                   >
                     <div className="w-8 h-8 rounded-lg bg-blue-500/10 border border-blue-500/20 flex items-center justify-center flex-shrink-0">
                       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#60A5FA" strokeWidth="2">
-                        <path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z" />
+                        <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4" />
+                        <polyline points="7 10 12 15 17 10" />
+                        <line x1="12" y1="15" x2="12" y2="3" />
                       </svg>
                     </div>
                     <div className="flex-1 min-w-0">
-                      <div className="text-[#F0F6FF] text-sm font-medium truncate group-hover:text-[#60A5FA] transition-colors">{list.name}</div>
-                      <div className="text-[#4A6280] text-xs">{list.test_count} tests</div>
+                      <div className="text-[#F0F6FF] text-sm font-medium truncate group-hover:text-[#60A5FA] transition-colors">{imp.name}</div>
+                      <div className="text-[#4A6280] text-xs">{imp.test_case_count} test cases · {imp.status}</div>
                     </div>
                     <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="text-[#4A6280] group-hover:text-[#8BA4C8] transition-colors">
                       <polyline points="9 18 15 12 9 6" />
@@ -318,13 +337,15 @@ export default function HomePage() {
               )}
 
               <Link
-                href="/test-lists"
+                href="/import-tests"
                 className="flex items-center gap-2 px-3 py-2.5 rounded-xl text-[#60A5FA] hover:bg-blue-500/10 transition-colors text-sm font-medium mt-1"
               >
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                  <line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" />
+                  <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4" />
+                  <polyline points="7 10 12 15 17 10" />
+                  <line x1="12" y1="15" x2="12" y2="3" />
                 </svg>
-                New Test List
+                Import Excel
               </Link>
             </div>
           </motion.div>
@@ -354,34 +375,44 @@ export default function HomePage() {
                     <span className="px-3 py-1 rounded-full bg-blue-500/10 border border-blue-500/20 text-[#60A5FA] text-sm font-bold capitalize">
                       {plan}
                     </span>
-                    <span className="text-[#4A6280] text-xs">{credits} credits left</span>
+                    <span className="text-[#4A6280] text-xs">{tokensRemaining.toLocaleString()} tokens left</span>
                   </div>
 
                   <div className="mb-2">
                     <div className="flex items-center justify-between mb-1.5">
-                      <span className="text-[#8BA4C8] text-xs">Credits used</span>
-                      <span className="text-[#F0F6FF] text-xs font-semibold">{creditsTotal - credits}/{creditsTotal}</span>
+                      <span className="text-[#8BA4C8] text-xs">Credits remaining</span>
+                      <span className="text-[#F0F6FF] text-xs font-semibold">{tokensRemaining.toLocaleString()}/{tokensTotal.toLocaleString()}</span>
                     </div>
                     <div className="h-2 bg-white/5 rounded-full overflow-hidden">
                       <motion.div
                         initial={{ width: 0 }}
-                        animate={{ width: `${(((creditsTotal - credits) / creditsTotal) * 100).toFixed(1)}%` }}
+                        animate={{ width: `${tokensRemainingPct.toFixed(1)}%` }}
                         transition={{ duration: 1, delay: 0.5 }}
                         className="h-full rounded-full bg-gradient-to-r from-blue-500 to-cyan-500"
                       />
                     </div>
                   </div>
 
-                  <p className="text-[#4A6280] text-xs mt-3">
-                    Upgrade to Pro for unlimited credits + Jira integration + all AI providers.
-                  </p>
-
-                  <Link
-                    href="/plan-billing"
-                    className="mt-4 block w-full py-2.5 rounded-xl btn-gradient text-black font-semibold text-sm text-center"
-                  >
-                    Upgrade to Pro
-                  </Link>
+                  {nextPlan ? (
+                    <>
+                      <p className="text-[#4A6280] text-xs mt-3">
+                        {nextPlan.description}
+                      </p>
+                      <Link
+                        href="/plan-billing"
+                        className="mt-4 block w-full py-2.5 rounded-xl btn-gradient text-black font-semibold text-sm text-center"
+                      >
+                        Upgrade to {nextPlan.label}
+                      </Link>
+                    </>
+                  ) : (
+                    <Link
+                      href="/plan-billing"
+                      className="mt-4 block w-full py-2.5 rounded-xl border border-white/10 text-[#8BA4C8] font-semibold text-sm text-center hover:bg-white/5 transition-colors"
+                    >
+                      Manage Plan →
+                    </Link>
+                  )}
                 </>
               )}
             </div>

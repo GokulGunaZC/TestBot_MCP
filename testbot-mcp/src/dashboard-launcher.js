@@ -22,11 +22,11 @@ function resolveBoolean(value, fallback) {
 
 class DashboardLauncher {
   static shouldOpenBrowser(options = {}) {
-    const headless = resolveBoolean(options.headless, resolveBoolean(process.env.TESTBOT_HEADLESS, true));
+    const headless = resolveBoolean(options.headless, resolveBoolean(process.env.HEALIX_HEADLESS, true));
     if (headless) {
       return false;
     }
-    return resolveBoolean(options.openBrowser, resolveBoolean(process.env.TESTBOT_AUTO_OPEN_BROWSER, false));
+    return resolveBoolean(options.openBrowser, resolveBoolean(process.env.HEALIX_AUTO_OPEN_BROWSER, false));
   }
 
   /**
@@ -41,7 +41,7 @@ class DashboardLauncher {
       path.join(__dirname, '../../dashboard/public'),
       path.join(__dirname, '../../../dashboard/public'),
       path.join(process.cwd(), 'dashboard/public'),
-      path.join(process.cwd(), 'node_modules/@testbot/mcp/dashboard/public'),
+      path.join(process.cwd(), 'node_modules/@healix/mcp/dashboard/public'),
     ];
 
     let dashboardDir = null;
@@ -98,11 +98,11 @@ class DashboardLauncher {
       const embeddedScript = `// Auto-generated embedded report data - DO NOT EDIT
 // Generated at: ${new Date().toISOString()}
 // This file is used to bypass CORS restrictions when opening dashboard via file:// protocol
-window.__TESTBOT_EMBEDDED_REPORT__ = ${reportContent || 'null'};
-window.__TESTBOT_REPORT_TIMESTAMP__ = ${timestamp};
+window.__HEALIX_EMBEDDED_REPORT__ = ${reportContent || 'null'};
+window.__HEALIX_REPORT_TIMESTAMP__ = ${timestamp};
 console.error('📊 Embedded report data loaded:', {
-  project: window.__TESTBOT_EMBEDDED_REPORT__?.metadata?.projectName || 'Unknown',
-  tests: window.__TESTBOT_EMBEDDED_REPORT__?.stats?.total || 0,
+  project: window.__HEALIX_EMBEDDED_REPORT__?.metadata?.projectName || 'Unknown',
+  tests: window.__HEALIX_EMBEDDED_REPORT__?.stats?.total || 0,
   timestamp: new Date(${timestamp}).toISOString()
 });
 `;

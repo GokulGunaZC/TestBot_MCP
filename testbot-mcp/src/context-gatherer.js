@@ -159,6 +159,13 @@ class ContextGatherer {
       navigationGraph: { nodes: [], edges: [] },
       selectorHints: [],
       mockableApiContracts: [],
+      sourceContext: {
+        files: [],
+        assertableText: [],
+        routePaths: [],
+        testIds: [],
+        sourceFilesAnalyzed: 0,
+      },
     };
     
     // Read package.json for dependencies
@@ -190,17 +197,20 @@ class ContextGatherer {
       richContext.apiEndpoints,
       richContext.forms
     );
+    richContext.sourceContext = this.extractSourceContext(projectPath, richContext.pages);
     richContext.extractionConfidence = {
       selectorHints: richContext.selectorHints.length > 0 ? 0.9 : 0.5,
       navigationGraph: (richContext.navigationGraph.edges || []).length > 0 ? 0.85 : 0.4,
       forms: (richContext.forms || []).length > 0 ? 0.9 : 0.5,
       apiContracts: (richContext.mockableApiContracts || []).length > 0 ? 0.9 : 0.5,
+      sourceContext: (richContext.sourceContext.files || []).length > 0 ? 0.9 : 0.35,
     };
     richContext.extractionSources = {
       selectorHints: 'pages+forms',
       navigationGraph: 'page-link-analysis',
       forms: 'jsx-tsx-form-parsing',
       apiContracts: 'endpoint-handler-parsing',
+      sourceContext: 'route-source-and-component-literal-parsing',
     };
     
     return richContext;
@@ -532,6 +542,7 @@ class ContextGatherer {
     let hasNextAuth = false;
     let hasClerk = false;
     let hasAuth0 = false;
+    let hasCookieAuth = false;
     
     for (const file of files.slice(0, this.config.maxFiles)) {
       try {
@@ -545,6 +556,13 @@ class ContextGatherer {
         if (content.includes('next-auth') || content.includes('NextAuth')) hasNextAuth = true;
         if (content.includes('@clerk') || content.includes('clerk')) hasClerk = true;
         if (content.includes('@auth0') || content.includes('auth0')) hasAuth0 = true;
+        if (
+          content.includes('createSupabaseServerClient') ||
+          content.includes('createServerComponentClient') ||
+          content.includes('@supabase/ssr') ||
+          content.includes('supabase/auth-helpers') ||
+          (content.includes('cookies()') && content.includes('supabase'))
+        ) hasCookieAuth = true;
       } catch (error) {
         // Ignore errors
       }
@@ -553,8 +571,9 @@ class ContextGatherer {
     if (hasNextAuth) patterns.push({ type: 'NextAuth', description: 'NextAuth.js authentication' });
     if (hasClerk) patterns.push({ type: 'Clerk', description: 'Clerk authentication service' });
     if (hasAuth0) patterns.push({ type: 'Auth0', description: 'Auth0 authentication service' });
-    if (hasJWT) patterns.push({ type: 'JWT', description: 'JSON Web Token authentication' });
-    if (hasSession) patterns.push({ type: 'Session', description: 'Session-based authentication' });
+    if (hasCookieAuth) patterns.push({ type: 'Cookie', description: 'Cookie/session-based authentication — login response contains no token field; use request.newContext() cookie jar for authenticated API tests', cookieBased: true });
+    if (hasJWT && !hasCookieAuth) patterns.push({ type: 'JWT', description: 'JSON Web Token authentication' });
+    if (hasSession && !hasCookieAuth) patterns.push({ type: 'Session', description: 'Session-based authentication' });
     if (hasOAuth) patterns.push({ type: 'OAuth', description: 'OAuth authentication' });
     if (hasBasicAuth) patterns.push({ type: 'Basic', description: 'Basic HTTP authentication' });
     
@@ -960,6 +979,7 @@ class ContextGatherer {
           
           pages.push({
             path: routePath,
+            sourceFile: path.relative(this.config.projectPath, fullPath),
             description: this.formatPageName(routePath),
             components: uiHints.components,
             interactions: uiHints.interactions,
@@ -1012,6 +1032,7 @@ class ContextGatherer {
             const uiHints = this.extractPageUIHints(pageFile);
             pages.push({
               path: newBasePath || '/',
+              sourceFile: path.relative(this.config.projectPath, pageFile),
               description: this.formatPageName(newBasePath || '/'),
               components: uiHints.components,
               interactions: uiHints.interactions,
@@ -1063,6 +1084,8 @@ class ContextGatherer {
               const uiHints = this.extractPageUIHints(file);
               pages.push({
                 path: routePath,
+                sourceFile: path.relative(this.config.projectPath, file),
+                routeComponent: this.extractRouteComponentName(content, match.index),
                 description: this.formatPageName(routePath),
                 components: uiHints.components,
                 interactions: uiHints.interactions,
@@ -1107,6 +1130,7 @@ class ContextGatherer {
           const uiHints = this.extractPageUIHints(routerFile);
           pages.push({
             path: routePath,
+            sourceFile: path.relative(this.config.projectPath, routerFile),
             description: this.formatPageName(routePath),
             components: uiHints.components,
             interactions: uiHints.interactions,
@@ -1162,6 +1186,8 @@ class ContextGatherer {
         path: '/api/health',
         description: 'Health check endpoint',
         requiresAuth: false,
+        synthetic: true,
+        source: 'healix_fallback',
       });
     }
     
@@ -1754,6 +1780,208 @@ class ContextGatherer {
     } catch (error) {
       return false;
     }
+  }
+
+  extractRouteComponentName(content, matchIndex = 0) {
+    const window = String(content || '').slice(Math.max(0, matchIndex - 200), matchIndex + 500);
+    const elementMatch = window.match(/element=\{\s*<([A-Z][A-Za-z0-9_]*)\b/);
+    if (elementMatch) return elementMatch[1];
+
+    const componentMatch = window.match(/component=\{\s*([A-Z][A-Za-z0-9_]*)\s*\}/);
+    if (componentMatch) return componentMatch[1];
+
+    return null;
+  }
+
+  normalizeSourceLiteral(value) {
+    return String(value || '')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/&nbsp;/g, ' ')
+      .replace(/&amp;/g, '&')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  shouldKeepSourceLiteral(value) {
+    const text = this.normalizeSourceLiteral(value);
+    if (text.length < 2 || text.length > 100) return false;
+    if (/^https?:\/\//i.test(text)) return false;
+    if (/^\.+\//.test(text)) return false;
+    if (/\.(tsx?|jsx?|css|svg|png|jpe?g|json)$/i.test(text)) return false;
+    if (/^[{}[\](),.;:]+$/.test(text)) return false;
+    if (/^(className|children|props|return|import|export|from|true|false|null|undefined)$/i.test(text)) return false;
+
+    const tokens = text.split(/\s+/);
+    const dashTokenCount = tokens.filter((token) => token.includes('-') || token.includes(':')).length;
+    if (tokens.length >= 5 && dashTokenCount >= Math.ceil(tokens.length * 0.6)) return false;
+
+    // Short lowercase machine values are usually enum values, CSS tokens, or ids.
+    // Keep capitalized short labels such as "Todo", "Review", and "Standup".
+    if (/^[a-z0-9_-]{2,12}$/.test(text) && !/[A-Z]/.test(value)) return false;
+
+    return true;
+  }
+
+  extractStableSourceStrings(content) {
+    const literals = [];
+    const add = (raw) => {
+      const text = this.normalizeSourceLiteral(raw);
+      if (this.shouldKeepSourceLiteral(text)) literals.push(text);
+    };
+
+    for (const match of String(content || '').matchAll(/>\s*([^<>{}]{2,100})\s*</g)) {
+      add(match[1]);
+    }
+
+    for (const match of String(content || '').matchAll(/\b(?:aria-label|title|placeholder|alt|data-testid)=\{?\s*["'`]([^"'`{}]{2,100})["'`]\s*\}?/g)) {
+      add(match[1]);
+    }
+
+    for (const match of String(content || '').matchAll(/(?:label|title|name|text|summary|description|status|priority|assignee|dueDate)\s*:\s*["'`]([^"'`{}]{2,100})["'`]/g)) {
+      add(match[1]);
+    }
+
+    for (const match of String(content || '').matchAll(/["'`]([^"'`{}<>]{2,100})["'`]/g)) {
+      add(match[1]);
+    }
+
+    return [...new Set(literals)].slice(0, 80);
+  }
+
+  findLikelyComponentFile(projectPath, componentName) {
+    if (!componentName) return null;
+    const candidates = [
+      path.join(projectPath, 'src', 'pages', `${componentName}.tsx`),
+      path.join(projectPath, 'src', 'pages', `${componentName}.jsx`),
+      path.join(projectPath, 'src', 'components', `${componentName}.tsx`),
+      path.join(projectPath, 'src', 'components', `${componentName}.jsx`),
+      path.join(projectPath, 'pages', `${componentName}.tsx`),
+      path.join(projectPath, 'pages', `${componentName}.jsx`),
+      path.join(projectPath, 'components', `${componentName}.tsx`),
+      path.join(projectPath, 'components', `${componentName}.jsx`),
+    ];
+    return candidates.find((candidate) => fs.existsSync(candidate)) || null;
+  }
+
+  classifySourceContextFile(relativePath) {
+    if (/\/pages\//.test(relativePath)) return 'page';
+    if (/\/components\//.test(relativePath)) return 'component';
+    if (/\/data\//.test(relativePath)) return 'data';
+    if (/app\.(tsx?|jsx?)$/i.test(relativePath)) return 'router';
+    return 'source';
+  }
+
+  extractSourceContext(projectPath, pages = []) {
+    const candidates = new Set();
+    const addFile = (filePath) => {
+      if (!filePath) return;
+      const absolute = path.isAbsolute(filePath) ? filePath : path.join(projectPath, filePath);
+      if (!fs.existsSync(absolute)) return;
+      if (/\.(spec|test)\.(tsx?|jsx?)$/i.test(absolute)) return;
+      if (absolute.includes(`${path.sep}tests${path.sep}`)) return;
+      candidates.add(absolute);
+    };
+
+    for (const page of pages || []) {
+      addFile(page.sourceFile);
+      const componentFile = this.findLikelyComponentFile(projectPath, page.routeComponent);
+      addFile(componentFile);
+    }
+
+    for (const root of [
+      'src/pages',
+      'src/components',
+      'src/data',
+      'src/App.tsx',
+      'src/App.jsx',
+      'src/App.js',
+      'app',
+      'pages',
+      'components',
+    ]) {
+      const fullPath = path.join(projectPath, root);
+      if (!fs.existsSync(fullPath)) continue;
+      const stat = fs.statSync(fullPath);
+      if (stat.isFile()) {
+        addFile(fullPath);
+      } else {
+        for (const file of this.findFiles(fullPath, ['.js', '.jsx', '.ts', '.tsx']).slice(0, 80)) {
+          addFile(file);
+        }
+      }
+    }
+
+    const routePaths = new Set();
+    const testIds = new Set();
+    const assertableText = new Set();
+    const files = [];
+
+    for (const filePath of [...candidates].slice(0, 120)) {
+      const content = this.readFileCached(filePath, { allowLarge: true, maxBytes: 500000 });
+      if (!content) continue;
+
+      const relativePath = path.relative(projectPath, filePath);
+      const fileRoutePaths = new Set();
+      const fileTestIds = new Set();
+
+      for (const match of content.matchAll(/\b(?:path|to|href)=["'`]([^"'`]+)["'`]/g)) {
+        const routePath = String(match[1] || '').trim();
+        if (routePath.startsWith('/')) {
+          routePaths.add(routePath);
+          fileRoutePaths.add(routePath);
+        }
+      }
+      for (const match of content.matchAll(/(?:router\.push|navigate)\(\s*["'`]([^"'`]+)["'`]\s*\)/g)) {
+        const routePath = String(match[1] || '').trim();
+        if (routePath.startsWith('/')) {
+          routePaths.add(routePath);
+          fileRoutePaths.add(routePath);
+        }
+      }
+      for (const match of content.matchAll(/data-testid=["'`]([^"'`]+)["'`]/g)) {
+        testIds.add(match[1]);
+        fileTestIds.add(match[1]);
+      }
+
+      const fileText = this.extractStableSourceStrings(content);
+      fileText.forEach((text) => assertableText.add(text));
+
+      const components = this.extractComponents(filePath);
+      const entry = {
+        file: relativePath,
+        kind: this.classifySourceContextFile(relativePath),
+        routePaths: [...fileRoutePaths].slice(0, 20),
+        components: components.slice(0, 10),
+        testIds: [...fileTestIds].slice(0, 20),
+        assertableText: fileText.slice(0, 30),
+      };
+
+      if (
+        entry.routePaths.length > 0 ||
+        entry.components.length > 0 ||
+        entry.testIds.length > 0 ||
+        entry.assertableText.length > 0 ||
+        /(pages|components|data|App\.)/.test(relativePath)
+      ) {
+        files.push(entry);
+      }
+    }
+
+    files.sort((a, b) => {
+      const kindRank = { page: 0, router: 1, component: 2, data: 3, source: 4 };
+      const aRank = kindRank[a.kind] ?? 9;
+      const bRank = kindRank[b.kind] ?? 9;
+      if (aRank !== bRank) return aRank - bRank;
+      return a.file.localeCompare(b.file);
+    });
+
+    return {
+      files: files.slice(0, 40),
+      assertableText: [...assertableText].slice(0, 220),
+      routePaths: [...routePaths].slice(0, 120),
+      testIds: [...testIds].slice(0, 120),
+      sourceFilesAnalyzed: files.length,
+    };
   }
 
   extractPageUIHints(filePath) {

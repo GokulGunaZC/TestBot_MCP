@@ -18,6 +18,18 @@ const SUPPORTED_PRD_CONTENT_TYPES = new Set([
   'text/yaml',
 ]);
 
+const CREDENTIAL_SCHEMA = z.object({
+  role: z.string().max(100).optional(),
+  username: z.string().max(200).optional(),
+  password: z.string().max(200).optional(),
+});
+
+const PRD_FILE_SCHEMA = z.object({
+  name: z.string().min(1).max(255),
+  contentType: z.string().optional(),
+  textContent: z.string().min(1).max(500000),
+});
+
 const CONFIG_UI_PAYLOAD_SCHEMA = z.object({
   testType: z.enum(['frontend', 'backend', 'both']),
   scope: z.enum(['codebase', 'diff']).optional(),
@@ -25,15 +37,12 @@ const CONFIG_UI_PAYLOAD_SCHEMA = z.object({
   startCommand: z.string().min(1).max(500),
   generateTests: z.boolean(),
   openDashboard: z.boolean(),
-  credentials: z.object({
-    username: z.string().max(200).optional(),
-    password: z.string().max(200).optional(),
-  }).optional(),
-  prd: z.object({
-    name: z.string().min(1).max(255),
-    contentType: z.string().optional(),
-    textContent: z.string().min(1).max(500000),
-  }).optional().nullable(),
+  credentials: z.union([
+    CREDENTIAL_SCHEMA,
+    z.array(CREDENTIAL_SCHEMA).max(10),
+  ]).optional(),
+  prd: PRD_FILE_SCHEMA.optional().nullable(),
+  prdFiles: z.array(PRD_FILE_SCHEMA).max(5).optional().nullable(),
 });
 
 function resolveBoolean(value, fallback) {
@@ -49,8 +58,8 @@ function resolveBoolean(value, fallback) {
 
 class ConfigUILauncher {
   constructor(config = {}) {
-    const envHeadless = process.env.TESTBOT_HEADLESS;
-    const envAutoOpen = process.env.TESTBOT_AUTO_OPEN_BROWSER;
+    const envHeadless = process.env.HEALIX_HEADLESS;
+    const envAutoOpen = process.env.HEALIX_AUTO_OPEN_BROWSER;
     this.config = {
       ...config,
       port: config.port || 54321,
@@ -189,6 +198,23 @@ class ConfigUILauncher {
       };
     }
 
+    if (Array.isArray(parsed.data.prdFiles)) {
+      for (const prdFile of parsed.data.prdFiles) {
+        if (prdFile.contentType && !SUPPORTED_PRD_CONTENT_TYPES.has(prdFile.contentType)) {
+          return {
+            ok: false,
+            message: `Unsupported PRD content type: ${prdFile.contentType}`,
+          };
+        }
+        if (prdFile.textContent && prdFile.textContent.length > this.config.maxPrdChars) {
+          return {
+            ok: false,
+            message: `PRD file "${prdFile.name}" exceeds limit of ${this.config.maxPrdChars} characters`,
+          };
+        }
+      }
+    }
+
     return {
       ok: true,
       value: parsed.data,
@@ -203,6 +229,13 @@ class ConfigUILauncher {
   }
 
   rejectSubmission(error) {
+    // Force-close existing TCP keep-alive connections immediately so the
+    // browser gets an instant network error instead of hanging until our
+    // client-side timeout fires. Only applies on session expiry / cancel;
+    // resolveSubmission does NOT call this (the 200 response must drain first).
+    if (this.server && typeof this.server.closeAllConnections === 'function') {
+      try { this.server.closeAllConnections(); } catch (_) {}
+    }
     if (this.rejectConfig) {
       this.rejectConfig(error);
     }
@@ -260,10 +293,46 @@ class ConfigUILauncher {
           return;
         }
         
+        // Health-check endpoint — lets the form verify the session is still
+        // alive before submitting the POST (fast-fail instead of 15 s hang).
+        if (pathname === '/api/health' && req.method === 'GET') {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ status: 'ok', sessionActive: true }));
+          return;
+        }
+
         // API endpoint for form submission
         if (pathname === '/api/config' && req.method === 'POST') {
           let body = '';
           let bodyTooLarge = false;
+          let responseSent = false;
+
+          // Guarantee a response is always sent. If the req stream never fires
+          // 'end' (Windows TCP backlog race, socket error, etc.) the browser
+          // would otherwise hang for the full AbortController timeout.
+          const handlerTimeout = setTimeout(() => {
+            if (!responseSent) {
+              responseSent = true;
+              process.stderr.write('[HEALIX] WARN: POST /api/config handler timed out — no response sent within 10 s\n');
+              try {
+                res.writeHead(503, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: false, message: 'Server processing timeout — please try again.' }));
+              } catch (_) {}
+            }
+          }, 10000);
+
+          // Handle socket errors so 'end' never fires and we don't silently drop the request.
+          req.on('error', (err) => {
+            process.stderr.write(`[HEALIX] WARN: POST /api/config req error: ${err.message}\n`);
+            clearTimeout(handlerTimeout);
+            if (!responseSent) {
+              responseSent = true;
+              try {
+                res.writeHead(500, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: false, message: 'Request stream error — please try again.' }));
+              } catch (_) {}
+            }
+          });
 
           req.on('data', chunk => {
             if (bodyTooLarge) {
@@ -272,6 +341,8 @@ class ConfigUILauncher {
             body += chunk.toString('utf-8');
             if (Buffer.byteLength(body, 'utf-8') > this.config.maxRequestBytes) {
               bodyTooLarge = true;
+              clearTimeout(handlerTimeout);
+              responseSent = true;
               res.writeHead(413, { 'Content-Type': 'application/json' });
               res.end(JSON.stringify({
                 success: false,
@@ -280,9 +351,11 @@ class ConfigUILauncher {
             }
           });
           req.on('end', () => {
-            if (bodyTooLarge) {
+            if (responseSent) {
               return;
             }
+            clearTimeout(handlerTimeout);
+            responseSent = true;
             try {
               const config = JSON.parse(body);
               const validation = this.validatePayload(config);
@@ -294,14 +367,19 @@ class ConfigUILauncher {
 
               Logger.info('ConfigUILauncher', 'Received valid configuration from user');
               
-              res.writeHead(200, { 'Content-Type': 'application/json' });
+              // Connection: close tells the browser to tear down the socket
+              // after it reads the response, so server.close() can never race
+              // the response delivery on Windows keep-alive connections.
+              res.writeHead(200, { 'Content-Type': 'application/json', 'Connection': 'close' });
               // Resolve only after response is fully flushed — prevents server.close() racing the response
               res.end(JSON.stringify({ success: true, message: 'Configuration received' }), () => {
                 this.resolveSubmission(validation.value);
               });
             } catch (error) {
-              res.writeHead(400, { 'Content-Type': 'application/json' });
-              res.end(JSON.stringify({ success: false, message: 'Invalid JSON payload' }));
+              if (!res.headersSent) {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: false, message: 'Invalid JSON payload' }));
+              }
             }
           });
           return;
@@ -364,8 +442,19 @@ class ConfigUILauncher {
           // never-bound server may never fire it in some Node.js versions.
           // Skip close() and go straight to the next port.
           this.server = null;
+          this._portRetries = (this._portRetries || 0) + 1;
+          const MAX_PORT_RETRIES = 10;
+          if (this._portRetries > MAX_PORT_RETRIES) {
+            safeReject(new Error(
+              `Config UI could not find a free port after ${MAX_PORT_RETRIES} attempts ` +
+              `(tried ${this._startingPort || this.config.port - MAX_PORT_RETRIES}–${this.config.port}). ` +
+              `Free a port in that range or set a custom port in the MCP config.`
+            ));
+            return;
+          }
+          if (!this._startingPort) this._startingPort = this.config.port;
           this.config.port++;
-          Logger.debug('ConfigUILauncher', `Port in use, trying next port`, { port: this.config.port });
+          Logger.debug('ConfigUILauncher', `Port in use, trying next port`, { port: this.config.port, attempt: this._portRetries });
           setImmediate(() => {
             this.startServer(projectInfo).then(safeResolve).catch(safeReject);
           });

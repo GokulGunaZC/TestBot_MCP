@@ -16,6 +16,31 @@ const PROTECTED_ROUTES = [
 const AUTH_ROUTES = ['/login', '/signup', '/forgot-password']
 
 export async function proxy(request: NextRequest) {
+  const { pathname } = request.nextUrl
+
+  // Skip middleware for artifact upload endpoint (uses API key auth, not session)
+  // This reduces latency from 11-1832ms to near-zero
+  if (pathname === '/api/upload-artifacts' || pathname === '/api/mcp-telemetry/ingest') {
+    const response = NextResponse.next({ request })
+    response.headers.set('Access-Control-Allow-Origin', '*')
+    response.headers.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS')
+    response.headers.set('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin')
+    return response
+  }
+
+  // Handle CORS preflight requests
+  if (request.method === 'OPTIONS') {
+    return new NextResponse(null, {
+      status: 200,
+      headers: {
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, PATCH, OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Requested-With, Accept, Origin',
+        'Access-Control-Max-Age': '86400',
+      },
+    })
+  }
+
   let supabaseResponse = NextResponse.next({ request })
 
   const supabase = createServerClient(
@@ -40,8 +65,6 @@ export async function proxy(request: NextRequest) {
   // Refresh session — must be called before any redirect checks.
   const { data: { user } } = await supabase.auth.getUser()
 
-  const { pathname } = request.nextUrl
-
   const isProtected = PROTECTED_ROUTES.some(
     (route) => pathname === route || pathname.startsWith(route + '/')
   )
@@ -62,6 +85,11 @@ export async function proxy(request: NextRequest) {
     homeUrl.search = ''
     return NextResponse.redirect(homeUrl)
   }
+
+  // Add CORS headers to all responses
+  supabaseResponse.headers.set('Access-Control-Allow-Origin', '*')
+  supabaseResponse.headers.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS')
+  supabaseResponse.headers.set('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin')
 
   return supabaseResponse
 }

@@ -1,0 +1,6 @@
+test/
+.env
+.env.*
+*.test.js
+healix-reports/
+node_modules/

@@ -1,0 +1,16 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "buildCommand": "cd webapp && npm run build",
+  "outputDirectory": "webapp/.next",
+  "installCommand": "npm install && cd webapp && npm install",
+  "framework": "nextjs",
+  "functions": {
+    "webapp/src/app/api/generate-tests/route.ts": { "maxDuration": 800 },
+    "webapp/src/app/api/parse-prd/route.ts": { "maxDuration": 600 },
+    "webapp/src/app/api/exploration/plan/route.ts": { "maxDuration": 600 },
+    "webapp/src/app/api/analyze-failures/route.ts": { "maxDuration": 600 },
+    "webapp/src/app/api/test-runs/ingest/route.ts": { "maxDuration": 60 },
+    "webapp/src/app/api/test-runs/phase/route.ts": { "maxDuration": 10 },
+    "webapp/src/app/api/import-tests/[id]/generate/route.ts": { "maxDuration": 600 }
+  }
+}

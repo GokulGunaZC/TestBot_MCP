@@ -1,6 +1,6 @@
 /**
  * Results Merger
- * Merges test results from multiple sources (TestBot direct execution + Playwright MCP)
+ * Merges test results from multiple sources (Healix direct execution + Playwright MCP)
  * Combines artifacts and deduplicates tests
  */
 
@@ -18,7 +18,7 @@ class ResultsMerger {
   }
 
   /**
-   * Merge results from TestBot direct execution and Playwright MCP
+   * Merge results from Healix direct execution and Playwright MCP
    */
   mergeResults(directResults, mcpResults) {
     Logger.info('ResultsMerger', 'Merging results from parallel executions...');
@@ -41,6 +41,7 @@ class ResultsMerger {
       passed: 0,
       failed: 0,
       skipped: 0,
+      flaky: 0,
       duration: 0,
       tests: [],
       failures: [],
@@ -55,13 +56,15 @@ class ResultsMerger {
           total: directResults.total,
           passed: directResults.passed,
           failed: directResults.failed,
-          skipped: directResults.skipped
+          skipped: directResults.skipped,
+          flaky: directResults.flaky || 0
         },
         mcp: {
           total: mcpResults.total,
           passed: mcpResults.passed,
           failed: mcpResults.failed,
           skipped: mcpResults.skipped,
+          flaky: mcpResults.flaky || 0,
           sessionId: mcpResults.sessionId
         }
       }
@@ -105,6 +108,11 @@ class ResultsMerger {
       const status = this.normalizeStatus(test.status);
       if (status === 'passed') {
         merged.passed++;
+      } else if (status === 'flaky') {
+        // Count flaky as passed for headline stats but track it separately so the
+        // dashboard and triage system can treat it as a distinct state.
+        merged.flaky++;
+        merged.passed++;
       } else if (status === 'failed') {
         merged.failed++;
         merged.failures.push({
@@ -115,6 +123,8 @@ class ResultsMerger {
         });
       } else if (status === 'skipped') {
         merged.skipped++;
+      } else if (status === 'blocked') {
+        merged.blocked = (merged.blocked || 0) + 1;
       }
       
       merged.duration += test.duration || 0;
@@ -220,7 +230,10 @@ class ResultsMerger {
   }
 
   /**
-   * Get the "worst" status between two (failed > skipped > passed)
+   * Get the "worst" status between two (failed > blocked > skipped > passed).
+   * `blocked` means "we couldn't run this test because a prerequisite (usually
+   * auth) failed" — distinct from `failed` (the test ran and an assertion went
+   * wrong). Ranking blocked > skipped so a tier with blocked tests stands out.
    */
   getWorstStatus(status1, status2) {
     const normalize = (s) => {
@@ -229,17 +242,21 @@ class ResultsMerger {
       if (s === 'pending') return 'skipped';
       return s;
     };
-    
+
     const s1 = normalize(status1);
     const s2 = normalize(status2);
-    
+
     if (s1 === 'failed' || s2 === 'failed') return 'failed';
+    if (s1 === 'blocked' || s2 === 'blocked') return 'blocked';
+    if (s1 === 'flaky' || s2 === 'flaky') return 'flaky';
     if (s1 === 'skipped' || s2 === 'skipped') return 'skipped';
     return 'passed';
   }
 
   /**
-   * Normalize status to standard values
+   * Normalize status to standard values. `blocked` is a distinct status used
+   * for Tier B tests that never ran because the login step couldn't establish
+   * a storageState for the role.
    */
   normalizeStatus(status) {
     if (!status) return 'unknown';
@@ -248,6 +265,35 @@ class ResultsMerger {
     if (s === 'unexpected') return 'failed';
     if (s === 'pending') return 'skipped';
     return s;
+  }
+
+  /**
+   * Group tests by tier and return per-tier { passed, failed, blocked, skipped }
+   * counts. `tier` is read from the Playwright project name:
+   *   tierA-public          -> A-public
+   *   tierB-auth-{role}     -> B-auth (one entry per role)
+   *   tierC-backend         -> C-backend
+   * Tests without a recognisable project name fall into `untiered`.
+   */
+  computeTierResults(tests) {
+    const tiers = {};
+    for (const test of tests || []) {
+      const project = (test.projectName || test.project || '').toLowerCase();
+      let tier = 'untiered';
+      if (project.startsWith('tiera') || project.includes('public')) tier = 'A-public';
+      else if (project.startsWith('tierb')) {
+        const m = project.match(/tierb-auth-([a-z0-9_-]+)/);
+        tier = m ? `B-auth-${m[1]}` : 'B-auth';
+      }
+      else if (project.startsWith('tierc') || project.includes('backend') || project.includes('api')) {
+        tier = 'C-backend';
+      }
+      if (!tiers[tier]) tiers[tier] = { passed: 0, failed: 0, blocked: 0, skipped: 0, flaky: 0, total: 0 };
+      tiers[tier].total += 1;
+      const status = this.normalizeStatus(test.status);
+      if (tiers[tier][status] !== undefined) tiers[tier][status] += 1;
+    }
+    return tiers;
   }
 
   /**
@@ -350,6 +396,7 @@ class ResultsMerger {
       passed: results.passed || 0,
       failed: results.failed || 0,
       skipped: results.skipped || 0,
+      flaky: results.flaky || 0,
       duration: results.duration || 0,
       tests: results.tests || [],
       failures: results.failures || [],

@@ -3,6 +3,25 @@ TESTBOT MCP dev_documentation.txt - Development log
 ================================================================================
 
 ================================================================================
+Update: 2026-04-20 12:37:40 IST - Test Lists empty-state CTA text color
+================================================================================
+
+SUMMARY:
+--------
+Adjusted the empty-state call-to-action button on the Test Lists page so the
+"Create Test List" label renders in black for consistency with other gradient
+CTAs.
+
+ACTIONS TAKEN:
+--------------
+- webapp/src/app/(dashboard)/test-lists/page.tsx:
+  - Updated empty-state "Create Test List" button class from text-white to text-black.
+
+FILES MODIFIED:
+---------------
+- webapp/src/app/(dashboard)/test-lists/page.tsx
+
+================================================================================
 Update: 2026-03-05 - Dashboard CTA text colour (Test Locally, Upgrade to Pro, New Test)
 ================================================================================
 

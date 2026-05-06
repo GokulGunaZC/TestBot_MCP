@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>TestBot Configuration</title>
+    <title>Healix Configuration</title>
     <!-- Google Fonts: Space Grotesk + Space Mono -->
     <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700;900&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
     <script src="https://cdn.tailwindcss.com"></script>
@@ -192,6 +192,21 @@
             margin-bottom: 8px;
         }
 
+        .section-badge-required {
+            display: inline-flex;
+            align-items: center;
+            background: #000000;
+            border: 2px solid #ffffff;
+            color: #f57474;
+            font-family: var(--font-mono);
+            font-size: 10px;
+            font-weight: 700;
+            letter-spacing: 0.12em;
+            text-transform: uppercase;
+            padding: 2px 10px;
+            margin-bottom: 8px;
+        }
+
         /* ── URL preview block ── */
         .url-preview {
             background: #1a1a1a;
@@ -297,7 +312,7 @@
         <!-- Header -->
         <div class="flex items-center gap-4 mb-2">
             <div style="display:inline-flex;align-items:center;background:#000000;border:2px solid #ffffff;color:#ffffff;font-family:'Space Mono',monospace;font-size:11px;font-weight:700;letter-spacing:0.12em;text-transform:uppercase;padding:4px 12px;box-shadow:3px 3px 0 #ffffff;">
-                &#x2713; TESTBOT_MCP
+                &#x2713; HEALIX_MCP
             </div>
         </div>
 
@@ -308,7 +323,7 @@
             
             <!-- Section 1 -->
             <div>
-                <span class="section-badge">01 — Required</span>
+                <span class="section-badge-required">01 — Required</span>
                 <h3 style="font-size:1.1rem;font-weight:700;margin:4px 0 4px;color:#ffffff;">Testing Types</h3>
                 <p style="font-size:13px;color:#a0a0a0;margin-bottom:14px;">Select your testing types.</p>
                 <div class="brutal-card p-6">
@@ -323,22 +338,12 @@
                             <p style="font-size:12px;color:#505050;margin-top:8px;">Choose whether to test your backend service or frontend workflows.</p>
                         </div>
                     </div>
-                    <div class="field-row flex items-center gap-4" style="margin-top:20px;">
-                        <div class="field-label" style="padding-top:2px;">Scope</div>
-                        <div style="flex:1;">
-                            <div class="toggle-group" id="scope-group">
-                                <div class="toggle-btn active" data-value="codebase">Codebase</div>
-                                <div class="toggle-btn" data-value="diff">Code diff</div>
-                            </div>
-                            <p style="font-size:12px;color:#505050;margin-top:8px;">Select whether to test against the entire codebase or just recent changes.</p>
-                        </div>
-                    </div>
                 </div>
             </div>
 
             <!-- Section 2 -->
             <div>
-                <span class="section-badge">02 — Required</span>
+                <span class="section-badge-required">02 — Required</span>
                 <h3 style="font-size:1.1rem;font-weight:700;margin:4px 0 4px;color:#ffffff;">Execution Settings</h3>
                 <p style="font-size:13px;color:#a0a0a0;margin-bottom:14px;">Choose test generation and run behavior before launching the pipeline.</p>
                 <div class="brutal-card p-6">
@@ -346,7 +351,7 @@
                         <div class="field-label" style="padding-top:11px;">Start Command</div>
                         <div style="flex:1;">
                             <input type="text" id="startCommand" class="input-glass" placeholder="npm run dev">
-                            <p style="font-size:12px;color:#505050;margin-top:8px;">Command used by TestBot to start your app server if needed.</p>
+                            <p style="font-size:12px;color:#505050;margin-top:8px;">Command used by Healix to start your app server if needed.</p>
                         </div>
                     </div>
                     <div class="field-row flex items-center gap-4" style="margin-top:20px;">
@@ -356,17 +361,7 @@
                                 <div class="toggle-btn active" data-value="true">Yes</div>
                                 <div class="toggle-btn" data-value="false">No</div>
                             </div>
-                            <p style="font-size:12px;color:#505050;margin-top:8px;">When disabled, TestBot runs existing tests only.</p>
-                        </div>
-                    </div>
-                    <div class="field-row flex items-center gap-4" style="margin-top:20px;">
-                        <div class="field-label" style="padding-top:2px;">Open Dashboard</div>
-                        <div style="flex:1;">
-                            <div class="toggle-group" id="dashboard-group">
-                                <div class="toggle-btn active" data-value="true">Yes</div>
-                                <div class="toggle-btn" data-value="false">No</div>
-                            </div>
-                            <p style="font-size:12px;color:#505050;margin-top:8px;">Automatically open dashboard when tests finish.</p>
+                            <p style="font-size:12px;color:#505050;margin-top:8px;">When disabled, Healix runs existing tests only.</p>
                         </div>
                     </div>
                 </div>
@@ -375,28 +370,18 @@
             <!-- Section 3 -->
             <div>
                 <span class="section-badge">03 — Optional</span>
-                <h3 style="font-size:1.1rem;font-weight:700;margin:4px 0 4px;color:#ffffff;">Test Account Info</h3>
-                <p style="font-size:13px;color:#a0a0a0;margin-bottom:14px;">Provide the login credentials for a test account that can be used to access and test your application.</p>
+                <h3 style="font-size:1.1rem;font-weight:700;margin:4px 0 4px;color:#ffffff;">Test Account Credentials</h3>
+                <p style="font-size:13px;color:#a0a0a0;margin-bottom:14px;">Add login credentials for test accounts. Multiple accounts supported for role-based access control testing.</p>
                 <div class="brutal-card p-6">
-                    <div class="field-row flex items-start gap-4">
-                        <div class="field-label" style="padding-top:11px;">Username</div>
-                        <div style="flex:1;">
-                            <input type="text" id="username" class="input-glass" placeholder="test@example.com">
-                            <p style="font-size:12px;color:#505050;margin-top:8px;">Provide a test account username, e.g., test@example.com.</p>
-                        </div>
-                    </div>
-                    <div class="field-row flex items-start gap-4" style="margin-top:20px;">
-                        <div class="field-label" style="padding-top:11px;">Password</div>
-                        <div style="flex:1;">
-                            <input type="password" id="password" class="input-glass" placeholder="••••••••">
-                            <p style="font-size:12px;color:#505050;margin-top:8px;">Enter the corresponding password for the test account, e.g., 123456abc.</p>
-                        </div>
-                    </div>
+                    <div id="credentialsList"></div>
+                    <button type="button" id="addCredentialBtn" class="btn-secondary" style="margin-top:16px;padding:8px 16px;font-size:11px;">
+                        + Add Credential
+                    </button>
                 </div>
             </div>
 
             <div>
-                <span class="section-badge">04 — Required</span>
+                <span class="section-badge-required">04 — Required</span>
                 <h3 style="font-size:1.1rem;font-weight:700;margin:4px 0 4px;color:#ffffff;">Local Server Port</h3>
                 <p style="font-size:13px;color:#a0a0a0;margin-bottom:14px;">Port where your local server is running e.g. 3000 in localhost:3000. If there is a specific path you want to test, enter it in the Path field.</p>
                 <div class="brutal-card p-6">
@@ -417,7 +402,7 @@
                         <div id="baseUrlPreview">http://localhost:5173/</div>
                     </div>
                     <div class="info-banner" style="margin-top:10px;">
-                        <div style="font-size:12px;font-family:'Space Mono',monospace;color:#a0a0a0;">// dev servers may crash under concurrent load &mdash; frontend tests capped at 15</div>
+                        <!-- <div style="font-size:12px;font-family:'Space Mono',monospace;color:#a0a0a0;">// dev servers may crash under concurrent load &mdash; frontend tests capped at 15</div> -->
                     </div>
                 </div>
             </div>
@@ -425,26 +410,21 @@
             <!-- Section 4 -->
             <div>
                 <span class="section-badge">05 — Optional</span>
-                <h3 style="font-size:1.1rem;font-weight:700;margin:4px 0 4px;color:#ffffff;">Product Specification Doc</h3>
-                <p style="font-size:13px;color:#a0a0a0;margin-bottom:14px;">Upload a document that explains your desired product's features, purpose, and how it should work.</p>
+                <h3 style="font-size:1.1rem;font-weight:700;margin:4px 0 4px;color:#ffffff;">Product Specification Docs</h3>
+                <p style="font-size:13px;color:#a0a0a0;margin-bottom:14px;">Upload documents that explain your product's features, purpose, and how it should work. Up to 5 files allowed.</p>
                 <div class="brutal-card p-6">
                     <div class="upload-zone" id="dropzone">
                         <svg class="mx-auto mb-4" width="44" height="44" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
                             <path d="M22 19C22 20.1046 21.1046 21 20 21H4C2.89543 21 2 20.1046 2 19V5C2 3.89543 2.89543 3 4 3H9.17157C9.70201 3 10.2107 3.21071 10.5858 3.58579L12.4142 5.41421C12.7893 5.78929 13.298 6 13.8284 6H20C21.1046 6 22 6.89543 22 8V19Z" stroke="#505050" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
                         </svg>
-                        <p style="font-size:13px;font-weight:700;color:#a0a0a0;font-family:'Space Mono',monospace;">Drop file or click to browse</p>
+                        <p style="font-size:13px;font-weight:700;color:#a0a0a0;font-family:'Space Mono',monospace;">Drop files or click to browse</p>
                         <p style="font-size:11px;color:#505050;margin-top:6px;font-family:'Space Mono',monospace;letter-spacing:0.06em;">.md &nbsp;&middot;&nbsp; .txt &nbsp;&middot;&nbsp; .json &nbsp;&middot;&nbsp; .yaml &nbsp;&middot;&nbsp; .yml</p>
-                        <input type="file" id="fileInput" class="hidden" accept=".md,.txt,.json,.yaml,.yml,text/plain,application/json">
+                        <p id="fileCountLabel" style="font-size:11px;color:#505050;margin-top:8px;font-family:'Space Mono',monospace;">0 / 5 files</p>
+                        <input type="file" id="fileInput" class="hidden" accept=".md,.txt,.json,.yaml,.yml,text/plain,application/json" multiple>
                     </div>
                     <p style="font-size:12px;color:#505050;font-family:'Space Mono',monospace;margin-top:12px;">Text-based docs only. PDF parsing is intentionally disabled.</p>
 
-                    <div id="filePreview" class="hidden">
-                        <div style="display:flex;align-items:center;gap:10px;">
-                            <span style="font-family:'Space Mono',monospace;font-size:12px;color:#505050;">[doc]</span>
-                            <span id="fileName"></span>
-                        </div>
-                        <button type="button" id="removeFile">&times;</button>
-                    </div>
+                    <div id="filesPreviewList" style="margin-top:12px;"></div>
                 </div>
             </div>
 
@@ -482,13 +462,15 @@
             baseURL: urlParams.get('baseURL') || 'http://localhost:3000',
         };
 
+        const MAX_PRD_FILES = 5;
+
         const state = {
             mode: defaults.mode,
-            scope: defaults.scope,
+            scope: 'codebase',
             generateTests: defaults.generateTests,
-            openDashboard: defaults.openDashboard,
-            prdMeta: null,
-            prdContent: null,
+            openDashboard: true,
+            credentials: [],
+            prdFiles: [],
         };
 
         const hostInput = document.getElementById('host');
@@ -502,9 +484,10 @@
 
         const dropzone = document.getElementById('dropzone');
         const fileInput = document.getElementById('fileInput');
-        const filePreview = document.getElementById('filePreview');
-        const fileName = document.getElementById('fileName');
-        const removeFile = document.getElementById('removeFile');
+        const filesPreviewList = document.getElementById('filesPreviewList');
+        const fileCountLabel = document.getElementById('fileCountLabel');
+        const credentialsList = document.getElementById('credentialsList');
+        const addCredentialBtn = document.getElementById('addCredentialBtn');
 
         function showError(message) {
             formError.textContent = message;
@@ -576,12 +559,36 @@
             });
         }
 
-        function resetPRDFile() {
+        function resetPRDFiles() {
             fileInput.value = '';
-            state.prdMeta = null;
-            state.prdContent = null;
-            filePreview.classList.add('hidden');
-            fileName.textContent = '';
+            state.prdFiles = [];
+            renderPRDFiles();
+        }
+
+        function renderPRDFiles() {
+            filesPreviewList.innerHTML = '';
+            fileCountLabel.textContent = `${state.prdFiles.length} / ${MAX_PRD_FILES} files`;
+            
+            state.prdFiles.forEach((prd, index) => {
+                const fileItem = document.createElement('div');
+                fileItem.style.cssText = 'background:#1a1a1a;border:2px solid #ffffff;box-shadow:3px 3px 0px #ffffff;padding:10px 14px;display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;';
+                fileItem.innerHTML = `
+                    <div style="display:flex;align-items:center;gap:10px;">
+                        <span style="font-family:'Space Mono',monospace;font-size:12px;color:#505050;">[doc]</span>
+                        <span style="font-family:'Space Mono',monospace;font-size:12px;color:#ffffff;">${prd.name}</span>
+                    </div>
+                    <button type="button" class="remove-prd-btn" data-index="${index}" style="background:none;border:none;cursor:pointer;font-size:18px;font-weight:700;color:#a0a0a0;line-height:1;padding:0 4px;">&times;</button>
+                `;
+                filesPreviewList.appendChild(fileItem);
+            });
+
+            filesPreviewList.querySelectorAll('.remove-prd-btn').forEach(btn => {
+                btn.addEventListener('click', (e) => {
+                    const idx = parseInt(e.target.dataset.index, 10);
+                    state.prdFiles.splice(idx, 1);
+                    renderPRDFiles();
+                });
+            });
         }
 
         function getFileExtension(fileNameValue) {
@@ -589,39 +596,125 @@
             return lastDot >= 0 ? fileNameValue.slice(lastDot).toLowerCase() : '';
         }
 
-        function handlePRDFile(file) {
+        let pendingFileReads = 0;
+
+        function setPendingReads(delta) {
+            pendingFileReads += delta;
+            if (pendingFileReads > 0) {
+                submitBtn.disabled = true;
+                submitBtn.textContent = 'Reading files…';
+            } else {
+                pendingFileReads = 0;
+                submitBtn.disabled = false;
+                submitBtn.textContent = 'Run Tests →';
+            }
+        }
+
+        function handlePRDFiles(files) {
             clearError();
-            const extension = getFileExtension(file.name);
-            const isValidExtension = SUPPORTED_EXTENSIONS.has(extension);
-            const isValidMime = !file.type || SUPPORTED_MIME_TYPES.has(file.type);
+            const filesToAdd = Array.from(files);
+            const remainingSlots = MAX_PRD_FILES - state.prdFiles.length;
 
-            if (!isValidExtension || !isValidMime) {
-                showError('Unsupported PRD file type. Use .md, .txt, .json, .yaml, or .yml.');
-                resetPRDFile();
+            if (filesToAdd.length > remainingSlots) {
+                showError(`Can only add ${remainingSlots} more file(s). Max ${MAX_PRD_FILES} files allowed.`);
                 return;
             }
 
-            if (file.size > MAX_PRD_BYTES) {
-                showError('PRD file is too large. Max size is 1MB.');
-                resetPRDFile();
-                return;
-            }
+            filesToAdd.forEach(file => {
+                const extension = getFileExtension(file.name);
+                const isValidExtension = SUPPORTED_EXTENSIONS.has(extension);
+                const isValidMime = !file.type || SUPPORTED_MIME_TYPES.has(file.type);
 
-            const reader = new FileReader();
-            reader.onload = (event) => {
-                state.prdContent = String(event.target.result || '');
-                state.prdMeta = {
-                    name: file.name,
-                    contentType: file.type || 'text/plain',
+                if (!isValidExtension || !isValidMime) {
+                    showError(`Unsupported file type for ${file.name}. Use .md, .txt, .json, .yaml, or .yml.`);
+                    return;
+                }
+
+                if (file.size > MAX_PRD_BYTES) {
+                    showError(`File ${file.name} is too large. Max size is 1MB.`);
+                    return;
+                }
+
+                setPendingReads(+1);
+                const reader = new FileReader();
+                reader.onload = (event) => {
+                    state.prdFiles.push({
+                        name: file.name,
+                        contentType: file.type || 'text/plain',
+                        textContent: String(event.target.result || ''),
+                    });
+                    renderPRDFiles();
+                    setPendingReads(-1);
                 };
-                fileName.textContent = file.name;
-                filePreview.classList.remove('hidden');
-            };
-            reader.onerror = () => {
-                showError('Failed to read PRD file.');
-                resetPRDFile();
-            };
-            reader.readAsText(file);
+                reader.onerror = () => {
+                    showError(`Failed to read file ${file.name}.`);
+                    setPendingReads(-1);
+                };
+                reader.readAsText(file);
+            });
+        }
+
+        function createCredentialRow(index, role = '', username = '', password = '') {
+            const row = document.createElement('div');
+            row.className = 'credential-row';
+            row.dataset.index = index;
+            row.style.cssText = 'border:1px solid #333;padding:16px;margin-bottom:12px;background:#0a0a0a;';
+            row.innerHTML = `
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+                    <span style="font-family:'Space Mono',monospace;font-size:11px;font-weight:700;color:#a0a0a0;text-transform:uppercase;letter-spacing:0.06em;">Credential #${index + 1}</span>
+                    <button type="button" class="remove-credential-btn" data-index="${index}" style="background:none;border:1px solid #333;cursor:pointer;font-size:12px;font-weight:700;color:#a0a0a0;padding:4px 8px;font-family:'Space Mono',monospace;">&times; Remove</button>
+                </div>
+                <div style="display:flex;gap:12px;margin-bottom:12px;">
+                    <div style="flex:1;">
+                        <label style="font-family:'Space Mono',monospace;font-size:10px;font-weight:700;color:#505050;text-transform:uppercase;letter-spacing:0.06em;display:block;margin-bottom:6px;">Role (optional)</label>
+                        <input type="text" class="input-glass cred-role" placeholder="e.g., admin, user" value="${role}">
+                    </div>
+                </div>
+                <div style="display:flex;gap:12px;">
+                    <div style="flex:1;">
+                        <label style="font-family:'Space Mono',monospace;font-size:10px;font-weight:700;color:#505050;text-transform:uppercase;letter-spacing:0.06em;display:block;margin-bottom:6px;">Username</label>
+                        <input type="text" class="input-glass cred-username" placeholder="test@example.com" value="${username}">
+                    </div>
+                    <div style="flex:1;">
+                        <label style="font-family:'Space Mono',monospace;font-size:10px;font-weight:700;color:#505050;text-transform:uppercase;letter-spacing:0.06em;display:block;margin-bottom:6px;">Password</label>
+                        <input type="password" class="input-glass cred-password" placeholder="••••••••" value="${password}">
+                    </div>
+                </div>
+            `;
+            return row;
+        }
+
+        function renderCredentials() {
+            credentialsList.innerHTML = '';
+            state.credentials.forEach((cred, index) => {
+                const row = createCredentialRow(index, cred.role, cred.username, cred.password);
+                credentialsList.appendChild(row);
+            });
+
+            credentialsList.querySelectorAll('.remove-credential-btn').forEach(btn => {
+                btn.addEventListener('click', (e) => {
+                    const idx = parseInt(e.target.dataset.index, 10);
+                    state.credentials.splice(idx, 1);
+                    renderCredentials();
+                });
+            });
+
+            credentialsList.querySelectorAll('.credential-row').forEach((row, idx) => {
+                row.querySelector('.cred-role').addEventListener('input', (e) => {
+                    state.credentials[idx].role = e.target.value;
+                });
+                row.querySelector('.cred-username').addEventListener('input', (e) => {
+                    state.credentials[idx].username = e.target.value;
+                });
+                row.querySelector('.cred-password').addEventListener('input', (e) => {
+                    state.credentials[idx].password = e.target.value;
+                });
+            });
+        }
+
+        function addCredential() {
+            state.credentials.push({ role: '', username: '', password: '' });
+            renderCredentials();
         }
 
         function initDefaults() {
@@ -632,22 +725,21 @@
             startCommandInput.value = defaults.startCommand;
 
             setActiveToggle('mode-group', defaults.mode);
-            setActiveToggle('scope-group', defaults.scope);
             setActiveToggle('generate-group', String(defaults.generateTests));
-            setActiveToggle('dashboard-group', String(defaults.openDashboard));
 
             state.mode = defaults.mode;
-            state.scope = defaults.scope;
+            state.scope = 'codebase';
             state.generateTests = defaults.generateTests;
-            state.openDashboard = defaults.openDashboard;
-            resetPRDFile();
+            state.openDashboard = true;
+            state.credentials = [];
+            state.prdFiles = [];
+            renderCredentials();
+            resetPRDFiles();
             updateBaseURLPreview();
         }
 
         setupToggle('mode-group', 'mode');
-        setupToggle('scope-group', 'scope');
         setupToggle('generate-group', 'generateTests', (value) => value === 'true');
-        setupToggle('dashboard-group', 'openDashboard', (value) => value === 'true');
 
         hostInput.addEventListener('input', updateBaseURLPreview);
         portInput.addEventListener('input', updateBaseURLPreview);
@@ -663,20 +755,18 @@
             event.preventDefault();
             dropzone.classList.remove('dragover');
             if (event.dataTransfer.files.length > 0) {
-                handlePRDFile(event.dataTransfer.files[0]);
+                handlePRDFiles(event.dataTransfer.files);
             }
         });
 
         fileInput.addEventListener('change', (event) => {
             if (event.target.files.length > 0) {
-                handlePRDFile(event.target.files[0]);
+                handlePRDFiles(event.target.files);
+                fileInput.value = '';
             }
         });
 
-        removeFile.addEventListener('click', () => {
-            resetPRDFile();
-            clearError();
-        });
+        addCredentialBtn.addEventListener('click', addCredential);
 
         document.getElementById('submitBtn').addEventListener('click', async () => {
             clearError();
@@ -695,35 +785,55 @@
                 return;
             }
 
-            const username = (document.getElementById('username').value || '').trim();
-            const password = (document.getElementById('password').value || '').trim();
-            const credentials = (username || password) ? { username, password } : undefined;
+            const validCredentials = state.credentials.filter(c => c.username || c.password);
 
             const payload = {
                 testType: state.mode,
-                scope: state.scope,
+                scope: 'codebase',
                 baseURL,
                 startCommand,
                 generateTests: state.generateTests,
-                openDashboard: state.openDashboard,
-                ...(credentials ? { credentials } : {}),
-                prd: state.prdContent ? {
-                    name: state.prdMeta?.name || 'uploaded-prd.md',
-                    contentType: state.prdMeta?.contentType || 'text/plain',
-                    textContent: state.prdContent,
-                } : null,
+                openDashboard: true,
+                ...(validCredentials.length > 0 ? { credentials: validCredentials } : {}),
+                prdFiles: state.prdFiles.length > 0 ? state.prdFiles : null,
             };
 
             const serverPort = urlParams.get('serverPort') || '54321';
             submitBtn.disabled = true;
             submitBtn.textContent = 'Sending…';
 
+            // --- Health check: verify the session is still alive before POSTing.
+            // If the server has closed (timeout / force re-run), the health check
+            // fails immediately (connection refused / network error) instead of
+            // hanging for the full 15 s AbortController timeout.
+            const healthCtrl = new AbortController();
+            const healthTimer = setTimeout(() => healthCtrl.abort(), 3000);
+            try {
+                const health = await fetch(`http://localhost:${serverPort}/api/health`, {
+                    signal: healthCtrl.signal,
+                });
+                clearTimeout(healthTimer);
+                if (!health.ok) throw new Error('unhealthy');
+            } catch (healthErr) {
+                clearTimeout(healthTimer);
+                showError('Session expired or the Healix server was restarted. Please close this tab and re-invoke the Healix tool to start a new session.');
+                submitBtn.disabled = false;
+                submitBtn.textContent = 'Run Tests →';
+                return;
+            }
+
+            const abortCtrl = new AbortController();
+            const abortTimer = setTimeout(() => abortCtrl.abort(), 15000);
+
             try {
                 const response = await fetch(`http://localhost:${serverPort}/api/config`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(payload),
+                    signal: abortCtrl.signal,
                 });
+
+                clearTimeout(abortTimer);
 
                 if (!response.ok) {
                     const body = await response.json().catch(() => ({}));
@@ -732,7 +842,18 @@
 
                 successOverlay.classList.remove('hidden');
             } catch (error) {
-                showError(error.message || 'Could not send configuration to TestBot server.');
+                clearTimeout(abortTimer);
+                const isTimeout = error.name === 'AbortError';
+                const isNetworkError = !isTimeout && (error instanceof TypeError || error.name === 'TypeError');
+                let errMsg;
+                if (isNetworkError) {
+                    errMsg = 'Session expired or the server was restarted. Please reload this page and resubmit.';
+                } else if (isTimeout) {
+                    errMsg = 'Request timed out — the Healix server did not respond. Please reload this page and resubmit.';
+                } else {
+                    errMsg = error.message || 'Could not send configuration to Healix server.';
+                }
+                showError(errMsg);
                 submitBtn.disabled = false;
                 submitBtn.textContent = 'Run Tests →';
             }

@@ -120,7 +120,7 @@ class PlaywrightMCPIntegration {
 
   /**
    * Run tests with full artifact capture using Playwright MCP
-   * This runs in parallel with TestBot's direct execution
+   * This runs in parallel with Healix's direct execution
    */
   async runTests() {
     const log = (msg) => console.error(`[PlaywrightMCP] ${msg}`);

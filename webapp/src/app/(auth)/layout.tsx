@@ -21,9 +21,9 @@ export default function AuthLayout({ children }: { children: ReactNode }) {
       <div className="absolute inset-0 dot-grid opacity-40 pointer-events-none" />
 
       {/* Centered content */}
-      <div className="relative z-10 w-full flex items-center justify-center p-4">
+      <main className="relative z-10 w-full flex items-center justify-center p-4">
         {children}
-      </div>
+      </main>
     </div>
   )
 }

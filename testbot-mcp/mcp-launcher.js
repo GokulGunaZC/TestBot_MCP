@@ -8,7 +8,7 @@
 delete require.cache[require.resolve('./src/index.js')];
 
 // Force stderr output for debugging
-console.error('[MCP-LAUNCHER] Starting TestBot MCP with fresh module load...');
+console.error('[MCP-LAUNCHER] Starting Healix MCP with fresh module load...');
 console.error('[MCP-LAUNCHER] Timestamp:', new Date().toISOString());
 
 // Load and start the server

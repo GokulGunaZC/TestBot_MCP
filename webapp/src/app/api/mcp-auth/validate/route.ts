@@ -50,17 +50,26 @@ export async function POST(request: NextRequest) {
     }
 
     const [profile] = await db
-      .select({ creditsRemaining: profiles.creditsRemaining, plan: profiles.plan })
+      .select({
+        creditsRemaining: profiles.creditsRemaining,
+        tokensRemaining: profiles.tokensRemaining,
+        plan: profiles.plan,
+      })
       .from(profiles)
       .where(eq(profiles.id, apiKeyRecord.userId))
       .limit(1)
 
-    if (profile && typeof profile.creditsRemaining === 'number' && profile.creditsRemaining <= 0) {
+    // Gate on `tokens_remaining` because that's the field the runtime actually
+    // deducts (`/api/generate-tests`, `/api/parse-prd`, `/api/analyze-failures`
+    // all call deductTokens). `credits_remaining` is a legacy column that never
+    // moves once the user first signs up — gating on it here produced stale
+    // "NO_CREDITS" denials that didn't match the user's real billing state.
+    if (profile && typeof profile.tokensRemaining === 'number' && profile.tokensRemaining <= 0) {
       return NextResponse.json(
         {
           valid: false,
-          error: 'NO_CREDITS',
-          message: 'No credits remaining. Please upgrade your plan or purchase more credits.',
+          error: 'NO_TOKENS',
+          message: 'No tokens remaining. Please upgrade your plan or wait for the next billing cycle.',
         },
         { status: 402 }
       )
@@ -75,7 +84,8 @@ export async function POST(request: NextRequest) {
       valid: true,
       userId: apiKeyRecord.userId,
       plan: profile?.plan ?? 'starter',
-      creditsRemaining: profile?.creditsRemaining ?? null,
+      tokensRemaining: profile?.tokensRemaining ?? null,
+      creditsRemaining: profile?.creditsRemaining ?? null, // kept for legacy clients; prefer tokensRemaining
     })
   } catch (error) {
     console.error('[MCP Auth Validate] Unexpected error:', error)

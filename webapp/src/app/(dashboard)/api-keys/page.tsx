@@ -106,7 +106,7 @@ export default function ApiKeysPage() {
       <motion.div initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} className="flex items-center justify-between">
         <div>
           <h2 className="text-[#F0F6FF] font-bold text-xl">API Keys</h2>
-          <p className="text-[#4A6280] text-sm mt-0.5">Manage API keys for connecting TestBot to your IDE</p>
+          <p className="text-[#4A6280] text-sm mt-0.5">Manage API keys for connecting Healix to your IDE</p>
         </div>
         <button
           onClick={() => { setShowCreateForm(true); setGeneratedKey(null); setError(null); }}

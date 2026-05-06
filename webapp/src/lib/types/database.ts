@@ -11,10 +11,15 @@ export interface Profile {
   full_name: string | null
   avatar_url: string | null
   company: string | null
-  plan: 'starter' | 'pro' | 'enterprise'
+  plan: 'free' | 'starter' | 'team' | 'enterprise'
   credits_remaining: number
   credits_total: number
+  tokens_remaining: number
+  tokens_total: number
   onboarding_completed: boolean
+  stripe_customer_id: string | null
+  stripe_subscription_id: string | null
+  subscription_status: string | null
   created_at: string
   updated_at: string
 }
@@ -29,6 +34,42 @@ export interface ApiKey {
   expires_at: string | null
   is_active: boolean
   created_at: string
+}
+
+export interface PipelineError {
+  kind?: 'pipeline'
+  stage?: string
+  reason?: string | null
+  stderr?: string | null
+  stdout?: string | null
+  firstSpecPreview?: { file: string; lines: string } | null
+  generatedSpecCount?: number
+  qualityAuditErrors?: string[] | null
+  errorCode?: string | null
+  userFacingMessage?: string | null
+}
+
+export type FailureVerdict = 'test_is_wrong' | 'app_is_wrong' | 'environment' | 'ambiguous' | 'flake'
+export type FailureVerdictSource = 'classifier' | 'ai' | 'user_override'
+
+export interface TestFailure {
+  id: string
+  test_name: string
+  test_file: string | null
+  tier: string | null
+  verdict: FailureVerdict
+  verdict_source: FailureVerdictSource
+  verdict_confidence: number | null
+  fix_target: string | null
+  reason: string | null
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  suggested_patch: any | null
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  evidence: any | null
+  cluster_id: string | null
+  user_override: FailureVerdict | null
+  user_override_at: string | null
+  created_at: string | null
 }
 
 export interface TestRun {
@@ -47,6 +88,11 @@ export interface TestRun {
   report_json: any
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   ai_analysis: any
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  coverage_metrics: any | null
+  tier_results?: Record<string, { passed: number; failed: number; blocked: number; skipped: number; total: number }> | null
+  pipeline_error?: PipelineError | null
+  test_failures?: TestFailure[] | null
   framework: string | null
   source: 'mcp' | 'api' | 'dashboard'
   created_at: string
@@ -57,15 +103,46 @@ export interface TestRun {
   is_live?: boolean
 }
 
-export interface TestList {
+export interface ImportSession {
   id: string
   user_id: string
   name: string
   description: string | null
-  test_count: number
-  last_run_at: string | null
+  original_filename: string
+  file_storage_path: string | null
+  status: 'pending' | 'processing' | 'completed' | 'failed'
+  test_case_count: number
+  groovy_file_count: number
+  error_message: string | null
   created_at: string
   updated_at: string
+}
+
+export interface ImportedTestCase {
+  id: string
+  import_id: string
+  tc_id: string
+  active: string | null
+  functional_area: string | null
+  scenario: string | null
+  description: string | null
+  environment_name: string | null
+  ndc_version: string | null
+  pcc: string | null
+  raw_data: Record<string, unknown> | null
+  created_at: string
+}
+
+export interface GeneratedGroovyFile {
+  id: string
+  import_id: string
+  file_name: string
+  class_name: string
+  api_type: string
+  groovy_content: string
+  status: 'generated' | 'failed'
+  error_message: string | null
+  created_at: string
 }
 
 export interface MCPTelemetryEvent {

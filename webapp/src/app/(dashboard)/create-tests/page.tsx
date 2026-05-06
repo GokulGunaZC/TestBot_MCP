@@ -2,8 +2,27 @@
 
 import { motion } from 'framer-motion';
 import Link from 'next/link';
+import { useEffect, useState } from 'react';
+
+const MIN_TOKENS_GENERATE = 40_000;   // p50 — block below this
+const REC_TOKENS_GENERATE = 120_000;  // p95 — warn between min and rec
 
 export default function CreateTestsPage() {
+  const [tokensRemaining, setTokensRemaining] = useState<number | null>(null);
+
+  useEffect(() => {
+    fetch('/api/profile')
+      .then(r => r.ok ? r.json() : null)
+      .then(json => {
+        const remaining = json?.data?.tokens_remaining ?? json?.tokens_remaining ?? null;
+        if (remaining != null) setTokensRemaining(Number(remaining));
+      })
+      .catch(() => {});
+  }, []);
+
+  const outOfTokens = tokensRemaining != null && tokensRemaining < MIN_TOKENS_GENERATE;
+  const lowTokens   = tokensRemaining != null && tokensRemaining >= MIN_TOKENS_GENERATE && tokensRemaining < REC_TOKENS_GENERATE;
+
   return (
     <motion.div
       initial={{ opacity: 0, y: 10 }}
@@ -14,6 +33,54 @@ export default function CreateTestsPage() {
       <h1 className="text-3xl font-bold text-[#F0F6FF] tracking-tight mb-8">
         Create Tests
       </h1>
+
+      {outOfTokens && (
+        <motion.div
+          initial={{ opacity: 0, y: -8 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="mb-6 flex items-start gap-3 px-4 py-3.5 rounded-xl bg-red-500/10 border border-red-500/25"
+        >
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#f87171" strokeWidth="2" className="mt-0.5 flex-shrink-0">
+            <path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>
+          </svg>
+          <div className="flex-1">
+            <p className="text-red-400 text-sm font-semibold">Not enough tokens to start a test run</p>
+            <p className="text-red-300/70 text-xs mt-0.5">
+              You have {tokensRemaining?.toLocaleString() ?? 0} tokens. A typical run needs at least {MIN_TOKENS_GENERATE.toLocaleString()}.
+            </p>
+          </div>
+          <Link
+            href="/plan-billing"
+            className="flex-shrink-0 px-3 py-1.5 rounded-lg bg-red-500/20 border border-red-500/30 text-red-300 text-xs font-semibold hover:bg-red-500/30 transition-colors"
+          >
+            Upgrade Plan
+          </Link>
+        </motion.div>
+      )}
+
+      {lowTokens && (
+        <motion.div
+          initial={{ opacity: 0, y: -8 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="mb-6 flex items-start gap-3 px-4 py-3.5 rounded-xl bg-amber-500/10 border border-amber-500/25"
+        >
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#FBBF24" strokeWidth="2" className="mt-0.5 flex-shrink-0">
+            <circle cx="12" cy="12" r="10" /><path d="M12 8v4M12 16h.01" />
+          </svg>
+          <div className="flex-1">
+            <p className="text-amber-300 text-sm font-semibold">Low token balance</p>
+            <p className="text-amber-200/70 text-xs mt-0.5">
+              You have {tokensRemaining?.toLocaleString()} tokens. A typical run uses ~40K, but larger runs can use up to {REC_TOKENS_GENERATE.toLocaleString()}. Your run may stop early if it exceeds your balance.
+            </p>
+          </div>
+          <Link
+            href="/plan-billing"
+            className="flex-shrink-0 px-3 py-1.5 rounded-lg bg-amber-500/20 border border-amber-500/30 text-amber-200 text-xs font-semibold hover:bg-amber-500/30 transition-colors"
+          >
+            Upgrade Plan
+          </Link>
+        </motion.div>
+      )}
 
       <motion.div
         initial={{ opacity: 0, y: 20 }}
@@ -41,8 +108,8 @@ export default function CreateTestsPage() {
               Create Tests with Your AI Code Editor
             </h2>
             <p className="text-[#8BA4C8] mb-6 leading-relaxed">
-              TestBot MCP integrates directly into your IDE. Simply type a natural language command
-              and TestBot will auto-generate, run, and analyze tests for your project.
+              Healix MCP integrates directly into your IDE. Simply type a natural language command
+              and Healix will auto-generate, run, and analyze tests for your project.
             </p>
 
             <div className="backdrop-blur-md bg-white/[0.04] border border-white/10 rounded-xl p-4 mb-6">
@@ -51,7 +118,7 @@ export default function CreateTestsPage() {
                 <span className="text-sm text-[#8BA4C8]">Type this in your AI code editor:</span>
               </div>
               <p className="font-mono text-[#F0F6FF] text-sm">
-                &ldquo;Hey, help me to test this project with TestBot MCP.&rdquo;
+                &ldquo;Hey, help me to test this project with Healix MCP.&rdquo;
               </p>
             </div>
 
@@ -90,7 +157,7 @@ export default function CreateTestsPage() {
         className="mt-8 grid grid-cols-1 md:grid-cols-3 gap-4"
       >
         {[
-          { step: '1', title: 'Install MCP Server', desc: 'Add TestBot MCP to your IDE configuration' },
+          { step: '1', title: 'Install MCP Server', desc: 'Add Healix MCP to your IDE configuration' },
           { step: '2', title: 'Add API Key', desc: 'Generate and configure your API key' },
           { step: '3', title: 'Start Testing', desc: 'Type a command and let AI generate tests' },
         ].map((item, i) => (

@@ -3,6 +3,7 @@ import { db } from '@/lib/db'
 import { profiles } from '@/lib/db/schema'
 import { eq } from 'drizzle-orm'
 import { getCurrentProfile } from '@/lib/auth/session'
+import { PLAN_TOKEN_TOTALS } from '@/lib/plans'
 
 function mapProfileToSnakeCase(profile: typeof profiles.$inferSelect) {
   return {
@@ -15,7 +16,12 @@ function mapProfileToSnakeCase(profile: typeof profiles.$inferSelect) {
     plan: profile.plan,
     credits_remaining: profile.creditsRemaining,
     credits_total: profile.creditsTotal,
+    tokens_remaining: profile.tokensRemaining ?? 0,
+    tokens_total: profile.tokensTotal ?? 0,
     onboarding_completed: profile.onboardingCompleted,
+    stripe_customer_id: profile.stripeCustomerId ?? null,
+    stripe_subscription_id: profile.stripeSubscriptionId ?? null,
+    subscription_status: profile.subscriptionStatus ?? 'inactive',
     created_at: profile.createdAt?.toISOString() ?? null,
     updated_at: profile.updatedAt?.toISOString() ?? null,
   }
@@ -30,7 +36,28 @@ export async function GET() {
     if (!result.profile) {
       return NextResponse.json({ error: 'Profile not found' }, { status: 404 })
     }
-    return NextResponse.json({ data: mapProfileToSnakeCase(result.profile) })
+
+    let profile = result.profile
+    const expectedTotal = PLAN_TOKEN_TOTALS[profile.plan ?? 'free']
+    if (expectedTotal !== undefined && profile.tokensTotal !== expectedTotal) {
+      // If the user hasn't spent any tokens yet (remaining >= total), bump both
+      // so the meter shows the correct full allocation after a plan token update.
+      // If they have spent tokens, only update the denominator (total) and leave
+      // remaining intact so we don't silently refill a partially-used balance.
+      const noTokensUsed = (profile.tokensRemaining ?? 0) >= (profile.tokensTotal ?? 0)
+      const [fixed] = await db
+        .update(profiles)
+        .set({
+          tokensTotal: expectedTotal,
+          ...(noTokensUsed ? { tokensRemaining: expectedTotal } : {}),
+          updatedAt: new Date(),
+        })
+        .where(eq(profiles.id, profile.id))
+        .returning()
+      profile = fixed
+    }
+
+    return NextResponse.json({ data: mapProfileToSnakeCase(profile) })
   } catch (error) {
     console.error('Profile GET error:', error)
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })

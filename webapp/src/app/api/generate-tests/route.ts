@@ -1,242 +1,499 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
-import { apiKeys, profiles } from '@/lib/db/schema'
-import { eq, and } from 'drizzle-orm'
+import { apiKeys, generationJobs, profiles } from '@/lib/db/schema'
+import { eq, and, inArray, sql } from 'drizzle-orm'
 import { hashApiKey } from '@/lib/utils/api-keys'
+import { dispatchAgents, planAgents } from '@/lib/test-generation/agent-dispatcher'
+import { inngest } from '@/lib/inngest/client'
+import type {
+  CapturedContext,
+  GenerationOptions,
+  ProjectInfo,
+  ParsedPRD,
+  ExplorationArtifact,
+  Role,
+  AgentRunRecord,
+  AgentName,
+} from '@/lib/test-generation/types'
+import { CURRENT_PLAN_VERSION } from '@/lib/test-generation/plan-schema'
+import { checkRateLimit } from '@/lib/rate-limit'
+import { checkTokenBalance, recordTokenUsage, MIN_TOKENS_GENERATE, REC_TOKENS_GENERATE } from '@/lib/tokens'
+import { resolveModel } from '@/lib/pricing'
+import { checkConcurrencyLimit } from '@/lib/concurrency-limit'
+import { checkIdempotency, storeIdempotencyResult } from '@/lib/idempotency'
+import { validateGenerateTests } from '@/lib/validation'
+import { checkAiGuard, recordAiCall } from '@/lib/ai-guard'
+import { runAbuseDetection } from '@/lib/abuse-detector'
+import { logBlockedRequest } from '@/lib/security-logger'
 
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY
-const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o'
-const OPENAI_MAX_TOKENS = 4000
-const OPENAI_TEMPERATURE = 0.2
-const OPENAI_TIMEOUT = 180_000 // 3 minutes
+const ENDPOINT = '/api/generate-tests'
 
-// ── OpenAI Chat Completions call ──────────────────────────────────────
-async function callOpenAI(messages: Array<{ role: string; content: string }>) {
-  const controller = new AbortController()
-  const timeout = setTimeout(() => controller.abort(), OPENAI_TIMEOUT)
+// Matches vercel.json maxDuration for this route. Previously set to 60 (Hobby
+// ceiling) but that silently killed agents before gpt-5.4-mini could respond.
+// Set to 800 to match vercel.json; local Next.js ignores this entirely.
+export const maxDuration = 800
 
-  try {
-    const res = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-      },
-      body: JSON.stringify({
-        model: OPENAI_MODEL,
-        messages,
-        temperature: OPENAI_TEMPERATURE,
-        max_tokens: OPENAI_MAX_TOKENS,
-      }),
-      signal: controller.signal,
-    })
+const KNOWN_AGENTS: readonly AgentName[] = ['smoke', 'frontend', 'api', 'workflow', 'error', 'expansion']
 
-    clearTimeout(timeout)
+// Normalise an incoming agents[] list: lowercase, trim, dedupe. Returns either
+// a validated Set<AgentName> or a ValidationIssue the caller turns into 400.
+function normalizeAgents(raw: unknown):
+  | { ok: true; set: Set<AgentName> | null }
+  | { ok: false; code: 'INVALID_AGENTS' | 'EMPTY_AGENTS'; unknown?: string[] } {
+  if (raw === undefined || raw === null || raw === false) return { ok: true, set: null }
+  if (!Array.isArray(raw)) return { ok: false, code: 'INVALID_AGENTS' }
 
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}))
-      throw new Error(err.error?.message || `OpenAI HTTP ${res.status}`)
-    }
+  const cleaned = raw
+    .filter((v) => typeof v === 'string')
+    .map((v) => (v as string).trim().toLowerCase())
+    .filter((v) => v.length > 0)
 
-    const data = await res.json()
-    return data.choices?.[0]?.message?.content ?? ''
-  } catch (error: unknown) {
-    clearTimeout(timeout)
-    if (error instanceof Error && error.name === 'AbortError')
-      throw new Error('OpenAI request timed out (3 min)')
-    throw error
-  }
-}
+  if (cleaned.length === 0) return { ok: false, code: 'EMPTY_AGENTS' }
 
-// ── Parse test file JSON out of GPT response ─────────────────────────
-function parseTestFiles(raw: string, prefix: string) {
-  try {
-    const content = raw.trim()
-    let parsed: unknown
+  const unknown = cleaned.filter((a) => !KNOWN_AGENTS.includes(a as AgentName))
+  if (unknown.length > 0) return { ok: false, code: 'INVALID_AGENTS', unknown }
 
-    try {
-      parsed = JSON.parse(content)
-    } catch {
-      const md = content.match(/```(?:json)?\s*(\[[\s\S]*?\])\s*```/)
-      if (md) parsed = JSON.parse(md[1])
-      else {
-        const arr = content.match(/(\[[\s\S]*\])/)
-        if (arr) parsed = JSON.parse(arr[1])
-        else throw new Error('No JSON array found')
-      }
-    }
-
-    if (!Array.isArray(parsed)) parsed = [parsed]
-
-    return (parsed as Array<{ filename?: string; content?: string }>)
-      .map((f, i) => ({
-        filename: f.filename || `${prefix}-${i + 1}.spec.ts`,
-        content: f.content || '',
-        type: prefix,
-      }))
-      .filter((f) => f.content.length > 0)
-  } catch {
-    console.error('[generate-tests] Failed to parse GPT response')
-    return []
-  }
-}
-
-// ── Prompt builders ───────────────────────────────────────────────────
-function systemPrompt(kind: 'frontend' | 'backend' | 'smoke' | 'workflow', projectInfo: Record<string, string>) {
-  const base = `You are an expert Playwright test engineer. Generate comprehensive, production-ready Playwright tests using @playwright/test.
-Framework: ${projectInfo.framework || 'Unknown'}
-Base URL: ${projectInfo.baseURL || 'http://localhost:3000'}
-
-Return your response as a JSON array of test files:
-[{ "filename": "name.spec.ts", "content": "// full test code" }]
-IMPORTANT: Return ONLY valid JSON, no markdown code blocks.`
-
-  const extras: Record<string, string> = {
-    frontend: `\nFocus on: page loads, user interactions, form inputs, navigation, accessibility, error states.\nUse data-testid selectors when possible.`,
-    backend: `\nFocus on: API endpoint testing using Playwright request API. Cover GET/POST/PUT/DELETE, status codes, auth, validation errors, edge cases.`,
-    smoke: `\nGenerate basic smoke tests: app loads, no console errors, basic navigation, responsive viewports, key elements visible.`,
-    workflow: `\nGenerate end-to-end workflow tests simulating real user journeys from start to finish. Include happy paths and error scenarios.`,
-  }
-
-  return base + (extras[kind] || '')
-}
-
-function buildUserPrompt(
-  kind: string,
-  context: { pages?: unknown[]; apiEndpoints?: unknown[]; workflows?: unknown[] },
-  prd: string,
-  projectInfo: Record<string, string>,
-) {
-  let prompt = `Generate Playwright ${kind} tests.\n\n## Project\n- Name: ${projectInfo.name || 'App'}\n- Base URL: ${projectInfo.baseURL || 'http://localhost:3000'}\n- Framework: ${projectInfo.framework || 'Unknown'}\n\n`
-
-  if (kind === 'frontend' && context.pages?.length) {
-    prompt += `## Pages\n${JSON.stringify(context.pages, null, 2)}\n\n`
-  }
-  if (kind === 'backend' && context.apiEndpoints?.length) {
-    prompt += `## API Endpoints\n${JSON.stringify(context.apiEndpoints, null, 2)}\n\n`
-  }
-  if (kind === 'workflow' && context.workflows?.length) {
-    prompt += `## Workflows\n${JSON.stringify(context.workflows, null, 2)}\n\n`
-  }
-  if (prd) {
-    prompt += `## PRD\n${prd}\n\n`
-  }
-
-  prompt += 'Return as JSON array of test files.'
-  return prompt
+  return { ok: true, set: new Set(cleaned as AgentName[]) }
 }
 
 // ── Main POST handler ─────────────────────────────────────────────────
 export async function POST(request: NextRequest) {
   try {
     // 0. Validate server-side key exists
-    if (!OPENAI_API_KEY) {
+    if (!process.env.OPENAI_API_KEY) {
       return NextResponse.json({ error: 'Server OpenAI key not configured' }, { status: 503 })
     }
 
+    // 1. API key presence check (header or body)
+    const rawKey = request.headers.get('x-api-key') ?? null
     const body = await request.json()
-    const { api_key, context, testType, prd, projectInfo } = body
+    const api_key: string = rawKey ?? body?.api_key ?? ''
 
-    // 1. Validate required fields
     if (!api_key) {
-      return NextResponse.json({ error: 'Missing api_key' }, { status: 400 })
+      logBlockedRequest({ type: 'MISSING_API_KEY', reason: 'No x-api-key header or api_key body field', endpoint: ENDPOINT })
+      return NextResponse.json({ error: 'Missing api_key' }, { status: 401 })
     }
 
-    // 2. Authenticate
+    // 2. Authenticate — validate key, check isActive and NOT revoked, check expiry
     const keyHash = hashApiKey(api_key)
     const [apiKeyRecord] = await db
-      .select({ id: apiKeys.id, userId: apiKeys.userId, isActive: apiKeys.isActive })
+      .select({ id: apiKeys.id, userId: apiKeys.userId, isActive: apiKeys.isActive, revoked: apiKeys.revoked, expiresAt: apiKeys.expiresAt })
       .from(apiKeys)
       .where(and(eq(apiKeys.keyHash, keyHash), eq(apiKeys.isActive, true)))
       .limit(1)
 
     if (!apiKeyRecord) {
+      logBlockedRequest({ type: 'INVALID_API_KEY', reason: 'Key not found or inactive', endpoint: ENDPOINT })
       return NextResponse.json({ error: 'Invalid or inactive API key' }, { status: 401 })
+    }
+
+    if (apiKeyRecord.revoked) {
+      logBlockedRequest({ type: 'REVOKED_API_KEY', user_id: apiKeyRecord.userId, reason: 'API key has been revoked', endpoint: ENDPOINT })
+      return NextResponse.json({ error: 'API key has been revoked' }, { status: 401 })
+    }
+
+    if (apiKeyRecord.expiresAt && apiKeyRecord.expiresAt < new Date()) {
+      logBlockedRequest({ type: 'EXPIRED_API_KEY', user_id: apiKeyRecord.userId, reason: 'API key has expired', endpoint: ENDPOINT })
+      return NextResponse.json({ error: 'API key has expired' }, { status: 401 })
     }
 
     const userId = apiKeyRecord.userId
 
-    // 3. Deduct 1 credit
-    try {
-      const [profile] = await db
-        .select({ creditsRemaining: profiles.creditsRemaining })
-        .from(profiles)
-        .where(eq(profiles.id, userId))
-        .limit(1)
-
-      if (profile && typeof profile.creditsRemaining === 'number') {
-        if (profile.creditsRemaining <= 0) {
-          return NextResponse.json({ error: 'No credits remaining' }, { status: 402 })
-        }
-        await db
-          .update(profiles)
-          .set({ creditsRemaining: Math.max(0, profile.creditsRemaining - 1) })
-          .where(eq(profiles.id, userId))
-      }
-    } catch (e) {
-      console.warn('[generate-tests] credit deduction failed:', e)
+    // 3. Rate limit check
+    const rateResult = await checkRateLimit({ keyHash, userId, endpoint: ENDPOINT })
+    if (!rateResult.allowed) {
+      return NextResponse.json(
+        { error: 'RATE_LIMIT_EXCEEDED' },
+        { status: 429, headers: { 'Retry-After': String(rateResult.retryAfter ?? 1) } }
+      )
     }
 
-    // 4. Update last_used_at
+    // 4. Concurrency limit check
+    const concurrencyResult = await checkConcurrencyLimit({ userId, endpoint: ENDPOINT })
+    if (!concurrencyResult.allowed) {
+      return NextResponse.json({ error: 'CONCURRENT_LIMIT_EXCEEDED' }, { status: 429 })
+    }
+
+    // 5. Idempotency check
+    const idempotencyKey = request.headers.get('x-idempotency-key')
+    if (idempotencyKey) {
+      const idempotencyResult = await checkIdempotency({ idempotencyKey, userId, endpoint: ENDPOINT })
+      if (idempotencyResult.isDuplicate) {
+        return NextResponse.json(idempotencyResult.cachedBody)
+      }
+    }
+
+    // 6. Input validation
+    const validationError = validateGenerateTests(body)
+    if (validationError) {
+      return NextResponse.json(validationError, { status: 422 })
+    }
+
+    // 6a. Validate optional agents[] body field. When present, only the named
+    // agents run — this is how the MCP chunks generation across multiple <60s
+    // Vercel invocations. Omitted / null / false → run all agents (back-compat).
+    const agentsResult = normalizeAgents((body as { agents?: unknown }).agents)
+    if (agentsResult.ok === false) {
+      const errPayload: Record<string, unknown> = {
+        error: agentsResult.code,
+        allowed: KNOWN_AGENTS,
+      }
+      if (agentsResult.code === 'INVALID_AGENTS' && agentsResult.unknown) {
+        errPayload.unknown = agentsResult.unknown
+      }
+      return NextResponse.json(errPayload, { status: 400 })
+    }
+    const agentsAllowlist = agentsResult.set
+
+    // 6b. Optional per-agent plan slice. When the MCP ran the P1.5 planner
+    // pre-pass, it projects a slice per agent and passes it through here so
+    // the agent-level prompt can scope itself to "only these targets". A
+    // planVersion mismatch means the caller is on an old client / schema
+    // drift; we reject eagerly rather than silently ignore the slice.
+    const planBody = (body as { plan?: { slice?: unknown; planVersion?: unknown } }).plan
+    let agentPlanSlice: Record<string, unknown> | undefined
+    if (planBody) {
+      if (planBody.planVersion !== CURRENT_PLAN_VERSION) {
+        return NextResponse.json(
+          { error: 'INCOMPATIBLE_PLAN_VERSION', expected: CURRENT_PLAN_VERSION, got: planBody.planVersion ?? null },
+          { status: 400 },
+        )
+      }
+      if (planBody.slice && typeof planBody.slice === 'object' && !Array.isArray(planBody.slice)) {
+        agentPlanSlice = planBody.slice as Record<string, unknown>
+      }
+    }
+
+    // 7. AI cost guard
+    const aiGuardResult = await checkAiGuard({ userId, endpoint: ENDPOINT })
+    if (!aiGuardResult.allowed) {
+      return NextResponse.json({ error: 'RATE_LIMIT_EXCEEDED' }, { status: 429 })
+    }
+
+    // 8. Token balance gate — check before making AI calls
+    const tokenCheck = await checkTokenBalance({ userId, endpoint: ENDPOINT, minRequired: MIN_TOKENS_GENERATE, recommended: REC_TOKENS_GENERATE })
+    if (!tokenCheck.allowed) {
+      return NextResponse.json({ error: tokenCheck.reason }, { status: 402 })
+    }
+
+    // Update last_used_at
     await db
       .update(apiKeys)
       .set({ lastUsedAt: new Date() })
       .where(eq(apiKeys.id, apiKeyRecord.id))
 
-    // 5. Generate tests
-    const ctx = context || { pages: [], apiEndpoints: [], workflows: [] }
-    const info = projectInfo || { name: 'App', framework: 'Unknown', baseURL: 'http://localhost:3000' }
-    const type = testType || 'both'
-    const prdContent = prd || ''
+    // ── Dual-mode decision: sync (Phase 1) vs async Inngest enqueue (Phase 2) ──
+    //
+    // Async path is opt-in per-request via `x-healix-async: 1` header (or
+    // `body.async: true`) AND gated by either the global env flag
+    // `HEALIX_GEN_ASYNC=true` or the per-user early-access override
+    // `profile.settings.gen_async_enabled=true`. Legacy MCP clients that
+    // never send the header stay on the sync path even when the env flag
+    // is on — a zero-risk rollout.
+    //
+    // Manual smoke test for this block:
+    //   curl -X POST http://localhost:3000/api/generate-tests \
+    //     -H "x-api-key: $HEALIX_KEY" \
+    //     -H "x-healix-async: 1" \
+    //     -H "content-type: application/json" \
+    //     -d '{"context":{},"testType":"backend","projectInfo":{"apiOnly":true}}'
+    //   # expect: { jobId, status:"queued", agentsRequested, pollUrl } with HTTP 202
+    const asyncHeader = request.headers.get('x-healix-async')
+    const asyncBodyFlag = (body as { async?: unknown })?.async === true
+    // Best-effort user-level override lookup. The `profiles` table doesn't
+    // currently carry a `settings` jsonb, so this cast stays a no-op until
+    // that column ships — at which point the override lights up automatically
+    // without further code change. Failures are swallowed: if we can't read
+    // the row we just fall back to env-only gating.
+    let userOverrideEnabled = false
+    try {
+      const [profile] = await db
+        .select()
+        .from(profiles)
+        .where(eq(profiles.id, userId))
+        .limit(1)
+      userOverrideEnabled = Boolean(
+        (profile as unknown as { settings?: { gen_async_enabled?: unknown } })?.settings?.gen_async_enabled
+      )
+    } catch {
+      // swallow: env flag remains the only gate
+    }
+    const flagEnabled = process.env.HEALIX_GEN_ASYNC === 'true' || userOverrideEnabled
+    const wantAsync = (asyncHeader === '1' || asyncBodyFlag) && flagEnabled
 
-    const allTests: Array<{ filename: string; content: string; type: string }> = []
+    let fallbackToSync = false
 
-    // Frontend tests
-    if (type === 'frontend' || type === 'both') {
-      const raw = await callOpenAI([
-        { role: 'system', content: systemPrompt('frontend', info) },
-        { role: 'user', content: buildUserPrompt('frontend', ctx, prdContent, info) },
-      ])
-      allTests.push(...parseTestFiles(raw, 'frontend'))
+    if (wantAsync) {
+      // 1. Per-user concurrent-job cap. `count(*)` here is cheap because
+      //    the partial index `generation_jobs_status_idx` covers
+      //    WHERE status IN ('queued','running') — Postgres plans this as
+      //    an index-only scan on a tiny row subset. We also report the
+      //    true in-flight count in the error message via future edits.
+      const MAX_CONCURRENT_JOBS = 3
+      const inFlight = await db
+        .select({ count: sql<number>`count(*)` })
+        .from(generationJobs)
+        .where(
+          and(
+            eq(generationJobs.userId, userId),
+            inArray(generationJobs.status, ['queued', 'running'])
+          )
+        )
+      const currentInFlight = Number(inFlight[0]?.count ?? 0)
+      if (currentInFlight >= MAX_CONCURRENT_JOBS) {
+        return NextResponse.json(
+          {
+            error: 'TOO_MANY_CONCURRENT_JOBS',
+            message: `You have ${MAX_CONCURRENT_JOBS} generation jobs in flight. Wait for one to complete.`,
+          },
+          { status: 429 }
+        )
+      }
+
+      // 2. Determine the agent list. Either the caller pinned the set
+      //    explicitly via `body.agents[]` (already validated above into
+      //    `agentsAllowlist`), or we run the same rule-based planner the
+      //    sync path uses so the Inngest orchestrator fans out the same
+      //    shape the sync path would have produced.
+      let agentsRequested: AgentName[]
+      if (agentsAllowlist && agentsAllowlist.size > 0) {
+        agentsRequested = Array.from(agentsAllowlist)
+      } else {
+        const plan = planAgents({
+          testType: (body.testType || 'both') as 'frontend' | 'backend' | 'both',
+          projectInfo: (body.projectInfo || {}) as ProjectInfo,
+          context: (body.context || {}) as CapturedContext,
+          parsedPRD: (body.parsedPRD || null) as ParsedPRD | null,
+          explorationArtifact: (body.explorationArtifact || null) as ExplorationArtifact | null,
+          options: (body.options || {}) as GenerationOptions,
+        })
+        agentsRequested = plan.agents
+      }
+
+      // 3. Per-user idempotency: if a prior job exists for the same
+      //    (userId, idempotencyKey), replay the 202 shape. Honors both the
+      //    header and the body field — same contract as the sync path.
+      const asyncIdemKey =
+        request.headers.get('x-idempotency-key') ||
+        (typeof (body as { idempotencyKey?: unknown })?.idempotencyKey === 'string'
+          ? ((body as { idempotencyKey?: string }).idempotencyKey as string)
+          : null)
+      if (asyncIdemKey) {
+        const [existing] = await db
+          .select()
+          .from(generationJobs)
+          .where(
+            and(
+              eq(generationJobs.userId, userId),
+              eq(generationJobs.idempotencyKey, asyncIdemKey)
+            )
+          )
+          .limit(1)
+        if (existing) {
+          return NextResponse.json(
+            {
+              jobId: existing.id,
+              status: existing.status,
+              agentsRequested: existing.agentsRequested ?? [],
+              pollUrl: `/api/generate-tests/jobs/${existing.id}`,
+            },
+            { status: 202 }
+          )
+        }
+      }
+
+      // 4. Insert the job row with the frozen payload. The Inngest worker
+      //    re-hydrates the request from this row, so we store the *raw*
+      //    validated body (including `plan.slice` etc.) rather than the
+      //    post-unpack variables.
+      const [inserted] = await db
+        .insert(generationJobs)
+        .values({
+          userId,
+          apiKeyId: apiKeyRecord.id,
+          status: 'queued',
+          payload: body as Record<string, unknown>,
+          agentsRequested: agentsRequested as string[],
+          idempotencyKey: asyncIdemKey,
+        })
+        .returning({ id: generationJobs.id })
+
+      const jobId = inserted.id
+
+      // 5. Send the Inngest event. On failure we mark the orphaned row as
+      //    failed (best-effort) and FALL THROUGH to the sync path so the
+      //    caller gets a real 200 response rather than a 500 — an
+      //    Inngest outage must never turn into a user-visible outage.
+      try {
+        await inngest.send({ name: 'generation/job.requested', data: { jobId } })
+      } catch (inngestErr) {
+        const msg = inngestErr instanceof Error ? inngestErr.message : String(inngestErr)
+        console.warn('[generate-tests] inngest.send failed, falling back to sync', {
+          jobId,
+          err: msg,
+        })
+        await db
+          .update(generationJobs)
+          .set({
+            status: 'failed',
+            completedAt: new Date(),
+            error: { reason: 'inngest_send_failed', message: msg },
+          })
+          .where(eq(generationJobs.id, jobId))
+          .catch(() => {
+            /* swallow; best-effort cleanup */
+          })
+        fallbackToSync = true
+      }
+
+      if (!fallbackToSync) {
+        const responsePayload = {
+          jobId,
+          status: 'queued' as const,
+          agentsRequested,
+          pollUrl: `/api/generate-tests/jobs/${jobId}`,
+        }
+        if (asyncIdemKey) {
+          await storeIdempotencyResult({
+            idempotencyKey: asyncIdemKey,
+            userId,
+            endpoint: ENDPOINT,
+            responseBody: responsePayload,
+          })
+        }
+        console.log('[generate-tests] async-enqueue', {
+          userId,
+          jobId,
+          agents: agentsRequested,
+        })
+        return NextResponse.json(responsePayload, { status: 202 })
+      }
+      // fall through to the sync path below
     }
 
-    // Backend tests
-    if (type === 'backend' || type === 'both') {
-      const raw = await callOpenAI([
-        { role: 'system', content: systemPrompt('backend', info) },
-        { role: 'user', content: buildUserPrompt('backend', ctx, prdContent, info) },
-      ])
-      allTests.push(...parseTestFiles(raw, 'api'))
-    }
+    // Business logic
+    const { context, testType, prd, parsedPRD, explorationArtifact, roles, projectInfo, options } = body
 
-    // Workflow tests
-    if (ctx.workflows?.length) {
-      const raw = await callOpenAI([
-        { role: 'system', content: systemPrompt('workflow', info) },
-        { role: 'user', content: buildUserPrompt('workflow', ctx, prdContent, info) },
-      ])
-      allTests.push(...parseTestFiles(raw, 'workflow'))
-    }
+    const ctx = (context || {}) as CapturedContext
+    const info = (projectInfo || {}) as ProjectInfo
+    const type = (testType || 'both') as 'frontend' | 'backend' | 'both'
+    const prdContent = (prd || '') as string
+    const genOptions = (options || {}) as GenerationOptions
+    const parsedPRDInput = (parsedPRD || null) as ParsedPRD | null
+    const explorationInput = (explorationArtifact || null) as ExplorationArtifact | null
+    const rolesInput = Array.isArray(roles) ? (roles as Role[]) : []
 
-    // Smoke tests fallback
-    if (allTests.length === 0) {
-      const raw = await callOpenAI([
-        { role: 'system', content: systemPrompt('smoke', info) },
-        { role: 'user', content: buildUserPrompt('smoke', ctx, prdContent, info) },
-      ])
-      allTests.push(...parseTestFiles(raw, 'smoke'))
-    }
-
-    return NextResponse.json({
-      success: true,
-      tests: allTests,
-      count: allTests.length,
+    // Per-agent telemetry. Each generator agent (smoke/frontend/api/workflow/
+    // error/expansion) emits one `recordAiCall` row tagged with the agent name,
+    // latency, and its own token usage — the rows drive the per-agent dashboard
+    // (SELECT agent, AVG(latency_ms), SUM(tokens_total) FROM ... GROUP BY agent).
+    const agentTelemetry: AgentRunRecord[] = []
+    const runId = request.headers.get('x-healix-run-id') || null
+    // Cooperative cancellation across the parallel fan-out. The moment any
+    // agent's debit lands and zeroes the user's balance we abort the
+    // remaining agents — they stop streaming OpenAI tokens we cannot bill
+    // for. Margin protection without a pre-flight buffer that would reject
+    // users who have just enough to start.
+    const generationAbort = new AbortController()
+    const { files: generatedFiles, summary, plan } = await dispatchAgents({
+      context: ctx,
+      prd: prdContent,
+      parsedPRD: parsedPRDInput,
+      explorationArtifact: explorationInput,
+      roles: rolesInput,
+      testType: type,
+      projectInfo: info,
+      options: genOptions,
+      agentsAllowlist: agentsAllowlist ?? undefined,
+      agentPlanSlice,
+      abortSignal: generationAbort.signal,
+      generatorConfig: {
+        apiKey: process.env.OPENAI_API_KEY,
+        model: process.env.OPENAI_MODEL || 'gpt-4.1-mini',
+        fallbackOnFailure: genOptions.strictAIGeneration !== true,
+        enforceValidation: true,
+        syntaxValidationMode: 'fail-open',
+        strictAIGeneration: genOptions.strictAIGeneration === true,
+        // Localhost-first: generation legitimately runs for minutes under
+        // gpt-5.4-mini high-reasoning, especially for the frontend and error
+        // agents. HEALIX_OPENAI_TIMEOUT_MS lets operators tighten this
+        // when running behind a reverse proxy with its own budget.
+        timeout: Number(process.env.HEALIX_OPENAI_TIMEOUT_MS) || 540_000,
+      },
+      onAgentComplete: async (record) => {
+        agentTelemetry.push(record)
+        // Per-agent ledger entry — gives `SELECT agent, SUM(tokens_total) FROM
+        // token_ledger GROUP BY agent` for free, with input/output split and
+        // snapshotted rates. Telemetry row stays for ops dashboards.
+        if (record.success && (record.tokensTotal ?? 0) > 0) {
+          const usage = await recordTokenUsage({
+            userId,
+            endpoint: ENDPOINT,
+            agent: record.agent,
+            model: resolveModel(record.modelUsed),
+            tokensInput:  record.tokensPrompt ?? 0,
+            tokensOutput: record.tokensCompletion ?? 0,
+            referenceType: 'test_run',
+            referenceId: runId,
+          })
+          // Balance just hit 0 — abort siblings still talking to OpenAI.
+          if (usage && usage.balanceAfter <= 0 && !generationAbort.signal.aborted) {
+            generationAbort.abort(new Error('CREDITS_EXHAUSTED'))
+          }
+        }
+        await recordAiCall({
+          userId,
+          apiKeyId: apiKeyRecord.id,
+          endpoint: ENDPOINT,
+          agent: record.agent,
+          latencyMs: record.latencyMs,
+          modelUsed: resolveModel(record.modelUsed),
+          tokensPrompt: record.tokensPrompt,
+          tokensCompletion: record.tokensCompletion,
+          tokensTotal: record.tokensTotal,
+          success: record.success,
+          errorCode: record.errorCode ?? null,
+          runId,
+        })
+      },
     })
+
+    const responseBody = {
+      success: true,
+      tests: generatedFiles,
+      count: generatedFiles.length,
+      generationMeta: summary.generationMeta,
+      byType: summary.byType,
+      agentPlan: plan,
+      agentRuns: agentTelemetry,
+    }
+
+    // 9. Store idempotency result
+    if (idempotencyKey) {
+      await storeIdempotencyResult({ idempotencyKey, userId, endpoint: ENDPOINT, responseBody })
+    }
+
+    // 10. Async abuse detection (non-blocking)
+    runAbuseDetection({ userId, apiKeyId: apiKeyRecord.id }).catch((err: unknown) => {
+      console.error('[generate-tests] abuse detection failed', err)
+    })
+
+    return NextResponse.json(responseBody)
   } catch (error) {
     console.error('[generate-tests] error:', error)
+    const errCode = (error as NodeJS.ErrnoException).code
+    const status =
+      errCode === 'OPENAI_KEY_MISSING'
+        ? 503
+        : errCode === 'AI_GENERATION_INSUFFICIENT' || errCode === 'MIN_TEST_COUNT_NOT_MET' || errCode === 'COVERAGE_GATES_FAILED'
+          ? 422
+          : 500
     return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Internal server error' },
-      { status: 500 },
+      {
+        error: error instanceof Error ? error.message : 'Internal server error',
+        code: errCode || null,
+      },
+      { status },
     )
   }
 }

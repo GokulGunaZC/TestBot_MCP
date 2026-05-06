@@ -8,16 +8,13 @@ node_modules/
 
 # Test outputs
 test-results/
-testbot-reports/
+healix-reports/
 playwright-report/
 .last-run.json
 
-# Cache
-.testbot-cascade/
-.testbot-windsurf/
-.testbot-jira-cache/
-.cascade-temp/
-.cascade-workspace/
+# Healix local state
+.healix/
+.healix-jira-cache/
 .ai-agent-temp/
 ai-agent-requests/
 
@@ -39,3 +36,7 @@ npm-debug.log*
 
 # Debug
 debug/
+
+# Notebooks (local data exploration — never commit)
+notebooks/
+.claude/

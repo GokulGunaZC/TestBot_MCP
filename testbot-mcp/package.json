@@ -1,10 +1,10 @@
 {
-  "name": "@testbot/mcp",
-  "version": "1.1.0",
-  "description": "Testbot MCP Server",
+  "name": "@healix/mcp",
+  "version": "2.0.0",
+  "description": "Healix MCP Server — thin client, billing via Healix webapp (HEALIX_API_KEY only)",
   "main": "src/index.js",
   "bin": {
-    "testbot-mcp": "bin/testbot-mcp.js"
+    "healix-mcp": "bin/healix-mcp.js"
   },
   "scripts": {
     "start": "node src/index.js",
@@ -21,26 +21,30 @@
     "openai",
     "test-generation"
   ],
-  "author": "",
+  "author": "Zapminds",
   "license": "MIT",
   "files": [
     "bin/",
     "src/",
     "dashboard/",
+    "scripts/",
     "mcp-launcher.js"
   ],
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
     "@playwright/test": "^1.49.0",
     "dotenv": "^16.3.1",
+    "form-data": "^4.0.0",
     "node-fetch": "^2.7.0",
     "open": "^8.4.2",
+    "sharp": "^0.33.0",
+    "yauzl": "^3.3.0",
     "zod": "^3.25.0"
-  },
-  "optionalDependencies": {
-    "openai": "^4.28.0"
   },
   "engines": {
     "node": ">=18.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }
