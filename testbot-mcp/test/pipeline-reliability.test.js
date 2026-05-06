@@ -276,12 +276,16 @@ test('quality audit rejects brittle implementation-detail UI assertions', () => 
       await expect(page.getByRole('dialog')).toBeVisible();
       await page.getByRole('button', { name: 'Next Month' }).click();
       await expect(page.getByRole('button', { name: 'Standup' })).toBeVisible();
+      await expect(page.getByRole('heading', { level: 1, name: 'May 2026 —Monthly View' })).toBeVisible();
+      await page.getByRole('button', { name: 'Previous Month' }).click();
+      await expect(page.getByRole('heading', { level: 2, name: 'Showing May 2026' })).toBeVisible();
       const teamFilter = page.locator('select');
       const label = 'Alpha Team';
       await teamFilter.selectOption('t1');
       await expect(page.getByText(label)).toBeVisible();
       await expect(page.getByText('Due: Dec 1')).toBeVisible();
       await expect(page.getByText('Review')).toBeVisible();
+      await expect(page.getByRole('button', { name: /Priority: MediumAPI Schema Validation/ })).toBeVisible();
     });
   `, (projectPath) => {
     const srcDir = path.join(projectPath, 'src');
@@ -307,6 +311,8 @@ test('quality audit rejects brittle implementation-detail UI assertions', () => 
     assert.ok(audit.errors.some((error) => error.startsWith('brittle_select_option_label_visibility:')));
     assert.ok(audit.errors.some((error) => error.startsWith('brittle_invented_due_label:')));
     assert.ok(audit.errors.some((error) => error.startsWith('brittle_ambiguous_single_word_text:')));
+    assert.ok(audit.errors.some((error) => error.startsWith('brittle_stale_month_after_navigation:')));
+    assert.ok(audit.errors.some((error) => error.startsWith('brittle_concatenated_accessible_name_regex:')));
   });
 });
 

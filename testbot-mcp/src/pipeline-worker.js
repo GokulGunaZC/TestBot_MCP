@@ -2972,9 +2972,11 @@ function auditGeneratedTestQuality({ projectPath, testType, context, exploration
   const unprovenNewProjectDialogPattern = /getByRole\(\s*['"`]button['"`]\s*,\s*\{[^}]*name\s*:\s*['"`]New Project['"`][^}]*\}\s*\)\.click\(\)[\s\S]{0,1200}getByRole\(\s*['"`]dialog['"`]\s*\)/i;
   const selectOptionVisibleLabelPattern = /selectOption\([\s\S]{0,500}getByText\(\s*(?:label|teamLabel|optionLabel)\s*\)[\s\S]{0,160}\.toBeVisible\(/i;
   const crossMonthEventAssertionPattern = /getByRole\(\s*['"`]button['"`]\s*,\s*\{[^}]*name\s*:\s*['"`]Next Month['"`][^}]*\}\s*\)\.click\(\)[\s\S]{0,1200}getByRole\(\s*['"`]button['"`]\s*,\s*\{[^}]*name\s*:\s*['"`](?:Standup|Planning|Review)['"`][^}]*\}\s*\)/i;
+  const staleMonthAfterNavigationPattern = /getByRole\(\s*['"`]button['"`]\s*,\s*\{[^}]*name\s*:\s*['"`](?:Next Month|Previous Month)['"`][^}]*\}\s*\)\.click\(\)[\s\S]{0,1400}(?:getByRole\(\s*['"`]heading['"`][\s\S]{0,300}name\s*:\s*['"`](?:May 2026|Showing May 2026|May 2026\s*—\s*Monthly View)['"`]|toHaveText\(\s*['"`](?:May 2026|Showing May 2026|May 2026\s*—\s*Monthly View)['"`])/i;
   const resetThenAddWidgetPattern = /getByRole\(\s*['"`]button['"`]\s*,\s*\{[^}]*name\s*:\s*['"`]Reset Layout['"`][^}]*\}\s*\)\.click\(\)[\s\S]{0,800}getByRole\(\s*['"`]button['"`]\s*,\s*\{[^}]*name\s*:\s*['"`]Add widget['"`][^}]*\}\s*\)/i;
   const inventedDueLabelPattern = /getByText\(\s*['"`]Due:\s*(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\b[^'"`]*['"`]/i;
   const ambiguousSingleWordTextPattern = /getByText\(\s*['"`](?:Standup|Planning|Review)['"`]\s*\)/i;
+  const roleNameRegexPattern = /getByRole\(\s*['"`][^'"`]+['"`]\s*,\s*\{[\s\S]{0,320}?\bname\s*:\s*\/([^/\n]{12,220})\/[a-z]*/gi;
   const riskyUiPattern = /page\.pause\(/i;
   const riskyPhrasesPattern = /(invalid credentials|email is required|password is required|network error|try again|not found|does not exist|cannot find)/gi;
   const enforcePhraseRiskGates = String(process.env.HEALIX_ENFORCE_PHRASE_RISK_GATES || '').toLowerCase() === 'true';
@@ -3005,10 +3007,9 @@ function auditGeneratedTestQuality({ projectPath, testType, context, exploration
 
   const looksLikeConcatenatedAccessibleName = (value) => {
     const text = String(value || '').replace(/\\['"`]/g, '').trim();
+    if (/[a-z][A-Z]/.test(text)) return true;
     if (text.length < 45) return false;
-    const compact = text.replace(/\s+/g, '');
     if (text.length >= 80) return true;
-    if (/[a-z][A-Z]/.test(compact)) return true;
     return /(Priority:\s*\w+.*Due:|Assignee:|Update[A-Z]|Validation[A-Z]|Integration[A-Z])/i.test(text);
   };
 
@@ -3171,6 +3172,10 @@ function auditGeneratedTestQuality({ projectPath, testType, context, exploration
         recordBrittlePattern('brittle_cross_month_event_assertion', name);
       }
 
+      if (staleMonthAfterNavigationPattern.test(content)) {
+        recordBrittlePattern('brittle_stale_month_after_navigation', name);
+      }
+
       if (resetThenAddWidgetPattern.test(content)) {
         recordBrittlePattern('brittle_reset_then_add_widget_assertion', name);
       }
@@ -3191,6 +3196,12 @@ function auditGeneratedTestQuality({ projectPath, testType, context, exploration
       for (const match of content.matchAll(roleNameStringPattern)) {
         if (looksLikeConcatenatedAccessibleName(match[2])) {
           recordBrittlePattern('brittle_concatenated_accessible_name', name);
+          break;
+        }
+      }
+      for (const match of content.matchAll(roleNameRegexPattern)) {
+        if (looksLikeConcatenatedAccessibleName(match[1])) {
+          recordBrittlePattern('brittle_concatenated_accessible_name_regex', name);
           break;
         }
       }
