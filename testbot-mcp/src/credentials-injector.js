@@ -38,6 +38,16 @@ const COMMON_LOGIN_PATHS = [
   '/account/login',
 ];
 
+const AUTH_STATE_NAME_RE = /(auth|session|token|jwt|supabase|sb-|next-auth|clerk|firebase|amplify|cognito|oidc|okta|access|refresh)/i;
+const WEAK_COOKIE_NAME_RE = /^(csrf|xsrf|_ga|_gid|_gat|ajs_|amplitude|intercom|visitor|locale|theme|pref)/i;
+const DEFAULT_SUCCESS_LOCATORS = [
+  'text=/log\\s*out/i',
+  'text=/sign\\s*out/i',
+  'text=/my account/i',
+  'text=/dashboard/i',
+  'text=/profile/i',
+];
+
 function authDirFor(projectPath) {
   return path.join(projectPath, AUTH_DIR_NAME);
 }
@@ -107,13 +117,180 @@ async function readVisibleAuthError(page, authFlow = null) {
 
   for (const selector of selectors) {
     try {
-      const text = await page.locator(selector).first().textContent({ timeout: 800 });
+      const locator = page.locator(selector).first();
+      const visible = await locator.isVisible({ timeout: 800 }).catch(() => false);
+      if (!visible) continue;
+      const text = await locator.textContent({ timeout: 800 });
       const trimmed = String(text || '').replace(/\s+/g, ' ').trim();
       if (trimmed && trimmed.length <= 240) return trimmed;
       if (trimmed) return trimmed.slice(0, 240);
     } catch { /* try next selector */ }
   }
   return null;
+}
+
+function pathFromUrl(value, fallback = '') {
+  try {
+    return new URL(value).pathname;
+  } catch {
+    return fallback;
+  }
+}
+
+function queryFromUrl(value) {
+  try {
+    return new URL(value).search;
+  } catch {
+    return '';
+  }
+}
+
+function isAuthLikeName(name) {
+  const raw = String(name || '');
+  return AUTH_STATE_NAME_RE.test(raw) && !WEAK_COOKIE_NAME_RE.test(raw);
+}
+
+function summarizeAuthStateEvidence({ cookies = [], storageKeys = [] } = {}) {
+  const authCookie = cookies.find((cookie) => (
+    cookie &&
+    cookie.value &&
+    isAuthLikeName(cookie.name)
+  ));
+  const authStorageKey = storageKeys.find((key) => isAuthLikeName(key));
+  return {
+    hasAuthState: Boolean(authCookie || authStorageKey),
+    cookieName: authCookie?.name || null,
+    storageKey: authStorageKey || null,
+  };
+}
+
+async function collectAuthStateEvidence(page, context, baseURL) {
+  const cookies = await context.cookies(baseURL).catch(() => []);
+  const storageState = await context.storageState().catch(() => ({ origins: [] }));
+  const localStorageKeys = (storageState.origins || [])
+    .flatMap((origin) => origin.localStorage || [])
+    .map((item) => item.name);
+  const browserStorageKeys = await page.evaluate(() => {
+    const keys = [];
+    try {
+      for (let i = 0; i < window.localStorage.length; i += 1) keys.push(window.localStorage.key(i));
+    } catch { /* ignore */ }
+    try {
+      for (let i = 0; i < window.sessionStorage.length; i += 1) keys.push(window.sessionStorage.key(i));
+    } catch { /* ignore */ }
+    return keys.filter(Boolean);
+  }).catch(() => []);
+  return summarizeAuthStateEvidence({
+    cookies,
+    storageKeys: unique([...localStorageKeys, ...browserStorageKeys]),
+  });
+}
+
+async function isAnyLocatorVisible(page, locators = [], timeout = 500) {
+  for (const selector of unique(locators)) {
+    try {
+      const visible = await page.locator(selector).first().isVisible({ timeout }).catch(() => false);
+      if (visible) return { visible: true, selector };
+    } catch { /* try next */ }
+  }
+  return { visible: false, selector: null };
+}
+
+function buildSuccessLocators(authFlow = null, credentials = {}) {
+  const locators = [
+    authFlow?.successIndicator,
+    ...DEFAULT_SUCCESS_LOCATORS,
+  ];
+  if (credentials?.username && String(credentials.username).includes('@')) {
+    locators.push(`text=${JSON.stringify(credentials.username)}`);
+  }
+  return unique(locators);
+}
+
+function shouldAcceptLoginVerification({
+  urlChanged = false,
+  successIndicatorVisible = false,
+  authStateEvidence = null,
+  failureVisible = false,
+} = {}) {
+  if (failureVisible) return false;
+  return Boolean(urlChanged || successIndicatorVisible || authStateEvidence?.hasAuthState);
+}
+
+async function waitForLoginVerification({
+  page,
+  context,
+  baseURL,
+  loginPathname,
+  authFlow,
+  credentials,
+  timeoutMs = 25_000,
+} = {}) {
+  const start = Date.now();
+  const successLocators = buildSuccessLocators(authFlow, credentials);
+  let last = {
+    finalPathname: loginPathname,
+    query: '',
+    authStateEvidence: null,
+    successSelector: null,
+    failureText: null,
+  };
+
+  while (Date.now() - start < timeoutMs) {
+    const currentUrl = page.url();
+    const finalPathname = pathFromUrl(currentUrl, loginPathname);
+    const query = queryFromUrl(currentUrl);
+    const failureText = await readVisibleAuthError(page, authFlow);
+    const failureVisible = Boolean(failureText) && finalPathname === loginPathname;
+    const marker = await isAnyLocatorVisible(page, successLocators, 500);
+    const authStateEvidence = await collectAuthStateEvidence(page, context, baseURL);
+    const urlChanged = finalPathname !== loginPathname;
+
+    last = {
+      finalPathname,
+      query,
+      authStateEvidence,
+      successSelector: marker.selector,
+      failureText,
+    };
+
+    if (shouldAcceptLoginVerification({
+      urlChanged,
+      successIndicatorVisible: marker.visible,
+      authStateEvidence,
+      failureVisible,
+    })) {
+      return {
+        ok: true,
+        signal: marker.visible
+          ? `success_selector:${marker.selector}`
+          : authStateEvidence.hasAuthState
+            ? `auth_state:${authStateEvidence.cookieName || authStateEvidence.storageKey}`
+            : `url_changed:${loginPathname}->${finalPathname}`,
+      };
+    }
+
+    if (failureVisible) {
+      return {
+        ok: false,
+        reason: `Login failed on ${loginPathname}: ${failureText}`,
+        terminal: true,
+      };
+    }
+
+    await page.waitForTimeout(500).catch(() => null);
+  }
+
+  const indicatorNote = authFlow?.successIndicator
+    ? `; successIndicator ${authFlow.successIndicator} was not observed`
+    : '';
+  const authStateNote = last.authStateEvidence?.hasAuthState
+    ? `; auth state present via ${last.authStateEvidence.cookieName || last.authStateEvidence.storageKey}`
+    : '; no auth-like cookie/localStorage/sessionStorage observed';
+  return {
+    ok: false,
+    reason: `Login verification timed out after submitting ${loginPathname}; final path ${last.finalPathname}${last.query || ''}${indicatorNote}${authStateNote}`,
+  };
 }
 
 /**
@@ -183,35 +360,36 @@ async function driveLogin({ baseURL, authFlow, credentials, storageStatePath }) 
           }),
         ]);
 
-        // Allow middleware chain redirects (e.g. /admin → / for non-admin users) to settle.
+        // Allow middleware chain redirects (e.g. /admin -> / for non-admin
+        // users) and client-side auth UI repainting to settle. Do not make a
+        // browser-use-provided successIndicator mandatory: SPAs often render
+        // account/logout markers in a delayed useEffect, and browser-use can
+        // choose a stale or over-specific locator. Accept any strong auth signal.
         await page.waitForLoadState('domcontentloaded', { timeout: 8_000 }).catch(() => null);
+        const verification = await waitForLoginVerification({
+          page,
+          context,
+          baseURL,
+          loginPathname,
+          authFlow: effectiveAuthFlow,
+          credentials,
+          timeoutMs: effectiveAuthFlow?.successIndicator ? 30_000 : 25_000,
+        });
 
-        // Primary signal: URL must have changed away from the login page.
-        // A successful Supabase auth always redirects; staying on the same page means failure.
-        const finalPathname = (() => { try { return new URL(page.url()).pathname; } catch { return loginPathname; } })();
-        let loginVerified = finalPathname !== loginPathname;
-
-        // Secondary signal: if a custom success indicator was provided, that overrides.
-        if (effectiveAuthFlow?.successIndicator) {
-          loginVerified = await page.locator(effectiveAuthFlow.successIndicator).first().isVisible({ timeout: 5_000 }).catch(() => false);
-        } else if (loginVerified && effectiveAuthFlow?.failureIndicator) {
-          // URL changed but still check no failure banner appeared (e.g. wrong-role redirect to error page)
-          const failureVisible = await page.locator(effectiveAuthFlow.failureIndicator).first().isVisible({ timeout: 1_000 }).catch(() => false);
-          if (failureVisible) loginVerified = false;
-        }
-
-        if (!loginVerified) {
-          const visibleError = await readVisibleAuthError(page, effectiveAuthFlow);
+        if (!verification.ok) {
+          const visibleError = verification.terminal
+            ? verification.reason.replace(/^Login failed on [^:]+:\s*/, '')
+            : await readVisibleAuthError(page, effectiveAuthFlow);
           return {
             ok: false,
             reason: visibleError
               ? `Login failed on ${loginPathname}: ${visibleError}`
-              : `Login success indicator not detected after submitting ${loginPathname}`,
+              : verification.reason,
           };
         }
 
         await context.storageState({ path: storageStatePath });
-        return { ok: true };
+        return { ok: true, signal: verification.signal };
       } catch (err) {
         lastError = err;
       }
@@ -267,4 +445,7 @@ module.exports = {
   stateFileFor,
   buildLoginCandidates,
   normalizeRoleLabel,
+  summarizeAuthStateEvidence,
+  shouldAcceptLoginVerification,
+  buildSuccessLocators,
 };

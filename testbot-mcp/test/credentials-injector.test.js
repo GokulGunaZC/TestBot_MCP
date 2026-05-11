@@ -3,8 +3,11 @@ const test = require('node:test');
 
 const {
   buildLoginCandidates,
+  buildSuccessLocators,
   normalizeRoleLabel,
+  shouldAcceptLoginVerification,
   stateFileFor,
+  summarizeAuthStateEvidence,
 } = require('../src/credentials-injector');
 
 test('credential injector probes common login routes when authFlow is unknown', () => {
@@ -58,4 +61,64 @@ test('credential injector normalizes role aliases for storageState names', () =>
   assert.equal(normalizeRoleLabel('Authenticated'), 'user');
   assert.equal(normalizeRoleLabel('QA Admin'), 'qa_admin');
   assert.match(stateFileFor('/tmp/app', 'Administrator'), /auth-state-admin\.json$/);
+});
+
+test('credential injector recognizes common auth storage evidence', () => {
+  assert.deepEqual(
+    summarizeAuthStateEvidence({
+      cookies: [{ name: '__Secure-next-auth.session-token', value: 'abc' }],
+      storageKeys: [],
+    }),
+    {
+      hasAuthState: true,
+      cookieName: '__Secure-next-auth.session-token',
+      storageKey: null,
+    },
+  );
+
+  assert.deepEqual(
+    summarizeAuthStateEvidence({
+      cookies: [{ name: '_ga', value: 'analytics' }],
+      storageKeys: ['sb-otanlyuasavknmdnvzxz-auth-token'],
+    }),
+    {
+      hasAuthState: true,
+      cookieName: null,
+      storageKey: 'sb-otanlyuasavknmdnvzxz-auth-token',
+    },
+  );
+});
+
+test('credential injector treats discovered successIndicator as advisory', () => {
+  assert.equal(shouldAcceptLoginVerification({
+    urlChanged: true,
+    successIndicatorVisible: false,
+    authStateEvidence: { hasAuthState: false },
+    failureVisible: false,
+  }), true);
+
+  assert.equal(shouldAcceptLoginVerification({
+    urlChanged: false,
+    successIndicatorVisible: false,
+    authStateEvidence: { hasAuthState: true, storageKey: 'sb-app-auth-token' },
+    failureVisible: false,
+  }), true);
+
+  assert.equal(shouldAcceptLoginVerification({
+    urlChanged: true,
+    successIndicatorVisible: true,
+    authStateEvidence: { hasAuthState: true },
+    failureVisible: true,
+  }), false);
+});
+
+test('credential injector checks durable logged-in markers and username text', () => {
+  const locators = buildSuccessLocators(
+    { successIndicator: 'nav >> text=Signed in' },
+    { username: 'customer@example.test' },
+  );
+
+  assert.ok(locators.includes('nav >> text=Signed in'));
+  assert.ok(locators.includes('text=/log\\s*out/i'));
+  assert.ok(locators.includes('text=\"customer@example.test\"'));
 });
