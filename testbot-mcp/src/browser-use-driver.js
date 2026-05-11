@@ -147,7 +147,7 @@ function driveExploration({
       // HEALIX_API_KEY is already in process.env; include it explicitly so it
       // is never accidentally shadowed by a dotenv override.
       HEALIX_API_KEY: process.env.HEALIX_API_KEY || '',
-      HEALIX_BROWSER_USE_MODEL: process.env.HEALIX_BROWSER_USE_MODEL || 'gpt-5.4-mini',
+      HEALIX_BROWSER_USE_MODEL: process.env.HEALIX_BROWSER_USE_MODEL || 'gpt-5.5-mini',
       // Direct OpenAI is the preferred local/free-tier browser-use path when
       // the Healix proxy is not available. Browser Use Cloud remains opt-in
       // via HEALIX_BROWSER_USE_PROVIDER=cloud or a last-resort fallback.

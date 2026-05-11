@@ -1,9 +1,11 @@
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
 const { spawnSync } = require('node:child_process');
 const path = require('node:path');
 const test = require('node:test');
 
 const runnerPath = path.join(__dirname, '..', 'scripts', 'browser_use_runner.py');
+const driverPath = path.join(__dirname, '..', 'src', 'browser-use-driver.js');
 
 function pythonCmd() {
   for (const cmd of ['python3', 'python']) {
@@ -56,4 +58,12 @@ test('browser-use task bounds login retries for async auth chrome apps', (t) => 
   assert.match(task, /Submit the login form at most ONE time/i);
   assert.match(task, /do\s+NOT retry login just because the navbar still shows Login\/Sign up/i);
   assert.match(task, /repaint auth chrome asynchronously/i);
+});
+
+test('browser-use defaults to gpt-5.5-mini for JSON-stable exploration', () => {
+  const runnerSource = fs.readFileSync(runnerPath, 'utf-8');
+  const driverSource = fs.readFileSync(driverPath, 'utf-8');
+
+  assert.match(runnerSource, /HEALIX_BROWSER_USE_MODEL",\s*"gpt-5\.5-mini"/);
+  assert.match(driverSource, /HEALIX_BROWSER_USE_MODEL:\s*process\.env\.HEALIX_BROWSER_USE_MODEL\s*\|\|\s*'gpt-5\.5-mini'/);
 });
