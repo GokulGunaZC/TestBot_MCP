@@ -779,6 +779,12 @@ function isBrittleGeneratedTestBlock(blockContent) {
     /(?:\bmain\b|page\.locator\(\s*['"`]main['"`]\s*\))[\s\S]{0,700}\.toContainText\(\s*['"`][A-Z][A-Z0-9 _&.-]{2,}['"`]\s*\)/i,
   ];
   if (brittlePatterns.some((pattern) => pattern.test(text))) return true;
+  if (looksLikeCartAssertionWithoutSetup(text)) return true;
+  if (looksLikeAuthGatedReviewWithoutAuth(text)) return true;
+  if (looksLikeAuthStateNavMismatch(text)) return true;
+  if (looksLikeExactCartAccessibleNameAssertion(text)) return true;
+  if (looksLikeCompressedHeadingWhitespaceAssertion(text)) return true;
+  if (looksLikeIncompleteProductCreateSuccessAssertion(text)) return true;
 
   for (const match of text.matchAll(/getByRole\(\s*['"`][^'"`]+['"`]\s*,\s*\{[\s\S]{0,320}?\bname\s*:\s*(['"`])([\s\S]*?)\1/gi)) {
     if (looksLikeConcatenatedGeneratedName(match[2])) return true;
@@ -1814,6 +1820,10 @@ function buildGenerationRepairContext({
     instructions.push('Remove brittle generated assertions: no DOM checkValidity(), no raw getComputedStyle assertions, no exact concatenated card accessible names, and no toContainText([...]) on a single container. Replace them with user-visible behavior assertions grounded in source text.');
     instructions.push('For cards with multiple text nodes, locate by the stable title text and assert metadata with toContainText() inside the card/container.');
     instructions.push('Do not assert dialogs, month-specific event chips, selected option labels, or invented formatted labels unless the exact behavior/text is proven by route/source context.');
+    instructions.push('Keep auth state consistent: @auth/@tierB tests must not assert Login/Sign up links, and public unauthenticated tests must not assert Logout/account chrome unless they first establish auth.');
+    instructions.push('Cart filled-state tests must add an item or seed cart state before asserting subtotal, checkout, or line items. Do not open /cart directly and expect items.');
+    instructions.push('For headings split across markup or line breaks, use whitespace-tolerant regex such as /One storefront,\\s*four stacks\\./ instead of a compressed exact string.');
+    instructions.push('API create/update success tests must send source-required fields; incomplete validation payloads belong in negative tests that expect 4xx.');
   }
   if (errors.some((item) => /source_reference|ungrounded_selector_text|ungrounded_route|ungrounded_ui_files/.test(String(item)))) {
     instructions.push('Regenerate from source evidence: every UI test must include a // [SRC:<relative-source-file>] comment naming a file from context.sourceContext.files.');
@@ -3497,6 +3507,46 @@ function looksLikeAuthGatedReviewWithoutAuth(blockContent) {
   return /#rating|getByLabel\([^)]*rating|getByRole\([^)]*(?:review|rating)|leave\s+a\s+review|submit\s+review/i.test(text);
 }
 
+function looksLikeAuthStateNavMismatch(blockContent) {
+  const text = String(blockContent || '');
+  const assertsUnauthedNav =
+    /getByRole\(\s*['"`](?:link|button)['"`]\s*,\s*\{[^}]*name\s*:\s*(?:\/[^/]*(?:log\s*in|login|sign\s*up|signup|create\s+account)[^/]*\/[a-z]*|['"`][^'"`]*(?:log\s*in|login|sign\s*up|signup|create\s+account)[^'"`]*['"`])/i.test(text);
+  if (hasAuthTag(text) && assertsUnauthedNav) return true;
+
+  const assertsAuthedNav =
+    /getByRole\(\s*['"`](?:link|button)['"`]\s*,\s*\{[^}]*name\s*:\s*(?:\/[^/]*(?:logout|log\s*out|sign\s*out)[^/]*\/[a-z]*|['"`][^'"`]*(?:logout|log\s*out|sign\s*out)[^'"`]*['"`])/i.test(text);
+  const establishesAuth =
+    hasAuthTag(text) ||
+    /storageState|\/api\/(?:auth\/)?(?:login|signin|session)|getByRole\([^)]*(?:log\s*in|login|sign\s*in)[\s\S]{0,260}\.click\(/i.test(text);
+  return assertsAuthedNav && !establishesAuth;
+}
+
+function looksLikeExactCartAccessibleNameAssertion(blockContent) {
+  const text = String(blockContent || '');
+  return /getByRole\(\s*['"`]link['"`]\s*,\s*\{[^}]*name\s*:\s*['"`]Cart['"`][^}]*\bexact\s*:\s*true/i.test(text);
+}
+
+function looksLikeCompressedHeadingWhitespaceAssertion(blockContent) {
+  const text = String(blockContent || '');
+  for (const match of text.matchAll(/getByRole\(\s*['"`]heading['"`]\s*,\s*\{[\s\S]{0,240}\bname\s*:\s*(['"`])([^'"`]+)\1/gi)) {
+    const name = match[2] || '';
+    if (/,[A-Za-z0-9]/.test(name)) return true;
+  }
+  return false;
+}
+
+function looksLikeIncompleteProductCreateSuccessAssertion(blockContent) {
+  const text = String(blockContent || '');
+  if (!/request\.post\(\s*['"`][^'"`]*\/api\/products(?:[/?#][^'"`]*)?['"`]/i.test(text)) return false;
+  if (!/(?:expect\(\s*\[\s*200\s*,\s*201\s*\]\s*\)\.toContain|toBe\(\s*20[01]\s*\)|toBeOK\(\s*\))/i.test(text)) return false;
+  const hasRequiredProductFields =
+    /\btitle\s*:/i.test(text) &&
+    /\bdescription\s*:/i.test(text) &&
+    /\bcategory\s*:/i.test(text) &&
+    /\bpriceCents\s*:/i.test(text);
+  return !hasRequiredProductFields;
+}
+
 function looksLikeUnprovenMissingCollectionError(content) {
   const text = String(content || '');
   const targetsMissingCollection =
@@ -3754,6 +3804,28 @@ function auditGeneratedTestQuality({ projectPath, testType, context, exploration
       summary.riskyFiles.push(name);
     }
 
+    const generatedBlocks = findGeneratedTestBlocks(content);
+    if (generatedBlocks.some((block) => looksLikeCartAssertionWithoutSetup(block.content))) {
+      recordBrittlePattern('brittle_cart_state_without_add_item_setup', name);
+    }
+
+    if (generatedBlocks.some((block) => looksLikeAuthGatedReviewWithoutAuth(block.content))) {
+      summary.authGatingFiles.push(name);
+      summary.errors.push(`auth_gated_review_form_without_auth_tag:${name}`);
+    }
+
+    if (generatedBlocks.some((block) => looksLikeAuthStateNavMismatch(block.content))) {
+      recordBrittlePattern('brittle_auth_state_nav_mismatch', name);
+    }
+
+    if (generatedBlocks.some((block) => looksLikeExactCartAccessibleNameAssertion(block.content))) {
+      recordBrittlePattern('brittle_exact_cart_accessible_name', name);
+    }
+
+    if (generatedBlocks.some((block) => looksLikeCompressedHeadingWhitespaceAssertion(block.content))) {
+      recordBrittlePattern('brittle_compressed_heading_whitespace', name);
+    }
+
     if (isApiFile) {
       summary.apiFiles += 1;
       const burstMatch = /Promise\.all|HEALIX_API_STRESS_BURST|burst|p95|percentile/i.test(content);
@@ -3765,6 +3837,12 @@ function auditGeneratedTestQuality({ projectPath, testType, context, exploration
       }
       if (looksLikeUnprovenMissingCollectionError(content)) {
         recordBrittlePattern('brittle_unproven_collection_missing_id_status', name);
+      }
+      if (
+        generatedBlocks.some((block) => looksLikeIncompleteProductCreateSuccessAssertion(block.content)) &&
+        projectSourceMatches(projectPath, /missing_fields[\s\S]{0,800}(title|description|category|priceCents)|priceCents[\s\S]{0,800}missing_fields/i)
+      ) {
+        recordBrittlePattern('brittle_incomplete_product_create_payload', name);
       }
     } else {
       summary.uiFiles += 1;
@@ -3898,16 +3976,6 @@ function auditGeneratedTestQuality({ projectPath, testType, context, exploration
           summary.authGatingFiles.push(name);
           summary.errors.push(`protected_route_missing_auth_tag:${name}:${untaggedAuthBlocks.length}`);
         }
-      }
-
-      const generatedBlocks = findGeneratedTestBlocks(content);
-      if (generatedBlocks.some((block) => looksLikeCartAssertionWithoutSetup(block.content))) {
-        recordBrittlePattern('brittle_cart_state_without_add_item_setup', name);
-      }
-
-      if (generatedBlocks.some((block) => looksLikeAuthGatedReviewWithoutAuth(block.content))) {
-        summary.authGatingFiles.push(name);
-        summary.errors.push(`auth_gated_review_form_without_auth_tag:${name}`);
       }
 
       if (
@@ -4467,6 +4535,20 @@ async function maybeRunCoverageTopUp({
     Math.min(20, decision.target - before.totalTests),
   );
   const routeAccessSummary = buildRouteAccessSummary(sharedPayload?.explorationArtifact || null);
+  let preTopUpAudit = null;
+  try {
+    preTopUpAudit = auditGeneratedTestQuality({
+      projectPath: config.projectPath,
+      testType: config.testType,
+      context: sharedPayload?.context || {},
+      explorationArtifact: sharedPayload?.explorationArtifact || null,
+      roles: sharedPayload?.roles || [],
+    });
+  } catch (auditErr) {
+    Logger.warn('PipelineWorker', 'Pre-top-up quality audit failed (non-fatal)', {
+      reason: auditErr?.message,
+    });
+  }
   const feedbackContext = buildGenerationRepairContext({
     context: sharedPayload?.context || {},
     error: {
@@ -4479,8 +4561,11 @@ async function maybeRunCoverageTopUp({
       minGeneratedTests: decision.target,
       minimumUsefulRunnableFloor: decision.minimumUsefulRunnableFloor,
       adaptiveRunnableFloor: decision.minimumUsefulRunnableFloor,
-      missingCategories: before.missingCategories || [],
-      errors: [],
+      missingCategories: preTopUpAudit?.missingCategories || before.missingCategories || [],
+      errors: [
+        ...(Array.isArray(preTopUpAudit?.errors) ? preTopUpAudit.errors : []),
+        ...(Array.isArray(preTopUpAudit?.warnings) ? preTopUpAudit.warnings : []),
+      ],
     },
     routeAccessSummary,
     attempt: 1,

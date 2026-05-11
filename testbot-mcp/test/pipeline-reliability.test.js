@@ -1275,6 +1275,124 @@ test('quality pruning removes only brittle generated test blocks inside a mixed 
   }
 });
 
+test('quality pruning removes cart and auth-state anti-pattern blocks without deleting file', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'healix-quality-prune-state-'));
+  try {
+    const generatedDir = path.join(root, 'tests', 'generated');
+    fs.mkdirSync(generatedDir, { recursive: true });
+    const content = `
+      import { test, expect } from '@playwright/test';
+
+      test('good product grid assertion', async ({ page }) => {
+        await page.goto('/products');
+        await expect(page.getByRole('heading', { name: /Products/i })).toBeVisible();
+      });
+
+      test('bad cart subtotal without setup', async ({ page }) => {
+        await page.goto('/cart');
+        await expect(page.getByText(/subtotal/i)).toBeVisible();
+      });
+
+      test('@auth bad authenticated nav assertion', async ({ page }) => {
+        await page.goto('/');
+        await expect(page.getByRole('link', { name: 'Login' })).toBeVisible();
+      });
+    `;
+    fs.writeFileSync(path.join(generatedDir, 'mixed-state.spec.ts'), content);
+
+    const recovery = pruneGeneratedTestsByQuality({
+      projectPath: root,
+      qualityAudit: {
+        errors: [
+          'brittle_cart_state_without_add_item_setup:mixed-state.spec.ts',
+          'brittle_auth_state_nav_mismatch:mixed-state.spec.ts',
+        ],
+      },
+      reason: 'test',
+    });
+
+    assert.equal(recovery.applied, true);
+    assert.deepEqual(recovery.prunedFiles.map((file) => ({
+      filename: file.filename,
+      removedTests: file.removedTests,
+      remainingTests: file.remainingTests,
+    })), [{ filename: 'mixed-state.spec.ts', removedTests: 2, remainingTests: 1 }]);
+
+    const nextContent = fs.readFileSync(path.join(generatedDir, 'mixed-state.spec.ts'), 'utf-8');
+    assert.equal(countTestsInContent(nextContent), 1);
+    assert.equal(nextContent.includes('good product grid assertion'), true);
+    assert.equal(nextContent.includes('bad cart subtotal'), false);
+    assert.equal(nextContent.includes('authenticated nav assertion'), false);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('quality audit rejects top-up nav, heading whitespace, and incomplete API payloads', () => {
+  withGeneratedSuite(`
+    import { test, expect } from '@playwright/test';
+
+    test('@auth rejects signed-in suite asserting login nav', async ({ page }) => {
+      // [SRC:src/App.tsx] navigation changes by auth state
+      await page.goto('/');
+      await expect(page.getByRole('link', { name: 'Login' })).toBeVisible();
+    });
+
+    test('rejects compressed hero heading', async ({ page }) => {
+      // [SRC:src/App.tsx] hero heading contains a line break
+      await page.goto('/');
+      await expect(page.getByRole('heading', { name: 'One storefront,four stacks.', level: 1 })).toBeVisible();
+    });
+
+    test('rejects exact cart link name', async ({ page }) => {
+      // [SRC:src/App.tsx] cart link contains a dynamic count
+      await page.goto('/');
+      await expect(page.getByRole('link', { name: 'Cart', exact: true })).toBeVisible();
+    });
+
+    test('rejects incomplete product create success', async ({ request }) => {
+      const res = await request.post('/api/products', { data: { title: 'Only title' } });
+      expect([200, 201]).toContain(res.status());
+    });
+  `, (projectPath) => {
+    const srcDir = path.join(projectPath, 'src');
+    fs.mkdirSync(srcDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(srcDir, 'App.tsx'),
+      `
+        export function App() {
+          return <><h1>One storefront,<br />four stacks.</h1><a aria-label="Cart">Cart<span data-testid="cart-count">0</span></a></>;
+        }
+        export async function POST(req) {
+          const { title, description, category, priceCents } = await req.json();
+          if (!title || !description || !category || !priceCents) return Response.json({ error: 'missing_fields' }, { status: 400 });
+        }
+      `,
+    );
+
+    const audit = auditGeneratedTestQuality({
+      projectPath,
+      testType: 'both',
+      context: {
+        pages: [{ path: '/', sourceFile: 'src/App.tsx' }],
+        sourceContext: {
+          files: [{ path: 'src/App.tsx' }],
+          assertableText: ['One storefront,', 'four stacks.', 'Cart'],
+        },
+        apiEndpoints: [{ method: 'POST', path: '/api/products', sourceFile: 'src/App.tsx' }],
+      },
+      explorationArtifact: { routes: [{ path: '/', requiresAuth: false }] },
+      roles: [{ role: 'user', loginVerified: true, storageStatePath: '/tmp/auth.json' }],
+    });
+
+    assert.equal(audit.valid, false);
+    assert.ok(audit.errors.some((error) => error.startsWith('brittle_auth_state_nav_mismatch:')));
+    assert.ok(audit.errors.some((error) => error.startsWith('brittle_compressed_heading_whitespace:')));
+    assert.ok(audit.errors.some((error) => error.startsWith('brittle_exact_cart_accessible_name:')));
+    assert.ok(audit.errors.some((error) => error.startsWith('brittle_incomplete_product_create_payload:')));
+  });
+});
+
 test('quality quarantine refuses to remove the entire generated suite', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'healix-quality-quarantine-all-'));
   try {

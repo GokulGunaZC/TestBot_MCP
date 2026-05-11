@@ -1785,6 +1785,11 @@ Return only the JSON array of generated files.`
 - Credential rule: generated tests must never invent real-looking email/password literals. If CONTEXT_JSON.meta.authContext.credentialFixtures is non-empty, API auth setup may use those exact username/password values only; UI protected-route tests must still use @auth/@tierB storageState. If credentialFixtures is empty, do not generate success login/API auth tests that require credentials.
 - Protected route rule: unauthenticated protected-route checks must assert the rendered auth boundary, not transport semantics. Do not require response.status() to be 3xx; accept either a /login URL or visible login/auth UI rendered in-place with HTTP 200.
 - Angular hash routing rule: if CONTEXT_JSON.meta.projectInfo.routingMode is "hash", preserve observed hash URLs such as /admin#/products. Never replace them with /admin/products unless routeAccess/source proves that exact path works.
+- Auth chrome state rule: @auth/@tierB tests run with a signed-in storageState. They must not assert unauthenticated nav such as Login, Sign up, Register, or Create account. Public unauthenticated tests must not assert Logout/account chrome unless the test first establishes auth.
+- Cart state rule: never open /cart and assert subtotal, checkout, or line items unless the same test first adds an item or seeds a documented cart state. Empty-cart behavior is a valid public test; filled-cart behavior requires setup.
+- Heading whitespace rule: when source/DOM can split text across elements or <br>, use whitespace-tolerant regex names, for example /One storefront,\\s*four stacks\\./. Do not compress punctuation-separated heading text into exact strings like "One storefront,four stacks.".
+- Nav accessible-name rule: avoid exact header/cart/logo accessible-name assertions when source shows counters, nested spans, badges, or dynamic auth chrome. Scope to nav/header and use regex or aria-label/test id when proven.
+- API validation rule: success POST/PUT/PATCH tests must send every source-required field. Missing-field payloads are negative validation tests and must expect 4xx, not 200/201.
 
 ## Auth Gating Rules (check CONTEXT_JSON.meta.authContext before generating any test)
 - CONTEXT_JSON.meta.authContext.availableRoles lists every role that has a verified Playwright storageState for this run. Values are normalized lower-case labels such as "user" and "admin". If it is an empty array, NO authentication context exists.
@@ -2327,6 +2332,40 @@ Return JSON array only.`
         !/add\s+to\s+cart|cart\/items|\/api\/cart|request\.(?:post|put|patch)\(|localStorage\.setItem|sessionStorage\.setItem/i.test(content)
       if (cartFilledStateWithoutSetup) {
         errors.push('Cart filled-state tests must add an item or seed cart state before asserting subtotal/checkout/line items')
+      }
+
+      const authStateNavMismatch =
+        /@auth|@tierB/i.test(content) &&
+        /getByRole\(\s*['"`](?:link|button)['"`]\s*,\s*\{[^}]*name\s*:\s*(?:\/[^/]*(?:log\s*in|login|sign\s*up|signup|create\s+account)[^/]*\/[a-z]*|['"`][^'"`]*(?:log\s*in|login|sign\s*up|signup|create\s+account)[^'"`]*['"`])/i.test(content)
+      if (authStateNavMismatch) {
+        errors.push('@auth/@tierB tests must not assert unauthenticated nav such as Login or Sign up')
+      }
+
+      const publicLogoutAssertion =
+        !/@auth|@tierB|storageState|\/api\/(?:auth\/)?(?:login|signin|session)/i.test(content) &&
+        /getByRole\(\s*['"`](?:link|button)['"`]\s*,\s*\{[^}]*name\s*:\s*(?:\/[^/]*(?:logout|log\s*out|sign\s*out)[^/]*\/[a-z]*|['"`][^'"`]*(?:logout|log\s*out|sign\s*out)[^'"`]*['"`])/i.test(content)
+      if (publicLogoutAssertion) {
+        errors.push('Unauthenticated public tests must not assert Logout/account chrome unless they first establish auth')
+      }
+
+      if (/getByRole\(\s*['"`]link['"`]\s*,\s*\{[^}]*name\s*:\s*['"`]Cart['"`][^}]*\bexact\s*:\s*true/i.test(content)) {
+        errors.push('Do not assert an exact Cart link accessible name when counters/badges may be present; use aria-label/test id or a scoped regex')
+      }
+
+      for (const match of content.matchAll(/getByRole\(\s*['"`]heading['"`]\s*,\s*\{[\s\S]{0,240}\bname\s*:\s*(['"`])([^'"`]+)\1/gi)) {
+        const name = match[2] || ''
+        if (/,[A-Za-z0-9]/.test(name)) {
+          errors.push('Heading assertions must be whitespace-tolerant around punctuation/line breaks; use a regex with \\s* or \\s+')
+          break
+        }
+      }
+
+      const incompleteProductCreate =
+        /request\.post\(\s*['"`][^'"`]*\/api\/products(?:[/?#][^'"`]*)?['"`]/i.test(content) &&
+        /(?:expect\(\s*\[\s*200\s*,\s*201\s*\]\s*\)\.toContain|toBe\(\s*20[01]\s*\)|toBeOK\(\s*\))/i.test(content) &&
+        !(/\btitle\s*:/i.test(content) && /\bdescription\s*:/i.test(content) && /\bcategory\s*:/i.test(content) && /\bpriceCents\s*:/i.test(content))
+      if (incompleteProductCreate) {
+        errors.push('Successful product-create API tests must include all source-required fields; incomplete payloads should be negative 4xx validation tests')
       }
 
       if (
