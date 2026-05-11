@@ -36,6 +36,12 @@ const GENERATED_TEST_FILE_SCHEMA = z.object({
 
 const GENERATED_TEST_ARRAY_SCHEMA = z.array(GENERATED_TEST_FILE_SCHEMA).min(1).max(20)
 
+function adaptiveRunnableFloor(minGeneratedTests: number): number {
+  const target = Math.max(0, Math.floor(Number(minGeneratedTests) || 0))
+  if (target <= 0) return 1
+  return Math.max(8, Math.min(25, Math.ceil(target * 0.4)))
+}
+
 const FORBIDDEN_PATTERN_RULES = [
   { pattern: /xpath\s*=/i, reason: 'Avoid XPath selectors for deterministic and secure locators' },
   { pattern: /:nth-child\s*\(/i, reason: 'Avoid :nth-child selectors because they are brittle' },
@@ -2935,16 +2941,28 @@ test.describe('Fallback error handling checks', () => {
       : 'qa-max'
     const minCategoryHits = normalizedProfile === 'exhaustive' ? 2 : 1
     const minRunnableRatio = normalizedProfile === 'balanced' ? 0.25 : 0.5
+    const adaptiveFloor = adaptiveRunnableFloor(minGeneratedTests)
     const requiredCategories = this.requiredCategoriesForContext({ testType, context })
     const missingCategories = requiredCategories.filter(
       (category) => (categories[category] || 0) < minCategoryHits
     )
     const errors: string[] = []
+    const qualityWarnings: NonNullable<GenerationQuality['qualityWarnings']> = []
     let errorCode: string | null = null
 
     if (strictAIGeneration && minGeneratedTests > 0 && totalTests < minGeneratedTests) {
-      errors.push(`MIN_TEST_COUNT_NOT_MET:${totalTests}/${minGeneratedTests}`)
-      errorCode = 'MIN_TEST_COUNT_NOT_MET'
+      const minCountWarning = {
+        code: 'MIN_TEST_COUNT_NOT_MET',
+        message: `Generated ${totalTests} tests below target ${minGeneratedTests}; ${runnableTests >= adaptiveFloor ? 'execution is allowed because the runnable suite meets the adaptive floor' : 'the suite is below the adaptive runnable floor'}.`,
+        actual: totalTests,
+        expected: minGeneratedTests,
+        severity: 'warning',
+      }
+      qualityWarnings.push(minCountWarning)
+      if (runnableTests < adaptiveFloor) {
+        errors.push(`INSUFFICIENT_RUNNABLE_COVERAGE:${runnableTests}/${adaptiveFloor}`)
+        errorCode = 'INSUFFICIENT_RUNNABLE_COVERAGE'
+      }
     }
 
     if (strictAIGeneration && totalTests > 0 && runnableTests === 0) {
@@ -2966,11 +2984,18 @@ test.describe('Fallback error handling checks', () => {
       valid: errors.length === 0,
       errorCode,
       errors,
+      qualityWarnings,
+      qualityGateStatus: errors.length > 0 ? 'failed' : (qualityWarnings.length > 0 ? 'warning' : 'passed'),
       totalTests,
       skippedTests,
       runnableTests,
       runnableRatio,
       minGeneratedTests,
+      minGeneratedTestsTarget: minGeneratedTests,
+      adaptiveRunnableFloor: adaptiveFloor,
+      generatedTestsActual: totalTests,
+      runnableTestsActual: runnableTests,
+      executionAllowedDespiteWarnings: errors.length === 0 && qualityWarnings.length > 0,
       minRunnableRatio,
       coverageProfile: normalizedProfile,
       minCategoryHits,

@@ -1256,6 +1256,12 @@ function minimumCategoryHitsByProfile(profile) {
   return 1;
 }
 
+function adaptiveRunnableFloor(minGeneratedTests) {
+  const target = Math.max(0, toFiniteNumber(minGeneratedTests, 50));
+  if (target <= 0) return 1;
+  return Math.max(8, Math.min(25, Math.ceil(target * 0.4)));
+}
+
 // Compute a 0-100 quality score and a list of "if you do X, quality can
 // improve by Y%" suggestions. Heuristic on purpose — the dashboard banner
 // isn't a scientific rubric, it's a nudge that tells users WHY we couldn't
@@ -1374,21 +1380,29 @@ function evaluateGenerationQualityGates({ config, context, quality, prdContent, 
   const missingCategories = requiredCategories.filter((category) => (quality.categories[category] || 0) < minHits);
 
   const minGeneratedTests = toFiniteNumber(config.minGeneratedTests, 50);
+  const adaptiveFloor = adaptiveRunnableFloor(minGeneratedTests);
   const minSelectorQuality = profile === 'balanced' ? 0.35 : (profile === 'exhaustive' ? 0.6 : 0.5);
   const minRunnableRatio = profile === 'balanced' ? 0.25 : 0.5;
+  const buildQualityEnvelope = (status, extra = {}) => ({
+    ...quality,
+    minGeneratedTests,
+    minGeneratedTestsTarget: minGeneratedTests,
+    adaptiveRunnableFloor: adaptiveFloor,
+    generatedTestsActual: quality.totalTests,
+    runnableTestsActual: quality.runnableTests,
+    qualityGateStatus: status,
+    requiredCategories,
+    missingCategories,
+    minSelectorQuality,
+    minRunnableRatio,
+    coverageProfile: profile,
+    ...extra,
+  });
 
   if (quality.totalTests > 0 && quality.runnableTests === 0) {
     const error = new Error(`Generated suite has zero runnable tests (${quality.skippedTests}/${quality.totalTests} skipped).`);
     error.code = 'ZERO_RUNNABLE_TESTS';
-    error.generationQuality = {
-      ...quality,
-      minGeneratedTests,
-      requiredCategories,
-      missingCategories,
-      minSelectorQuality,
-      minRunnableRatio,
-      coverageProfile: profile,
-    };
+    error.generationQuality = buildQualityEnvelope('failed');
     return { ok: false, error };
   }
 
@@ -1399,15 +1413,7 @@ function evaluateGenerationQualityGates({ config, context, quality, prdContent, 
       .join(', ');
     const error = new Error(`Generated suite hardcoded a different app origin than baseURL (${sample}).`);
     error.code = 'HARDCODED_BASE_URL_MISMATCH';
-    error.generationQuality = {
-      ...quality,
-      minGeneratedTests,
-      requiredCategories,
-      missingCategories,
-      minSelectorQuality,
-      minRunnableRatio,
-      coverageProfile: profile,
-    };
+    error.generationQuality = buildQualityEnvelope('failed');
     error.diagnostics = buildPipelineDiagnostics({
       projectPath: config.projectPath,
       stage: 'generation',
@@ -1424,44 +1430,36 @@ function evaluateGenerationQualityGates({ config, context, quality, prdContent, 
   if (quality.totalTests > 0 && quality.runnableRatio < minRunnableRatio) {
     const error = new Error(`Generated suite runnable coverage too low (${quality.runnableTests}/${quality.totalTests} runnable, minimum ratio ${minRunnableRatio}).`);
     error.code = 'RUNNABLE_COVERAGE_TOO_LOW';
-    error.generationQuality = {
-      ...quality,
-      minGeneratedTests,
-      requiredCategories,
-      missingCategories,
-      minSelectorQuality,
-      minRunnableRatio,
-      coverageProfile: profile,
-    };
+    error.generationQuality = buildQualityEnvelope('failed');
     return { ok: false, error };
   }
 
-  // Hard-fail when running under a strict coverage profile (qa-max / exhaustive)
-  // with strictAIGeneration enabled. Non-strict profiles (balanced) retain the
-  // legacy warn-and-continue behavior so dev-loop runs still produce artifacts
-  // even when generation undershoots.
+  const qualityWarnings = [];
   if (quality.totalTests < minGeneratedTests) {
-    const strictCoverage = profile === 'qa-max' || profile === 'exhaustive';
-    if (strictAIEnabled(config) && strictCoverage) {
+    const minCountWarning = {
+      code: 'MIN_TEST_COUNT_NOT_MET',
+      message: `Generated ${quality.totalTests} tests below target ${minGeneratedTests}; executing because the runnable suite meets the adaptive floor.`,
+      actual: quality.totalTests,
+      expected: minGeneratedTests,
+      severity: 'warning',
+    };
+
+    if (quality.runnableTests < adaptiveFloor) {
       const error = new Error(
-        `Generated tests ${quality.totalTests} below minimum ${minGeneratedTests} for strict profile ${profile}`
+        `Generated runnable tests ${quality.runnableTests} below adaptive floor ${adaptiveFloor} for target ${minGeneratedTests}.`
       );
-      error.code = 'MIN_TEST_COUNT_NOT_MET';
-      error.generationQuality = {
-        ...quality,
-        minGeneratedTests,
-        requiredCategories,
-        missingCategories,
-        minSelectorQuality,
-        minRunnableRatio,
-        coverageProfile: profile,
-      };
+      error.code = 'INSUFFICIENT_RUNNABLE_COVERAGE';
+      error.generationQuality = buildQualityEnvelope('failed', {
+        qualityWarnings: [minCountWarning],
+      });
       return { ok: false, error };
     }
-    Logger.warn('PipelineWorker', `Generated tests ${quality.totalTests} below minimum ${minGeneratedTests}, but continuing pipeline`);
+
+    qualityWarnings.push(minCountWarning);
+    Logger.warn('PipelineWorker', `Generated tests ${quality.totalTests} below target ${minGeneratedTests}, but continuing because runnable tests ${quality.runnableTests} meet adaptive floor ${adaptiveFloor}`);
   }
 
-  const warnings = [];
+  const warnings = qualityWarnings.map((warning) => warning.message);
   if (missingCategories.length > 0) {
     warnings.push(`missing categories: ${missingCategories.join(', ')}`);
   }
@@ -1478,15 +1476,7 @@ function evaluateGenerationQualityGates({ config, context, quality, prdContent, 
   if (warnings.length > 0 && quality.totalTests === 0) {
     const error = new Error(`Coverage gates failed with zero tests generated. ${warnings.join('; ')}`);
     error.code = 'COVERAGE_GATES_FAILED';
-    error.generationQuality = {
-      ...quality,
-      minGeneratedTests,
-      requiredCategories,
-      missingCategories,
-      minSelectorQuality,
-      minRunnableRatio,
-      coverageProfile: profile,
-    };
+    error.generationQuality = buildQualityEnvelope('failed', { qualityWarnings });
     return { ok: false, error };
   }
 
@@ -1510,19 +1500,14 @@ function evaluateGenerationQualityGates({ config, context, quality, prdContent, 
 
   return {
     ok: true,
-    result: {
-      ...quality,
-      minGeneratedTests,
-      requiredCategories,
-      missingCategories,
-      minSelectorQuality,
-      minRunnableRatio,
-      coverageProfile: profile,
+    result: buildQualityEnvelope(qualityWarnings.length > 0 || warnings.length > 0 ? 'warning' : 'passed', {
       warnings,
+      qualityWarnings,
+      executionAllowedDespiteWarnings: qualityWarnings.length > 0 || warnings.length > 0,
       qualityScore: scoreBundle.qualityScore,
       potentialImprovement: scoreBundle.totalPotentialImprovement,
       improvementSuggestions: scoreBundle.suggestions,
-    },
+    }),
   };
 }
 
@@ -1531,6 +1516,7 @@ function isRepairableGenerationFailure(error) {
   return [
     'ZERO_RUNNABLE_TESTS',
     'RUNNABLE_COVERAGE_TOO_LOW',
+    'INSUFFICIENT_RUNNABLE_COVERAGE',
     'MIN_TEST_COUNT_NOT_MET',
     'COVERAGE_GATES_FAILED',
     'GENERATION_VALIDATION_FAILED',
@@ -1583,6 +1569,15 @@ function buildGenerationRepairContext({
   }
   if (missingCategories.length > 0) {
     instructions.push(`Close missing coverage categories: ${missingCategories.join(', ')}.`);
+  }
+  if (code === 'INSUFFICIENT_RUNNABLE_COVERAGE' || code === 'MIN_TEST_COUNT_NOT_MET') {
+    const floor = quality?.adaptiveRunnableFloor;
+    const actual = quality?.runnableTests ?? quality?.totalTests;
+    const target = quality?.minGeneratedTestsTarget ?? quality?.minGeneratedTests;
+    instructions.push(
+      `Add focused runnable tests for uncovered high-value routes/workflows until runnable count clears the adaptive floor${floor ? ` (${floor})` : ''}${target ? ` while still aiming for target ${target}` : ''}. Current runnable/total count: ${actual ?? 'unknown'}/${quality?.totalTests ?? 'unknown'}.`
+    );
+    instructions.push('Do not pad with page-load-only tests; add source-grounded assertions for distinct visible behavior, forms, navigation, validation, or real API contracts.');
   }
   if (code === 'HARDCODED_BASE_URL_MISMATCH') {
     const mismatches = Array.isArray(quality?.hardcodedBaseUrlMismatches)
@@ -1840,6 +1835,9 @@ function classifyErrorCode(error) {
   if (message.includes('minimum') && message.includes('generated')) {
     return 'MIN_TEST_COUNT_NOT_MET';
   }
+  if (message.includes('adaptive floor') || message.includes('insufficient_runnable_coverage')) {
+    return 'INSUFFICIENT_RUNNABLE_COVERAGE';
+  }
   if (message.includes('zero runnable') || message.includes('all were skipped')) {
     return 'ZERO_RUNNABLE_TESTS';
   }
@@ -1949,6 +1947,10 @@ function buildUserFacingPipelineError(errorCode, error) {
 
   if (errorCode === 'RUNNABLE_COVERAGE_TOO_LOW') {
     return `Healix generated too many skipped tests for the available app surface. ${normalizedMessage}`;
+  }
+
+  if (errorCode === 'INSUFFICIENT_RUNNABLE_COVERAGE') {
+    return `Healix generated too few runnable tests to produce a useful execution result. ${normalizedMessage}`;
   }
 
   if (errorCode === 'HARDCODED_BASE_URL_MISMATCH') {
@@ -5730,7 +5732,7 @@ async function runPipeline(config, runId) {
 
       const maxGenerationRepairAttempts = Math.max(
         0,
-        Math.min(2, toFiniteNumber(config.maxGenerationRepairAttempts ?? process.env.HEALIX_GENERATION_REPAIR_ATTEMPTS, 0))
+        Math.min(2, toFiniteNumber(config.maxGenerationRepairAttempts ?? process.env.HEALIX_GENERATION_REPAIR_ATTEMPTS, 1))
       );
       let activeGenerationContext = codebaseContext || {};
       let generationResult = null;
@@ -5865,14 +5867,21 @@ async function runPipeline(config, runId) {
       if (
         generationMeta &&
         generationQuality &&
-        Array.isArray(generationQuality.improvementSuggestions) &&
-        generationQuality.improvementSuggestions.length > 0
+        (
+          (Array.isArray(generationQuality.improvementSuggestions) && generationQuality.improvementSuggestions.length > 0) ||
+          (Array.isArray(generationQuality.qualityWarnings) && generationQuality.qualityWarnings.length > 0)
+        )
       ) {
         generationMeta.qualityWarning = {
           qualityScore: generationQuality.qualityScore,
           potentialImprovement: generationQuality.potentialImprovement,
-          suggestions: generationQuality.improvementSuggestions,
+          suggestions: generationQuality.improvementSuggestions || [],
           totalTests: generationQuality.totalTests,
+          minGeneratedTestsTarget: generationQuality.minGeneratedTestsTarget,
+          adaptiveRunnableFloor: generationQuality.adaptiveRunnableFloor,
+          runnableTestsActual: generationQuality.runnableTestsActual,
+          qualityWarnings: generationQuality.qualityWarnings || [],
+          executionAllowedDespiteWarnings: generationQuality.executionAllowedDespiteWarnings,
           selectorQuality: generationQuality.selectorQuality,
           coverageProfile: generationQuality.coverageProfile,
           missingCategories: generationQuality.missingCategories,
@@ -6786,6 +6795,7 @@ module.exports = {
   effectiveApiEndpoints,
   isSyntheticHealthEndpoint,
   buildGenerationRepairContext,
+  adaptiveRunnableFloor,
   isRepairableGenerationFailure,
   collectGenerationQuality,
   evaluateGenerationQualityGates,

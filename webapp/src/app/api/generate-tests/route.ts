@@ -485,7 +485,7 @@ export async function POST(request: NextRequest) {
     const status =
       errCode === 'OPENAI_KEY_MISSING'
         ? 503
-        : errCode === 'AI_GENERATION_INSUFFICIENT' || errCode === 'MIN_TEST_COUNT_NOT_MET' || errCode === 'COVERAGE_GATES_FAILED'
+        : errCode === 'AI_GENERATION_INSUFFICIENT' || errCode === 'INSUFFICIENT_RUNNABLE_COVERAGE' || errCode === 'MIN_TEST_COUNT_NOT_MET' || errCode === 'COVERAGE_GATES_FAILED'
           ? 422
           : 500
     return NextResponse.json(

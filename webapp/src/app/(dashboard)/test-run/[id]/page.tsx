@@ -74,6 +74,11 @@ interface QualityWarning {
   potentialImprovement: number;
   suggestions: QualityImprovementSuggestion[];
   totalTests?: number;
+  minGeneratedTestsTarget?: number;
+  adaptiveRunnableFloor?: number;
+  runnableTestsActual?: number;
+  qualityWarnings?: Array<{ code?: string; message?: string; actual?: number; expected?: number; severity?: string }>;
+  executionAllowedDespiteWarnings?: boolean;
   selectorQuality?: number;
   coverageProfile?: string;
   missingCategories?: string[];
@@ -83,8 +88,12 @@ interface AgentGenerationQuality {
   valid?: boolean;
   errorCode?: string;
   errors?: string[];
+  qualityWarnings?: Array<{ code?: string; message?: string }>;
+  qualityGateStatus?: string;
   totalTests?: number;
+  runnableTests?: number;
   minGeneratedTests?: number;
+  adaptiveRunnableFloor?: number;
   coverageProfile?: string;
   requiredCategories?: string[];
   missingCategories?: string[];
@@ -1675,6 +1684,7 @@ function QualityWarningBanner({ warning }: { warning: QualityWarning }) {
   const targetScore = Math.min(100, score + potential);
   const suggestions = warning.suggestions || [];
   const topSuggestion = suggestions[0];
+  const minCountWarning = (warning.qualityWarnings || []).find((item) => item.code === 'MIN_TEST_COUNT_NOT_MET');
 
   // amber for 60-79, orange/red for below 60
   const toneClass = score >= 60
@@ -1700,10 +1710,14 @@ function QualityWarningBanner({ warning }: { warning: QualityWarning }) {
           </div>
           <div className="min-w-0">
             <div className={`font-semibold text-[15px] ${accentText}`}>
-              Test suite quality: {score}%
+              {minCountWarning ? 'Generated fewer tests than target' : `Test suite quality: ${score}%`}
             </div>
             <div className="text-[#F0F6FF]/85 text-sm mt-0.5">
-              {potential > 0 ? (
+              {minCountWarning ? (
+                <>
+                  Generated tests were below target, but valid runnable tests ran because the suite met Healix&apos;s adaptive execution floor.
+                </>
+              ) : potential > 0 ? (
                 <>
                   Tests were generated and will run, but quality could improve by{' '}
                   <span className="font-semibold text-[#FDE68A]">~{potential}%</span>{' '}
@@ -1730,6 +1744,21 @@ function QualityWarningBanner({ warning }: { warning: QualityWarning }) {
               {typeof warning.totalTests === 'number' && (
                 <span className="px-2 py-0.5 rounded-md bg-white/5 border border-white/10 text-[#D8E8FF]/70 text-[11px] font-mono">
                   {warning.totalTests} tests
+                </span>
+              )}
+              {typeof warning.runnableTestsActual === 'number' && (
+                <span className="px-2 py-0.5 rounded-md bg-white/5 border border-white/10 text-[#D8E8FF]/70 text-[11px] font-mono">
+                  runnable: {warning.runnableTestsActual}
+                </span>
+              )}
+              {typeof warning.minGeneratedTestsTarget === 'number' && (
+                <span className="px-2 py-0.5 rounded-md bg-white/5 border border-white/10 text-[#D8E8FF]/70 text-[11px] font-mono">
+                  target: {warning.minGeneratedTestsTarget}
+                </span>
+              )}
+              {typeof warning.adaptiveRunnableFloor === 'number' && (
+                <span className="px-2 py-0.5 rounded-md bg-white/5 border border-white/10 text-[#D8E8FF]/70 text-[11px] font-mono">
+                  floor: {warning.adaptiveRunnableFloor}
                 </span>
               )}
               {typeof warning.selectorQuality === 'number' && (
@@ -1792,6 +1821,8 @@ function AgentCoveragePanel({ agentMeta }: { agentMeta: AgentMetaEntry[] }) {
         total,
         valid: q.valid !== false,
         errorCode: q.errorCode ?? null,
+        needsMoreCoverage: q.errorCode === 'MIN_TEST_COUNT_NOT_MET'
+          || (Array.isArray(q.qualityWarnings) && q.qualityWarnings.some((warning) => warning.code === 'MIN_TEST_COUNT_NOT_MET')),
         missing,
         met,
         totalRequired: required.length,
@@ -1841,7 +1872,11 @@ function AgentCoveragePanel({ agentMeta }: { agentMeta: AgentMetaEntry[] }) {
                   )}
                 </td>
                 <td className="py-2 pr-4">
-                  {row.valid ? (
+                  {row.needsMoreCoverage ? (
+                    <span className="px-2 py-0.5 rounded bg-amber-500/10 border border-amber-500/30 text-[#FCD34D] text-[11px]">
+                      needs more coverage
+                    </span>
+                  ) : row.valid ? (
                     <span className="px-2 py-0.5 rounded bg-emerald-500/10 border border-emerald-500/30 text-emerald-300/90 text-[11px]">ok</span>
                   ) : (
                     <span className="px-2 py-0.5 rounded bg-amber-500/10 border border-amber-500/30 text-[#FCD34D] text-[11px] font-mono">
@@ -2055,6 +2090,16 @@ function buildSuggestedFix(error: PipelineErrorShape): SuggestedFix | null {
     };
   }
 
+  if (code === 'INSUFFICIENT_RUNNABLE_COVERAGE' || code === 'MIN_TEST_COUNT_NOT_MET') {
+    return {
+      title: 'Suggested fix — add focused runnable coverage',
+      steps: [
+        { action: 'Regenerate with source-grounded coverage top-up', detail: 'Healix should add focused tests for uncovered routes/workflows rather than padding with page-load checks.' },
+        { action: 'Keep the target, but execute useful suites', detail: '`minGeneratedTests` is a target. Valid suites that meet the adaptive runnable floor should run and show a warning instead of failing.' },
+      ],
+    };
+  }
+
   if (code === 'PLAYWRIGHT_DEPENDENCY_MISSING') {
     return {
       title: 'Suggested fix — install @playwright/test',
@@ -2197,11 +2242,20 @@ function PipelineErrorBanner({ error, runId }: { error: PipelineErrorShape; runI
     || /Generated suite hardcoded a different app origin than baseURL|hardcoded a different app origin/i.test(
       `${error.userFacingMessage ?? ''} ${error.stderr ?? ''} ${error.reason ?? ''}`
     );
-  const stage = isHardcodedBaseUrlMismatch ? 'generation' : (error.stage || 'unknown');
-  const reason = isHardcodedBaseUrlMismatch ? 'hardcoded_base_url_mismatch' : (error.reason || 'unknown_reason');
+  const isMinCountIssue = code === 'MIN_TEST_COUNT_NOT_MET'
+    || code === 'INSUFFICIENT_RUNNABLE_COVERAGE'
+    || /MIN_TEST_COUNT_NOT_MET|Generated tests \d+ below minimum|below adaptive floor/i.test(
+      `${error.userFacingMessage ?? ''} ${error.stderr ?? ''} ${error.reason ?? ''}`
+    );
+  const stage = isHardcodedBaseUrlMismatch || isMinCountIssue ? 'generation' : (error.stage || 'unknown');
+  const reason = isHardcodedBaseUrlMismatch
+    ? 'hardcoded_base_url_mismatch'
+    : (isMinCountIssue ? (code === 'INSUFFICIENT_RUNNABLE_COVERAGE' ? 'insufficient_runnable_coverage' : 'min_test_count_not_met') : (error.reason || 'unknown_reason'));
   const displayMessage = isHardcodedBaseUrlMismatch && !error.userFacingMessage
     ? 'Generated tests used an absolute URL outside the configured baseURL. Healix blocked execution so results do not come from the wrong target app.'
-    : error.userFacingMessage;
+    : (isMinCountIssue && !error.userFacingMessage
+      ? 'Generated tests were below the target count. Current runs execute when valid runnable tests meet the adaptive floor; otherwise Healix reports insufficient runnable coverage.'
+      : error.userFacingMessage);
 
   const errorBlob = `${code ?? ''} ${error.userFacingMessage ?? ''} ${error.stderr ?? ''} ${reason}`;
   const isCreditsError = /INSUFFICIENT_CREDITS|No credits remaining|Insufficient credits/i.test(errorBlob);
@@ -2211,6 +2265,7 @@ function PipelineErrorBanner({ error, runId }: { error: PipelineErrorShape; runI
 
   const stageLabel =
     code === 'HARDCODED_BASE_URL_MISMATCH' ? 'Generated tests targeted the wrong app origin' :
+    isMinCountIssue ? 'Generated fewer runnable tests than needed' :
     stage === 'validation' ? 'Generated tests failed Playwright validation' :
     stage === 'generation' ? 'Test generation failed' :
     stage === 'server_start' ? 'Dev server failed to start' :
@@ -2907,7 +2962,9 @@ export default function TestRunDetailPage() {
         />
       )}
 
-      {!pipelineError && qualityWarning && qualityWarning.suggestions?.length > 0 && (
+      {!pipelineError && qualityWarning && (
+        (qualityWarning.suggestions?.length || 0) > 0 || (qualityWarning.qualityWarnings?.length || 0) > 0
+      ) && (
         <QualityWarningBanner warning={qualityWarning} />
       )}
 

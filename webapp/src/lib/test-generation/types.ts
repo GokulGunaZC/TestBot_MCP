@@ -215,11 +215,24 @@ export interface GenerationQuality {
   valid: boolean
   errorCode: string | null
   errors: string[]
+  qualityWarnings?: Array<{
+    code: string
+    message: string
+    actual?: number
+    expected?: number
+    severity: string
+  }>
+  qualityGateStatus?: 'passed' | 'warning' | 'failed'
   totalTests: number
   skippedTests?: number
   runnableTests?: number
   runnableRatio?: number
   minGeneratedTests: number
+  minGeneratedTestsTarget?: number
+  adaptiveRunnableFloor?: number
+  generatedTestsActual?: number
+  runnableTestsActual?: number
+  executionAllowedDespiteWarnings?: boolean
   minRunnableRatio?: number
   coverageProfile: string
   minCategoryHits: number

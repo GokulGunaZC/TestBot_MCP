@@ -11,6 +11,7 @@ const {
 const {
   buildRouteAccessSummary,
   buildGenerationRepairContext,
+  adaptiveRunnableFloor,
   collectGenerationQuality,
   countSkippedTestsInContent,
   countTestsInContent,
@@ -134,6 +135,86 @@ test('quality gates reject low runnable coverage', () => {
   });
 });
 
+function generatedRunnableTests(count) {
+  return Array.from({ length: count }, (_, index) => `
+    test('source grounded workflow ${index}', async ({ page }) => {
+      await page.goto('/route-${index}');
+      await expect(page.getByRole('heading', { name: 'Route ${index}' })).toBeVisible();
+    });
+  `).join('\n');
+}
+
+test('quality gates execute valid suites that miss target but meet adaptive floor', () => {
+  withGeneratedSuite(`
+    import { test, expect } from '@playwright/test';
+    ${generatedRunnableTests(26)}
+  `, (projectPath) => {
+    const quality = collectGenerationQuality(projectPath);
+    const gate = evaluateGenerationQualityGates({
+      config: { testType: 'frontend', coverageProfile: 'qa-max', minGeneratedTests: 50 },
+      context: { pages: Array.from({ length: 26 }, (_, index) => ({ path: `/route-${index}` })) },
+      quality,
+      prdContent: '',
+      parsedPRD: {},
+      requirementsCoverage: {},
+    });
+
+    assert.equal(adaptiveRunnableFloor(50), 20);
+    assert.equal(gate.ok, true);
+    assert.equal(gate.result.qualityGateStatus, 'warning');
+    assert.equal(gate.result.minGeneratedTestsTarget, 50);
+    assert.equal(gate.result.adaptiveRunnableFloor, 20);
+    assert.equal(gate.result.generatedTestsActual, 26);
+    assert.equal(gate.result.runnableTestsActual, 26);
+    assert.equal(gate.result.executionAllowedDespiteWarnings, true);
+    assert.equal(gate.result.qualityWarnings[0].code, 'MIN_TEST_COUNT_NOT_MET');
+  });
+});
+
+test('quality gates fail below adaptive runnable floor instead of min-count hard fail', () => {
+  withGeneratedSuite(`
+    import { test, expect } from '@playwright/test';
+    ${generatedRunnableTests(12)}
+  `, (projectPath) => {
+    const quality = collectGenerationQuality(projectPath);
+    const gate = evaluateGenerationQualityGates({
+      config: { testType: 'frontend', coverageProfile: 'qa-max', minGeneratedTests: 50 },
+      context: { pages: Array.from({ length: 12 }, (_, index) => ({ path: `/route-${index}` })) },
+      quality,
+      prdContent: '',
+      parsedPRD: {},
+      requirementsCoverage: {},
+    });
+
+    assert.equal(gate.ok, false);
+    assert.equal(gate.error.code, 'INSUFFICIENT_RUNNABLE_COVERAGE');
+    assert.equal(gate.error.generationQuality.adaptiveRunnableFloor, 20);
+    assert.equal(gate.error.generationQuality.qualityWarnings[0].code, 'MIN_TEST_COUNT_NOT_MET');
+  });
+});
+
+test('quality gates allow small targets at the adaptive minimum', () => {
+  withGeneratedSuite(`
+    import { test, expect } from '@playwright/test';
+    ${generatedRunnableTests(8)}
+  `, (projectPath) => {
+    const quality = collectGenerationQuality(projectPath);
+    const gate = evaluateGenerationQualityGates({
+      config: { testType: 'frontend', coverageProfile: 'qa-max', minGeneratedTests: 20 },
+      context: { pages: Array.from({ length: 8 }, (_, index) => ({ path: `/route-${index}` })) },
+      quality,
+      prdContent: '',
+      parsedPRD: {},
+      requirementsCoverage: {},
+    });
+
+    assert.equal(adaptiveRunnableFloor(20), 8);
+    assert.equal(gate.ok, true);
+    assert.equal(gate.result.qualityGateStatus, 'warning');
+    assert.equal(gate.result.executionAllowedDespiteWarnings, true);
+  });
+});
+
 test('quality gates reject hardcoded origins that do not match configured baseURL', () => {
   withGeneratedSuite(`
     import { test, expect } from '@playwright/test';
@@ -172,6 +253,22 @@ test('pipeline error classifier treats hardcoded baseURL mismatch as generation 
   assert.equal(classified.stage, 'generation');
   assert.equal(classified.reason, 'hardcoded_base_url_mismatch');
   assert.equal(classified.errorCode, 'HARDCODED_BASE_URL_MISMATCH');
+});
+
+test('pipeline error classifier treats min-count and adaptive-floor failures as generation issues', () => {
+  const legacyMin = classifyPipelineErrorFromStderr({
+    stderr: 'Generated tests 26 below minimum 50 for strict profile qa-max',
+  });
+  assert.equal(legacyMin.stage, 'generation');
+  assert.equal(legacyMin.reason, 'min_test_count_not_met');
+  assert.equal(legacyMin.errorCode, 'MIN_TEST_COUNT_NOT_MET');
+
+  const insufficient = classifyPipelineErrorFromStderr({
+    stderr: 'Generated runnable tests 12 below adaptive floor 20 for target 50.',
+  });
+  assert.equal(insufficient.stage, 'generation');
+  assert.equal(insufficient.reason, 'insufficient_runnable_coverage');
+  assert.equal(insufficient.errorCode, 'INSUFFICIENT_RUNNABLE_COVERAGE');
 });
 
 test('quality gates reject placeholder external API hosts even without a configured baseURL', () => {
