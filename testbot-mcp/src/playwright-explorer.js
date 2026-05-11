@@ -27,9 +27,11 @@ const {
   scoreAuthFlowCandidate,
 } = require('./auth-flow-utils');
 
-const MAX_ROUTES_PER_WALK = 12;
+const MAX_ROUTES_PER_WALK = 20;
+const MAX_CLICK_PROBES_PER_WALK = 8;
 const GOTO_TIMEOUT_MS = 15_000;
 const SETTLE_WAIT_MS = 800;
+const CLICK_PROBE_TIMEOUT_MS = 1_500;
 
 function sameOrigin(hrefAbs, originAbs) {
   try {
@@ -37,6 +39,31 @@ function sameOrigin(hrefAbs, originAbs) {
   } catch {
     return false;
   }
+}
+
+function routeKeyFromUrl(rawUrl, baseURL) {
+  try {
+    const url = new URL(rawUrl, baseURL);
+    return `${url.pathname || '/'}${url.search || ''}${url.hash || ''}`;
+  } catch {
+    return null;
+  }
+}
+
+function urlForRoute(baseURL, routePath) {
+  try {
+    return new URL(routePath || '/', baseURL).toString();
+  } catch {
+    return `${String(baseURL || '').replace(/\/$/, '')}${routePath || '/'}`;
+  }
+}
+
+function isAuthishRoute(routePath) {
+  return /(^|\/|#)(login|sign-in|signin|auth|register|signup|sign-up)(\/|$|\?)/i.test(String(routePath || ''));
+}
+
+function queueContainsRoute(queue, routeKey, baseURL) {
+  return queue.some((queuedUrl) => routeKeyFromUrl(queuedUrl, baseURL) === routeKey);
 }
 
 /**
@@ -48,8 +75,8 @@ async function _scrollToReveal(page) {
     await page.evaluate(async () => {
       await new Promise((resolve) => {
         const step = 280;
-        const intervalMs = 120;
-        const maxMs = 2500;
+        const intervalMs = 100;
+        const maxMs = 1200;
         let elapsed = 0;
         const timer = setInterval(() => {
           window.scrollBy(0, step);
@@ -63,7 +90,7 @@ async function _scrollToReveal(page) {
         }, intervalMs);
       });
     });
-    await page.waitForTimeout(400);
+    await page.waitForTimeout(250);
   } catch {
     // non-fatal — page may have navigated or context closed
   }
@@ -72,6 +99,29 @@ async function _scrollToReveal(page) {
 async function _collectRouteSignals(page) {
   return page.evaluate(() => {
     const safeText = (el) => (el?.textContent || '').trim().slice(0, 80);
+    const attrSelector = (name, value) =>
+      `[${name}="${String(value || '').replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"]`;
+    const idSelector = (id) => {
+      if (!id) return null;
+      if (window.CSS && typeof window.CSS.escape === 'function') return `#${window.CSS.escape(id)}`;
+      return `#${String(id).replace(/[^a-zA-Z0-9_-]/g, '\\$&')}`;
+    };
+    const isVisible = (el) => {
+      const style = window.getComputedStyle(el);
+      return style && style.visibility !== 'hidden' && style.display !== 'none' && el.getClientRects().length > 0;
+    };
+    const unsafeClickText = /(delete|remove|logout|log out|sign out|submit|save|create|update|checkout|pay|purchase|register|sign up|add to cart|clear|cancel)/i;
+    const selectorFor = (el) => {
+      const testId = el.getAttribute('data-testid') || el.getAttribute('data-test-id') || el.getAttribute('data-cy');
+      if (testId) {
+        const attr = el.hasAttribute('data-testid') ? 'data-testid' : (el.hasAttribute('data-test-id') ? 'data-test-id' : 'data-cy');
+        return attrSelector(attr, testId);
+      }
+      if (el.id) return idSelector(el.id);
+      const aria = el.getAttribute('aria-label');
+      if (aria) return attrSelector('aria-label', aria);
+      return null;
+    };
     const anchors = Array.from(document.querySelectorAll('a[href]'))
       .map((a) => ({ href: a.href, text: safeText(a) }))
       .filter((a) => a.href && !a.href.startsWith('javascript:'))
@@ -125,6 +175,26 @@ async function _collectRouteSignals(page) {
       }))
       .filter((e) => e.name);
 
+    const clickCandidates = Array.from(document.querySelectorAll('button, [role="button"], [role="link"], [data-testid], [data-test-id], [data-cy], [aria-label]'))
+      .filter((el) => isVisible(el))
+      .filter((el) => !el.closest('form'))
+      .filter((el) => !el.disabled && el.getAttribute('aria-disabled') !== 'true')
+      .map((el) => {
+        const tag = el.tagName.toLowerCase();
+        const role = el.getAttribute('role') || (tag === 'button' ? 'button' : null);
+        const name = safeText(el) || el.getAttribute('aria-label') || el.getAttribute('title') || '';
+        return {
+          role,
+          name: name.slice(0, 80),
+          selector: selectorFor(el),
+          type: el.getAttribute('type') || '',
+        };
+      })
+      .filter((candidate) => candidate.selector || candidate.name)
+      .filter((candidate) => candidate.type.toLowerCase() !== 'submit')
+      .filter((candidate) => !unsafeClickText.test(candidate.name))
+      .slice(0, 8);
+
     const headings = Array.from(document.querySelectorAll('h1, h2, h3'))
       .map((el) => safeText(el))
       .filter(Boolean)
@@ -132,8 +202,67 @@ async function _collectRouteSignals(page) {
     const buttonTexts = landmarks.map((el) => el.name).filter(Boolean).slice(0, 20);
     const title = document.title || '';
 
-    return { anchors, forms, authElements, landmarks, headings, buttonTexts, title };
+    return { anchors, forms, authElements, landmarks, clickCandidates, headings, buttonTexts, title };
   });
+}
+
+async function _collectAnchors(page) {
+  return page.evaluate(() => {
+    const safeText = (el) => (el?.textContent || '').trim().slice(0, 80);
+    return Array.from(document.querySelectorAll('a[href]'))
+      .map((a) => ({ href: a.href, text: safeText(a) }))
+      .filter((a) => a.href && !a.href.startsWith('javascript:'))
+      .slice(0, 40);
+  }).catch(() => []);
+}
+
+async function _discoverClickRoutes(page, { resetUrl, maxClicks }) {
+  const initialSignals = await _collectRouteSignals(page).catch(() => null);
+  const candidates = (initialSignals?.clickCandidates || []).slice(0, Math.max(0, maxClicks || 0));
+  const discoveredUrls = [];
+  let attempted = 0;
+
+  for (const candidate of candidates) {
+    attempted += 1;
+    try {
+      const beforeUrl = page.url();
+      let locator = null;
+      if (candidate.selector) {
+        locator = page.locator(candidate.selector).first();
+      } else if (candidate.role && candidate.name) {
+        locator = page.getByRole(candidate.role, { name: candidate.name, exact: true }).first();
+      } else if (candidate.name) {
+        locator = page.getByText(candidate.name, { exact: true }).first();
+      }
+      if (!locator) continue;
+      await locator.click({ timeout: CLICK_PROBE_TIMEOUT_MS });
+      await page.waitForLoadState('domcontentloaded', { timeout: CLICK_PROBE_TIMEOUT_MS }).catch(() => {});
+      await page.waitForTimeout(250);
+
+      const afterUrl = page.url();
+      if (afterUrl && afterUrl !== beforeUrl) discoveredUrls.push(afterUrl);
+      const anchors = await _collectAnchors(page);
+      for (const anchor of anchors) discoveredUrls.push(anchor.href);
+
+      if (page.url() !== resetUrl) {
+        await page.goto(resetUrl, { waitUntil: 'domcontentloaded', timeout: GOTO_TIMEOUT_MS }).catch(() => {});
+        await page.waitForTimeout(200).catch(() => {});
+      } else {
+        await page.keyboard.press('Escape').catch(() => {});
+      }
+    } catch {
+      try {
+        if (page.url() !== resetUrl) {
+          await page.goto(resetUrl, { waitUntil: 'domcontentloaded', timeout: GOTO_TIMEOUT_MS });
+          await page.waitForTimeout(200);
+        }
+      } catch {
+        // ignore failed reset and continue the route walk
+      }
+    }
+  }
+
+  return { attempted, discoveredUrls };
 }
 
 function _buildAuthFlowCandidate({ resolvedPathname, signals }) {
@@ -187,13 +316,23 @@ async function _walkRoutes({ browser, contextOptions, baseURL, origin, credentia
   const formsOut = [];
   let authFlow = null;
   const queue = [baseURL];
+  let remainingClickProbes = MAX_CLICK_PROBES_PER_WALK;
+
+  const enqueueUrl = (href) => {
+    if (!href || !sameOrigin(href, origin)) return;
+    const routeKey = routeKeyFromUrl(href, baseURL);
+    if (!routeKey || visitedPaths.has(routeKey) || queueContainsRoute(queue, routeKey, baseURL)) return;
+    if (queue.length + routes.length >= MAX_ROUTES_PER_WALK) return;
+    queue.push(new URL(href, baseURL).toString());
+  };
 
   try {
     while (queue.length && routes.length < MAX_ROUTES_PER_WALK) {
       const url = queue.shift();
       const parsed = (() => { try { return new URL(url); } catch { return null; } })();
       if (!parsed) continue;
-      const pathKey = parsed.pathname;
+      const pathKey = routeKeyFromUrl(parsed.toString(), baseURL);
+      if (!pathKey) continue;
       if (visitedPaths.has(pathKey)) continue;
       visitedPaths.add(pathKey);
 
@@ -208,7 +347,7 @@ async function _walkRoutes({ browser, contextOptions, baseURL, origin, credentia
       // Capture the actual URL after server/client redirects. If the app
       // redirects "/" to "/login", authFlow.loginUrl must point at "/login",
       // and route auth detection must compare against the rendered path.
-      const resolvedPathname = (() => { try { return new URL(page.url()).pathname; } catch { return pathKey; } })();
+      const resolvedPathname = routeKeyFromUrl(page.url(), baseURL) || pathKey;
 
       await page.waitForTimeout(SETTLE_WAIT_MS);
 
@@ -223,10 +362,11 @@ async function _walkRoutes({ browser, contextOptions, baseURL, origin, credentia
       if (!signals) continue;
 
       const status = response?.status() ?? 0;
+      const baseRouteKey = routeKeyFromUrl(baseURL, baseURL) || '/';
       const requiresAuth =
         status === 401 ||
         status === 403 ||
-        (!!signals.authElements && resolvedPathname !== (new URL(baseURL).pathname));
+        (!!signals.authElements && !isAuthishRoute(pathKey) && resolvedPathname !== baseRouteKey);
 
       routes.push({
         path: pathKey,
@@ -246,11 +386,16 @@ async function _walkRoutes({ browser, contextOptions, baseURL, origin, credentia
       }
 
       for (const a of signals.anchors || []) {
-        if (queue.length + routes.length >= MAX_ROUTES_PER_WALK) break;
-        if (!sameOrigin(a.href, origin)) continue;
-        const aPath = (() => { try { return new URL(a.href).pathname; } catch { return null; } })();
-        if (!aPath || visitedPaths.has(aPath)) continue;
-        queue.push(a.href);
+        enqueueUrl(a.href);
+      }
+
+      if (remainingClickProbes > 0 && (routes.length <= 2 || queue.length < 2)) {
+        const maxClicks = Math.min(4, remainingClickProbes);
+        const clickDiscovery = await _discoverClickRoutes(page, { resetUrl: page.url(), maxClicks });
+        remainingClickProbes -= clickDiscovery.attempted || 0;
+        for (const discoveredUrl of clickDiscovery.discoveredUrls || []) {
+          enqueueUrl(discoveredUrl);
+        }
       }
     }
 
@@ -465,7 +610,7 @@ async function enrichRoutesWithDOM({ baseURL, routes = [], storageStatePaths = [
     const page = await context.newPage();
 
     for (const route of routes.slice(0, MAX_ENRICH_ROUTES)) {
-      const url = `${baseURL.replace(/\/$/, '')}${route.path}`;
+      const url = urlForRoute(baseURL, route.path);
       try {
         await page.goto(url, { waitUntil: 'domcontentloaded', timeout: ENRICH_GOTO_TIMEOUT_MS });
         await page.waitForTimeout(SETTLE_WAIT_MS);
@@ -503,4 +648,5 @@ module.exports = {
   enrichRoutesWithDOM,
   _buildAuthFlowCandidate,
   _mergeWalks,
+  _routeKeyFromUrl: routeKeyFromUrl,
 };

@@ -10,6 +10,7 @@ const {
 const {
   _buildAuthFlowCandidate,
   _mergeWalks,
+  _routeKeyFromUrl,
 } = require('../src/playwright-explorer');
 const {
   artifactHasUsefulContext,
@@ -88,9 +89,16 @@ test('exploration artifact normalizer drops unsafe browser-use authFlow', () => 
 
 test('exploration useful-context gate rejects empty browser-use artifacts', () => {
   assert.equal(artifactHasUsefulContext({ routes: [], forms: [], keyFlows: [], authFlow: null }), false);
+  assert.equal(artifactHasUsefulContext({ routes: [{ path: '/', requiresAuth: false }] }), false);
   assert.equal(artifactHasUsefulContext({ routes: [{ path: '/login', requiresAuth: false }], authFlow: { loginUrl: '/login' } }), false);
   assert.equal(artifactHasUsefulContext({ authFlow: { loginUrl: '/login' } }), false);
-  assert.equal(artifactHasUsefulContext({ routes: [{ path: '/', requiresAuth: false }] }), true);
+  assert.equal(artifactHasUsefulContext({ routes: [{ path: '/products', requiresAuth: false }] }), true);
   assert.equal(artifactHasUsefulContext({ forms: [{ route: '/', fields: [] }] }), true);
   assert.equal(artifactHasUsefulContext({ keyFlows: [{ name: 'checkout', steps: [] }] }), true);
+});
+
+test('playwright route keys preserve SPA hash and query state', () => {
+  assert.equal(_routeKeyFromUrl('http://localhost:8080/admin#/products', 'http://localhost:8080'), '/admin#/products');
+  assert.equal(_routeKeyFromUrl('/products?q=book', 'http://localhost:8080'), '/products?q=book');
+  assert.equal(_routeKeyFromUrl('/admin#/orders?status=open', 'http://localhost:8080'), '/admin#/orders?status=open');
 });

@@ -226,6 +226,11 @@ def _build_llm():
         if llm is not None:
             return llm, "direct_openai"
 
+    if has_direct_openai and provider not in {"cloud", "browser-use", "browser_use"}:
+        llm = _build_openai_compatible_llm(model, openai_api_key, openai_base_url)
+        if llm is not None:
+            return llm, "direct_openai"
+
     if has_cloud_key:
         llm = _build_cloud_llm()
         if llm is not None:
@@ -381,11 +386,12 @@ def main():
 
     has_browser_use_key = os.environ.get("BROWSER_USE_API_KEY") or os.environ.get("HEALIX_BROWSER_USE_API_KEY")
     has_healix_proxy = os.environ.get("HEALIX_API_KEY") and os.environ.get("HEALIX_LLM_PROXY_URL")
-    if not has_browser_use_key and not has_healix_proxy:
+    has_direct_openai = os.environ.get("OPENAI_API_KEY")
+    if not has_browser_use_key and not has_healix_proxy and not has_direct_openai:
         _emit({
             "type": "error",
             "reason": (
-                "BROWSER_USE_API_KEY or HEALIX_API_KEY/HEALIX_LLM_PROXY_URL not set."
+                "BROWSER_USE_API_KEY, OPENAI_API_KEY, or HEALIX_API_KEY/HEALIX_LLM_PROXY_URL not set."
                 " The Node driver sets these automatically from your MCP config."
                 " The driver will fall back to heuristic Playwright exploration."
             ),

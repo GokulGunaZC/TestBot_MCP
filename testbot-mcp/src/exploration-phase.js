@@ -96,15 +96,20 @@ function normalizeExplorationArtifact(rawArtifact = {}, source = 'unknown') {
 function artifactHasUsefulContext(artifact = {}) {
   if (!artifact || typeof artifact !== 'object') return false;
   const routes = Array.isArray(artifact.routes) ? artifact.routes : [];
-  const nonAuthRouteCount = routes.filter((route) => {
+  const usefulRouteCount = routes.filter((route) => {
     const pathValue = String(route?.path || route?.url || '').toLowerCase();
-    return pathValue && !/(^|\/|#)(login|sign-in|signin|auth|register|signup|sign-up)(\/|$|\?)/.test(pathValue);
+    return (
+      pathValue &&
+      pathValue !== '/' &&
+      pathValue !== '/#' &&
+      !/(^|\/|#)(login|sign-in|signin|auth|register|signup|sign-up)(\/|$|\?)/.test(pathValue)
+    );
   }).length;
   const formCount = Array.isArray(artifact.forms) ? artifact.forms.length : 0;
   const keyFlowCount = Array.isArray(artifact.keyFlows) ? artifact.keyFlows.length : 0;
-  // An authFlow or login-only route is not enough; that is exactly the
-  // failure mode where browser-use stalled before mapping the application.
-  return Boolean(nonAuthRouteCount > 0 || formCount > 0 || keyFlowCount > 0);
+  // An authFlow, login-only route, or homepage-only route is not enough; that
+  // is exactly the failure mode where browser-use stalled before mapping the app.
+  return Boolean(usefulRouteCount > 0 || formCount > 0 || keyFlowCount > 0);
 }
 
 async function runPlaywrightFallback({ baseURL, credsForAgent, preAuthRoles }) {
