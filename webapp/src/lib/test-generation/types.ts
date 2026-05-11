@@ -229,6 +229,7 @@ export interface GenerationQuality {
   runnableRatio?: number
   minGeneratedTests: number
   minGeneratedTestsTarget?: number
+  minimumUsefulRunnableFloor?: number
   adaptiveRunnableFloor?: number
   generatedTestsActual?: number
   runnableTestsActual?: number

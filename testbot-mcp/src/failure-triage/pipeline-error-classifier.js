@@ -31,10 +31,10 @@ const CLASSIFIERS = [
   {
     id: 'insufficient_runnable_coverage',
     test: (s) => /INSUFFICIENT_RUNNABLE_COVERAGE/i.test(s)
-      || /Generated runnable tests \d+ below adaptive floor/i.test(s),
+      || /Generated runnable tests \d+ below (?:adaptive|minimum useful) floor/i.test(s),
     stage: 'generation',
     errorCode: 'INSUFFICIENT_RUNNABLE_COVERAGE',
-    userFacingMessage: 'Healix generated too few runnable tests to produce a useful execution result. The suite stayed below the adaptive execution floor after bounded repair attempts, so execution was blocked before producing misleading results.',
+    userFacingMessage: 'Healix generated too few runnable tests to produce a useful execution result. The suite stayed below the minimum useful runnable floor after bounded repair attempts, so execution was blocked before producing misleading results.',
   },
   {
     id: 'min_test_count_not_met',
@@ -42,7 +42,7 @@ const CLASSIFIERS = [
       || /Generated tests \d+ below minimum \d+/i.test(s),
     stage: 'generation',
     errorCode: 'MIN_TEST_COUNT_NOT_MET',
-    userFacingMessage: 'Healix generated fewer tests than the target count. Current versions treat this as a quality warning when the runnable suite meets the adaptive floor, not as a Playwright crash.',
+    userFacingMessage: 'Healix generated fewer tests than the target count. Current versions treat this as a quality warning when the runnable suite meets the minimum useful floor, not as a Playwright crash.',
   },
   {
     id: 'hardcoded_base_url_mismatch',

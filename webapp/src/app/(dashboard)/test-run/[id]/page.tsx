@@ -75,6 +75,7 @@ interface QualityWarning {
   suggestions: QualityImprovementSuggestion[];
   totalTests?: number;
   minGeneratedTestsTarget?: number;
+  minimumUsefulRunnableFloor?: number;
   adaptiveRunnableFloor?: number;
   runnableTestsActual?: number;
   qualityWarnings?: Array<{ code?: string; message?: string; actual?: number; expected?: number; severity?: string }>;
@@ -93,6 +94,7 @@ interface AgentGenerationQuality {
   totalTests?: number;
   runnableTests?: number;
   minGeneratedTests?: number;
+  minimumUsefulRunnableFloor?: number;
   adaptiveRunnableFloor?: number;
   coverageProfile?: string;
   requiredCategories?: string[];
@@ -1644,6 +1646,15 @@ interface PipelineErrorShape {
   firstSpecPreview?: { file?: string; lines?: string } | null;
   generatedSpecCount?: number;
   qualityAuditErrors?: string[] | null;
+  generationQuality?: {
+    totalTests?: number;
+    runnableTests?: number;
+    generatedTestsActual?: number;
+    runnableTestsActual?: number;
+    minimumUsefulRunnableFloor?: number;
+    adaptiveRunnableFloor?: number;
+    minGeneratedTestsTarget?: number;
+  } | null;
   errorCode?: string | null;
   userFacingMessage?: string | null;
 }
@@ -1705,6 +1716,7 @@ function QualityWarningBanner({ warning }: { warning: QualityWarning }) {
   const suggestions = warning.suggestions || [];
   const topSuggestion = suggestions[0];
   const minCountWarning = (warning.qualityWarnings || []).find((item) => item.code === 'MIN_TEST_COUNT_NOT_MET');
+  const usefulFloor = warning.minimumUsefulRunnableFloor ?? warning.adaptiveRunnableFloor;
 
   // amber for 60-79, orange/red for below 60
   const toneClass = score >= 60
@@ -1735,7 +1747,7 @@ function QualityWarningBanner({ warning }: { warning: QualityWarning }) {
             <div className="text-[#F0F6FF]/85 text-sm mt-0.5">
               {minCountWarning ? (
                 <>
-                  Generated tests were below target, but valid runnable tests ran because the suite met Healix&apos;s adaptive execution floor.
+                  Generated tests were below target, but valid runnable tests ran because the suite met Healix&apos;s minimum useful runnable floor.
                 </>
               ) : potential > 0 ? (
                 <>
@@ -1776,9 +1788,9 @@ function QualityWarningBanner({ warning }: { warning: QualityWarning }) {
                   target: {warning.minGeneratedTestsTarget}
                 </span>
               )}
-              {typeof warning.adaptiveRunnableFloor === 'number' && (
+              {typeof usefulFloor === 'number' && (
                 <span className="px-2 py-0.5 rounded-md bg-white/5 border border-white/10 text-[#D8E8FF]/70 text-[11px] font-mono">
-                  floor: {warning.adaptiveRunnableFloor}
+                  floor: {usefulFloor}
                 </span>
               )}
               {typeof warning.selectorQuality === 'number' && (
@@ -2115,7 +2127,7 @@ function buildSuggestedFix(error: PipelineErrorShape): SuggestedFix | null {
       title: 'Suggested fix — add focused runnable coverage',
       steps: [
         { action: 'Regenerate with source-grounded coverage top-up', detail: 'Healix should add focused tests for uncovered routes/workflows rather than padding with page-load checks.' },
-        { action: 'Keep the target, but execute useful suites', detail: '`minGeneratedTests` is a target. Valid suites that meet the adaptive runnable floor should run and show a warning instead of failing.' },
+        { action: 'Keep the target, but execute useful suites', detail: '`minGeneratedTests` is a target. Valid suites that meet the minimum useful runnable floor should run and show a warning instead of failing.' },
       ],
     };
   }
@@ -2264,17 +2276,30 @@ function PipelineErrorBanner({ error, runId }: { error: PipelineErrorShape; runI
     );
   const isMinCountIssue = code === 'MIN_TEST_COUNT_NOT_MET'
     || code === 'INSUFFICIENT_RUNNABLE_COVERAGE'
-    || /MIN_TEST_COUNT_NOT_MET|Generated tests \d+ below minimum|below adaptive floor/i.test(
+    || /MIN_TEST_COUNT_NOT_MET|Generated tests \d+ below minimum|below (?:adaptive|minimum useful) floor/i.test(
       `${error.userFacingMessage ?? ''} ${error.stderr ?? ''} ${error.reason ?? ''}`
     );
+  const isInsufficientRunnableCoverage = code === 'INSUFFICIENT_RUNNABLE_COVERAGE';
+  const generatedFromQuality = error.generationQuality?.generatedTestsActual
+    ?? error.generationQuality?.totalTests
+    ?? null;
+  const runnableFromQuality = error.generationQuality?.runnableTestsActual
+    ?? error.generationQuality?.runnableTests
+    ?? null;
+  const displayedGeneratedSpecCount = typeof error.generatedSpecCount === 'number' && error.generatedSpecCount > 0
+    ? error.generatedSpecCount
+    : (typeof generatedFromQuality === 'number' ? generatedFromQuality : error.generatedSpecCount);
+  const usefulFloor = error.generationQuality?.minimumUsefulRunnableFloor
+    ?? error.generationQuality?.adaptiveRunnableFloor
+    ?? null;
   const stage = isHardcodedBaseUrlMismatch || isMinCountIssue ? 'generation' : (error.stage || 'unknown');
   const reason = isHardcodedBaseUrlMismatch
     ? 'hardcoded_base_url_mismatch'
-    : (isMinCountIssue ? (code === 'INSUFFICIENT_RUNNABLE_COVERAGE' ? 'insufficient_runnable_coverage' : 'min_test_count_not_met') : (error.reason || 'unknown_reason'));
+    : (isMinCountIssue ? (isInsufficientRunnableCoverage ? 'insufficient_runnable_coverage' : 'min_test_count_not_met') : (error.reason || 'unknown_reason'));
   const displayMessage = isHardcodedBaseUrlMismatch && !error.userFacingMessage
     ? 'Generated tests used an absolute URL outside the configured baseURL. Healix blocked execution so results do not come from the wrong target app.'
     : (isMinCountIssue && !error.userFacingMessage
-      ? 'Generated tests were below the target count. Current runs execute when valid runnable tests meet the adaptive floor; otherwise Healix reports insufficient runnable coverage.'
+      ? 'Generated tests were below the target count. Current runs execute when valid runnable tests meet the minimum useful floor; otherwise Healix reports insufficient runnable coverage.'
       : error.userFacingMessage);
 
   const errorBlob = `${code ?? ''} ${error.userFacingMessage ?? ''} ${error.stderr ?? ''} ${reason}`;
@@ -2285,7 +2310,8 @@ function PipelineErrorBanner({ error, runId }: { error: PipelineErrorShape; runI
 
   const stageLabel =
     code === 'HARDCODED_BASE_URL_MISMATCH' ? 'Generated tests targeted the wrong app origin' :
-    isMinCountIssue ? 'Generated fewer runnable tests than needed' :
+    isInsufficientRunnableCoverage ? 'Generated fewer runnable tests than the useful minimum' :
+    isMinCountIssue ? 'Generated fewer tests than target' :
     stage === 'validation' ? 'Generated tests failed Playwright validation' :
     stage === 'generation' ? 'Test generation failed' :
     stage === 'server_start' ? 'Dev server failed to start' :
@@ -2348,9 +2374,19 @@ function PipelineErrorBanner({ error, runId }: { error: PipelineErrorShape; runI
                   {code}
                 </span>
               )}
-              {typeof error.generatedSpecCount === 'number' && (
+              {typeof displayedGeneratedSpecCount === 'number' && (
                 <span className="px-2 py-0.5 rounded-md bg-white/5 border border-white/10 text-[#D8E8FF]/70 text-[11px] font-mono">
-                  generated: {error.generatedSpecCount} spec{error.generatedSpecCount === 1 ? '' : 's'}
+                  generated: {displayedGeneratedSpecCount} spec{displayedGeneratedSpecCount === 1 ? '' : 's'}
+                </span>
+              )}
+              {typeof runnableFromQuality === 'number' && (
+                <span className="px-2 py-0.5 rounded-md bg-white/5 border border-white/10 text-[#D8E8FF]/70 text-[11px] font-mono">
+                  runnable: {runnableFromQuality}
+                </span>
+              )}
+              {typeof usefulFloor === 'number' && (
+                <span className="px-2 py-0.5 rounded-md bg-white/5 border border-white/10 text-[#D8E8FF]/70 text-[11px] font-mono">
+                  floor: {usefulFloor}
                 </span>
               )}
             </div>

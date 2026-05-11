@@ -1256,10 +1256,30 @@ function minimumCategoryHitsByProfile(profile) {
   return 1;
 }
 
-function adaptiveRunnableFloor(minGeneratedTests) {
+function minimumUsefulRunnableFloor(minGeneratedTests) {
   const target = Math.max(0, toFiniteNumber(minGeneratedTests, 50));
   if (target <= 0) return 1;
-  return Math.max(8, Math.min(25, Math.ceil(target * 0.4)));
+  if (target <= 20) return Math.max(4, Math.ceil(target * 0.4));
+  return Math.max(8, Math.min(25, Math.ceil(target * 0.24)));
+}
+
+function adaptiveRunnableFloor(minGeneratedTests) {
+  return minimumUsefulRunnableFloor(minGeneratedTests);
+}
+
+function shouldAttemptCoverageTopUp({ config = {}, quality = null } = {}) {
+  const target = toFiniteNumber(config.minGeneratedTests, 50);
+  const floor = minimumUsefulRunnableFloor(target);
+  if (config.coverageTopUp === false || config.disableCoverageTopUp === true) {
+    return { attempt: false, reason: 'disabled', target, minimumUsefulRunnableFloor: floor };
+  }
+  if (!quality || quality.totalTests <= 0 || quality.runnableTests <= 0) {
+    return { attempt: false, reason: 'no_runnable_tests', target, minimumUsefulRunnableFloor: floor };
+  }
+  if (quality.totalTests >= target) {
+    return { attempt: false, reason: 'target_met', target, minimumUsefulRunnableFloor: floor };
+  }
+  return { attempt: true, reason: 'below_target', target, minimumUsefulRunnableFloor: floor };
 }
 
 // Compute a 0-100 quality score and a list of "if you do X, quality can
@@ -1380,14 +1400,15 @@ function evaluateGenerationQualityGates({ config, context, quality, prdContent, 
   const missingCategories = requiredCategories.filter((category) => (quality.categories[category] || 0) < minHits);
 
   const minGeneratedTests = toFiniteNumber(config.minGeneratedTests, 50);
-  const adaptiveFloor = adaptiveRunnableFloor(minGeneratedTests);
+  const usefulFloor = minimumUsefulRunnableFloor(minGeneratedTests);
   const minSelectorQuality = profile === 'balanced' ? 0.35 : (profile === 'exhaustive' ? 0.6 : 0.5);
   const minRunnableRatio = profile === 'balanced' ? 0.25 : 0.5;
   const buildQualityEnvelope = (status, extra = {}) => ({
     ...quality,
     minGeneratedTests,
     minGeneratedTestsTarget: minGeneratedTests,
-    adaptiveRunnableFloor: adaptiveFloor,
+    minimumUsefulRunnableFloor: usefulFloor,
+    adaptiveRunnableFloor: usefulFloor,
     generatedTestsActual: quality.totalTests,
     runnableTestsActual: quality.runnableTests,
     qualityGateStatus: status,
@@ -1403,6 +1424,13 @@ function evaluateGenerationQualityGates({ config, context, quality, prdContent, 
     const error = new Error(`Generated suite has zero runnable tests (${quality.skippedTests}/${quality.totalTests} skipped).`);
     error.code = 'ZERO_RUNNABLE_TESTS';
     error.generationQuality = buildQualityEnvelope('failed');
+    error.diagnostics = buildPipelineDiagnostics({
+      projectPath: config.projectPath,
+      stage: 'generation',
+      reason: 'zero_runnable_tests',
+      stderr: error.message,
+      qualityAudit: { errors: ['zero_runnable_tests'], ...quality },
+    });
     return { ok: false, error };
   }
 
@@ -1431,6 +1459,13 @@ function evaluateGenerationQualityGates({ config, context, quality, prdContent, 
     const error = new Error(`Generated suite runnable coverage too low (${quality.runnableTests}/${quality.totalTests} runnable, minimum ratio ${minRunnableRatio}).`);
     error.code = 'RUNNABLE_COVERAGE_TOO_LOW';
     error.generationQuality = buildQualityEnvelope('failed');
+    error.diagnostics = buildPipelineDiagnostics({
+      projectPath: config.projectPath,
+      stage: 'generation',
+      reason: 'runnable_coverage_too_low',
+      stderr: error.message,
+      qualityAudit: { errors: ['runnable_coverage_too_low'], ...quality },
+    });
     return { ok: false, error };
   }
 
@@ -1438,25 +1473,32 @@ function evaluateGenerationQualityGates({ config, context, quality, prdContent, 
   if (quality.totalTests < minGeneratedTests) {
     const minCountWarning = {
       code: 'MIN_TEST_COUNT_NOT_MET',
-      message: `Generated ${quality.totalTests} tests below target ${minGeneratedTests}; executing because the runnable suite meets the adaptive floor.`,
+      message: `Generated ${quality.totalTests} tests below target ${minGeneratedTests}; executing because the runnable suite meets the minimum useful floor.`,
       actual: quality.totalTests,
       expected: minGeneratedTests,
       severity: 'warning',
     };
 
-    if (quality.runnableTests < adaptiveFloor) {
+    if (quality.runnableTests < usefulFloor) {
       const error = new Error(
-        `Generated runnable tests ${quality.runnableTests} below adaptive floor ${adaptiveFloor} for target ${minGeneratedTests}.`
+        `Generated runnable tests ${quality.runnableTests} below minimum useful floor ${usefulFloor} for target ${minGeneratedTests}.`
       );
       error.code = 'INSUFFICIENT_RUNNABLE_COVERAGE';
       error.generationQuality = buildQualityEnvelope('failed', {
         qualityWarnings: [minCountWarning],
       });
+      error.diagnostics = buildPipelineDiagnostics({
+        projectPath: config.projectPath,
+        stage: 'generation',
+        reason: 'insufficient_runnable_coverage',
+        stderr: error.message,
+        qualityAudit: { errors: ['insufficient_runnable_coverage'], ...quality },
+      });
       return { ok: false, error };
     }
 
     qualityWarnings.push(minCountWarning);
-    Logger.warn('PipelineWorker', `Generated tests ${quality.totalTests} below target ${minGeneratedTests}, but continuing because runnable tests ${quality.runnableTests} meet adaptive floor ${adaptiveFloor}`);
+    Logger.warn('PipelineWorker', `Generated tests ${quality.totalTests} below target ${minGeneratedTests}, but continuing because runnable tests ${quality.runnableTests} meet minimum useful floor ${usefulFloor}`);
   }
 
   const warnings = qualityWarnings.map((warning) => warning.message);
@@ -1571,11 +1613,11 @@ function buildGenerationRepairContext({
     instructions.push(`Close missing coverage categories: ${missingCategories.join(', ')}.`);
   }
   if (code === 'INSUFFICIENT_RUNNABLE_COVERAGE' || code === 'MIN_TEST_COUNT_NOT_MET') {
-    const floor = quality?.adaptiveRunnableFloor;
+    const floor = quality?.minimumUsefulRunnableFloor ?? quality?.adaptiveRunnableFloor;
     const actual = quality?.runnableTests ?? quality?.totalTests;
     const target = quality?.minGeneratedTestsTarget ?? quality?.minGeneratedTests;
     instructions.push(
-      `Add focused runnable tests for uncovered high-value routes/workflows until runnable count clears the adaptive floor${floor ? ` (${floor})` : ''}${target ? ` while still aiming for target ${target}` : ''}. Current runnable/total count: ${actual ?? 'unknown'}/${quality?.totalTests ?? 'unknown'}.`
+      `Add focused runnable tests for uncovered high-value routes/workflows until runnable count clears the minimum useful floor${floor ? ` (${floor})` : ''}${target ? ` while still aiming for target ${target}` : ''}. Current runnable/total count: ${actual ?? 'unknown'}/${quality?.totalTests ?? 'unknown'}.`
     );
     instructions.push('Do not pad with page-load-only tests; add source-grounded assertions for distinct visible behavior, forms, navigation, validation, or real API contracts.');
   }
@@ -1835,7 +1877,7 @@ function classifyErrorCode(error) {
   if (message.includes('minimum') && message.includes('generated')) {
     return 'MIN_TEST_COUNT_NOT_MET';
   }
-  if (message.includes('adaptive floor') || message.includes('insufficient_runnable_coverage')) {
+  if (message.includes('adaptive floor') || message.includes('minimum useful floor') || message.includes('insufficient_runnable_coverage')) {
     return 'INSUFFICIENT_RUNNABLE_COVERAGE';
   }
   if (message.includes('zero runnable') || message.includes('all were skipped')) {
@@ -1950,7 +1992,7 @@ function buildUserFacingPipelineError(errorCode, error) {
   }
 
   if (errorCode === 'INSUFFICIENT_RUNNABLE_COVERAGE') {
-    return `Healix generated too few runnable tests to produce a useful execution result. ${normalizedMessage}`;
+    return `Healix generated too few runnable tests to produce a useful execution result after a bounded coverage top-up. ${normalizedMessage}`;
   }
 
   if (errorCode === 'HARDCODED_BASE_URL_MISMATCH') {
@@ -2886,6 +2928,7 @@ function buildPipelineDiagnostics({ projectPath, stage, reason, stderr, stdout, 
     firstSpecPreview,
     generatedSpecCount,
     qualityAuditErrors: qualityAudit?.errors || null,
+    generationQuality: qualityAudit || null,
   };
 }
 
@@ -3949,6 +3992,199 @@ async function maybeGenerateViaSaaS({
   });
 }
 
+async function maybeRunCoverageTopUp({
+  client,
+  sharedPayload,
+  testsDir,
+  usedFilenames,
+  files,
+  config,
+  runBudget = null,
+  statusDir = null,
+  runId = null,
+  telemetryReporter = null,
+  sourceTag = 'saas-topup',
+}) {
+  const before = collectGenerationQuality(config.projectPath, {
+    baseURL: config.baseURL || sharedPayload?.projectInfo?.baseURL,
+  });
+  const decision = shouldAttemptCoverageTopUp({ config, quality: before });
+  if (!decision.attempt) return null;
+
+  const remainingMs = getStageBudgetRemainingMs(runBudget, 'generation');
+  if (Number.isFinite(remainingMs) && remainingMs < 90_000) {
+    return {
+      attempted: false,
+      status: 'skipped_budget',
+      reason: 'generation_budget_too_low',
+      before,
+      target: decision.target,
+      minimumUsefulRunnableFloor: decision.minimumUsefulRunnableFloor,
+    };
+  }
+
+  const requestedAdditional = Math.max(
+    5,
+    Math.min(20, decision.target - before.totalTests),
+  );
+  const routeAccessSummary = buildRouteAccessSummary(sharedPayload?.explorationArtifact || null);
+  const feedbackContext = buildGenerationRepairContext({
+    context: sharedPayload?.context || {},
+    error: {
+      code: 'MIN_TEST_COUNT_NOT_MET',
+      message: `Generated ${before.totalTests} tests below target ${decision.target}; running one bounded coverage top-up.`,
+    },
+    quality: {
+      ...before,
+      minGeneratedTestsTarget: decision.target,
+      minGeneratedTests: decision.target,
+      minimumUsefulRunnableFloor: decision.minimumUsefulRunnableFloor,
+      adaptiveRunnableFloor: decision.minimumUsefulRunnableFloor,
+      missingCategories: before.missingCategories || [],
+      errors: [],
+    },
+    routeAccessSummary,
+    attempt: 1,
+    testType: sharedPayload?.testType,
+  });
+
+  if (statusDir) {
+    updateStatus(statusDir, 'generation_top_up', {
+      runId,
+      message: `Generated ${before.runnableTests}/${decision.target} runnable tests; requesting one focused coverage top-up...`,
+      target: decision.target,
+      minimumUsefulRunnableFloor: decision.minimumUsefulRunnableFloor,
+      runnableTests: before.runnableTests,
+      totalTests: before.totalTests,
+    }, telemetryReporter);
+  }
+
+  const event = {
+    attempted: true,
+    status: 'started',
+    reason: decision.reason,
+    requestedAdditional,
+    before,
+    target: decision.target,
+    minimumUsefulRunnableFloor: decision.minimumUsefulRunnableFloor,
+    addedFiles: [],
+    error: null,
+  };
+
+  try {
+    const timeoutMs = Math.max(
+      60_000,
+      Math.min(
+        computeGenerationAgentTimeoutMs({
+          config,
+          runBudget,
+          agents: ['expansion'],
+          concurrency: 1,
+          context: feedbackContext,
+          parsedPRD: sharedPayload?.parsedPRD || {},
+          projectInfo: sharedPayload?.projectInfo || {},
+        }),
+        Number.isFinite(remainingMs) ? Math.max(60_000, remainingMs - 30_000) : 600_000,
+      ),
+    );
+    const payload = await client.generateTestsForAgent({
+      agent: 'expansion',
+      ...sharedPayload,
+      context: feedbackContext,
+      transportTimeoutMs: timeoutMs,
+      options: {
+        ...(sharedPayload?.options || {}),
+        minGeneratedTests: requestedAdditional,
+        maxExpansionAttempts: 1,
+      },
+    });
+
+    const incoming = Array.isArray(payload?.tests) ? payload.tests : [];
+    const beforeFileCount = files.length;
+    for (const test of incoming) {
+      try {
+        const written = safeWriteGeneratedTest(
+          testsDir,
+          test,
+          files.length,
+          sourceTag,
+          usedFilenames,
+        );
+        files.push({ ...written, type: test.type || 'expansion', agent: 'expansion' });
+        event.addedFiles.push(written.filename);
+      } catch (writeErr) {
+        Logger.warn('PipelineWorker', 'safeWriteGeneratedTest failed for coverage top-up', {
+          filename: test?.filename,
+          reason: writeErr?.message,
+        });
+      }
+    }
+
+    const after = collectGenerationQuality(config.projectPath, {
+      baseURL: config.baseURL || sharedPayload?.projectInfo?.baseURL,
+    });
+    event.after = after;
+    event.status = after.runnableTests > before.runnableTests
+      ? 'added'
+      : (files.length > beforeFileCount ? 'added_files_pending_quality' : 'no_new_valid_tests');
+
+    if (statusDir) {
+      updateStatus(statusDir, 'generation_top_up_complete', {
+        runId,
+        message: event.status === 'added'
+          ? `Coverage top-up added ${after.runnableTests - before.runnableTests} runnable test(s).`
+          : 'Coverage top-up completed without increasing runnable tests; continuing with the best valid suite.',
+        status: event.status,
+        addedFiles: event.addedFiles,
+        before: {
+          totalTests: before.totalTests,
+          runnableTests: before.runnableTests,
+        },
+        after: {
+          totalTests: after.totalTests,
+          runnableTests: after.runnableTests,
+        },
+      }, telemetryReporter);
+    }
+
+    if (telemetryReporter && telemetryReporter.isEnabled() && event.addedFiles.length > 0) {
+      telemetryReporter.emitBackground({
+        toolName: 'healix_test_my_app',
+        eventType: 'tests_generated',
+        runId,
+        phase: 'generation_top_up_complete',
+        status: 'info',
+        success: true,
+        message: `Coverage top-up generated ${event.addedFiles.length} spec file${event.addedFiles.length === 1 ? '' : 's'}`,
+        metadata: {
+          files: event.addedFiles,
+          generatedCount: files.length,
+          target: decision.target,
+          minimumUsefulRunnableFloor: decision.minimumUsefulRunnableFloor,
+        },
+      });
+    }
+
+    return event;
+  } catch (err) {
+    event.status = 'failed';
+    event.error = {
+      code: err?.code || classifyErrorCode(err),
+      message: err?.message || String(err),
+    };
+    Logger.warn('PipelineWorker', 'Coverage top-up failed; continuing with generated suite', event.error);
+    if (statusDir) {
+      updateStatus(statusDir, 'generation_top_up_failed', {
+        runId,
+        message: 'Coverage top-up failed; continuing with the best valid generated suite.',
+        errorCode: event.error.code,
+        reason: event.error.message,
+      }, telemetryReporter);
+    }
+    return event;
+  }
+}
+
 /**
  * P1 per-agent parallel fan-out — one generateTestsForAgent call per agent,
  * all in flight simultaneously. A rejection in one agent cannot cancel the
@@ -3979,6 +4215,7 @@ async function runPhase1FanOut({
   const agentsCompleted = [];
   const agentMeta = [];
   const allTokenRuns = [];
+  const coverageTopUps = [];
   let doneCount = 0;
 
   // Dispatch agents through a bounded pool. The per-agent transport timeout is
@@ -4267,6 +4504,23 @@ async function runPhase1FanOut({
     throw err;
   }
 
+  const topUpEvent = await maybeRunCoverageTopUp({
+    client,
+    sharedPayload,
+    testsDir,
+    usedFilenames: used,
+    files,
+    config,
+    runBudget,
+    statusDir,
+    runId,
+    telemetryReporter,
+    sourceTag: 'saas-topup',
+  });
+  if (topUpEvent) {
+    coverageTopUps.push(topUpEvent);
+  }
+
   // Deps must be installed once, after all writes are done (dedupes axios/etc.
   // across agents — installing during the Promise.allSettled loop would race).
   installMissingDependencies(config.projectPath, testsDir);
@@ -4287,6 +4541,7 @@ async function runPhase1FanOut({
       agentConcurrency: AGENT_CONCURRENCY,
       agentTransportTimeoutMs,
       agentMeta,
+      coverageTopUps,
     },
   };
 }
@@ -4377,6 +4632,24 @@ async function runAsyncGenerationPath({
         throw err;
       }
 
+      const coverageTopUps = [];
+      const topUpEvent = await maybeRunCoverageTopUp({
+        client,
+        sharedPayload,
+        testsDir,
+        usedFilenames: used,
+        files,
+        config,
+        runBudget,
+        statusDir,
+        runId,
+        telemetryReporter,
+        sourceTag: 'saas-sync-topup',
+      });
+      if (topUpEvent) {
+        coverageTopUps.push(topUpEvent);
+      }
+
       installMissingDependencies(config.projectPath, testsDir);
 
       return {
@@ -4393,6 +4666,7 @@ async function runAsyncGenerationPath({
           planStatus: planMeta?.status || null,
           backendGenerationSkippedReason,
           ...(syncPayload.generationMeta || {}),
+          coverageTopUps,
         },
       };
     }
@@ -4559,6 +4833,24 @@ async function runAsyncGenerationPath({
     throw err;
   }
 
+  const coverageTopUps = [];
+  const topUpEvent = await maybeRunCoverageTopUp({
+    client,
+    sharedPayload,
+    testsDir,
+    usedFilenames: used,
+    files,
+    config,
+    runBudget,
+    statusDir,
+    runId,
+    telemetryReporter,
+    sourceTag: 'saas-async-topup',
+  });
+  if (topUpEvent) {
+    coverageTopUps.push(topUpEvent);
+  }
+
   // Deps install once after all writes (dedupes axios/etc. across agents).
   installMissingDependencies(config.projectPath, testsDir);
 
@@ -4578,6 +4870,7 @@ async function runAsyncGenerationPath({
       planStatus: planMeta?.status || null,
       backendGenerationSkippedReason,
       ...(finalResp?.generationMeta || {}),
+      coverageTopUps,
     },
   };
 }
@@ -5878,6 +6171,7 @@ async function runPipeline(config, runId) {
           suggestions: generationQuality.improvementSuggestions || [],
           totalTests: generationQuality.totalTests,
           minGeneratedTestsTarget: generationQuality.minGeneratedTestsTarget,
+          minimumUsefulRunnableFloor: generationQuality.minimumUsefulRunnableFloor,
           adaptiveRunnableFloor: generationQuality.adaptiveRunnableFloor,
           runnableTestsActual: generationQuality.runnableTestsActual,
           qualityWarnings: generationQuality.qualityWarnings || [],
@@ -6672,6 +6966,9 @@ async function runPipeline(config, runId) {
           || (errorCode === 'GENERATION_VALIDATION_FAILED' ? 'validation' : null),
       });
 
+      const generatedSpecCount = Number.isFinite(Number(error.diagnostics?.generatedSpecCount))
+        ? Number(error.diagnostics.generatedSpecCount)
+        : listGeneratedTestFiles(config.projectPath).length;
       const pipelineError = {
         errorCode,
         stage: error.diagnostics?.stage && error.diagnostics.stage !== 'unknown'
@@ -6683,8 +6980,9 @@ async function runPipeline(config, runId) {
         stderr: error.diagnostics?.stderr || (typeof error.message === 'string' ? error.message.slice(0, 4000) : null),
         stdout: error.diagnostics?.stdout || null,
         firstSpecPreview: error.diagnostics?.firstSpecPreview || null,
-        generatedSpecCount: error.diagnostics?.generatedSpecCount || 0,
+        generatedSpecCount,
         qualityAuditErrors: error.diagnostics?.qualityAuditErrors || null,
+        generationQuality: error.generationQuality || error.diagnostics?.generationQuality || null,
       };
       // Mark the synthetic row so the dashboard can hide it when the banner
       // carries full diagnostics — otherwise stats strip double-counts it as
@@ -6795,7 +7093,9 @@ module.exports = {
   effectiveApiEndpoints,
   isSyntheticHealthEndpoint,
   buildGenerationRepairContext,
+  minimumUsefulRunnableFloor,
   adaptiveRunnableFloor,
+  shouldAttemptCoverageTopUp,
   isRepairableGenerationFailure,
   collectGenerationQuality,
   evaluateGenerationQualityGates,
