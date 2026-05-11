@@ -26,7 +26,6 @@ import type {
   ApiEndpoint,
   MockableApiContract,
   Role,
-  AcceptanceCriterion,
 } from './types'
 
 const GENERATED_TEST_FILE_SCHEMA = z.object({
@@ -62,6 +61,23 @@ const PREFERRED_SELECTOR_PATTERN =
 const FORBIDDEN_IMPORT_PATTERN =
   /from\s+['"`](fs|child_process|net|tls|http|https|dgram|cluster|worker_threads|vm)['"`]/i
 const FORBIDDEN_GLOBAL_PATTERN = /\b(eval|Function|process\.exit)\b/
+
+function normalizeRoleLabel(role: unknown): string {
+  const raw = String(role || 'user').trim().toLowerCase()
+  if (!raw) return 'user'
+  if (raw === 'administrator' || raw === 'superadmin' || raw === 'super_admin') return 'admin'
+  if (raw === 'customer' || raw === 'member' || raw === 'authed' || raw === 'authenticated') return 'user'
+  return raw.replace(/[^a-zA-Z0-9_-]/g, '_')
+}
+
+function redactCredentialLikeText(value: unknown): string {
+  return String(value ?? '')
+    .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, '[REDACTED_EMAIL]')
+    .replace(
+      /\b(password|passwd|pwd|secret|token|api[_-]?key)\s*[:=]\s*['"`]?[^'"`,\s)}\]]+/gi,
+      '$1: [REDACTED_SECRET]'
+    )
+}
 
 export interface OpenAITestGeneratorConfig {
   apiKey?: string
@@ -633,7 +649,7 @@ export class OpenAITestGenerator {
   }
 
   private async generateErrorTests(context: CapturedContext, projectInfo: ProjectInfo) {
-    const systemPrompt = this.buildErrorTestSystemPrompt(projectInfo)
+    const systemPrompt = this.buildErrorTestSystemPrompt()
     const userPrompt = this.applyPlanPreamble(
       this.buildErrorTestUserPrompt(context, projectInfo),
     )
@@ -1082,7 +1098,7 @@ IMPORTANT: Return ONLY valid JSON, no markdown code blocks.`
     })
   }
 
-  buildErrorTestSystemPrompt(projectInfo: ProjectInfo): string {
+  buildErrorTestSystemPrompt(): string {
     return `You are an expert test engineer. Generate tests for error states and edge cases.
 
 ## Guidelines
@@ -1124,7 +1140,7 @@ IMPORTANT: Return ONLY valid JSON.`
 
   truncateText(value: unknown, maxChars: number): string {
     if (!value) return ''
-    const text = String(value).replace(/\u0000/g, '').trim()
+    const text = redactCredentialLikeText(value).replace(/\u0000/g, '').trim()
     if (text.length <= maxChars) return text
     return `${text.slice(0, maxChars)}\n[TRUNCATED]`
   }
@@ -1220,14 +1236,18 @@ IMPORTANT: Return ONLY valid JSON.`
           sourceFilesAnalyzed: sourceContextRaw.sourceFilesAnalyzed || 0,
           routePaths: (sourceContextRaw.routePaths || []).slice(0, 80),
           testIds: (sourceContextRaw.testIds || []).slice(0, 80),
-          assertableText: (sourceContextRaw.assertableText || []).slice(0, 160),
+          assertableText: (sourceContextRaw.assertableText || [])
+            .slice(0, 160)
+            .map((text) => redactCredentialLikeText(text)),
           files: (sourceContextRaw.files || []).slice(0, 24).map((file) => ({
             file: file.file,
             kind: file.kind || 'source',
             routePaths: (file.routePaths || []).slice(0, 12),
             components: (file.components || []).slice(0, 8),
             testIds: (file.testIds || []).slice(0, 12),
-            assertableText: (file.assertableText || []).slice(0, 18),
+            assertableText: (file.assertableText || [])
+              .slice(0, 18)
+              .map((text) => redactCredentialLikeText(text)),
           })),
         }
       : null
@@ -1266,13 +1286,14 @@ IMPORTANT: Return ONLY valid JSON.`
     // storage states and which tests must be skipped.
     const verifiedRoles = (this.roles || [])
       .filter((r) => r && r.loginVerified && r.storageStatePath)
-      .map((r) => String(r.name || (r as Role & { role?: string }).role || 'user'))
-    const hasCredentials = verifiedRoles.length > 0
+      .map((r) => normalizeRoleLabel(r.name || r.role || 'user'))
+    const availableRoles = [...new Set(verifiedRoles)]
+    const hasCredentials = availableRoles.length > 0
     const authContext = {
-      availableRoles: verifiedRoles,
+      availableRoles,
       hasCredentials,
       note: hasCredentials
-        ? `Playwright storageState is available for these roles: [${verifiedRoles.join(', ')}]. Tests for those roles may use an authenticated context.`
+        ? `Playwright storageState is available for these roles: [${availableRoles.join(', ')}]. Tests for those roles may use an authenticated context.`
         : routeAccess.authMode === 'public_app'
           ? 'No credentials were injected, but exploration proved public routes are reachable. Public routes MUST be tested without storageState; do not skip them for missing credentials.'
           : 'No credentials were injected for this run — storageState is NOT available for any role. Any test that requires a signed-in user (protected routes, admin panels, account pages) MUST be wrapped in test.skip() with a human-readable reason string.',
@@ -1339,6 +1360,20 @@ IMPORTANT: Return ONLY valid JSON.`
     payload: unknown
   }): string {
     const promptRequirements = [...(requirements || [])]
+    promptRequirements.push(
+      'Treat live database/CMS values as dynamic: do not assert exact product/order/customer/card names or brand labels unless that exact text is present in sourceContext.assertableText.',
+      'For listings, assert stable structure and live navigation links instead of exact card h3 text.',
+      'For direct cart-route tests, assert the cart shell or empty-cart state unless the same test first added an item.',
+      'For add-to-cart actions, assert in-page feedback; do not assume a redirect to the cart route.',
+      'Do not generate credential-submitting login success tests. Healix never sends raw credentials to generation; use @auth/@tierB storageState for authenticated routes.',
+      'For login-form tests, only cover unauthenticated validation/error states with deliberately invalid placeholder input such as invalid@example.invalid; never use real-looking emails or copied project credentials.',
+      'For post-auth routes, do not guess the landing page after login. Navigate directly to the protected route under @auth/@tierB and assert route-owned content or a generic authenticated shell observed in context.',
+      'For unauthenticated protected routes, do not assert HTTP 3xx redirects. Modern apps may return 200 and render login UI in-place; assert either /login URL OR visible login/auth UI.',
+      'Separate route content from global layout chrome: navbar/header/footer/sidebar/logo text may prove the shell renders, but it must not be asserted as page-specific main content unless sourceContext ties it to that route page file.',
+      'A button click or form submit does not imply navigation. Only assert a URL change when OBSERVED_FLOWS endCondition, routeAccess, or sourceContext proves that exact action navigates; otherwise assert visible in-place feedback, changed button state, toast/dialog/inline message, or continued page usability.',
+      'Do not assert conditional UI before triggering its condition. Menus, dropdowns, dialogs, accordions, drawers, mobile nav, filters, tabs, and collapsed panels must be opened/selected first, then asserted within the opened container.',
+      'Avoid contradictory before/after assertions. After a transition, assert either the pre-state remains because the app stayed in place, or the post-state appears because the transition completed; never both in the same success path.',
+    )
     const payloadObj = payload as { prd?: string } | null
     if (payloadObj?.prd && String(payloadObj.prd).trim()) {
       promptRequirements.push(
@@ -1720,15 +1755,25 @@ Return only the JSON array of generated files.`
 - Avoid getByText('Standup')/getByText('Review') for single-word event labels that can appear in buttons, headings, and detail text. Use role + exact name, or scope to a specific region/card.
 - Avoid phase2 stress loops that repeatedly toggle the same UI state unless context proves the state machine. Prefer one interaction followed by stable user-visible assertions.
 - Source grounding rule: exact strings used in getByRole({name}), getByText(), getByLabel(), getByPlaceholder(), getByTestId(), toContainText(), or toHaveText() must be present in routeAccess.observedRoutes or sourceContext.assertableText/testIds. If the exact text is not proven, choose a proven visible text instead.
+- Global chrome rule: text from persistent layout files (layout, navbar, header, footer, sidebar, shell, logo) is not page content. Use it only in a dedicated shell/navigation assertion scoped to header/nav/footer/sidebar. Do not assert it inside main or as proof that a specific route rendered.
+- In-place feedback rule: button clicks and form submissions often update UI without navigation. Do not write toHaveURL() after an action unless the action's observed endCondition/source proves navigation. For unproven actions, assert a toast/dialog/inline success message, changed button text/disabled state, updated count, or that the current route remains usable.
+- Conditional visibility rule: if content lives behind a menu, dropdown, modal/dialog, accordion, drawer, hamburger nav, filter panel, tab, or lazy/collapsed section, the test must perform the opening interaction first and then scope the assertion to the opened container.
+- Database/CMS grounding rule: exact names that appear only in browser exploration are still not stable enough for product/order/customer/card assertions. Never assert exact level-3 card headings, product names, brand labels, or cart line-item text unless the exact text is present in sourceContext.assertableText. Prefer structure such as main.locator('h3').first(), row/card/link visibility, and live detail links extracted from the listing.
+- Login success rule: after submitting real credentials, success is leaving the login route/form or seeing authenticated account content. Never assert that the pre-auth login heading/form remains visible as the success condition.
+- Credential rule: generated tests must never fill login forms with real-looking email/password literals. Raw config-form credentials are intentionally unavailable to the generator. Authenticated tests must use @auth/@tierB storageState; login-form tests may only use deliberately invalid placeholder input for validation/error coverage.
+- Protected route rule: unauthenticated protected-route checks must assert the rendered auth boundary, not transport semantics. Do not require response.status() to be 3xx; accept either a /login URL or visible login/auth UI rendered in-place with HTTP 200.
 
 ## Auth Gating Rules (check CONTEXT_JSON.meta.authContext before generating any test)
-- CONTEXT_JSON.meta.authContext.availableRoles lists every role that has a verified Playwright storageState for this run. If it is an empty array, NO authentication context exists.
+- CONTEXT_JSON.meta.authContext.availableRoles lists every role that has a verified Playwright storageState for this run. Values are normalized lower-case labels such as "user" and "admin". If it is an empty array, NO authentication context exists.
 - CONTEXT_JSON.meta.routeAccess is authoritative for route accessibility. Routes listed in publicRoutes or observedRoutes with requiresAuth:false are public and MUST have runnable tests; do not add test.skip() to those tests because credentials are absent.
 - Any test that navigates to a route proven protected by routeAccess.protectedRoutes, an observed route with requiresAuth:true, or a real auth-only/admin-only surface MUST first check whether the required role is in availableRoles. If it is NOT, wrap only that protected-route test body in: test.skip('Requires <role> credentials — not available in this run').
+- If availableRoles is non-empty, protected-route tests MUST be tagged with @auth and @tierB so Healix runs them once for every verified role using persisted storageState. Do not put test.use({ storageState }) in generated files.
+- Do not submit the login form with stored credentials inside protected-route tests. Healix has already logged in and persisted sessions per role before execution; navigate directly to the protected route under the @auth/@tierB project.
 - If routeAccess.authMode is "public_app", generate public-first runnable coverage for the observed public routes and do not infer authentication from labels such as Dashboard, Projects, Calendar, Settings, Admin, Widget Library, Edit, Calendar, Logout, or role/admin wording in the PRD when exploration reached the route without redirecting.
 - If routeAccess.authMode is "public_app" and protectedRoutes is empty, authRequired/role/admin hints in PRD acceptance criteria are lower priority than routeAccess. Do NOT skip those tests for credentials; test the reachable public UI behavior instead.
 - NEVER hardcode test user credentials (e.g. email: 'user@app.test', password: 'Password123!'). These accounts almost certainly do not exist in the target database. For tests that need a signed-in customer without stored credentials, implement a fresh signUp() flow using the public /signup (or equivalent) route with a unique email per test.
-- Admin-only routes (/admin/**): skip unconditionally unless 'admin' is listed in availableRoles.`
+- Admin-only routes (/admin/**): skip unconditionally unless "admin" is listed in availableRoles.
+- Signed-in customer/user routes must run when any non-admin authenticated role such as "user" is listed in availableRoles.`
 
     if (prefix === 'api') {
       return `${shared}
@@ -1999,7 +2044,92 @@ Return JSON array only.`
     normalized = normalized.replace(/(?<![.\w])beforeEach\s*\(/g, 'test.beforeEach(')
     normalized = normalized.replace(/(?<![.\w])afterAll\s*\(/g, 'test.afterAll(')
     normalized = normalized.replace(/(?<![.\w])beforeAll\s*\(/g, 'test.beforeAll(')
+    normalized = normalized.replace(/\.catch\(\s*\(\s*\)\s*=>\s*\{\s*\}\s*\)/g, '.catch(() => undefined)')
+    normalized = normalized.replace(
+      /(\b(?:main|section|container|card|productCard|product|page))\.getByRole\(\s*(['"])heading\2\s*,\s*\{([^}]*)\}\s*\)/gi,
+      (match, receiver: string, _quote: string, options: string) => {
+        if (!/\blevel\s*:\s*3\b/i.test(options) || !/\bname\s*:/i.test(options)) return match
+        return `${receiver}.locator('h3').first()`
+      },
+    )
+    normalized = normalized.replace(
+      /\bpage\.getByRole\(\s*(['"])heading\1\s*,\s*\{([^}]*)\}\s*\)/gi,
+      (match, _quote: string, options: string) => {
+        if (!/\blevel\s*:\s*3\b/i.test(options) || !/\bname\s*:/i.test(options)) return match
+        return "page.locator('main h3, h3').first()"
+      },
+    )
     return normalized
+  }
+
+  collectSourceAssertableText(context: CapturedContext = {}): Set<string> {
+    const values = new Set<string>()
+    const add = (value: unknown) => {
+      if (typeof value !== 'string') return
+      const normalized = value.toLowerCase().replace(/\s+/g, ' ').trim()
+      if (normalized) values.add(normalized)
+    }
+
+    const sourceContext = context.sourceContext
+    for (const text of sourceContext?.assertableText || []) add(text)
+    for (const file of sourceContext?.files || []) {
+      for (const text of file.assertableText || []) add(text)
+    }
+
+    return values
+  }
+
+  collectSourceTextByFileKind(
+    context: CapturedContext = {},
+    predicate: (file: { file?: string; kind?: string }) => boolean
+  ): Set<string> {
+    const values = new Set<string>()
+    const add = (value: unknown) => {
+      if (typeof value !== 'string') return
+      const normalized = value.toLowerCase().replace(/\s+/g, ' ').trim()
+      if (normalized) values.add(normalized)
+    }
+
+    for (const file of context.sourceContext?.files || []) {
+      if (predicate(file)) {
+        for (const text of file.assertableText || []) add(text)
+      }
+    }
+
+    return values
+  }
+
+  collectLayoutChromeText(context: CapturedContext = {}): Set<string> {
+    return this.collectSourceTextByFileKind(context, (file) => {
+      const filePath = String(file.file || '').toLowerCase()
+      const kind = String(file.kind || '').toLowerCase()
+      return (
+        kind === 'layout' ||
+        /(?:^|[\\/])(layout|layouts|navbar|nav|header|footer|sidebar|shell|menu|logo)(?:[\\/._-]|$)/i.test(filePath)
+      )
+    })
+  }
+
+  collectRoutePageText(context: CapturedContext = {}): Set<string> {
+    return this.collectSourceTextByFileKind(context, (file) => {
+      const filePath = String(file.file || '').toLowerCase()
+      const kind = String(file.kind || '').toLowerCase()
+      return (
+        kind === 'page' ||
+        /(?:^|[\\/])(page|route|screen|view)\.(tsx?|jsx?|vue|svelte)$/i.test(filePath)
+      )
+    })
+  }
+
+  isSourceAssertableText(text: string, sourceText: Set<string>): boolean {
+    const normalized = String(text || '').toLowerCase().replace(/\s+/g, ' ').trim()
+    if (!normalized) return false
+    for (const known of sourceText) {
+      if (known === normalized || known.includes(normalized) || normalized.includes(known)) {
+        return true
+      }
+    }
+    return false
   }
 
   validateGeneratedContent(
@@ -2050,6 +2180,28 @@ Return JSON array only.`
       errors.push('Generated tests cannot use eval/process.exit/Function constructors')
     }
 
+    const containsLiteralEmail = /['"`][A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}['"`]/i.test(content)
+    const fillsPasswordLiteral =
+      /\.(?:fill|type)\(\s*['"`][^'"`]*(?:password|passwd|pwd)[^'"`]*['"`]\s*,\s*['"`][^'"`]{4,}['"`]\s*\)/i.test(content) ||
+      /getBy(?:Label|Placeholder|Role)\([^)]*(?:password|passwd|pwd)[^)]*\)\s*\.\s*(?:fill|type)\(\s*['"`][^'"`]{4,}['"`]\s*\)/i.test(content)
+    const submitsLoginForm =
+      /getByRole\(\s*['"`]button['"`]\s*,\s*\{[^}]*name\s*:\s*(?:\/[^/]*(?:sign\s*in|log\s*in|login)[^/]*\/[a-z]*|['"`][^'"`]*(?:sign\s*in|log\s*in|login)[^'"`]*['"`])[^}]*\}\s*\)\.click\(\s*\)/i.test(content)
+    const allowedInvalidLoginInput = /invalid@example\.invalid|example\.invalid/i.test(content)
+    if ((containsLiteralEmail || fillsPasswordLiteral) && submitsLoginForm && !allowedInvalidLoginInput) {
+      errors.push(
+        'Generated auth tests must not submit hardcoded real-looking credentials; use @auth/@tierB storageState for authenticated routes or deliberately invalid placeholder input for validation tests'
+      )
+    }
+
+    if (
+      /response\??\.(?:status|statusText)\(\s*\)[\s\S]{0,120}toBeGreaterThanOrEqual\(\s*30[0-9]\s*\)/i.test(content) ||
+      /expect\([^)]*response[^)]*status\(\s*\)[^)]*\)\.toBe\(\s*30[1278]\s*\)/i.test(content)
+    ) {
+      errors.push(
+        'Unauthenticated protected-route tests must not require HTTP 3xx redirects; assert rendered login/auth UI or a login URL instead'
+      )
+    }
+
     if (generationContext?.prd && String(generationContext.prd).trim()) {
       const hasRequirementTag = /\[REQ:[^\]]+\]/i.test(content)
       if (!hasRequirementTag) {
@@ -2064,6 +2216,63 @@ Return JSON array only.`
       if (hasNonBodyLocator && !hasPreferredSelector) {
         errors.push(
           'UI tests must prefer secure selectors such as getByRole/getByLabel/getByTestId'
+        )
+      }
+
+      const sourceText = this.collectSourceAssertableText(generationContext?.context || {})
+      if (sourceText.size > 0) {
+        const layoutChromeText = this.collectLayoutChromeText(generationContext?.context || {})
+        const routePageText = this.collectRoutePageText(generationContext?.context || {})
+        const exactLevel3HeadingPattern =
+          /getByRole\(\s*['"`]heading['"`]\s*,\s*\{[^}]*level\s*:\s*3[^}]*name\s*:\s*['"`]([^'"`]+)['"`][^}]*\}\s*\)/gi
+        for (const match of content.matchAll(exactLevel3HeadingPattern)) {
+          if (!this.isSourceAssertableText(match[1], sourceText)) {
+            errors.push(
+              'Avoid exact level-3/card heading assertions for dynamic database/CMS content; assert structure or source-proven text instead'
+            )
+            break
+          }
+        }
+
+        const mainScopedExactTextPattern =
+          /(?:\bmain|page\.locator\(\s*['"`]main(?:[^'"`]*)?['"`]\s*\))\s*\.\s*(?:getByText\(\s*['"`]([^'"`]{2,80})['"`]|getByRole\(\s*['"`](?:heading|button|link|region)['"`]\s*,\s*\{[^}]*name\s*:\s*['"`]([^'"`]{2,80})['"`])/gi
+        for (const match of content.matchAll(mainScopedExactTextPattern)) {
+          const assertedText = match[1] || match[2]
+          if (
+            this.isSourceAssertableText(assertedText, layoutChromeText) &&
+            !this.isSourceAssertableText(assertedText, routePageText)
+          ) {
+            errors.push(
+              'Do not assert global layout chrome text inside main as page-specific content; scope chrome checks to header/nav/footer/sidebar or assert route-owned content'
+            )
+            break
+          }
+        }
+      }
+
+      const conditionalRoleAssertionPattern =
+        /getByRole\(\s*['"`](menuitem|dialog|tabpanel|listbox|option)['"`][\s\S]{0,260}\)\s*\)\s*\.toBeVisible\(/i
+      const hasLikelyOpeningInteraction =
+        /getByRole\(\s*['"`](button|tab|combobox)['"`][\s\S]{0,260}\)\.click\(\s*\)|locator\([^)]*(?:details|summary|select|button|accordion|dropdown|menu|drawer|dialog|modal|tab)[^)]*\)\.click\(\s*\)/i.test(content)
+      if (conditionalRoleAssertionPattern.test(content) && !hasLikelyOpeningInteraction) {
+        errors.push(
+          'Conditional UI such as menus, dialogs, listboxes, options, and tab panels must be opened or selected before asserting visibility'
+        )
+      }
+
+      const addToCartThenCartRedirectPattern =
+        /getByRole\(\s*['"`]button['"`]\s*,\s*\{[^}]*name\s*:\s*(?:\/[^/]*add\s+to\s+cart[^/]*\/[a-z]*|['"`][^'"`]*add\s+to\s+cart[^'"`]*['"`])[^}]*\}\s*\)\.click\(\s*\)[\s\S]{0,800}toHaveURL\(\s*(?:\/[^/]*\\\/cart|['"`][^'"`]*\/cart[^'"`]*['"`])/i
+      if (addToCartThenCartRedirectPattern.test(content)) {
+        errors.push(
+          'Add-to-cart tests must assert in-page feedback; do not assume a redirect to the cart route'
+        )
+      }
+
+      const loginSubmitStillOnLoginPattern =
+        /getByRole\(\s*['"`]button['"`]\s*,\s*\{[^}]*name\s*:\s*(?:\/[^/]*(?:sign\s*in|log\s*in|login)[^/]*\/[a-z]*|['"`][^'"`]*(?:sign\s*in|log\s*in|login)[^'"`]*['"`])[^}]*\}\s*\)\.click\(\s*\)[\s\S]{0,1000}(?:toHaveURL\(\s*(?:\/[^/]*(?:login|signin|account)[^/]*\/[a-z]*|['"`][^'"`]*(?:login|signin|account)[^'"`]*['"`])|getByRole\(\s*['"`]heading['"`]\s*,\s*\{[^}]*name\s*:\s*(?:\/[^/]*(?:welcome back|sign\s*in|log\s*in|login)[^/]*\/[a-z]*|['"`][^'"`]*(?:welcome back|sign\s*in|log\s*in|login)[^'"`]*['"`]))/i
+      if (loginSubmitStillOnLoginPattern.test(content)) {
+        errors.push(
+          'Login submission success cannot assert the pre-auth login route/form remains visible'
         )
       }
     }

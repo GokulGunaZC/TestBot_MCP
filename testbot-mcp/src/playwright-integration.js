@@ -179,6 +179,54 @@ class PlaywrightIntegration {
     return [...new Set(candidates)];
   }
 
+  async probeHttpReady(probeUrl, timeoutMs = 1500) {
+    if (!probeUrl) return false;
+    const fetchFn = global.fetch || ((url, opts) => import('node-fetch').then((m) => m.default(url, opts)));
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      const response = await fetchFn(probeUrl, { signal: controller.signal, redirect: 'manual' });
+      clearTimeout(timer);
+      return response.status >= 200 && response.status < 500;
+    } catch {
+      return false;
+    }
+  }
+
+  async isConfiguredServerReady(timeoutMs = 1500) {
+    for (const probeUrl of this.getServerProbeUrls()) {
+      if (await this.probeHttpReady(probeUrl, timeoutMs)) {
+        return { ready: true, probeUrl };
+      }
+    }
+    return { ready: false, probeUrl: null };
+  }
+
+  shouldAutoSwitchPortForConflict() {
+    if (this.config.disablePortFallback === true) return false;
+    if (this.config.allowPortFallback === true) return true;
+    if (Array.isArray(this.config.services) && this.config.services.length > 1) return false;
+
+    const command = String(this.config.startCommand || '').toLowerCase();
+    if (
+      /\b(docker\s+compose|docker-compose|compose|concurrently|turbo|nx|lerna|mvn|gradle|java|dotnet|spring-boot)\b/.test(command)
+    ) {
+      return false;
+    }
+
+    const packageJson = this.packageJson || {};
+    const deps = { ...(packageJson.dependencies || {}), ...(packageJson.devDependencies || {}) };
+    return Boolean(
+      deps.vite ||
+      deps.next ||
+      deps['react-scripts'] ||
+      deps.nuxt ||
+      deps.nuxt3 ||
+      deps['@sveltejs/kit'] ||
+      deps['@remix-run/dev']
+    );
+  }
+
   probeTcpPort(hostname, port, timeoutMs = 1200) {
     return new Promise((resolve) => {
       if (!hostname || !port) {
@@ -1872,10 +1920,32 @@ test.describe('${this.sanitizeString(scenario.name)}', () => {
       const portInUse = await this.probeTcpPort('127.0.0.1', configuredPort, 500)
         || await this.probeTcpPort('localhost', configuredPort, 500);
       if (portInUse) {
+        const existing = await this.isConfiguredServerReady(1500);
+        if (existing.ready) {
+          Logger.info('PlaywrightIntegration', 'Configured port is already serving the target app — reusing existing server', {
+            port: configuredPort,
+            baseURL: this.config.baseURL,
+            probeUrl: existing.probeUrl,
+          });
+          this.config._primaryAppPreStarted = true;
+          this.config._healixReusedExistingServer = true;
+          return;
+        }
+
+        if (!this.shouldAutoSwitchPortForConflict()) {
+          const err = new Error(
+            `Configured target port ${configuredPort} is already in use, but ${this.config.baseURL} is not HTTP-ready. ` +
+            'Healix will not start a duplicate multi-service stack on a fallback port because that can break fixed backend ports and make tests target the wrong origin.'
+          );
+          err.code = 'TARGET_PORT_IN_USE_NOT_READY';
+          throw err;
+        }
+
         const freePort = await this.findFreePort(configuredPort + 1);
         Logger.warn('PlaywrightIntegration', `Configured port ${configuredPort} is already in use. Switching to port ${freePort} to avoid testing the wrong server.`, {
           originalPort: configuredPort,
           newPort: freePort,
+          reason: 'single_service_port_fallback',
         });
         try {
           const parsedBase = new URL(this.config.baseURL);

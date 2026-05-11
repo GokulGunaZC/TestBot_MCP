@@ -211,6 +211,29 @@ async function startSecondaryServices({ projectPath, services, waitMs = 30_000, 
       });
       continue;
     }
+
+    if (svc.port || svc.baseURL) {
+      const alreadyReady = await waitForServiceReady({
+        host: '127.0.0.1',
+        port: svc.port,
+        baseURL: svc.baseURL,
+        totalTimeoutMs: Math.min(2000, waitMs),
+        label: `${svc.role || 'secondary'} service (existing)`,
+        onReady: typeof onReady === 'function'
+          ? ({ elapsedMs, url }) => onReady({ elapsedMs, url, service: svc, reused: true })
+          : undefined,
+      });
+      if (alreadyReady) {
+        Logger.info('MultiServiceStarter', `Reusing already-running ${svc.role || 'secondary'} service`, {
+          role: svc.role,
+          port: svc.port,
+          baseURL: svc.baseURL,
+        });
+        started.push({ service: svc, pid: null, ready: true, reused: true });
+        continue;
+      }
+    }
+
     const cwd = svc.path && svc.path !== '.' ? path.join(projectPath, svc.path) : projectPath;
     const detached = process.platform !== 'win32';
     Logger.info('MultiServiceStarter', `Starting ${svc.role} service`, {

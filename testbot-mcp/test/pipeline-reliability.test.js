@@ -1,5 +1,6 @@
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
+const http = require('node:http');
 const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
@@ -25,6 +26,7 @@ const {
   estimateGenerationComplexity,
   extractQualityFailureFileNames,
   findGeneratedTestBlocks,
+  getCursorFixtureContent,
   maybeRunFailureTriage,
   maybeExpandGenerationStageBudget,
   isRepairableGenerationFailure,
@@ -34,8 +36,12 @@ const {
   pruneGeneratedTestsByQuality,
   quarantineGeneratedSpecFiles,
   resolveGenerationAgentConcurrency,
+  shouldAutoSwitchPortForConflict,
+  buildTargetPortInUseError,
   rewriteStartCommandForPort,
+  writeSupplementalAuthConfig,
 } = require('../src/pipeline-worker');
+const { startSecondaryServices } = require('../src/multi-service-starter');
 const ReportGenerator = require('../src/report-generator');
 
 function withGeneratedSuite(content, fn) {
@@ -325,6 +331,16 @@ test('pipeline error classifier treats min-count and useful-floor failures as ge
   assert.equal(insufficient.errorCode, 'INSUFFICIENT_RUNNABLE_COVERAGE');
 });
 
+test('pipeline error classifier treats occupied unreachable target port as setup failure', () => {
+  const classified = classifyPipelineErrorFromStderr({
+    stderr: 'TARGET_PORT_IN_USE_NOT_READY: Configured target port 8080 is already in use, but http://localhost:8080 is not HTTP-ready.',
+  });
+
+  assert.equal(classified.stage, 'server_start');
+  assert.equal(classified.reason, 'target_port_in_use_not_ready');
+  assert.equal(classified.errorCode, 'TARGET_PORT_IN_USE_NOT_READY');
+});
+
 test('quality gates reject placeholder external API hosts even without a configured baseURL', () => {
   withGeneratedSuite(`
     import { test, expect, request } from '@playwright/test';
@@ -567,6 +583,31 @@ test('quality audit allows protected-route success assertions when credentials a
 
     assert.ok(!audit.errors.some((error) => error.startsWith('unblocked_protected_route_without_credentials')));
   });
+});
+
+test('healix fixture injects verified auth state for tagged tests outside tierB projects', () => {
+  const { ts } = getCursorFixtureContent('', 'module', [], [
+    { role: 'Administrator', name: 'Administrator', loginVerified: true, storageStatePath: '/tmp/auth-state-admin.json' },
+  ]);
+
+  assert.match(ts, /tierB-auth-\(\.\+\)/);
+  assert.match(ts, /_isAuthTagged/);
+  assert.match(ts, /auth-state-admin\.json/);
+  assert.match(ts, /"admin": "\/tmp\/auth-state-admin\.json"/);
+});
+
+test('supplemental auth config normalizes role aliases', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'healix-auth-config-'));
+  try {
+    const configPath = writeSupplementalAuthConfig(root, 'http://localhost:3000', [
+      { role: 'Administrator', name: 'Administrator', loginVerified: true, storageStatePath: '/tmp/auth-state-admin.json' },
+    ]);
+    const config = fs.readFileSync(configPath, 'utf-8');
+    assert.match(config, /name: 'tierB-auth-admin'/);
+    assert.doesNotMatch(config, /Administrator/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('quality audit rejects brittle implementation-detail UI assertions', () => {
@@ -1058,6 +1099,88 @@ test('port conflict rewrite updates the dev start command with the reassigned po
       'PORT=3001 npm start'
     );
   } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('port conflict fallback is disabled for multi-service stacks by default', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'healix-port-policy-'));
+  try {
+    fs.writeFileSync(
+      path.join(root, 'package.json'),
+      JSON.stringify({ devDependencies: { vite: '^6.0.0' } }),
+    );
+    assert.equal(shouldAutoSwitchPortForConflict({
+      projectPath: root,
+      startCommand: 'npm run dev',
+      services: [
+        { role: 'frontend', port: 8080 },
+        { role: 'backend', port: 5002 },
+      ],
+    }), false);
+    assert.equal(shouldAutoSwitchPortForConflict({
+      projectPath: root,
+      startCommand: 'npm run dev',
+      services: [
+        { role: 'frontend', port: 8080 },
+        { role: 'backend', port: 5002 },
+      ],
+      allowPortFallback: true,
+    }), true);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('target port busy error is classified as server-start setup failure', () => {
+  const err = buildTargetPortInUseError({
+    configuredPort: 8080,
+    config: {
+      baseURL: 'http://localhost:8080',
+      startCommand: 'npm start',
+      services: [{ role: 'backend', port: 5002 }],
+    },
+  });
+
+  assert.equal(err.code, 'TARGET_PORT_IN_USE_NOT_READY');
+  assert.equal(err.diagnostics.stage, 'server_start');
+  assert.equal(err.diagnostics.reason, 'target_port_in_use_not_ready');
+  assert.match(err.message, /will not start a duplicate multi-service stack/);
+});
+
+test('secondary service starter reuses an already-running backend service', async () => {
+  const server = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/plain' });
+    res.end('ok');
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const port = server.address().port;
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'healix-secondary-reuse-'));
+
+  try {
+    const readyEvents = [];
+    const started = await startSecondaryServices({
+      projectPath: root,
+      waitMs: 1000,
+      services: [
+        { role: 'frontend', port: 8080, startCommand: 'npm run dev' },
+        {
+          role: 'backend',
+          port,
+          baseURL: `http://127.0.0.1:${port}`,
+          startCommand: 'node -e "process.exit(99)"',
+        },
+      ],
+      onReady: (event) => readyEvents.push(event),
+    });
+
+    assert.equal(started.length, 1);
+    assert.equal(started[0].reused, true);
+    assert.equal(started[0].pid, null);
+    assert.equal(started[0].ready, true);
+    assert.equal(readyEvents[0]?.reused, true);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
     fs.rmSync(root, { recursive: true, force: true });
   }
 });

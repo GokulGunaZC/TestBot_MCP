@@ -1,7 +1,11 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 
-const { buildLoginCandidates } = require('../src/credentials-injector');
+const {
+  buildLoginCandidates,
+  normalizeRoleLabel,
+  stateFileFor,
+} = require('../src/credentials-injector');
 
 test('credential injector probes common login routes when authFlow is unknown', () => {
   assert.deepEqual(
@@ -22,4 +26,12 @@ test('credential injector honors explicit authFlow loginUrl before fallbacks', (
     buildLoginCandidates('http://localhost:3001', { loginUrl: '/admin/login' }),
     ['http://localhost:3001/admin/login'],
   );
+});
+
+test('credential injector normalizes role aliases for storageState names', () => {
+  assert.equal(normalizeRoleLabel('Administrator'), 'admin');
+  assert.equal(normalizeRoleLabel('super_admin'), 'admin');
+  assert.equal(normalizeRoleLabel('Authenticated'), 'user');
+  assert.equal(normalizeRoleLabel('QA Admin'), 'qa_admin');
+  assert.match(stateFileFor('/tmp/app', 'Administrator'), /auth-state-admin\.json$/);
 });

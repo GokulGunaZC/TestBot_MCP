@@ -183,6 +183,14 @@ const CLASSIFIERS = [
     userFacingMessage: 'Playwright\'s built-in `webServer` block (in your playwright.config) timed out starting the dev server. Healix already starts the dev server itself — the duplicate attempt is fighting for the same port. Fix options: (1) remove the `webServer: {...}` block from playwright.config, or (2) align its `url`/port with the baseURL you configured in the Healix form, or (3) set `reuseExistingServer: true` AND match the port. Then re-run.',
   },
   {
+    id: 'target_port_in_use_not_ready',
+    test: (s) => /TARGET_PORT_IN_USE_NOT_READY/i.test(s)
+      || /Configured target port \d+ is already in use, but .* is not HTTP-ready/i.test(s),
+    stage: 'server_start',
+    errorCode: 'TARGET_PORT_IN_USE_NOT_READY',
+    userFacingMessage: 'The configured target port is occupied, but the configured baseURL is not reachable. Healix did not start a duplicate multi-service stack on a fallback port because that can break fixed backend ports and make auth/tests target the wrong origin. Stop the process holding the port, or start the app yourself and set baseURL to the reachable URL.',
+  },
+  {
     id: 'server_unreachable',
     test: (s) => /(ECONNREFUSED|net::ERR_CONNECTION_REFUSED|ENOTFOUND)/i.test(s),
     stage: 'server_start',

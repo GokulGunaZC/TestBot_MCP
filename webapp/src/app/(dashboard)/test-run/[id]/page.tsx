@@ -1434,6 +1434,8 @@ const PHASE_LABELS: Record<string, string> = {
   starting_pipeline: 'Starting Healix',
   started: 'Healix Started',
   port_conflict: 'Port Conflict',
+  dev_server_reused: 'Using Existing App',
+  server_start_blocked: 'Server Start Blocked',
   jira: 'Fetching Jira Stories',
   context: 'Gathering Context',
   context_enrichment: 'Enriching Context',
@@ -2083,6 +2085,22 @@ function buildSuggestedFix(error: PipelineErrorShape): SuggestedFix | null {
     };
   }
 
+  if (code === 'TARGET_PORT_IN_USE_NOT_READY') {
+    return {
+      title: 'Suggested fix — target port is occupied but not reachable',
+      steps: [
+        {
+          action: 'Use the already-running app',
+          detail: 'Start the target app yourself, confirm its baseURL opens in the browser, then set Healix baseURL to that exact URL. Healix will attach instead of starting a duplicate stack.',
+        },
+        {
+          action: 'Or free the configured port',
+          detail: 'Stop the process holding the configured port and rerun. Healix avoids silently moving multi-service apps to a fallback port because fixed backend services can fail to bind and auth can target the wrong origin.',
+        },
+      ],
+    };
+  }
+
   if (code === 'FIXTURE_MODULE_TYPE_MISMATCH') {
     return {
       title: 'Suggested fix — fixture ESM/CJS mismatch',
@@ -2310,6 +2328,7 @@ function PipelineErrorBanner({ error, runId }: { error: PipelineErrorShape; runI
 
   const stageLabel =
     code === 'HARDCODED_BASE_URL_MISMATCH' ? 'Generated tests targeted the wrong app origin' :
+    code === 'TARGET_PORT_IN_USE_NOT_READY' ? 'Target port is occupied but not reachable' :
     isInsufficientRunnableCoverage ? 'Generated fewer runnable tests than the useful minimum' :
     isMinCountIssue ? 'Generated fewer tests than target' :
     stage === 'validation' ? 'Generated tests failed Playwright validation' :

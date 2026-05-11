@@ -161,6 +161,11 @@ async function _walkRoutes({ browser, contextOptions, baseURL, origin, credentia
         continue;
       }
 
+      // Capture the actual URL after server/client redirects. If the app
+      // redirects "/" to "/login", authFlow.loginUrl must point at "/login",
+      // and route auth detection must compare against the rendered path.
+      const resolvedPathname = (() => { try { return new URL(page.url()).pathname; } catch { return pathKey; } })();
+
       await page.waitForTimeout(SETTLE_WAIT_MS);
 
       // Scroll to reveal lazy-loaded / below-fold content before collecting.
@@ -177,7 +182,7 @@ async function _walkRoutes({ browser, contextOptions, baseURL, origin, credentia
       const requiresAuth =
         status === 401 ||
         status === 403 ||
-        (!!signals.authElements && pathKey !== (new URL(baseURL).pathname));
+        (!!signals.authElements && resolvedPathname !== (new URL(baseURL).pathname));
 
       routes.push({
         path: pathKey,
@@ -191,7 +196,7 @@ async function _walkRoutes({ browser, contextOptions, baseURL, origin, credentia
 
       if (!authFlow && signals.authElements) {
         authFlow = {
-          loginUrl: pathKey,
+          loginUrl: resolvedPathname,
           credentialFields: {
             username: signals.authElements.usernameSelector,
             password: signals.authElements.passwordSelector,

@@ -34,7 +34,7 @@ const AIAnalyzer = require('./ai-providers/index');
 const WebappClient = require('./webapp-client');
 const { startSecondaryServices, stopSecondaryServices, probeHttpReady, waitForServiceReady } = require('./multi-service-starter');
 const { runExplorationPhase, EMPTY_ARTIFACT } = require('./exploration-phase');
-const { injectCredentials } = require('./credentials-injector');
+const { injectCredentials, normalizeRoleLabel } = require('./credentials-injector');
 const Logger = require('./logger');
 const MCPTelemetryReporter = require('./mcp-telemetry');
 
@@ -950,6 +950,49 @@ function rewriteStartCommandForPort(startCommand, port, projectPath) {
       : `${command} -- ${flag}`;
   }
   return `${command} ${flag}`;
+}
+
+function shouldAutoSwitchPortForConflict(config = {}) {
+  if (config.disablePortFallback === true) return false;
+  if (config.allowPortFallback === true) return true;
+  if (Array.isArray(config.services) && config.services.length > 1) return false;
+
+  const command = String(config.startCommand || '').toLowerCase();
+  if (
+    /\b(docker\s+compose|docker-compose|compose|concurrently|turbo|nx|lerna|mvn|gradle|java|dotnet|spring-boot)\b/.test(command)
+  ) {
+    return false;
+  }
+
+  const framework = detectProjectStartFramework(config.projectPath);
+  return ['vite', 'next', 'cra', 'nuxt', 'sveltekit', 'remix'].includes(framework);
+}
+
+function buildTargetPortInUseError({ config = {}, configuredPort, reason = 'target_port_in_use_not_ready' } = {}) {
+  const baseURL = config.baseURL || `http://localhost:${configuredPort}`;
+  const err = new Error(
+    `Configured target port ${configuredPort} is already in use, but ${baseURL} is not HTTP-ready. ` +
+    'Healix will not start a duplicate multi-service stack on a fallback port because that can break fixed backend ports and make auth/execution target the wrong origin. ' +
+    'Stop the process holding the port, or start the target app yourself and set baseURL to its reachable URL.'
+  );
+  err.code = 'TARGET_PORT_IN_USE_NOT_READY';
+  err.diagnostics = {
+    stage: 'server_start',
+    reason,
+    errorCode: err.code,
+    configuredPort,
+    baseURL,
+    startCommand: config.startCommand || null,
+    services: Array.isArray(config.services)
+      ? config.services.map((svc) => ({
+          role: svc.role || null,
+          port: svc.port || null,
+          baseURL: svc.baseURL || null,
+        }))
+      : [],
+    userFacingMessage: err.message,
+  };
+  return err;
 }
 
 function toCoverageProfile(value) {
@@ -2152,7 +2195,7 @@ function getCursorFixtureContent(serializedInitScript, moduleType = 'commonjs', 
   let authBlock = '';
   if (verifiedRoles.length > 0) {
     const stateMapEntries = verifiedRoles
-      .map((r) => `  ${JSON.stringify(String(r.role))}: ${JSON.stringify(r.storageStatePath)}`)
+      .map((r) => `  ${JSON.stringify(normalizeRoleLabel(r.role || r.name || 'user'))}: ${JSON.stringify(r.storageStatePath)}`)
       .join(',\n');
     // ESM/TS: top-level import + named reference in helper
     authPreamble =
@@ -2167,10 +2210,13 @@ function getCursorFixtureContent(serializedInitScript, moduleType = 'commonjs', 
       `function _healixLoadState(p) {\n` +
       `  try { return JSON.parse(require('fs').readFileSync(p, 'utf-8')); } catch { return null; }\n` +
       `}\n\n`;
+    const defaultRole = normalizeRoleLabel(verifiedRoles[0].role || verifiedRoles[0].name || 'user');
     authBlock =
       `    const _roleMatch = testInfo.project.name.match(/^tierB-auth-(.+)$/);\n` +
-      `    if (_roleMatch) {\n` +
-      `      const _statePath = _HEALIX_ROLE_STATES[_roleMatch[1]];\n` +
+      `    const _isAuthTagged = !_roleMatch && (testInfo.title.includes('@auth') || testInfo.title.includes('@tierB'));\n` +
+      `    const _effectiveRole = _roleMatch ? _roleMatch[1] : (_isAuthTagged ? ${JSON.stringify(defaultRole)} : null);\n` +
+      `    if (_effectiveRole) {\n` +
+      `      const _statePath = _HEALIX_ROLE_STATES[_effectiveRole];\n` +
       `      if (_statePath) {\n` +
       `        const _state = _healixLoadState(_statePath);\n` +
       `        if (_state && Array.isArray(_state.cookies) && _state.cookies.length > 0) {\n` +
@@ -2456,7 +2502,7 @@ function safeWriteGeneratedTest(testsDir, test, index, fallbackPrefix, usedFilen
 function writeSupplementalAuthConfig(projectPath, baseURL, verifiedRoles) {
   if (!verifiedRoles || verifiedRoles.length === 0) return null;
   const tierBProjects = verifiedRoles.map((r) => `    {
-      name: 'tierB-auth-${String(r.role || 'user').replace(/[^a-zA-Z0-9_-]/g, '_')}',
+      name: 'tierB-auth-${normalizeRoleLabel(r.role || r.name || 'user')}',
       grep: /@auth|@tierB/,
       retries: 2,
       use: {
@@ -2499,7 +2545,7 @@ ${tierBProjects}
     fs.writeFileSync(authConfigPath, body, 'utf-8');
     Logger.info('PipelineWorker', 'Emitted supplemental playwright.auth.config.ts', {
       path: authConfigPath,
-      tierBRoles: verifiedRoles.map((r) => r.role),
+      tierBRoles: verifiedRoles.map((r) => normalizeRoleLabel(r.role || r.name || 'user')),
     });
     return authConfigPath;
   } catch (err) {
@@ -2523,7 +2569,7 @@ function ensurePlaywrightConfig(projectPath, projectInfo = {}, roles = []) {
   // log can tell the user exactly what tier-aware config they're missing.
   const verifiedRolesSummary = (roles || [])
     .filter((r) => r && r.loginVerified && r.storageStatePath)
-    .map((r) => r.role || 'user');
+    .map((r) => normalizeRoleLabel(r.role || r.name || 'user'));
 
   // Check if config already exists
   for (const name of candidates) {
@@ -2582,7 +2628,7 @@ function ensurePlaywrightConfig(projectPath, projectInfo = {}, roles = []) {
   // as hard failures and so tierC (backend) doesn't waste budget on retryable HTTP
   // assertion bugs that are genuinely deterministic.
   const tierBProjects = verifiedRoles.map((r) => `    {
-      name: 'tierB-auth-${String(r.role || 'user').replace(/[^a-zA-Z0-9_-]/g, '_')}',
+      name: 'tierB-auth-${normalizeRoleLabel(r.role || r.name || 'user')}',
       grep: /@auth|@tierB/,
       retries: 2,
       use: {
@@ -2638,13 +2684,13 @@ ${projectsBlock}
   fs.writeFileSync(configPath, config, 'utf-8');
   Logger.info('PipelineWorker', 'Created playwright.config.ts', {
     path: configPath,
-    tierBRoles: verifiedRoles.map((r) => r.role),
+    tierBRoles: verifiedRoles.map((r) => normalizeRoleLabel(r.role || r.name || 'user')),
   });
   return {
     applied: true,
     reason: 'generated',
     configPath,
-    tierBRoles: verifiedRoles.map((r) => r.role),
+    tierBRoles: verifiedRoles.map((r) => normalizeRoleLabel(r.role || r.name || 'user')),
   };
 }
 
@@ -5542,39 +5588,78 @@ async function runPipeline(config, runId) {
         const portInUse = await _tempPI.probeTcpPort('127.0.0.1', configuredPort, 500)
           || await _tempPI.probeTcpPort('localhost', configuredPort, 500);
         if (portInUse) {
-          const freePort = await _tempPI.findFreePort(configuredPort + 1);
-          Logger.warn('PipelineWorker', `Port ${configuredPort} is already in use — switching dev server to port ${freePort}`, {
-            originalPort: configuredPort,
-            newPort: freePort,
-          });
-          // Clean up Next.js dev lock file — the existing server holds it and
-          // SIGKILL won't release it, so the new instance would fail to start.
-          const nextDevLock = path.join(config.projectPath, '.next', 'dev', 'lock');
-          try {
-            if (fs.existsSync(nextDevLock)) {
-              fs.unlinkSync(nextDevLock);
-              Logger.info('PipelineWorker', 'Removed stale Next.js dev lock file', { lockFile: nextDevLock });
+          const existingAppReady = config.baseURL
+            ? await probeHttpReady(config.baseURL, { controllerTimeoutMs: 1500 })
+            : false;
+          if (existingAppReady) {
+            Logger.info('PipelineWorker', 'Configured target port is already serving the app — reusing existing server', {
+              port: configuredPort,
+              baseURL: config.baseURL,
+            });
+            config = {
+              ...config,
+              _primaryAppPreStarted: true,
+              _healixReusedExistingServer: true,
+            };
+            updateStatus(statusDir, 'dev_server_reused', {
+              runId,
+              message: `Reusing existing target app at ${config.baseURL}; no duplicate dev server will be started.`,
+              project: config.projectName,
+              port: configuredPort,
+              baseURL: config.baseURL,
+              aiOnlyEnforced,
+            }, telemetryReporter);
+          } else {
+            if (!shouldAutoSwitchPortForConflict(config)) {
+              const err = buildTargetPortInUseError({ config, configuredPort });
+              updateStatus(statusDir, 'server_start_blocked', {
+                runId,
+                message: err.message,
+                project: config.projectName,
+                port: configuredPort,
+                baseURL: config.baseURL,
+                startCommand: config.startCommand,
+                services: err.diagnostics.services,
+                aiOnlyEnforced,
+              }, telemetryReporter);
+              throw err;
             }
-          } catch {
-            // non-fatal — best effort
+
+            const freePort = await _tempPI.findFreePort(configuredPort + 1);
+            Logger.warn('PipelineWorker', `Port ${configuredPort} is already in use — switching dev server to port ${freePort}`, {
+              originalPort: configuredPort,
+              newPort: freePort,
+              reason: 'single_service_port_fallback',
+            });
+            // Clean up Next.js dev lock file — the existing server holds it and
+            // SIGKILL won't release it, so the new instance would fail to start.
+            const nextDevLock = path.join(config.projectPath, '.next', 'dev', 'lock');
+            try {
+              if (fs.existsSync(nextDevLock)) {
+                fs.unlinkSync(nextDevLock);
+                Logger.info('PipelineWorker', 'Removed stale Next.js dev lock file', { lockFile: nextDevLock });
+              }
+            } catch {
+              // non-fatal — best effort
+            }
+            const rewrittenStartCommand = rewriteStartCommandForPort(config.startCommand, freePort, config.projectPath);
+            try {
+              const parsedBase = new URL(config.baseURL);
+              parsedBase.port = String(freePort);
+              config = { ...config, port: freePort, baseURL: parsedBase.toString().replace(/\/$/, ''), startCommand: rewrittenStartCommand };
+            } catch {
+              config = { ...config, port: freePort, baseURL: `http://localhost:${freePort}`, startCommand: rewrittenStartCommand };
+            }
+            updateStatus(statusDir, 'port_conflict', {
+              runId,
+              message: `Port ${configuredPort} is already in use. Dev server will start on port ${freePort} instead.`,
+              project: config.projectName,
+              originalPort: configuredPort,
+              newPort: freePort,
+              startCommand: rewrittenStartCommand,
+              aiOnlyEnforced,
+            }, telemetryReporter);
           }
-          const rewrittenStartCommand = rewriteStartCommandForPort(config.startCommand, freePort, config.projectPath);
-          try {
-            const parsedBase = new URL(config.baseURL);
-            parsedBase.port = String(freePort);
-            config = { ...config, port: freePort, baseURL: parsedBase.toString().replace(/\/$/, ''), startCommand: rewrittenStartCommand };
-          } catch {
-            config = { ...config, port: freePort, baseURL: `http://localhost:${freePort}`, startCommand: rewrittenStartCommand };
-          }
-          updateStatus(statusDir, 'port_conflict', {
-            runId,
-            message: `Port ${configuredPort} is already in use. Dev server will start on port ${freePort} instead.`,
-            project: config.projectName,
-            originalPort: configuredPort,
-            newPort: freePort,
-            startCommand: rewrittenStartCommand,
-            aiOnlyEnforced,
-          }, telemetryReporter);
         }
       }
     }
@@ -5939,8 +6024,8 @@ async function runPipeline(config, runId) {
       const preAuthRoles = Array.isArray(config._preAuthRoles) ? config._preAuthRoles : [];
       const allPreAuthVerified = preAuthRoles.length > 0
         && config.testCredentials.every((cred) => {
-          const role = cred.role || 'user';
-          return preAuthRoles.some((r) => r.role === role && r.loginVerified);
+          const role = normalizeRoleLabel(cred.role || cred.name || 'user');
+          return preAuthRoles.some((r) => normalizeRoleLabel(r.role || r.name || 'user') === role && r.loginVerified);
         });
       const hasAuthFlow = !!(explorationArtifact?.authFlow);
 
@@ -5949,12 +6034,12 @@ async function runPipeline(config, runId) {
         // from exploration — skip the redundant login round-trip.
         roles = preAuthRoles;
         Logger.info('PipelineWorker', 'Reusing pre-auth storageStates — skipping duplicate credential injection', {
-          roles: roles.map((r) => r.role),
+          roles: roles.map((r) => normalizeRoleLabel(r.role || r.name || 'user')),
         });
         updateStatus(statusDir, 'auth_injected', {
           runId,
           message: `${roles.filter((r) => r.loginVerified).length}/${roles.length} role login(s) verified (reused from pre-auth)`,
-          roles: roles.map((r) => ({ role: r.role, loginVerified: !!r.loginVerified, reason: r.reason || null })),
+          roles: roles.map((r) => ({ role: normalizeRoleLabel(r.role || r.name || 'user'), loginVerified: !!r.loginVerified, reason: r.reason || null })),
         }, telemetryReporter);
       } else {
         // Either pre-auth failed for some roles OR exploration found a richer
@@ -5976,7 +6061,7 @@ async function runPipeline(config, runId) {
           updateStatus(statusDir, 'auth_injected', {
             runId,
             message: `${verifiedCount}/${roles.length} role login(s) verified`,
-            roles: roles.map((r) => ({ role: r.role, loginVerified: !!r.loginVerified, reason: r.reason || null })),
+            roles: roles.map((r) => ({ role: normalizeRoleLabel(r.role || r.name || 'user'), loginVerified: !!r.loginVerified, reason: r.reason || null })),
           }, telemetryReporter);
         } catch (credErr) {
           Logger.warn('PipelineWorker', 'Credential injection failed (best-effort)', { reason: credErr.message });
@@ -6054,7 +6139,7 @@ async function runPipeline(config, runId) {
             generationMeta.routeAccessSummary = routeAccessSummary;
             generationMeta.blockedAuthRoles = roles
               .filter((r) => r && r.loginVerified === false)
-              .map((r) => ({ role: r.role || r.name || 'user', reason: r.reason || null }));
+              .map((r) => ({ role: normalizeRoleLabel(r.role || r.name || 'user'), reason: r.reason || null }));
           }
 
           // Ensure playwright.config.ts exists after test generation
@@ -6329,13 +6414,16 @@ async function runPipeline(config, runId) {
           },
         });
         if (started.length > 0) {
+          const reusedCount = started.filter((s) => s.reused).length;
+          const spawnedCount = started.length - reusedCount;
           updateStatus(statusDir, 'secondary_services_started', {
             runId,
-            message: `Started ${started.length} secondary service(s)`,
+            message: `Prepared ${started.length} secondary service(s) (${spawnedCount} started, ${reusedCount} reused)`,
             services: started.map((s) => ({
               role: s.service.role,
               port: s.service.port,
               ready: s.ready,
+              reused: !!s.reused,
             })),
           }, telemetryReporter);
         }
@@ -7121,6 +7209,8 @@ module.exports = {
   computeGenerationAgentTimeoutMs,
   maybeExpandGenerationStageBudget,
   resolveGenerationAgentConcurrency,
+  shouldAutoSwitchPortForConflict,
+  buildTargetPortInUseError,
   rewriteStartCommandForPort,
   DEFAULT_STAGE_CAPS_MS,
   DEFAULT_TOTAL_BUDGET_MS,

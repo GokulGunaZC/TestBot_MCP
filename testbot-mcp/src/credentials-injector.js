@@ -36,8 +36,16 @@ function authDirFor(projectPath) {
   return path.join(projectPath, AUTH_DIR_NAME);
 }
 
+function normalizeRoleLabel(role) {
+  const raw = String(role || 'user').trim().toLowerCase();
+  if (!raw) return 'user';
+  if (raw === 'administrator' || raw === 'superadmin' || raw === 'super_admin') return 'admin';
+  if (raw === 'customer' || raw === 'member' || raw === 'authed' || raw === 'authenticated') return 'user';
+  return raw.replace(/[^a-zA-Z0-9_-]/g, '_');
+}
+
 function stateFileFor(projectPath, role) {
-  const safeRole = String(role || 'default').replace(/[^a-zA-Z0-9_-]/g, '_');
+  const safeRole = normalizeRoleLabel(role || 'default');
   return path.join(authDirFor(projectPath), `${STATE_FILE_PREFIX}${safeRole}.json`);
 }
 
@@ -118,20 +126,24 @@ async function driveLogin({ baseURL, authFlow, credentials, storageStatePath }) 
   const page = await context.newPage();
 
   try {
-    const userField = authFlow?.credentialFields?.username || 'input[type="email"], input[name="email"], input[name="username"]';
+    const userField = authFlow?.credentialFields?.username || 'input[type="email"], input[name="email"], input[name="username"], input[autocomplete="username"]';
     const passField = authFlow?.credentialFields?.password || 'input[type="password"], input[name="password"]';
     const candidates = buildLoginCandidates(baseURL, authFlow);
     const attempted = [];
     let lastError = null;
 
     for (const loginUrl of candidates) {
-      const loginPathname = (() => { try { return new URL(loginUrl).pathname; } catch { return loginUrl; } })();
-      attempted.push(loginPathname);
+      const candidatePathname = (() => { try { return new URL(loginUrl).pathname; } catch { return loginUrl; } })();
+      attempted.push(candidatePathname);
 
       try {
         // Use `load` not `networkidle` — Next.js/Supabase apps have persistent background
         // fetches that can prevent networkidle from firing within any reasonable timeout.
         await page.goto(loginUrl, { waitUntil: 'load', timeout: 30_000 });
+        // Capture the actual rendered login path after redirects. Public roots
+        // often redirect to /login; comparing final URL against the original
+        // "/" candidate misclassifies successful login redirects back to "/".
+        const loginPathname = (() => { try { return new URL(page.url()).pathname; } catch { return candidatePathname; } })();
 
         // During discovery, do not spend 15s on a public home page that has no login form.
         const fieldTimeout = authFlow?.loginUrl ? 15_000 : 4_000;
@@ -139,18 +151,26 @@ async function driveLogin({ baseURL, authFlow, credentials, storageStatePath }) 
         await page.fill(userField, credentials.username, { timeout: 10_000 });
         await page.fill(passField, credentials.password, { timeout: 10_000 });
 
-        const submit = page.locator('button[type="submit"], input[type="submit"]').first();
-
         // Wait for SPA navigation to complete. Supabase fires router.replace() in the
         // .then() of signInWithPassword — this is async and fires AFTER the API response,
         // so networkidle can resolve before the redirect. waitForURL is the only reliable
-        // signal that the auth flow has actually completed.
+        // signal that the auth flow has actually completed. Pressing Enter is
+        // more reliable than only looking for button[type=submit], because many
+        // SPA forms use untyped <button> elements or custom UI wrappers.
         await Promise.all([
           page.waitForURL(
             (url) => { try { return url.pathname !== loginPathname; } catch { return false; } },
             { timeout: 20_000 }
           ).catch(() => null),
-          submit.click({ timeout: 10_000 }),
+          page.locator(passField).first().press('Enter').catch(async () => {
+            const submit = page.locator([
+              'button[type="submit"]',
+              'input[type="submit"]',
+              'button:not([type="reset"]):not([type="button"])',
+            ].join(', ')).first();
+            const count = await submit.count().catch(() => 0);
+            if (count > 0) await submit.click({ timeout: 10_000 });
+          }),
         ]);
 
         // Allow middleware chain redirects (e.g. /admin → / for non-admin users) to settle.
@@ -216,16 +236,16 @@ async function injectCredentials({
   const roles = [];
   for (const cred of credentials) {
     if (!cred?.username || !cred?.password) continue;
-    const role = cred.role || 'user';
+    const role = normalizeRoleLabel(cred.role || cred.name || 'user');
     const storageStatePath = stateFileFor(projectPath, role);
 
     const result = await driveLogin({ baseURL, authFlow, credentials: cred, storageStatePath });
     if (result.ok) {
       Logger.info('CredentialsInjector', `Login verified for role=${role}`, { storageStatePath });
-      roles.push({ role, storageStatePath, loginVerified: true });
+      roles.push({ role, name: role, storageStatePath, loginVerified: true });
     } else {
       Logger.warn('CredentialsInjector', `Login failed for role=${role}`, { reason: result.reason });
-      roles.push({ role, storageStatePath: null, loginVerified: false, reason: result.reason });
+      roles.push({ role, name: role, storageStatePath: null, loginVerified: false, reason: result.reason });
     }
   }
   return roles;
@@ -236,4 +256,5 @@ module.exports = {
   authDirFor,
   stateFileFor,
   buildLoginCandidates,
+  normalizeRoleLabel,
 };
