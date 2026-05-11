@@ -59,6 +59,29 @@ function isBrowserUseInstalled(pythonCmd) {
   }
 }
 
+function readEnvValueFromFile(envPath, key) {
+  try {
+    if (!fs.existsSync(envPath)) return '';
+    const parsed = require('dotenv').parse(fs.readFileSync(envPath));
+    return parsed[key] || '';
+  } catch {
+    return '';
+  }
+}
+
+function resolveOpenAIKeyForRunner() {
+  if (process.env.OPENAI_API_KEY) return process.env.OPENAI_API_KEY;
+  const candidates = [
+    path.join(__dirname, '..', '..', 'webapp', '.env.local'),
+    path.join(process.cwd(), 'webapp', '.env.local'),
+  ];
+  for (const envPath of candidates) {
+    const value = readEnvValueFromFile(envPath, 'OPENAI_API_KEY');
+    if (value) return value;
+  }
+  return '';
+}
+
 /**
  * Drive the runner. `targetUrl` must be an http(s) URL.
  * Returns the raw ExplorationArtifact when the runner succeeds.
@@ -122,6 +145,10 @@ function driveExploration({
       // HEALIX_API_KEY is already in process.env; include it explicitly so it
       // is never accidentally shadowed by a dotenv override.
       HEALIX_API_KEY: process.env.HEALIX_API_KEY || '',
+      // Direct OpenAI is a fallback for local/free-tier browser-use runs when
+      // Browser Use Cloud LLM Gateway is unavailable. Prefer the Healix proxy
+      // above when HEALIX_API_KEY is present.
+      OPENAI_API_KEY: resolveOpenAIKeyForRunner(),
       // Run headless by default so exploration is silent in the background.
       // Set HEALIX_BROWSER_HEADLESS=false in the environment to open a visible
       // browser window (useful when debugging exploration failures locally).

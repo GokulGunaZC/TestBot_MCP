@@ -101,6 +101,9 @@ def _build_task(target_url, username, password):
         f"GOAL: Rapidly map the route structure of {target_url}.\n"
         f"SPEED RULE: Spend at most 10 seconds per page. Breadth over depth.\n"
         f"OUTPUT: One JSON object only — no prose before or after.\n"
+        "STOP RULE: Use the final/done response with the JSON and then stop. "
+        "Do not write files. If a detail tool cannot extract a form, use the "
+        "visible DOM labels/names/placeholders you can see and continue.\n"
         "\nSchema:\n"
         '{"routes":[{"path":string,"requiresAuth":boolean,"elements":[{"role":string,"name":string,"selector":string}]}],'
         '"forms":[{"route":string,"fields":[{"name":string,"type":string,"required":boolean}],"submitLabel":string}],'
@@ -115,7 +118,7 @@ def _build_task(target_url, username, password):
         "  Do NOT re-visit paths already recorded.\n"
         "\nSTEP 3 — FORMS: For each page with a non-login form, record its fields.\n"
         "\nSTEP 4 — FLOWS: Identify up to 3 key user flows (e.g. create, edit, delete).\n"
-        "\nSTEP 5 — OUTPUT the JSON. Do NOT include any text outside the JSON block.\n"
+        "\nSTEP 5 — OUTPUT the JSON via final/done. Do NOT include any text outside the JSON block.\n"
         f"{roles_note}"
     )
 
@@ -162,30 +165,21 @@ def _normalize_artifact(parsed):
     return artifact
 
 
-def _build_llm():
-    """Construct the browser-use LLM instance.
+def _build_cloud_llm():
+    for import_path, ctor in (
+        ("browser_use.llm", "ChatBrowserUse"),
+        ("browser_use", "ChatBrowserUse"),
+    ):
+        try:
+            module = __import__(import_path, fromlist=[ctor])
+            cls = getattr(module, ctor)
+            return cls()
+        except Exception:
+            continue
+    return None
 
-    Prefer Browser Use Cloud's optimized model when BROWSER_USE_API_KEY is
-    present. Otherwise route OpenAI-compatible calls through the Healix webapp
-    proxy so users do not need a local OPENAI_API_KEY.
-    """
-    model = os.environ.get("HEALIX_BROWSER_USE_MODEL", "gpt-4o-mini")
-    api_key = os.environ.get("HEALIX_API_KEY")
-    base_url = os.environ.get("HEALIX_LLM_PROXY_URL")
 
-    if os.environ.get("BROWSER_USE_API_KEY") or os.environ.get("HEALIX_BROWSER_USE_API_KEY"):
-        for import_path, ctor in (
-            ("browser_use.llm", "ChatBrowserUse"),
-            ("browser_use", "ChatBrowserUse"),
-        ):
-            try:
-                module = __import__(import_path, fromlist=[ctor])
-                cls = getattr(module, ctor)
-                return cls()
-            except Exception:
-                continue
-
-    # temperature=0 gives deterministic, faster responses (no sampling overhead).
+def _build_openai_compatible_llm(model, api_key, base_url=None):
     for import_path, ctor in (
         ("browser_use.llm", "ChatOpenAI"),
         ("browser_use", "ChatOpenAI"),
@@ -194,12 +188,60 @@ def _build_llm():
         try:
             module = __import__(import_path, fromlist=[ctor])
             cls = getattr(module, ctor)
-            llm = cls(model=model, api_key=api_key, base_url=base_url, temperature=0)
+            kwargs = {"model": model, "api_key": api_key, "temperature": 0}
+            if base_url:
+                kwargs["base_url"] = base_url
+            llm = cls(**kwargs)
             return llm
         except Exception:
             continue
-
     return None
+
+
+def _build_llm():
+    """Construct the browser-use LLM instance.
+
+    Prefer the Healix webapp proxy when available. Browser Use Cloud keys may
+    exist on developer machines, but some account tiers reject LLM Gateway
+    calls at runtime; the proxy path is the stable default because Healix owns
+    the server-side OpenAI configuration.
+    """
+    model = os.environ.get("HEALIX_BROWSER_USE_MODEL", "gpt-4o-mini")
+    api_key = os.environ.get("HEALIX_API_KEY")
+    base_url = os.environ.get("HEALIX_LLM_PROXY_URL")
+    openai_api_key = os.environ.get("OPENAI_API_KEY")
+    openai_base_url = os.environ.get("OPENAI_BASE_URL") or os.environ.get("OPENAI_API_BASE")
+    provider = os.environ.get("HEALIX_BROWSER_USE_PROVIDER", "").strip().lower()
+    has_cloud_key = bool(os.environ.get("BROWSER_USE_API_KEY") or os.environ.get("HEALIX_BROWSER_USE_API_KEY"))
+    has_proxy = bool(api_key and base_url)
+    has_direct_openai = bool(openai_api_key)
+
+    if has_proxy and provider not in {"cloud", "browser-use", "browser_use"}:
+        llm = _build_openai_compatible_llm(model, api_key, base_url)
+        if llm is not None:
+            return llm, "healix_proxy"
+
+    if has_direct_openai and provider in {"openai", "direct", "local"}:
+        llm = _build_openai_compatible_llm(model, openai_api_key, openai_base_url)
+        if llm is not None:
+            return llm, "direct_openai"
+
+    if has_cloud_key:
+        llm = _build_cloud_llm()
+        if llm is not None:
+            return llm, "browser_use_cloud"
+
+    if has_direct_openai:
+        llm = _build_openai_compatible_llm(model, openai_api_key, openai_base_url)
+        if llm is not None:
+            return llm, "direct_openai"
+
+    if has_proxy:
+        llm = _build_openai_compatible_llm(model, api_key, base_url)
+        if llm is not None:
+            return llm, "healix_proxy"
+
+    return None, None
 
 
 async def _drive_agent(target_url, username, password, timeout_s):
@@ -209,13 +251,15 @@ async def _drive_agent(target_url, username, password, timeout_s):
         _emit({"type": "error", "reason": f"browser-use import failed: {exc}"})
         return None
 
-    llm = _build_llm()
+    llm, llm_provider = _build_llm()
     if llm is None:
         _emit({"type": "error", "reason": "Could not construct LLM — check BROWSER_USE_API_KEY or HEALIX_API_KEY/HEALIX_LLM_PROXY_URL"})
         return None
 
-    if os.environ.get("BROWSER_USE_API_KEY") or os.environ.get("HEALIX_BROWSER_USE_API_KEY"):
+    if llm_provider == "browser_use_cloud":
         _emit({"type": "progress", "message": "LLM routed through Browser Use Cloud"})
+    elif llm_provider == "direct_openai":
+        _emit({"type": "progress", "message": "LLM routed through direct OpenAI-compatible API"})
     else:
         _emit({"type": "progress", "message": "LLM routed through Healix webapp proxy"})
 
@@ -237,6 +281,20 @@ async def _drive_agent(target_url, username, password, timeout_s):
         # Allow several browser actions per LLM call — fewer round-trips = faster.
         if "max_actions_per_step" in sig_params:
             agent_kwargs["max_actions_per_step"] = 5
+        if "max_failures" in sig_params:
+            agent_kwargs["max_failures"] = 3
+        if "llm_timeout" in sig_params:
+            agent_kwargs["llm_timeout"] = 30
+        if "step_timeout" in sig_params:
+            agent_kwargs["step_timeout"] = 45
+        if "use_judge" in sig_params:
+            agent_kwargs["use_judge"] = False
+        if "enable_planning" in sig_params:
+            agent_kwargs["enable_planning"] = False
+        if "use_thinking" in sig_params:
+            agent_kwargs["use_thinking"] = False
+        if "max_history_items" in sig_params:
+            agent_kwargs["max_history_items"] = 10
 
         # Headless mode: default true so exploration runs silently in the background.
         # Set HEALIX_BROWSER_HEADLESS=false to show the browser window (debug only).
@@ -262,8 +320,14 @@ async def _drive_agent(target_url, username, password, timeout_s):
 
     _emit({"type": "progress", "message": "agent launched"})
 
+    max_steps = 10
     try:
-        result = await asyncio.wait_for(agent.run(), timeout=timeout_s)
+        max_steps = max(3, min(20, int(os.environ.get("HEALIX_BROWSER_USE_MAX_STEPS", "10"))))
+    except ValueError:
+        max_steps = 10
+
+    try:
+        result = await asyncio.wait_for(agent.run(max_steps=max_steps), timeout=timeout_s)
     except asyncio.TimeoutError:
         _emit({"type": "error", "reason": f"browser-use agent exceeded {timeout_s}s timeout"})
         return None
