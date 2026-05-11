@@ -40,3 +40,6 @@ debug/
 # Notebooks (local data exploration — never commit)
 notebooks/
 .claude/
+
+# Local target apps cloned for Healix evaluation
+targets/

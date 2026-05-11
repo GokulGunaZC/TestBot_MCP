@@ -89,6 +89,33 @@ test('compat fixture agent selection keeps frontend and backend surfaces separat
   );
 });
 
+test('form extraction uses real name/id attributes and preserves input types', () => {
+  const gatherer = new ContextGatherer({ projectPath: process.cwd(), language: 'typescript' });
+  const forms = gatherer.extractFormsFromFile(`
+    <form>
+      <label htmlFor="email">Email</label>
+      <input id="email" type="email" className="rounded-xl" required />
+      <label htmlFor="password">Password</label>
+      <Input id="password" type="password" className="rounded-xl" />
+      <textarea name="message" className="mt-1 w-full" />
+      <select id="status" className="rounded-xl" />
+      <button type="submit">Sign In</button>
+    </form>
+  `, path.join(process.cwd(), 'app/login/page.tsx'));
+
+  assert.equal(forms.length, 1);
+  assert.deepEqual(
+    forms[0].fields.map((field) => ({ name: field.name, type: field.type, label: field.label })),
+    [
+      { name: 'email', type: 'email', label: 'Email' },
+      { name: 'password', type: 'password', label: 'Password' },
+      { name: 'status', type: 'select', label: null },
+      { name: 'message', type: 'textarea', label: null },
+    ],
+  );
+  assert.ok(!forms[0].fields.some((field) => String(field.name).includes('rounded-xl')));
+});
+
 test('quality audit rejects fallback or template generated specs for compatibility runs', () => {
   const root = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'healix-compat-audit-'));
   try {

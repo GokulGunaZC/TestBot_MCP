@@ -24,6 +24,13 @@ const Logger = require('./logger');
 
 const AUTH_DIR_NAME = '.healix';
 const STATE_FILE_PREFIX = 'auth-state-';
+const COMMON_LOGIN_PATHS = [
+  '/login',
+  '/signin',
+  '/sign-in',
+  '/auth/login',
+  '/auth/signin',
+];
 
 function authDirFor(projectPath) {
   return path.join(projectPath, AUTH_DIR_NAME);
@@ -46,6 +53,53 @@ function ensureAuthDir(projectPath) {
   return dir;
 }
 
+function unique(values) {
+  return [...new Set(values.filter(Boolean))];
+}
+
+function buildLoginCandidates(baseURL, authFlow = null) {
+  const candidates = [];
+  const pushUrl = (value) => {
+    if (!value) return;
+    try {
+      candidates.push(new URL(value, baseURL).toString());
+    } catch { /* ignore invalid candidate */ }
+  };
+
+  if (authFlow?.loginUrl) {
+    pushUrl(authFlow.loginUrl);
+  } else {
+    pushUrl(baseURL);
+    for (const loginPath of COMMON_LOGIN_PATHS) pushUrl(loginPath);
+  }
+
+  return unique(candidates);
+}
+
+async function readVisibleAuthError(page, authFlow = null) {
+  const selectors = unique([
+    authFlow?.failureIndicator,
+    '[role="alert"]',
+    '.error',
+    '[class*="error"]',
+    '[class*="alert"]',
+    'text=/invalid api key/i',
+    'text=/invalid credentials/i',
+    'text=/email.*required/i',
+    'text=/password.*required/i',
+  ]);
+
+  for (const selector of selectors) {
+    try {
+      const text = await page.locator(selector).first().textContent({ timeout: 800 });
+      const trimmed = String(text || '').replace(/\s+/g, ' ').trim();
+      if (trimmed && trimmed.length <= 240) return trimmed;
+      if (trimmed) return trimmed.slice(0, 240);
+    } catch { /* try next selector */ }
+  }
+  return null;
+}
+
 /**
  * Drive a login with Playwright. Returns true if post-login state shows the
  * `successIndicator` and not the `failureIndicator`. We use Playwright via
@@ -64,60 +118,82 @@ async function driveLogin({ baseURL, authFlow, credentials, storageStatePath }) 
   const page = await context.newPage();
 
   try {
-    const loginUrl = authFlow?.loginUrl
-      ? new URL(authFlow.loginUrl, baseURL).toString()
-      : baseURL;
-    const loginPathname = (() => { try { return new URL(loginUrl).pathname; } catch { return loginUrl; } })();
-
-    // Use `load` not `networkidle` — Next.js/Supabase apps have persistent background
-    // fetches that can prevent networkidle from firing within any reasonable timeout.
-    await page.goto(loginUrl, { waitUntil: 'load', timeout: 30_000 });
-
     const userField = authFlow?.credentialFields?.username || 'input[type="email"], input[name="email"], input[name="username"]';
     const passField = authFlow?.credentialFields?.password || 'input[type="password"], input[name="password"]';
+    const candidates = buildLoginCandidates(baseURL, authFlow);
+    const attempted = [];
+    let lastError = null;
 
-    // Wait for the input to be visible — JS-rendered forms appear after hydration.
-    await page.locator(userField).first().waitFor({ state: 'visible', timeout: 15_000 });
-    await page.fill(userField, credentials.username, { timeout: 10_000 });
-    await page.fill(passField, credentials.password, { timeout: 10_000 });
+    for (const loginUrl of candidates) {
+      const loginPathname = (() => { try { return new URL(loginUrl).pathname; } catch { return loginUrl; } })();
+      attempted.push(loginPathname);
 
-    const submit = page.locator('button[type="submit"], input[type="submit"]').first();
+      try {
+        // Use `load` not `networkidle` — Next.js/Supabase apps have persistent background
+        // fetches that can prevent networkidle from firing within any reasonable timeout.
+        await page.goto(loginUrl, { waitUntil: 'load', timeout: 30_000 });
 
-    // Wait for SPA navigation to complete. Supabase fires router.replace() in the
-    // .then() of signInWithPassword — this is async and fires AFTER the API response,
-    // so networkidle can resolve before the redirect. waitForURL is the only reliable
-    // signal that the auth flow has actually completed.
-    await Promise.all([
-      page.waitForURL(
-        (url) => { try { return url.pathname !== loginPathname; } catch { return false; } },
-        { timeout: 20_000 }
-      ).catch(() => null),
-      submit.click({ timeout: 10_000 }),
-    ]);
+        // During discovery, do not spend 15s on a public home page that has no login form.
+        const fieldTimeout = authFlow?.loginUrl ? 15_000 : 4_000;
+        await page.locator(userField).first().waitFor({ state: 'visible', timeout: fieldTimeout });
+        await page.fill(userField, credentials.username, { timeout: 10_000 });
+        await page.fill(passField, credentials.password, { timeout: 10_000 });
 
-    // Allow middleware chain redirects (e.g. /admin → / for non-admin users) to settle.
-    await page.waitForLoadState('domcontentloaded', { timeout: 8_000 }).catch(() => null);
+        const submit = page.locator('button[type="submit"], input[type="submit"]').first();
 
-    // Primary signal: URL must have changed away from the login page.
-    // A successful Supabase auth always redirects; staying on the same page means failure.
-    const finalPathname = (() => { try { return new URL(page.url()).pathname; } catch { return loginPathname; } })();
-    let loginVerified = finalPathname !== loginPathname;
+        // Wait for SPA navigation to complete. Supabase fires router.replace() in the
+        // .then() of signInWithPassword — this is async and fires AFTER the API response,
+        // so networkidle can resolve before the redirect. waitForURL is the only reliable
+        // signal that the auth flow has actually completed.
+        await Promise.all([
+          page.waitForURL(
+            (url) => { try { return url.pathname !== loginPathname; } catch { return false; } },
+            { timeout: 20_000 }
+          ).catch(() => null),
+          submit.click({ timeout: 10_000 }),
+        ]);
 
-    // Secondary signal: if a custom success indicator was provided, that overrides.
-    if (authFlow?.successIndicator) {
-      loginVerified = await page.locator(authFlow.successIndicator).first().isVisible({ timeout: 5_000 }).catch(() => false);
-    } else if (loginVerified && authFlow?.failureIndicator) {
-      // URL changed but still check no failure banner appeared (e.g. wrong-role redirect to error page)
-      const failureVisible = await page.locator(authFlow.failureIndicator).first().isVisible({ timeout: 1_000 }).catch(() => false);
-      if (failureVisible) loginVerified = false;
+        // Allow middleware chain redirects (e.g. /admin → / for non-admin users) to settle.
+        await page.waitForLoadState('domcontentloaded', { timeout: 8_000 }).catch(() => null);
+
+        // Primary signal: URL must have changed away from the login page.
+        // A successful Supabase auth always redirects; staying on the same page means failure.
+        const finalPathname = (() => { try { return new URL(page.url()).pathname; } catch { return loginPathname; } })();
+        let loginVerified = finalPathname !== loginPathname;
+
+        // Secondary signal: if a custom success indicator was provided, that overrides.
+        if (authFlow?.successIndicator) {
+          loginVerified = await page.locator(authFlow.successIndicator).first().isVisible({ timeout: 5_000 }).catch(() => false);
+        } else if (loginVerified && authFlow?.failureIndicator) {
+          // URL changed but still check no failure banner appeared (e.g. wrong-role redirect to error page)
+          const failureVisible = await page.locator(authFlow.failureIndicator).first().isVisible({ timeout: 1_000 }).catch(() => false);
+          if (failureVisible) loginVerified = false;
+        }
+
+        if (!loginVerified) {
+          const visibleError = await readVisibleAuthError(page, authFlow);
+          return {
+            ok: false,
+            reason: visibleError
+              ? `Login failed on ${loginPathname}: ${visibleError}`
+              : `Login success indicator not detected after submitting ${loginPathname}`,
+          };
+        }
+
+        await context.storageState({ path: storageStatePath });
+        return { ok: true };
+      } catch (err) {
+        lastError = err;
+      }
     }
 
-    if (!loginVerified) {
-      return { ok: false, reason: 'Login success indicator not detected post-submit' };
-    }
-
-    await context.storageState({ path: storageStatePath });
-    return { ok: true };
+    const attemptedText = unique(attempted).join(', ');
+    return {
+      ok: false,
+      reason: lastError
+        ? `Login driver error after trying ${attemptedText}: ${lastError.message}`
+        : `No login form found after trying ${attemptedText}`,
+    };
   } catch (err) {
     return { ok: false, reason: `Login driver error: ${err.message}` };
   } finally {
@@ -159,4 +235,5 @@ module.exports = {
   injectCredentials,
   authDirFor,
   stateFileFor,
+  buildLoginCandidates,
 };

@@ -250,9 +250,14 @@ class ContextGatherer {
     const formHookMatches = content.match(/useForm\s*\([^)]*\)/gi) || [];
     const labelsMap = new Map();
 
-    const labelMatches = content.matchAll(/<label[^>]*(?:for=["']([^"']+)["'])?[^>]*>([\s\S]*?)<\/label>/gi);
+    const attrValue = (tag, attrName) => {
+      const match = String(tag || '').match(new RegExp(`\\b${attrName}=["']([^"']*)["']`, 'i'));
+      return match?.[1] || null;
+    };
+
+    const labelMatches = content.matchAll(/<label\b([^>]*)>([\s\S]*?)<\/label>/gi);
     for (const match of labelMatches) {
-      const targetId = String(match[1] || '').trim();
+      const targetId = String(attrValue(match[1], 'htmlFor') || attrValue(match[1], 'for') || '').trim();
       const labelText = String(match[2] || '').replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim();
       if (targetId && labelText) {
         labelsMap.set(targetId, labelText);
@@ -263,63 +268,70 @@ class ContextGatherer {
     const fields = [];
     
     // Input fields
-    const inputMatches = content.matchAll(/<(?:input|Input)[^>]*(?:name|id)=["']([^"']+)["'][^>]*(?:type=["']([^"']+)["'])?[^>]*>/gi);
+    const inputMatches = content.matchAll(/<(?:input|Input)\b[^>]*>/gi);
     for (const match of inputMatches) {
       const tag = match[0];
-      const idMatch = tag.match(/\bid=["']([^"']+)["']/i);
-      const placeholderMatch = tag.match(/\bplaceholder=["']([^"']+)["']/i);
-      const testIdMatch = tag.match(/\bdata-testid=["']([^"']+)["']/i);
-      const ariaLabelMatch = tag.match(/\baria-label=["']([^"']+)["']/i);
+      const name = attrValue(tag, 'name') || attrValue(tag, 'id');
+      if (!name) continue;
+      const id = attrValue(tag, 'id');
+      const type = attrValue(tag, 'type') || 'text';
+      const placeholder = attrValue(tag, 'placeholder');
+      const testId = attrValue(tag, 'data-testid');
+      const ariaLabel = attrValue(tag, 'aria-label');
       fields.push({
-        name: match[1],
-        type: match[2] || 'text',
+        name,
+        type,
         required: tag.includes('required'),
-        id: idMatch?.[1] || null,
-        label: labelsMap.get(idMatch?.[1] || '') || null,
-        placeholder: placeholderMatch?.[1] || null,
-        testId: testIdMatch?.[1] || null,
-        ariaLabel: ariaLabelMatch?.[1] || null,
+        id: id || null,
+        label: labelsMap.get(id || '') || null,
+        placeholder: placeholder || null,
+        testId: testId || null,
+        ariaLabel: ariaLabel || null,
         role: 'textbox',
       });
     }
     
     // Select fields
-    const selectMatches = content.matchAll(/<(?:select|Select)[^>]*(?:name|id)=["']([^"']+)["']/gi);
+    const selectMatches = content.matchAll(/<(?:select|Select)\b[^>]*>/gi);
     for (const match of selectMatches) {
       const tag = match[0];
-      const idMatch = tag.match(/\bid=["']([^"']+)["']/i);
-      const testIdMatch = tag.match(/\bdata-testid=["']([^"']+)["']/i);
-      const ariaLabelMatch = tag.match(/\baria-label=["']([^"']+)["']/i);
+      const name = attrValue(tag, 'name') || attrValue(tag, 'id');
+      if (!name) continue;
+      const id = attrValue(tag, 'id');
+      const testId = attrValue(tag, 'data-testid');
+      const ariaLabel = attrValue(tag, 'aria-label');
       fields.push({
-        name: match[1],
+        name,
         type: 'select',
         required: tag.includes('required'),
-        id: idMatch?.[1] || null,
-        label: labelsMap.get(idMatch?.[1] || '') || null,
+        id: id || null,
+        label: labelsMap.get(id || '') || null,
         placeholder: null,
-        testId: testIdMatch?.[1] || null,
-        ariaLabel: ariaLabelMatch?.[1] || null,
+        testId: testId || null,
+        ariaLabel: ariaLabel || null,
         role: 'combobox',
       });
     }
     
     // Textarea
-    const textareaMatches = content.matchAll(/<(?:textarea|Textarea)[^>]*(?:name|id)=["']([^"']+)["']/gi);
+    const textareaMatches = content.matchAll(/<(?:textarea|Textarea)\b[^>]*>/gi);
     for (const match of textareaMatches) {
       const tag = match[0];
-      const idMatch = tag.match(/\bid=["']([^"']+)["']/i);
-      const placeholderMatch = tag.match(/\bplaceholder=["']([^"']+)["']/i);
-      const testIdMatch = tag.match(/\bdata-testid=["']([^"']+)["']/i);
-      const ariaLabelMatch = tag.match(/\baria-label=["']([^"']+)["']/i);
+      const name = attrValue(tag, 'name') || attrValue(tag, 'id');
+      if (!name) continue;
+      const id = attrValue(tag, 'id');
+      const placeholder = attrValue(tag, 'placeholder');
+      const testId = attrValue(tag, 'data-testid');
+      const ariaLabel = attrValue(tag, 'aria-label');
       fields.push({
-        name: match[1],
+        name,
         type: 'textarea',
         required: tag.includes('required'),
-        id: idMatch?.[1] || null,
-        label: labelsMap.get(idMatch?.[1] || '') || null,
-        placeholder: placeholderMatch?.[1] || null,
-        testId: testIdMatch?.[1] || null,
-        ariaLabel: ariaLabelMatch?.[1] || null,
+        id: id || null,
+        label: labelsMap.get(id || '') || null,
+        placeholder: placeholder || null,
+        testId: testId || null,
+        ariaLabel: ariaLabel || null,
         role: 'textbox',
       });
     }

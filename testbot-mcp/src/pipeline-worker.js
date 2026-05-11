@@ -521,6 +521,8 @@ function extractQualityFailureFileNames(qualityAudit = {}) {
   for (const value of qualityAudit.ungroundedUiFiles || []) add(value);
   for (const value of qualityAudit.brittlePatternFiles || []) add(value);
   for (const value of qualityAudit.riskyFiles || []) add(value);
+  for (const value of qualityAudit.sourceMismatchFiles || []) add(value);
+  for (const value of qualityAudit.authGatingFiles || []) add(value);
 
   for (const item of qualityAudit.ungroundedSelectorFiles || []) {
     add(typeof item === 'string' ? item : item?.file);
@@ -635,7 +637,12 @@ function isBrittleGeneratedTestBlock(blockContent) {
     /getByRole\(\s*['"`]button['"`]\s*,\s*\{[^}]*name\s*:\s*['"`](?:Next Month|Previous Month)['"`][^}]*\}\s*\)\.click\(\)[\s\S]{0,1400}(?:getByRole\(\s*['"`]heading['"`][\s\S]{0,300}name\s*:\s*['"`](?:May 2026|Showing May 2026|May 2026\s*—\s*Monthly View)['"`]|toHaveText\(\s*['"`](?:May 2026|Showing May 2026|May 2026\s*—\s*Monthly View)['"`])/i,
     /getByRole\(\s*['"`]button['"`]\s*,\s*\{[^}]*name\s*:\s*['"`]Reset Layout['"`][^}]*\}\s*\)\.click\(\)[\s\S]{0,800}getByRole\(\s*['"`]button['"`]\s*,\s*\{[^}]*name\s*:\s*['"`]Add widget['"`][^}]*\}\s*\)/i,
     /getByText\(\s*['"`]Due:\s*(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\b[^'"`]*['"`]/i,
-    /getByText\(\s*['"`](?:Standup|Planning|Review)['"`]\s*\)/i,
+    /getByText\(\s*['"`](?:All|Standup|Planning|Review)['"`]\s*\)/i,
+    /expect\(\s*\w*(?:console)?errors\w*\s*\)\.toEqual\(\s*\[\s*\]\s*\)/i,
+    /page\.on\(\s*['"`]console['"`][\s\S]{0,600}msg\.type\(\)\s*={2,3}\s*['"`]error['"`][\s\S]{0,1000}expect\.poll\(\s*\(\)\s*=>\s*\w*(?:errors?)\w*\.length[\s\S]{0,180}\)\.toBe\(\s*0\s*\)/i,
+    /locator\(\s*(['"`])(?:(?!\1)[\s\S]){0,220}href\*=["']\/(?:shop|products?|items?|posts?|articles?|orders?)\/(?:(?!\1)[\s\S]){0,220}\1\s*\)\.first\(\)[\s\S]{0,700}(?:toHaveAttribute|getAttribute|click)\s*\(/i,
+    /(?:\bmain\b|page\.locator\(\s*['"`]main['"`]\s*\))[\s\S]{0,700}getByRole\(\s*['"`]heading['"`]\s*,\s*\{[\s\S]{0,240}\bname\s*:\s*['"`][A-Z][A-Z0-9 _&.-]{2,}['"`]/i,
+    /(?:\bmain\b|page\.locator\(\s*['"`]main['"`]\s*\))[\s\S]{0,700}\.toContainText\(\s*['"`][A-Z][A-Z0-9 _&.-]{2,}['"`]\s*\)/i,
   ];
   if (brittlePatterns.some((pattern) => pattern.test(text))) return true;
 
@@ -3083,7 +3090,47 @@ function isIntentionalUnknownRouteTest(content, fileName) {
   return /\b(not[- ]?found|404|invalid route|unknown route|error state|cat:error)\b/.test(text);
 }
 
-function auditGeneratedTestQuality({ projectPath, testType, context, explorationArtifact = null }) {
+function extractSourceRefsFromContent(content) {
+  const refs = [];
+  for (const match of String(content || '').matchAll(/\[SRC:([^\]]+)\]/gi)) {
+    const ref = String(match[1] || '').trim();
+    if (ref) refs.push(ref);
+  }
+  return [...new Set(refs)];
+}
+
+function extractAssertedLiteralText(content) {
+  const text = String(content || '');
+  const values = [];
+  const patterns = [
+    /getByRole\(\s*['"`][^'"`]+['"`]\s*,\s*\{[\s\S]{0,320}?\bname\s*:\s*(['"`])([^'"`\n]{2,160})\1/gi,
+    /getByText\(\s*(['"`])([^'"`\n]{2,160})\1/gi,
+    /getByLabel\(\s*(['"`])([^'"`\n]{2,160})\1/gi,
+    /getByPlaceholder\(\s*(['"`])([^'"`\n]{2,160})\1/gi,
+  ];
+  for (const pattern of patterns) {
+    for (const match of text.matchAll(pattern)) {
+      const value = String(match[2] || '').replace(/\s+/g, ' ').trim();
+      if (value) values.push(value);
+    }
+  }
+  return [...new Set(values)];
+}
+
+function sourceFileContainsLiteral(projectPath, sourceRef, literal) {
+  try {
+    const cleanRef = String(sourceRef || '').replace(/^\/+/, '');
+    const sourcePath = path.resolve(projectPath, cleanRef);
+    if (!sourcePath.startsWith(path.resolve(projectPath))) return false;
+    if (!fs.existsSync(sourcePath) || !fs.statSync(sourcePath).isFile()) return false;
+    const content = fs.readFileSync(sourcePath, 'utf-8');
+    return normalizeTextForAudit(content).includes(normalizeTextForAudit(literal));
+  } catch {
+    return false;
+  }
+}
+
+function auditGeneratedTestQuality({ projectPath, testType, context, explorationArtifact = null, roles = [] }) {
   const generatedDir = path.join(projectPath, 'tests', 'generated');
   const apiEndpointCount = effectiveApiEndpoints(context).length;
   Logger.info('PipelineWorker', `[QUALITY AUDIT] Starting audit — testType=${testType} apiEndpoints=${apiEndpointCount} dir=${generatedDir}`);
@@ -3107,6 +3154,8 @@ function auditGeneratedTestQuality({ projectPath, testType, context, exploration
     ungroundedSelectorFiles: [],
     ungroundedRouteFiles: [],
     brittlePatternFiles: [],
+    sourceMismatchFiles: [],
+    authGatingFiles: [],
     errors: [],
     warnings: [],
   };
@@ -3140,10 +3189,13 @@ function auditGeneratedTestQuality({ projectPath, testType, context, exploration
   const staleMonthAfterNavigationPattern = /getByRole\(\s*['"`]button['"`]\s*,\s*\{[^}]*name\s*:\s*['"`](?:Next Month|Previous Month)['"`][^}]*\}\s*\)\.click\(\)[\s\S]{0,1400}(?:getByRole\(\s*['"`]heading['"`][\s\S]{0,300}name\s*:\s*['"`](?:May 2026|Showing May 2026|May 2026\s*—\s*Monthly View)['"`]|toHaveText\(\s*['"`](?:May 2026|Showing May 2026|May 2026\s*—\s*Monthly View)['"`])/i;
   const resetThenAddWidgetPattern = /getByRole\(\s*['"`]button['"`]\s*,\s*\{[^}]*name\s*:\s*['"`]Reset Layout['"`][^}]*\}\s*\)\.click\(\)[\s\S]{0,800}getByRole\(\s*['"`]button['"`]\s*,\s*\{[^}]*name\s*:\s*['"`]Add widget['"`][^}]*\}\s*\)/i;
   const inventedDueLabelPattern = /getByText\(\s*['"`]Due:\s*(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\b[^'"`]*['"`]/i;
-  const ambiguousSingleWordTextPattern = /getByText\(\s*['"`](?:Standup|Planning|Review)['"`]\s*\)/i;
+  const ambiguousSingleWordTextPattern = /getByText\(\s*['"`](?:All|Standup|Planning|Review)['"`]\s*\)/i;
   const roleNameRegexPattern = /getByRole\(\s*['"`][^'"`]+['"`]\s*,\s*\{[\s\S]{0,320}?\bname\s*:\s*\/([^/\n]{12,220})\/[a-z]*/gi;
   const riskyUiPattern = /page\.pause\(/i;
   const riskyPhrasesPattern = /(invalid credentials|email is required|password is required|network error|try again|not found|does not exist|cannot find)/gi;
+  const strictConsoleErrorsPattern = /expect\(\s*\w*(?:console)?errors\w*\s*\)\.toEqual\(\s*\[\s*\]\s*\)/i;
+  const strictConsolePollPattern = /page\.on\(\s*['"`]console['"`][\s\S]{0,600}msg\.type\(\)\s*={2,3}\s*['"`]error['"`][\s\S]{0,1000}expect\.poll\(\s*\(\)\s*=>\s*\w*(?:errors?)\w*\.length[\s\S]{0,180}\)\.toBe\(\s*0\s*\)/i;
+  const dynamicDetailLinkPattern = /locator\(\s*(['"`])(?:(?!\1)[\s\S]){0,220}href\*=["']\/(shop|products?|items?|posts?|articles?|orders?)\/(?:(?!\1)[\s\S]){0,220}\1\s*\)\.first\(\)[\s\S]{0,700}(?:toHaveAttribute|getAttribute|click)\s*\(/i;
   const enforcePhraseRiskGates = String(process.env.HEALIX_ENFORCE_PHRASE_RISK_GATES || '').toLowerCase() === 'true';
   const knownCorpus = new Set();
   const sourceCorpus = extractSourceLiteralCorpus(projectPath);
@@ -3161,6 +3213,16 @@ function auditGeneratedTestQuality({ projectPath, testType, context, exploration
     const normalizedRoute = normalizeRouteForAudit(routePath);
     if (normalizedRoute) knownRoutes.add(normalizedRoute);
   }
+  const protectedRoutes = new Set();
+  const observedConcreteRoutes = new Set();
+  for (const route of explorationArtifact?.routes || []) {
+    const normalizedRoute = normalizeRouteForAudit(route?.path);
+    if (normalizedRoute && !/[:[]/.test(normalizedRoute)) observedConcreteRoutes.add(normalizedRoute);
+    if (route?.requiresAuth === true) {
+      if (normalizedRoute) protectedRoutes.add(normalizedRoute);
+    }
+  }
+  const verifiedRoleCount = (roles || []).filter((r) => r && r.loginVerified && r.storageStatePath).length;
 
   const recordBrittlePattern = (type, name) => {
     summary.brittlePatternFiles.push(name);
@@ -3317,6 +3379,40 @@ function auditGeneratedTestQuality({ projectPath, testType, context, exploration
         summary.warnings.push(`uses_route_mocking:${name}`);
       }
 
+      if (strictConsoleErrorsPattern.test(content) || strictConsolePollPattern.test(content)) {
+        recordBrittlePattern('brittle_strict_console_errors_assertion', name);
+      }
+
+      const dynamicDetailMatch = content.match(dynamicDetailLinkPattern);
+      if (dynamicDetailMatch) {
+        const rawPrefix = String(dynamicDetailMatch[2] || '').replace(/\?$/, '');
+        const prefix = `/${rawPrefix}/`;
+        const hasObservedDetailRoute = [...observedConcreteRoutes].some((route) => route.startsWith(prefix) && route.length > prefix.length);
+        if (!hasObservedDetailRoute) {
+          recordBrittlePattern('brittle_unobserved_dynamic_detail_link_assertion', name);
+        }
+      }
+
+      if (protectedRoutes.size > 0 && verifiedRoleCount === 0) {
+        const unsafeBlocks = findGeneratedTestBlocks(content).filter((block) => {
+          const blockRoutes = extractGotoRoutes(block.content)
+            .map(normalizeRouteForAudit)
+            .filter(Boolean);
+          if (!blockRoutes.some((route) => protectedRoutes.has(route))) return false;
+          if (/\btest\.skip\s*\(/.test(block.content) || /@auth|@tierB/i.test(block.content)) return false;
+          const expectsProtectedDestination = [...protectedRoutes].some((route) => {
+            const escaped = route.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\\\/$/, '');
+            return new RegExp(`toHaveURL\\([\\s\\S]{0,160}${escaped}`, 'i').test(block.content);
+          });
+          const claimsAuthenticatedSuccess = /\b(positive\s+auth|authenticated|signed[- ]?in|admin\s+(?:dashboard|panel)|role[- ]?based\s+redirect)/i.test(block.content);
+          return expectsProtectedDestination || claimsAuthenticatedSuccess;
+        });
+        if (unsafeBlocks.length > 0) {
+          summary.authGatingFiles.push(name);
+          summary.errors.push(`unblocked_protected_route_without_credentials:${name}:${unsafeBlocks.length}`);
+        }
+      }
+
       if (checkValidityPattern.test(content)) {
         recordBrittlePattern('brittle_check_validity_assertion', name);
       }
@@ -3355,6 +3451,21 @@ function auditGeneratedTestQuality({ projectPath, testType, context, exploration
 
       if (ambiguousSingleWordTextPattern.test(content)) {
         recordBrittlePattern('brittle_ambiguous_single_word_text', name);
+      }
+
+      for (const block of findGeneratedTestBlocks(content)) {
+        if (!/(?:\bmain\b|page\.locator\(\s*['"`]main['"`]\s*\))/.test(block.content)) continue;
+        const sourceRefs = extractSourceRefsFromContent(block.content);
+        if (sourceRefs.length === 0) continue;
+        const mismatched = extractAssertedLiteralText(block.content)
+          .filter((literal) => literal.length >= 3)
+          .filter((literal) => /^[A-Z][A-Z0-9 _&.-]{2,}$/.test(literal))
+          .filter((literal) => !sourceRefs.some((sourceRef) => sourceFileContainsLiteral(projectPath, sourceRef, literal)));
+        if (mismatched.length > 0) {
+          summary.sourceMismatchFiles.push(name);
+          summary.errors.push(`assertion_not_in_declared_source:${name}:${mismatched.slice(0, 3).join('|')}`);
+          break;
+        }
       }
 
       const exactCountMatches = [...content.matchAll(exactCountPattern)];
@@ -4490,6 +4601,7 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
       testType: config.testType,
       context,
       explorationArtifact,
+      roles,
     });
 
     Logger.info('PipelineWorker', '[QUALITY GATE] auditGeneratedTestQuality result', {
@@ -4553,6 +4665,7 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
           testType: config.testType,
           context,
           explorationArtifact,
+          roles,
         });
         qualityAudit.qualityRecovery = pruning;
         Logger.info('PipelineWorker', '[QUALITY GATE] post-pruning auditGeneratedTestQuality result', {
@@ -4618,12 +4731,13 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
           throw error;
         }
 
-        qualityAudit = auditGeneratedTestQuality({
-          projectPath: config.projectPath,
-          testType: config.testType,
-          context,
-          explorationArtifact,
-        });
+          qualityAudit = auditGeneratedTestQuality({
+            projectPath: config.projectPath,
+            testType: config.testType,
+            context,
+            explorationArtifact,
+            roles,
+          });
         qualityAudit.qualityRecovery = quarantine;
 
         Logger.info('PipelineWorker', '[QUALITY GATE] post-quarantine auditGeneratedTestQuality result', {

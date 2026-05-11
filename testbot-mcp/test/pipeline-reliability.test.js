@@ -264,6 +264,113 @@ test('quality audit rejects missing source references, invented selector text, a
   });
 });
 
+test('quality audit rejects unblocked protected-route tests when credentials are unavailable', () => {
+  withGeneratedSuite(`
+    import { test, expect } from '@playwright/test';
+
+    test('account login reaches protected account page', async ({ page }) => {
+      // [SRC:src/account.tsx] Account route requires a signed-in session.
+      await page.goto('/account');
+      await page.getByLabel('Email').fill('user@example.com');
+      await page.getByLabel('Password').fill('password');
+      await page.getByRole('button', { name: 'Sign In' }).click();
+      await expect(page).toHaveURL(/\\/account$/);
+    });
+  `, (projectPath) => {
+    fs.mkdirSync(path.join(projectPath, 'src'), { recursive: true });
+    fs.writeFileSync(
+      path.join(projectPath, 'src', 'account.tsx'),
+      '<main><h1>Account</h1><label htmlFor="email">Email</label><input id="email" /><label htmlFor="password">Password</label><input id="password" /><button>Sign In</button></main>',
+    );
+
+    const audit = auditGeneratedTestQuality({
+      projectPath,
+      testType: 'frontend',
+      context: {
+        pages: [{ path: '/account', sourceFile: 'src/account.tsx' }],
+        sourceContext: {
+          files: [{ file: 'src/account.tsx', assertableText: ['Account', 'Email', 'Password', 'Sign In'], routePaths: ['/account'] }],
+          assertableText: ['Account', 'Email', 'Password', 'Sign In'],
+          routePaths: ['/account'],
+        },
+      },
+      explorationArtifact: { routes: [{ path: '/account', requiresAuth: true }] },
+      roles: [],
+    });
+
+    assert.equal(audit.valid, false);
+    assert.ok(audit.errors.includes('unblocked_protected_route_without_credentials:generated.spec.ts:1'));
+  });
+});
+
+test('quality audit allows skipped protected-route tests when credentials are unavailable', () => {
+  withGeneratedSuite(`
+    import { test } from '@playwright/test';
+
+    test('account route is blocked without credentials', async ({ page }) => {
+      test.skip(true, 'Requires admin credentials — not available in this run');
+      // [SRC:src/account.tsx] Account route requires a signed-in session.
+      await page.goto('/account');
+    });
+  `, (projectPath) => {
+    fs.mkdirSync(path.join(projectPath, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(projectPath, 'src', 'account.tsx'), '<main><h1>Account</h1></main>');
+
+    const audit = auditGeneratedTestQuality({
+      projectPath,
+      testType: 'frontend',
+      context: {
+        pages: [{ path: '/account', sourceFile: 'src/account.tsx' }],
+        sourceContext: {
+          files: [{ file: 'src/account.tsx', assertableText: ['Account'], routePaths: ['/account'] }],
+          assertableText: ['Account'],
+          routePaths: ['/account'],
+        },
+      },
+      explorationArtifact: { routes: [{ path: '/account', requiresAuth: true }] },
+      roles: [],
+    });
+
+    assert.ok(!audit.errors.some((error) => error.startsWith('unblocked_protected_route_without_credentials')));
+  });
+});
+
+test('quality audit allows protected-route success assertions when credentials are verified', () => {
+  withGeneratedSuite(`
+    import { test, expect } from '@playwright/test';
+
+    test('admin reaches account page with storage state', async ({ page }) => {
+      // [SRC:src/account.tsx] Account route is reachable for a verified authenticated role.
+      await page.goto('/account');
+      await expect(page).toHaveURL(/\\/account$/);
+      await expect(page.getByRole('heading', { name: 'Account' })).toBeVisible();
+    });
+  `, (projectPath) => {
+    fs.mkdirSync(path.join(projectPath, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(projectPath, 'src', 'account.tsx'), '<main><h1>Account</h1></main>');
+    const storageStatePath = path.join(projectPath, '.healix', 'auth-state-admin.json');
+    fs.mkdirSync(path.dirname(storageStatePath), { recursive: true });
+    fs.writeFileSync(storageStatePath, '{"cookies":[],"origins":[]}', 'utf-8');
+
+    const audit = auditGeneratedTestQuality({
+      projectPath,
+      testType: 'frontend',
+      context: {
+        pages: [{ path: '/account', sourceFile: 'src/account.tsx' }],
+        sourceContext: {
+          files: [{ file: 'src/account.tsx', assertableText: ['Account'], routePaths: ['/account'] }],
+          assertableText: ['Account'],
+          routePaths: ['/account'],
+        },
+      },
+      explorationArtifact: { routes: [{ path: '/account', requiresAuth: true }] },
+      roles: [{ role: 'admin', loginVerified: true, storageStatePath }],
+    });
+
+    assert.ok(!audit.errors.some((error) => error.startsWith('unblocked_protected_route_without_credentials')));
+  });
+});
+
 test('quality audit rejects brittle implementation-detail UI assertions', () => {
   withGeneratedSuite(`
     import { test, expect } from '@playwright/test';
@@ -316,6 +423,133 @@ test('quality audit rejects brittle implementation-detail UI assertions', () => 
     assert.ok(audit.errors.some((error) => error.startsWith('brittle_ambiguous_single_word_text:')));
     assert.ok(audit.errors.some((error) => error.startsWith('brittle_stale_month_after_navigation:')));
     assert.ok(audit.errors.some((error) => error.startsWith('brittle_concatenated_accessible_name_regex:')));
+  });
+});
+
+test('quality audit rejects brittle strict console error assertions', () => {
+  withGeneratedSuite(`
+    import { test, expect } from '@playwright/test';
+
+    test('public route has no console errors', async ({ page }) => {
+      // [SRC:src/App.tsx] App source renders the public Home route.
+      const consoleErrors = [];
+      page.on('console', (msg) => {
+        if (msg.type() === 'error') consoleErrors.push(msg.text());
+      });
+      await page.goto('/');
+      await expect(page.getByRole('heading', { name: 'Home' })).toBeVisible();
+      expect(consoleErrors).toEqual([]);
+    });
+  `, (projectPath) => {
+    fs.mkdirSync(path.join(projectPath, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(projectPath, 'src', 'App.tsx'), '<main><h1>Home</h1></main>');
+
+    const audit = auditGeneratedTestQuality({
+      projectPath,
+      testType: 'frontend',
+      context: {
+        pages: [{ path: '/', sourceFile: 'src/App.tsx' }],
+        sourceContext: {
+          files: [{ file: 'src/App.tsx', assertableText: ['Home'], routePaths: ['/'] }],
+          assertableText: ['Home'],
+          routePaths: ['/'],
+        },
+      },
+    });
+
+    assert.equal(audit.valid, false);
+    assert.ok(audit.errors.includes('brittle_strict_console_errors_assertion:generated.spec.ts'));
+  });
+});
+
+test('quality audit rejects ambiguous generic getByText and console poll helpers', () => {
+  withGeneratedSuite(`
+    import { test, expect } from '@playwright/test';
+
+    async function assertNoConsoleErrors(page) {
+      const errors = [];
+      page.on('console', (msg) => {
+        if (msg.type() === 'error') errors.push(msg.text());
+      });
+      await expect.poll(() => errors.length, { timeout: 1000 }).toBe(0);
+    }
+
+    test('public filters are visible', async ({ page }) => {
+      // [SRC:src/Shop.tsx] Shop source renders a public filter list.
+      await page.goto('/shop');
+      await expect(page.getByRole('heading', { name: 'Shop Collection' })).toBeVisible();
+      await expect(page.getByText('All')).toBeVisible();
+      await assertNoConsoleErrors(page);
+    });
+  `, (projectPath) => {
+    fs.mkdirSync(path.join(projectPath, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(projectPath, 'src', 'Shop.tsx'), '<main><h1>Shop Collection</h1><label><input />All</label><footer>All rights reserved</footer></main>');
+
+    const audit = auditGeneratedTestQuality({
+      projectPath,
+      testType: 'frontend',
+      context: {
+        pages: [{ path: '/shop', sourceFile: 'src/Shop.tsx' }],
+        sourceContext: {
+          files: [{ file: 'src/Shop.tsx', assertableText: ['Shop Collection', 'All'], routePaths: ['/shop'] }],
+          assertableText: ['Shop Collection', 'All'],
+          routePaths: ['/shop'],
+        },
+      },
+    });
+
+    assert.equal(audit.valid, false);
+    assert.ok(audit.errors.includes('brittle_ambiguous_single_word_text:generated.spec.ts'));
+    assert.ok(audit.errors.includes('brittle_strict_console_errors_assertion:generated.spec.ts'));
+  });
+});
+
+test('quality audit rejects unobserved dynamic detail links and mismatched source assertions', () => {
+  withGeneratedSuite(`
+    import { test, expect } from '@playwright/test';
+
+    test('lookbook and product detail flow', async ({ page }) => {
+      // [SRC:src/Lookbook.tsx] Lookbook source renders public editorial content.
+      await page.goto('/lookbook');
+      const main = page.locator('main');
+      await expect(main.getByRole('heading', { level: 1, name: 'Lookbook' })).toBeVisible();
+      await expect(main.getByRole('heading', { level: 3, name: 'THEA' })).toBeVisible();
+      await expect(main).toContainText('THEA');
+
+      // [SRC:src/Shop.tsx] Dynamic product links must be observed before tests require them.
+      await page.goto('/shop');
+      const productLink = page.locator('main a[href*="/shop/"]').first();
+      const href = await productLink.getAttribute('href');
+      expect(href).toBeTruthy();
+    });
+  `, (projectPath) => {
+    fs.mkdirSync(path.join(projectPath, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(projectPath, 'src', 'Lookbook.tsx'), '<main><h1>Lookbook</h1></main>');
+    fs.writeFileSync(path.join(projectPath, 'src', 'Shop.tsx'), '<main><h1>Shop Collection</h1></main>');
+
+    const audit = auditGeneratedTestQuality({
+      projectPath,
+      testType: 'frontend',
+      context: {
+        pages: [
+          { path: '/lookbook', sourceFile: 'src/Lookbook.tsx' },
+          { path: '/shop', sourceFile: 'src/Shop.tsx' },
+        ],
+        sourceContext: {
+          files: [
+            { file: 'src/Lookbook.tsx', assertableText: ['Lookbook'], routePaths: ['/lookbook'] },
+            { file: 'src/Shop.tsx', assertableText: ['Shop Collection'], routePaths: ['/shop'] },
+          ],
+          assertableText: ['Lookbook', 'Shop Collection'],
+          routePaths: ['/lookbook', '/shop'],
+        },
+      },
+      explorationArtifact: { routes: [{ path: '/lookbook', requiresAuth: false }, { path: '/shop', requiresAuth: false }] },
+    });
+
+    assert.equal(audit.valid, false);
+    assert.ok(audit.errors.includes('brittle_unobserved_dynamic_detail_link_assertion:generated.spec.ts'));
+    assert.ok(audit.errors.some((error) => error.startsWith('assertion_not_in_declared_source:generated.spec.ts:')));
   });
 });
 
