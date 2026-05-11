@@ -29,7 +29,7 @@ Env inputs:
     HEALIX_LOGIN_USERNAME   - optional credential
     HEALIX_LOGIN_PASSWORD   - optional credential
     HEALIX_TOTAL_TIMEOUT_S  - hard cap in seconds (default 180)
-    HEALIX_BROWSER_USE_MODEL- OpenAI model id (default "gpt-4o-mini")
+    HEALIX_BROWSER_USE_MODEL- OpenAI model id (default "gpt-5.4-mini")
 
     LLM credentials (set automatically by the Node driver):
     HEALIX_API_KEY          - routes LLM calls through the Healix webapp proxy.
@@ -206,7 +206,7 @@ def _build_llm():
     calls at runtime; the proxy path is the stable default because Healix owns
     the server-side OpenAI configuration.
     """
-    model = os.environ.get("HEALIX_BROWSER_USE_MODEL", "gpt-4o-mini")
+    model = os.environ.get("HEALIX_BROWSER_USE_MODEL", "gpt-5.4-mini")
     api_key = os.environ.get("HEALIX_API_KEY")
     base_url = os.environ.get("HEALIX_LLM_PROXY_URL")
     openai_api_key = os.environ.get("OPENAI_API_KEY")
