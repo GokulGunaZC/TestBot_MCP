@@ -53,6 +53,7 @@ export interface SourceContext {
   routePaths?: string[]
   testIds?: string[]
   sourceFilesAnalyzed?: number
+  routingMode?: 'hash' | 'path' | string | null
 }
 
 export interface ApiEndpoint {
@@ -314,6 +315,10 @@ export interface Role {
   role?: string                // MCP credential injector historically emits this alias
   storageStatePath?: string    // path to Playwright storageState JSON for this role
   loginVerified?: boolean
+  username?: string            // optional test credential fixture supplied by MCP
+  password?: string            // optional test credential fixture supplied by MCP
+  credentialSource?: string
+  originalCredentialRole?: string | null
 }
 
 export interface ObservedLabel {

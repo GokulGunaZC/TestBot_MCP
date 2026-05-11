@@ -1234,6 +1234,7 @@ IMPORTANT: Return ONLY valid JSON.`
     const sourceContext = sourceContextRaw
       ? {
           sourceFilesAnalyzed: sourceContextRaw.sourceFilesAnalyzed || 0,
+          routingMode: sourceContextRaw.routingMode || null,
           routePaths: (sourceContextRaw.routePaths || []).slice(0, 80),
           testIds: (sourceContextRaw.testIds || []).slice(0, 80),
           assertableText: (sourceContextRaw.assertableText || [])
@@ -1288,12 +1289,30 @@ IMPORTANT: Return ONLY valid JSON.`
       .filter((r) => r && r.loginVerified && r.storageStatePath)
       .map((r) => normalizeRoleLabel(r.name || r.role || 'user'))
     const availableRoles = [...new Set(verifiedRoles)]
+    const credentialFixtures = (this.roles || [])
+      .filter((r) => r && r.loginVerified && r.storageStatePath && r.username && r.password)
+      .map((r) => ({
+        role: normalizeRoleLabel(r.name || r.role || 'user'),
+        originalRole: r.originalCredentialRole || r.role || r.name || null,
+        username: r.username,
+        password: r.password,
+        source: r.credentialSource || 'user_supplied',
+      }))
+    const sourceContextText = JSON.stringify(sourceContextRaw || {})
+    const routingMode =
+      /withHashLocation\s*\(|HashLocationStrategy|useHash\s*:\s*true|#\//i.test(sourceContextText)
+        ? 'hash'
+        : 'path'
     const hasCredentials = availableRoles.length > 0
     const authContext = {
       availableRoles,
       hasCredentials,
+      credentialFixtures,
+      credentialPolicy: credentialFixtures.length > 0
+        ? 'Use only the listed credentialFixtures when an API test must authenticate through a real login endpoint; never derive email/password from role labels.'
+        : 'No raw credential fixtures are available to generation; do not fabricate email/password pairs from role labels.',
       note: hasCredentials
-        ? `Playwright storageState is available for these roles: [${availableRoles.join(', ')}]. Tests for those roles may use an authenticated context.`
+        ? `Playwright storageState is available for these roles: [${availableRoles.join(', ')}]. UI tests for those roles must use @auth/@tierB. API login setup may use credentialFixtures only when listed.`
         : routeAccess.authMode === 'public_app'
           ? 'No credentials were injected, but exploration proved public routes are reachable. Public routes MUST be tested without storageState; do not skip them for missing credentials.'
           : 'No credentials were injected for this run — storageState is NOT available for any role. Any test that requires a signed-in user (protected routes, admin panels, account pages) MUST be wrapped in test.skip() with a human-readable reason string.',
@@ -1316,6 +1335,7 @@ IMPORTANT: Return ONLY valid JSON.`
           baseURL: projectInfo.baseURL || 'http://localhost:3000',
           framework: projectInfo.framework || 'Unknown',
           startCommand: projectInfo.startCommand || null,
+          routingMode,
         },
         testKind,
         authContext,
@@ -1365,9 +1385,11 @@ IMPORTANT: Return ONLY valid JSON.`
       'For listings, assert stable structure and live navigation links instead of exact card h3 text.',
       'For direct cart-route tests, assert the cart shell or empty-cart state unless the same test first added an item.',
       'For add-to-cart actions, assert in-page feedback; do not assume a redirect to the cart route.',
-      'Do not generate credential-submitting login success tests. Healix never sends raw credentials to generation; use @auth/@tierB storageState for authenticated routes.',
-      'For login-form tests, only cover unauthenticated validation/error states with deliberately invalid placeholder input such as invalid@example.invalid; never use real-looking emails or copied project credentials.',
+      'Do not generate credential-submitting UI login success tests; use @auth/@tierB storageState for authenticated UI routes.',
+      'For API auth setup, use only CONTEXT_JSON.meta.authContext.credentialFixtures when present. Never derive user@*.test, admin@*.test, User123!, Password123!, or any other credential from a role label.',
+      'For login-form UI tests, only cover unauthenticated validation/error states with deliberately invalid placeholder input such as invalid@example.invalid; never use real-looking emails unless they exactly match credentialFixtures and the test is specifically an API auth setup.',
       'For post-auth routes, do not guess the landing page after login. Navigate directly to the protected route under @auth/@tierB and assert route-owned content or a generic authenticated shell observed in context.',
+      'If CONTEXT_JSON.meta.projectInfo.routingMode is "hash", preserve hash fragments exactly for client routes. Angular hash apps commonly use /admin#/products; do not rewrite that to /admin/products.',
       'For unauthenticated protected routes, do not assert HTTP 3xx redirects. Modern apps may return 200 and render login UI in-place; assert either /login URL OR visible login/auth UI.',
       'Separate route content from global layout chrome: navbar/header/footer/sidebar/logo text may prove the shell renders, but it must not be asserted as page-specific main content unless sourceContext ties it to that route page file.',
       'A button click or form submit does not imply navigation. Only assert a URL change when OBSERVED_FLOWS endCondition, routeAccess, or sourceContext proves that exact action navigates; otherwise assert visible in-place feedback, changed button state, toast/dialog/inline message, or continued page usability.',
@@ -1406,7 +1428,7 @@ IMPORTANT: Return ONLY valid JSON.`
     if (sourceEvidence?.files && sourceEvidence.files.length > 0) {
       promptRequirements.push(
         'Source grounding is mandatory: every UI test must include a comment `// [SRC:<relative-source-file>] ...` naming a file from CONTEXT_JSON.context.sourceContext.files that proves the route, selector, or asserted text.',
-        'UI assertions must use exact text, test ids, routes, headings, buttons, or data values present in CONTEXT_JSON.meta.routeAccess.observedRoutes or CONTEXT_JSON.context.sourceContext. Do not invent labels by formatting data fields.',
+        'UI assertions must use exact text, test ids, routes, headings, buttons, or data values present in CONTEXT_JSON.meta.routeAccess.observedRoutes or CONTEXT_JSON.context.sourceContext. Do not invent labels by formatting data fields, and do not change observed element roles (for example, do not assert Logout as a link if source/rendered context shows it is a button).',
         'If a PRD acceptance criterion asks for behavior not proven by routeAccess or sourceContext, generate a bounded test for the nearest proven public behavior and include the source reference; do not fabricate modals, errors, counts, or backend calls.',
       )
     }
@@ -1760,24 +1782,28 @@ Return only the JSON array of generated files.`
 - Conditional visibility rule: if content lives behind a menu, dropdown, modal/dialog, accordion, drawer, hamburger nav, filter panel, tab, or lazy/collapsed section, the test must perform the opening interaction first and then scope the assertion to the opened container.
 - Database/CMS grounding rule: exact names that appear only in browser exploration are still not stable enough for product/order/customer/card assertions. Never assert exact level-3 card headings, product names, brand labels, or cart line-item text unless the exact text is present in sourceContext.assertableText. Prefer structure such as main.locator('h3').first(), row/card/link visibility, and live detail links extracted from the listing.
 - Login success rule: after submitting real credentials, success is leaving the login route/form or seeing authenticated account content. Never assert that the pre-auth login heading/form remains visible as the success condition.
-- Credential rule: generated tests must never fill login forms with real-looking email/password literals. Raw config-form credentials are intentionally unavailable to the generator. Authenticated tests must use @auth/@tierB storageState; login-form tests may only use deliberately invalid placeholder input for validation/error coverage.
+- Credential rule: generated tests must never invent real-looking email/password literals. If CONTEXT_JSON.meta.authContext.credentialFixtures is non-empty, API auth setup may use those exact username/password values only; UI protected-route tests must still use @auth/@tierB storageState. If credentialFixtures is empty, do not generate success login/API auth tests that require credentials.
 - Protected route rule: unauthenticated protected-route checks must assert the rendered auth boundary, not transport semantics. Do not require response.status() to be 3xx; accept either a /login URL or visible login/auth UI rendered in-place with HTTP 200.
+- Angular hash routing rule: if CONTEXT_JSON.meta.projectInfo.routingMode is "hash", preserve observed hash URLs such as /admin#/products. Never replace them with /admin/products unless routeAccess/source proves that exact path works.
 
 ## Auth Gating Rules (check CONTEXT_JSON.meta.authContext before generating any test)
 - CONTEXT_JSON.meta.authContext.availableRoles lists every role that has a verified Playwright storageState for this run. Values are normalized lower-case labels such as "user" and "admin". If it is an empty array, NO authentication context exists.
+- CONTEXT_JSON.meta.authContext.credentialFixtures lists actual user-provided test credentials when API login setup is allowed. Use exact values from this list only; never synthesize an email/password from "user", "customer", "admin", or a domain guess.
 - CONTEXT_JSON.meta.routeAccess is authoritative for route accessibility. Routes listed in publicRoutes or observedRoutes with requiresAuth:false are public and MUST have runnable tests; do not add test.skip() to those tests because credentials are absent.
 - Any test that navigates to a route proven protected by routeAccess.protectedRoutes, an observed route with requiresAuth:true, or a real auth-only/admin-only surface MUST first check whether the required role is in availableRoles. If it is NOT, wrap only that protected-route test body in: test.skip('Requires <role> credentials — not available in this run').
 - If availableRoles is non-empty, protected-route tests MUST be tagged with @auth and @tierB so Healix runs them once for every verified role using persisted storageState. Do not put test.use({ storageState }) in generated files.
 - Do not submit the login form with stored credentials inside protected-route tests. Healix has already logged in and persisted sessions per role before execution; navigate directly to the protected route under the @auth/@tierB project.
 - If routeAccess.authMode is "public_app", generate public-first runnable coverage for the observed public routes and do not infer authentication from labels such as Dashboard, Projects, Calendar, Settings, Admin, Widget Library, Edit, Calendar, Logout, or role/admin wording in the PRD when exploration reached the route without redirecting.
 - If routeAccess.authMode is "public_app" and protectedRoutes is empty, authRequired/role/admin hints in PRD acceptance criteria are lower priority than routeAccess. Do NOT skip those tests for credentials; test the reachable public UI behavior instead.
-- NEVER hardcode test user credentials (e.g. email: 'user@app.test', password: 'Password123!'). These accounts almost certainly do not exist in the target database. For tests that need a signed-in customer without stored credentials, implement a fresh signUp() flow using the public /signup (or equivalent) route with a unique email per test.
+- NEVER hardcode guessed test user credentials (e.g. email: 'user@app.test', password: 'Password123!'). These accounts almost certainly do not exist in the target database. If no credentialFixture exists for a role, test unauthenticated negative behavior or skip only that auth-scoped case.
 - Admin-only routes (/admin/**): skip unconditionally unless "admin" is listed in availableRoles.
 - Signed-in customer/user routes must run when any non-admin authenticated role such as "user" is listed in availableRoles.`
 
     if (prefix === 'api') {
       return `${shared}
 - Do not invent undocumented API status codes or response keys.
+- Do not assume missing collection resources return 4xx. Endpoints like GET /api/reviews/:productId may legitimately return 200 [] for an unknown id unless source/API contract proves otherwise.
+- If an API success path requires authentication, obtain tokens/sessions only from CONTEXT_JSON.meta.authContext.credentialFixtures or from a documented source-backed helper endpoint. Do not fabricate emails, passwords, bearer tokens, or seed identities.
 - At least one API test file must include a lightweight stress/burst check using Promise.all with small N.
 - Prefer bounded assertions for unknown error codes (example: status >= 400 && status < 500).
 - Include explicit category tags across suite: [CAT:api_contract], [CAT:api_auth], [CAT:api_negative], [CAT:api_stress].`
@@ -2180,17 +2206,45 @@ Return JSON array only.`
       errors.push('Generated tests cannot use eval/process.exit/Function constructors')
     }
 
-    const containsLiteralEmail = /['"`][A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}['"`]/i.test(content)
+    const allowedEmails = new Set(
+      (this.roles || [])
+        .filter((role) => role?.username)
+        .map((role) => String(role.username).toLowerCase())
+    )
+    const allowedPasswords = new Set(
+      (this.roles || [])
+        .filter((role) => role?.password)
+        .map((role) => String(role.password))
+    )
+    const literalEmails = [...content.matchAll(/['"`]([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})['"`]/gi)]
+      .map((match) => match[1])
+    const unverifiedLiteralEmails = literalEmails.filter((email) =>
+      !/example\.invalid$/i.test(email) &&
+      !allowedEmails.has(String(email).toLowerCase())
+    )
+    const containsLiteralEmail = unverifiedLiteralEmails.length > 0
     const fillsPasswordLiteral =
       /\.(?:fill|type)\(\s*['"`][^'"`]*(?:password|passwd|pwd)[^'"`]*['"`]\s*,\s*['"`][^'"`]{4,}['"`]\s*\)/i.test(content) ||
       /getBy(?:Label|Placeholder|Role)\([^)]*(?:password|passwd|pwd)[^)]*\)\s*\.\s*(?:fill|type)\(\s*['"`][^'"`]{4,}['"`]\s*\)/i.test(content)
     const submitsLoginForm =
       /getByRole\(\s*['"`]button['"`]\s*,\s*\{[^}]*name\s*:\s*(?:\/[^/]*(?:sign\s*in|log\s*in|login)[^/]*\/[a-z]*|['"`][^'"`]*(?:sign\s*in|log\s*in|login)[^'"`]*['"`])[^}]*\}\s*\)\.click\(\s*\)/i.test(content)
     const allowedInvalidLoginInput = /invalid@example\.invalid|example\.invalid/i.test(content)
-    if ((containsLiteralEmail || fillsPasswordLiteral) && submitsLoginForm && !allowedInvalidLoginInput) {
+    const unverifiedPasswordLiterals = [...content.matchAll(/(?:password|passwd|pwd)\s*:\s*['"`]([^'"`]{4,})['"`]|getBy(?:Label|Placeholder|Role)\([^)]*(?:password|passwd|pwd)[^)]*\)\s*\.\s*(?:fill|type)\(\s*['"`]([^'"`]{4,})['"`]\s*\)/gi)]
+      .map((match) => match[1] || match[2])
+      .filter(Boolean)
+      .filter((password) => !allowedPasswords.has(String(password)))
+      .filter((password) => !/invalid|wrong|bad|fake|placeholder|not-real/i.test(String(password)))
+    if ((containsLiteralEmail || (fillsPasswordLiteral && unverifiedPasswordLiterals.length > 0)) && submitsLoginForm && !allowedInvalidLoginInput) {
       errors.push(
-        'Generated auth tests must not submit hardcoded real-looking credentials; use @auth/@tierB storageState for authenticated routes or deliberately invalid placeholder input for validation tests'
+        'Generated auth tests must not submit invented real-looking credentials; use @auth/@tierB storageState, exact credentialFixtures for API auth setup, or deliberately invalid placeholder input for validation tests'
       )
+    }
+    if (
+      unverifiedLiteralEmails.length > 0 &&
+      unverifiedPasswordLiterals.length > 0 &&
+      /\/api\/(?:auth\/)?(?:login|signin|session)|request\.(?:post|put|patch)\(/i.test(content)
+    ) {
+      errors.push('API auth setup must not use role-derived or invented credentials; use exact credentialFixtures only')
     }
 
     if (
@@ -2268,6 +2322,20 @@ Return JSON array only.`
         )
       }
 
+      const cartFilledStateWithoutSetup =
+        /page\.goto\(\s*['"`][^'"`]*\/cart(?:[?#][^'"`]*)?['"`]\s*\)[\s\S]{0,1400}(subtotal|order\s+total|checkout|line\s+item|cart\s+total)/i.test(content) &&
+        !/add\s+to\s+cart|cart\/items|\/api\/cart|request\.(?:post|put|patch)\(|localStorage\.setItem|sessionStorage\.setItem/i.test(content)
+      if (cartFilledStateWithoutSetup) {
+        errors.push('Cart filled-state tests must add an item or seed cart state before asserting subtotal/checkout/line items')
+      }
+
+      if (
+        /#rating|getByLabel\([^)]*rating|getByRole\([^)]*(?:review|rating)|leave\s+a\s+review|submit\s+review/i.test(content) &&
+        !/@auth|@tierB/i.test(content)
+      ) {
+        errors.push('Auth-gated review/rating form tests must be tagged @auth/@tierB or assert the unauthenticated login prompt instead')
+      }
+
       const loginSubmitStillOnLoginPattern =
         /getByRole\(\s*['"`]button['"`]\s*,\s*\{[^}]*name\s*:\s*(?:\/[^/]*(?:sign\s*in|log\s*in|login)[^/]*\/[a-z]*|['"`][^'"`]*(?:sign\s*in|log\s*in|login)[^'"`]*['"`])[^}]*\}\s*\)\.click\(\s*\)[\s\S]{0,1000}(?:toHaveURL\(\s*(?:\/[^/]*(?:login|signin|account)[^/]*\/[a-z]*|['"`][^'"`]*(?:login|signin|account)[^'"`]*['"`])|getByRole\(\s*['"`]heading['"`]\s*,\s*\{[^}]*name\s*:\s*(?:\/[^/]*(?:welcome back|sign\s*in|log\s*in|login)[^/]*\/[a-z]*|['"`][^'"`]*(?:welcome back|sign\s*in|log\s*in|login)[^'"`]*['"`]))/i
       if (loginSubmitStillOnLoginPattern.test(content)) {
@@ -2283,6 +2351,12 @@ Return JSON array only.`
     }
 
     if (prefix === 'api') {
+      const unprovenMissingCollectionStatus =
+        /request\.get\(\s*(?:['"`][^'"`]*\/api\/[a-z0-9_-]+s\/(?:nonexistent|missing|unknown|invalid|does-not-exist|999999|000000)|`[^`]*\/api\/[a-z0-9_-]+s\/\$\{[^}]*nonexistent[^}]*\}[^`]*)/i.test(content) &&
+        /toBeGreaterThanOrEqual\(\s*400\s*\)|toBe\(\s*(?:400|404|422)\s*\)|status\(\)\)\.not\.toBe\(\s*200\s*\)/i.test(content)
+      if (unprovenMissingCollectionStatus) {
+        errors.push('Do not assert 4xx for unknown collection resource IDs unless source/API contract proves that behavior; 200 [] is also valid')
+      }
       const apiGroundingCheck = this.validateApiGrounding(
         content,
         generationContext?.context || {}

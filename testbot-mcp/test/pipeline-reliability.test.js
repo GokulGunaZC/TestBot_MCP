@@ -8,6 +8,7 @@ const test = require('node:test');
 const {
   classifyPipelineErrorFromStderr,
 } = require('../src/failure-triage/pipeline-error-classifier');
+const PlaywrightIntegration = require('../src/playwright-integration');
 
 const {
   buildRouteAccessSummary,
@@ -607,10 +608,370 @@ test('supplemental auth config normalizes role aliases', () => {
     ]);
     const config = fs.readFileSync(configPath, 'utf-8');
     assert.match(config, /name: 'tierB-auth-admin'/);
+    assert.match(config, /testMatch:\s*\[/);
+    assert.match(config, /\*\*\/\*\.spec\.\{ts,js,mts,mjs,cts,cjs\}/);
+    assert.match(config, /\*\*\/\*\.test\.\{ts,js,mts,mjs,cts,cjs\}/);
     assert.doesNotMatch(config, /Administrator/);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
+});
+
+test('supplemental auth pass runs current-run auth config and merges results', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'healix-auth-pass-'));
+  try {
+    const generatedDir = path.join(root, 'tests', 'generated');
+    fs.mkdirSync(generatedDir, { recursive: true });
+    fs.writeFileSync(path.join(generatedDir, 'auth.spec.ts'), `
+      import { test, expect } from '@playwright/test';
+      test('@auth @tierB admin dashboard', async ({ page }) => {
+        await page.goto('/admin');
+        await expect(page.locator('main')).toBeVisible();
+      });
+    `);
+    const authConfigPath = writeSupplementalAuthConfig(root, 'http://localhost:3000', [
+      { role: 'admin', loginVerified: true, storageStatePath: path.join(root, '.healix', 'auth-state-admin.json') },
+    ]);
+    const integration = new PlaywrightIntegration({
+      projectPath: root,
+      phaseMode: 'single',
+      tierBAuthConfigPath: authConfigPath,
+      tierBRoles: ['admin'],
+    });
+    const calls = [];
+    integration.executePlaywright = async (opts = {}) => {
+      calls.push(opts);
+      if (opts.configPath === authConfigPath) {
+        return { total: 1, passed: 1, failed: 0, skipped: 0, duration: 5, tests: [{ name: 'auth', status: 'passed' }], failures: [] };
+      }
+      assert.equal(opts.grepInvert, '@auth|@tierB');
+      return { total: 2, passed: 2, failed: 0, skipped: 0, duration: 3, tests: [], failures: [] };
+    };
+
+    const result = await integration.runTests();
+    assert.equal(result.total, 3);
+    assert.equal(result.passed, 3);
+    assert.equal(result.tierBAuthPass.status, 'executed');
+    assert.equal(result.tierBAuthPass.total, 1);
+    assert.equal(calls.length, 2);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('supplemental auth pass ignores stale root auth config without current-run path', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'healix-stale-auth-pass-'));
+  try {
+    const generatedDir = path.join(root, 'tests', 'generated');
+    fs.mkdirSync(generatedDir, { recursive: true });
+    fs.writeFileSync(path.join(generatedDir, 'auth.spec.ts'), `
+      import { test, expect } from '@playwright/test';
+      test('@auth @tierB admin dashboard', async ({ page }) => {
+        await page.goto('/admin');
+        await expect(page.locator('main')).toBeVisible();
+      });
+    `);
+    writeSupplementalAuthConfig(root, 'http://localhost:3000', [
+      { role: 'admin', loginVerified: true, storageStatePath: path.join(root, '.healix', 'auth-state-admin.json') },
+    ]);
+    const integration = new PlaywrightIntegration({ projectPath: root, phaseMode: 'single' });
+    let primaryGrepInvert = 'not-called';
+    integration.executePlaywright = async (opts = {}) => {
+      primaryGrepInvert = opts.grepInvert;
+      return { total: 1, passed: 1, failed: 0, skipped: 0, duration: 1, tests: [], failures: [] };
+    };
+
+    const result = await integration.runTests();
+    assert.equal(result.total, 1);
+    assert.equal(primaryGrepInvert, undefined);
+    assert.equal(result.tierBAuthPass, undefined);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('supplemental auth pass skips cleanly when no auth-tagged tests exist', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'healix-auth-pass-no-tags-'));
+  try {
+    const generatedDir = path.join(root, 'tests', 'generated');
+    fs.mkdirSync(generatedDir, { recursive: true });
+    fs.writeFileSync(path.join(generatedDir, 'public.spec.ts'), `
+      import { test, expect } from '@playwright/test';
+      test('public page', async ({ page }) => {
+        await page.goto('/');
+        await expect(page.locator('main')).toBeVisible();
+      });
+    `);
+    const authConfigPath = writeSupplementalAuthConfig(root, 'http://localhost:3000', [
+      { role: 'admin', loginVerified: true, storageStatePath: path.join(root, '.healix', 'auth-state-admin.json') },
+    ]);
+    const integration = new PlaywrightIntegration({
+      projectPath: root,
+      phaseMode: 'single',
+      tierBAuthConfigPath: authConfigPath,
+      tierBRoles: ['admin'],
+    });
+    let authPassCalled = false;
+    integration.executePlaywright = async (opts = {}) => {
+      if (opts.configPath === authConfigPath) authPassCalled = true;
+      return { total: 1, passed: 1, failed: 0, skipped: 0, duration: 1, tests: [], failures: [] };
+    };
+
+    const result = await integration.runTests();
+    assert.equal(authPassCalled, false);
+    assert.equal(result.tierBAuthPass.status, 'skipped_no_auth_tests');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('supplemental auth pass fails visibly when auth-tagged specs match zero tests', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'healix-auth-pass-zero-'));
+  try {
+    const generatedDir = path.join(root, 'tests', 'generated');
+    fs.mkdirSync(generatedDir, { recursive: true });
+    fs.writeFileSync(path.join(generatedDir, 'auth.spec.ts'), `
+      import { test, expect } from '@playwright/test';
+      test('@auth @tierB admin dashboard', async ({ page }) => {
+        await page.goto('/admin');
+        await expect(page.locator('main')).toBeVisible();
+      });
+    `);
+    const authConfigPath = writeSupplementalAuthConfig(root, 'http://localhost:3000', [
+      { role: 'admin', loginVerified: true, storageStatePath: path.join(root, '.healix', 'auth-state-admin.json') },
+    ]);
+    const integration = new PlaywrightIntegration({
+      projectPath: root,
+      phaseMode: 'single',
+      tierBAuthConfigPath: authConfigPath,
+      tierBRoles: ['admin'],
+    });
+    integration.executePlaywright = async (opts = {}) => {
+      if (opts.configPath === authConfigPath) {
+        return { total: 0, passed: 0, failed: 0, skipped: 0, duration: 0, tests: [], failures: [] };
+      }
+      return { total: 1, passed: 1, failed: 0, skipped: 0, duration: 1, tests: [], failures: [] };
+    };
+
+    await assert.rejects(() => integration.runTests(), (err) => {
+      assert.equal(err.code, 'TIER_B_AUTH_NO_MATCHING_TESTS');
+      return true;
+    });
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('quality audit rejects role-derived hallucinated API credentials', () => {
+  withGeneratedSuite(`
+    import { test, expect } from '@playwright/test';
+    test('[CAT:api_auth] fabricated user login', async ({ request }) => {
+      const response = await request.post('/api/auth/login', {
+        data: { email: 'user@polyshop.test', password: 'User123!' },
+      });
+      expect(response.status()).toBe(200);
+    });
+  `, (projectPath) => {
+    const audit = auditGeneratedTestQuality({
+      projectPath,
+      testType: 'backend',
+      context: { apiEndpoints: [{ method: 'POST', path: '/api/auth/login' }] },
+      roles: [{ role: 'user', loginVerified: true, storageStatePath: '/tmp/auth.json', username: 'customer@polyshop.test', password: 'Customer123!' }],
+    });
+
+    assert.ok(audit.errors.some((error) => error.startsWith('hardcoded_unverified_credentials:')));
+  });
+});
+
+test('quality audit allows exact supplied credential fixtures for API auth setup', () => {
+  withGeneratedSuite(`
+    import { test, expect } from '@playwright/test';
+    test('[CAT:api_auth] supplied customer login', async ({ request }) => {
+      const response = await request.post('/api/auth/login', {
+        data: { email: 'customer@polyshop.test', password: 'Customer123!' },
+      });
+      expect([200, 201]).toContain(response.status());
+    });
+  `, (projectPath) => {
+    const audit = auditGeneratedTestQuality({
+      projectPath,
+      testType: 'backend',
+      context: { apiEndpoints: [{ method: 'POST', path: '/api/auth/login' }] },
+      roles: [{ role: 'user', loginVerified: true, storageStatePath: '/tmp/auth.json', username: 'customer@polyshop.test', password: 'Customer123!' }],
+    });
+
+    assert.ok(!audit.errors.some((error) => error.startsWith('hardcoded_unverified_credentials:')));
+  });
+});
+
+test('quality audit rejects Angular hash routes rewritten as path routes', () => {
+  withGeneratedSuite(`
+    import { test, expect } from '@playwright/test';
+    test('@auth @tierB admin products route', async ({ page }) => {
+      // [SRC:src/app.config.ts] Angular admin uses hash location.
+      await page.goto('/admin/products');
+      await expect(page.getByRole('heading', { name: 'Products' })).toBeVisible();
+    });
+  `, (projectPath) => {
+    fs.mkdirSync(path.join(projectPath, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(projectPath, 'src', 'app.config.ts'), `
+      import { provideRouter, withHashLocation } from '@angular/router';
+      export const appConfig = { providers: [provideRouter([], withHashLocation())] };
+    `);
+    const audit = auditGeneratedTestQuality({
+      projectPath,
+      testType: 'frontend',
+      context: {
+        pages: [{ path: '/admin#/products', sourceFile: 'src/app.config.ts' }],
+        sourceContext: {
+          files: [{ file: 'src/app.config.ts', assertableText: ['Products'], routePaths: ['/admin#/products'] }],
+          assertableText: ['Products'],
+          routePaths: ['/admin#/products'],
+          routingMode: 'hash',
+        },
+      },
+      explorationArtifact: { routes: [{ path: '/admin#/products', requiresAuth: true }] },
+      roles: [{ role: 'admin', loginVerified: true, storageStatePath: '/tmp/auth-state-admin.json' }],
+    });
+
+    assert.ok(audit.errors.some((error) => error.startsWith('hash_route_without_hash_fragment:')));
+  });
+});
+
+test('quality audit rejects protected-route tests missing auth tags even with verified roles', () => {
+  withGeneratedSuite(`
+    import { test, expect } from '@playwright/test';
+    test('admin dashboard without auth tag', async ({ page }) => {
+      // [SRC:src/admin.tsx] Admin dashboard is protected.
+      await page.goto('/admin');
+      await expect(page.getByRole('heading', { name: 'Dashboard' })).toBeVisible();
+    });
+  `, (projectPath) => {
+    fs.mkdirSync(path.join(projectPath, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(projectPath, 'src', 'admin.tsx'), '<main><h1>Dashboard</h1></main>');
+    const audit = auditGeneratedTestQuality({
+      projectPath,
+      testType: 'frontend',
+      context: {
+        pages: [{ path: '/admin', sourceFile: 'src/admin.tsx' }],
+        sourceContext: {
+          files: [{ file: 'src/admin.tsx', assertableText: ['Dashboard'], routePaths: ['/admin'] }],
+          assertableText: ['Dashboard'],
+          routePaths: ['/admin'],
+        },
+      },
+      explorationArtifact: { routes: [{ path: '/admin', requiresAuth: true }] },
+      roles: [{ role: 'admin', loginVerified: true, storageStatePath: '/tmp/auth-state-admin.json' }],
+    });
+
+    assert.ok(audit.errors.some((error) => error.startsWith('protected_route_missing_auth_tag:')));
+  });
+});
+
+test('quality audit rejects cart filled-state assertions without item setup', () => {
+  withGeneratedSuite(`
+    import { test, expect } from '@playwright/test';
+    test('cart shows subtotal', async ({ page }) => {
+      // [SRC:src/cart.tsx] Cart route has an empty-cart state.
+      await page.goto('/cart');
+      await expect(page.getByText('Subtotal')).toBeVisible();
+    });
+  `, (projectPath) => {
+    fs.mkdirSync(path.join(projectPath, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(projectPath, 'src', 'cart.tsx'), '<main><h1>Cart</h1><p>Cart is empty.</p><p>Subtotal</p></main>');
+    const audit = auditGeneratedTestQuality({
+      projectPath,
+      testType: 'frontend',
+      context: {
+        pages: [{ path: '/cart', sourceFile: 'src/cart.tsx' }],
+        sourceContext: {
+          files: [{ file: 'src/cart.tsx', assertableText: ['Cart', 'Cart is empty.', 'Subtotal'], routePaths: ['/cart'] }],
+          assertableText: ['Cart', 'Cart is empty.', 'Subtotal'],
+          routePaths: ['/cart'],
+        },
+      },
+      explorationArtifact: { routes: [{ path: '/cart', requiresAuth: false }] },
+    });
+
+    assert.ok(audit.errors.some((error) => error.startsWith('brittle_cart_state_without_add_item_setup:')));
+  });
+});
+
+test('quality audit rejects auth-gated review form assertions without auth tag', () => {
+  withGeneratedSuite(`
+    import { test, expect } from '@playwright/test';
+    test('review form is visible', async ({ page }) => {
+      // [SRC:src/product.tsx] Reviews require login.
+      await page.goto('/products/sku-1');
+      await expect(page.locator('#rating')).toBeVisible();
+    });
+  `, (projectPath) => {
+    fs.mkdirSync(path.join(projectPath, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(projectPath, 'src', 'product.tsx'), '<main><p>Log in to leave a review.</p><label for="rating">Rating</label></main>');
+    const audit = auditGeneratedTestQuality({
+      projectPath,
+      testType: 'frontend',
+      context: {
+        pages: [{ path: '/products/sku-1', sourceFile: 'src/product.tsx' }],
+        sourceContext: {
+          files: [{ file: 'src/product.tsx', assertableText: ['Log in to leave a review.', 'Rating'], routePaths: ['/products/sku-1'] }],
+          assertableText: ['Log in to leave a review.', 'Rating'],
+          routePaths: ['/products/sku-1'],
+        },
+      },
+      explorationArtifact: { routes: [{ path: '/products/sku-1', requiresAuth: false }] },
+    });
+
+    assert.ok(audit.errors.some((error) => error.startsWith('auth_gated_review_form_without_auth_tag:')));
+  });
+});
+
+test('quality audit rejects logout link assertions when source renders a button', () => {
+  withGeneratedSuite(`
+    import { test, expect } from '@playwright/test';
+    test('@auth @tierB logout control', async ({ page }) => {
+      // [SRC:src/nav.tsx] Logout is an authenticated nav control.
+      await page.goto('/account');
+      await expect(page.getByRole('link', { name: 'Logout' })).toBeVisible();
+    });
+  `, (projectPath) => {
+    fs.mkdirSync(path.join(projectPath, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(projectPath, 'src', 'nav.tsx'), '<nav><button onClick={logout}>Logout</button></nav>');
+    const audit = auditGeneratedTestQuality({
+      projectPath,
+      testType: 'frontend',
+      context: {
+        pages: [{ path: '/account', sourceFile: 'src/nav.tsx' }],
+        sourceContext: {
+          files: [{ file: 'src/nav.tsx', assertableText: ['Logout'], routePaths: ['/account'] }],
+          assertableText: ['Logout'],
+          routePaths: ['/account'],
+        },
+      },
+      explorationArtifact: { routes: [{ path: '/account', requiresAuth: true }] },
+      roles: [{ role: 'user', loginVerified: true, storageStatePath: '/tmp/auth-state-user.json' }],
+    });
+
+    assert.ok(audit.errors.some((error) => error.startsWith('brittle_logout_role_mismatch_link_vs_button:')));
+  });
+});
+
+test('quality audit rejects unproven 4xx assertions for unknown collection resources', () => {
+  withGeneratedSuite(`
+    import { test, expect } from '@playwright/test';
+    test('[CAT:api_negative] unknown reviews collection id', async ({ request }) => {
+      const response = await request.get('/api/reviews/nonexistent');
+      expect(response.status()).toBeGreaterThanOrEqual(400);
+    });
+  `, (projectPath) => {
+    const audit = auditGeneratedTestQuality({
+      projectPath,
+      testType: 'backend',
+      context: { apiEndpoints: [{ method: 'GET', path: '/api/reviews/:productId' }] },
+    });
+
+    assert.ok(audit.errors.some((error) => error.startsWith('brittle_unproven_collection_missing_id_status:')));
+  });
 });
 
 test('quality audit rejects brittle implementation-detail UI assertions', () => {

@@ -1940,6 +1940,7 @@ class ContextGatherer {
     const testIds = new Set();
     const assertableText = new Set();
     const files = [];
+    let hashRoutingDetected = false;
 
     for (const filePath of [...candidates].slice(0, 120)) {
       const content = this.readFileCached(filePath, { allowLarge: true, maxBytes: 500000 });
@@ -1948,12 +1949,16 @@ class ContextGatherer {
       const relativePath = path.relative(projectPath, filePath);
       const fileRoutePaths = new Set();
       const fileTestIds = new Set();
+      if (/withHashLocation\s*\(|HashLocationStrategy|useHash\s*:\s*true/i.test(content)) {
+        hashRoutingDetected = true;
+      }
 
       for (const match of content.matchAll(/\b(?:path|to|href)=["'`]([^"'`]+)["'`]/g)) {
         const routePath = String(match[1] || '').trim();
         if (routePath.startsWith('/')) {
           routePaths.add(routePath);
           fileRoutePaths.add(routePath);
+          if (routePath.includes('#/')) hashRoutingDetected = true;
         }
       }
       for (const match of content.matchAll(/(?:router\.push|navigate)\(\s*["'`]([^"'`]+)["'`]\s*\)/g)) {
@@ -1961,6 +1966,7 @@ class ContextGatherer {
         if (routePath.startsWith('/')) {
           routePaths.add(routePath);
           fileRoutePaths.add(routePath);
+          if (routePath.includes('#/')) hashRoutingDetected = true;
         }
       }
       for (const match of content.matchAll(/data-testid=["'`]([^"'`]+)["'`]/g)) {
@@ -2006,6 +2012,7 @@ class ContextGatherer {
       routePaths: [...routePaths].slice(0, 120),
       testIds: [...testIds].slice(0, 120),
       sourceFilesAnalyzed: files.length,
+      routingMode: hashRoutingDetected ? 'hash' : 'path',
     };
   }
 

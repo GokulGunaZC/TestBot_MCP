@@ -84,6 +84,9 @@ const STRICT_AI_REQUIRED_CATEGORIES = [
   'api_stress',
 ];
 
+const GENERATED_SPEC_FILE_PATTERN = /\.(?:spec|test)\.(?:ts|js|mts|mjs|cts|cjs)$/i;
+const GENERATED_SPEC_FILENAME_PATTERN = /[A-Za-z0-9_.-]+\.(?:spec|test)\.(?:ts|js|mts|mjs|cts|cjs)\b/g;
+
 const CURSOR_FIXTURE_BASENAME = '__healix-fixture';
 const CURSOR_OVERLAY_INIT_SCRIPT = `
 (() => {
@@ -569,6 +572,34 @@ function summarizeAuthRoles(roles = []) {
   }));
 }
 
+function attachCredentialFixturesToRoles(roles = [], credentials = []) {
+  if (!Array.isArray(roles) || roles.length === 0 || !Array.isArray(credentials) || credentials.length === 0) {
+    return Array.isArray(roles) ? roles : [];
+  }
+
+  const credentialsByRole = new Map();
+  for (const credential of credentials) {
+    if (!credential?.username || !credential?.password) continue;
+    const key = normalizeRoleLabel(credential.role || credential.name || 'user');
+    if (!credentialsByRole.has(key)) {
+      credentialsByRole.set(key, credential);
+    }
+  }
+
+  return roles.map((role) => {
+    const key = roleKeyForAuth(role);
+    const credential = credentialsByRole.get(key);
+    if (!credential) return role;
+    return {
+      ...role,
+      username: credential.username,
+      password: credential.password,
+      credentialSource: 'user_supplied',
+      originalCredentialRole: credential.role || credential.name || null,
+    };
+  });
+}
+
 function hasBackendService(projectInfo = {}) {
   return (projectInfo.services || []).some((service) =>
     service && (service.role === 'backend' || service.role === 'fullstack')
@@ -605,7 +636,7 @@ function listGeneratedTestFiles(projectPath) {
   }
 
   return fs.readdirSync(generatedDir)
-    .filter((name) => /\.spec\.(ts|js)$/i.test(name))
+    .filter((name) => GENERATED_SPEC_FILE_PATTERN.test(name))
     .map((name) => path.join(generatedDir, name));
 }
 
@@ -613,7 +644,7 @@ function extractQualityFailureFileNames(qualityAudit = {}) {
   const names = new Set();
   const add = (value) => {
     if (!value) return;
-    const matches = String(value).match(/[A-Za-z0-9_.-]+\.spec\.(?:ts|js)\b/g) || [];
+    const matches = String(value).match(GENERATED_SPEC_FILENAME_PATTERN) || [];
     for (const match of matches) {
       names.add(path.basename(match));
     }
@@ -817,7 +848,7 @@ function quarantineGeneratedSpecFiles({ projectPath, qualityAudit = {}, reason =
   }
 
   const allFiles = fs.readdirSync(generatedDir)
-    .filter((name) => /\.spec\.(ts|js)$/i.test(name));
+    .filter((name) => GENERATED_SPEC_FILE_PATTERN.test(name));
   const candidates = extractQualityFailureFileNames(qualityAudit)
     .filter((name) => allFiles.includes(name));
 
@@ -845,7 +876,7 @@ function quarantineGeneratedSpecFiles({ projectPath, qualityAudit = {}, reason =
     let target = path.join(quarantineDir, name);
     let suffix = 1;
     while (fs.existsSync(target)) {
-      target = path.join(quarantineDir, name.replace(/\.spec\.(ts|js)$/i, `-${suffix}.spec.ts`));
+      target = path.join(quarantineDir, name.replace(GENERATED_SPEC_FILE_PATTERN, `-${suffix}.spec.ts`));
       suffix += 1;
     }
     fs.renameSync(source, target);
@@ -2038,6 +2069,9 @@ function classifyErrorCode(error) {
   if (message.includes('all observed routes require authentication')) {
     return 'AUTH_REQUIRED_NO_CREDENTIALS';
   }
+  if (message.includes('tier_b_auth_config_no_test_files') || message.includes('supplemental auth pass')) {
+    return 'TIER_B_AUTH_PASS_FAILED';
+  }
   if (message.includes('coverage gates')) {
     return 'COVERAGE_GATES_FAILED';
   }
@@ -2147,6 +2181,18 @@ function buildUserFacingPipelineError(errorCode, error) {
 
   if (errorCode === 'AUTH_REQUIRED_NO_CREDENTIALS') {
     return 'All observed app routes require authentication, but no verified credentials were available. Provide working role credentials or expose a public health/smoke route before running Healix.';
+  }
+
+  if (errorCode === 'TIER_B_AUTH_CONFIG_NO_TEST_FILES') {
+    return 'Healix generated authenticated tests, but the supplemental auth Playwright config did not discover the generated spec files. This is a pipeline configuration failure, not a target-app bug.';
+  }
+
+  if (errorCode === 'TIER_B_AUTH_NO_MATCHING_TESTS') {
+    return 'Healix generated authenticated tests, but the Tier B auth pass matched zero tests. Auth-scoped specs must be tagged @auth or @tierB and included by the current-run auth config.';
+  }
+
+  if (errorCode === 'TIER_B_AUTH_PASS_FAILED') {
+    return `Healix could not complete the supplemental authenticated Playwright pass. Public tests may have run, but authenticated coverage is incomplete. ${normalizedMessage}`;
   }
 
   return normalizedMessage;
@@ -2423,7 +2469,7 @@ function ensureHealixFixtureImports({ projectPath, roles = [] }) {
   }
 
   const testFiles = fs.readdirSync(generatedDir)
-    .filter((name) => /\.spec\.(ts|js)$/i.test(name))
+    .filter((name) => GENERATED_SPEC_FILE_PATTERN.test(name))
     .map((name) => path.join(generatedDir, name));
 
   if (testFiles.length === 0) {
@@ -2520,7 +2566,7 @@ function rescuePartialGeneration({ projectPath, generatorName, error, startedAt,
   }
 
   const files = entries
-    .filter((e) => e.isFile() && /\.spec\.(ts|js)$/i.test(e.name))
+    .filter((e) => e.isFile() && GENERATED_SPEC_FILE_PATTERN.test(e.name))
     .map((e) => ({
       path: path.join(testsDir, e.name),
       filename: e.name,
@@ -2559,7 +2605,7 @@ function sanitizeGeneratedFilename(rawFilename, fallbackPrefix, index) {
     return defaultName;
   }
 
-  if (!/\.spec\.(ts|js)$/i.test(base)) {
+  if (!GENERATED_SPEC_FILE_PATTERN.test(base)) {
     if (/\.(ts|js)$/i.test(base)) {
       base = base.replace(/\.(ts|js)$/i, '.spec.ts');
     } else {
@@ -2584,7 +2630,7 @@ function safeWriteGeneratedTest(testsDir, test, index, fallbackPrefix, usedFilen
   let safeFilename = filename;
   let suffix = 1;
   while (usedFilenames.has(safeFilename.toLowerCase())) {
-    safeFilename = filename.replace(/\.spec\.(ts|js)$/i, `-${suffix}.spec.ts`);
+    safeFilename = filename.replace(GENERATED_SPEC_FILE_PATTERN, `-${suffix}.spec.ts`);
     suffix += 1;
   }
   usedFilenames.add(safeFilename.toLowerCase());
@@ -2602,6 +2648,30 @@ function safeWriteGeneratedTest(testsDir, test, index, fallbackPrefix, usedFilen
   };
 }
 
+function removeHealixOwnedSupplementalAuthConfig(projectPath, reason = 'stale') {
+  const authConfigPath = path.join(projectPath, 'playwright.auth.config.ts');
+  if (!fs.existsSync(authConfigPath)) return { removed: false, reason: 'missing' };
+  try {
+    const content = fs.readFileSync(authConfigPath, 'utf-8');
+    const healixOwned = /Generated by Healix/i.test(content) && /tierB-auth-/i.test(content);
+    if (!healixOwned) {
+      return { removed: false, reason: 'not_healix_owned', path: authConfigPath };
+    }
+    fs.rmSync(authConfigPath, { force: true });
+    Logger.info('PipelineWorker', 'Removed stale Healix supplemental auth config', {
+      path: authConfigPath,
+      reason,
+    });
+    return { removed: true, reason, path: authConfigPath };
+  } catch (err) {
+    Logger.warn('PipelineWorker', 'Failed to remove stale supplemental auth config', {
+      path: authConfigPath,
+      reason: err.message,
+    });
+    return { removed: false, reason: 'remove_failed', error: err.message, path: authConfigPath };
+  }
+}
+
 function writeSupplementalAuthConfig(projectPath, baseURL, verifiedRoles) {
   if (!verifiedRoles || verifiedRoles.length === 0) return null;
   const tierBProjects = verifiedRoles.map((r) => `    {
@@ -2616,12 +2686,16 @@ function writeSupplementalAuthConfig(projectPath, baseURL, verifiedRoles) {
 
   const body = `// Generated by Healix — supplemental Playwright config for the tierB-auth projects.
 // Your own playwright.config.* remains the source of truth for the default run.
-// Use \`npx playwright test --config=playwright.auth.config.ts\` to exercise
-// @auth-tagged tests with pre-loaded storageState for each verified role.
+// Healix runs this config automatically after the public/default pass whenever
+// current-run generated specs contain @auth or @tierB tests.
 import { defineConfig, devices } from '@playwright/test';
 
 export default defineConfig({
   testDir: './tests/generated',
+  testMatch: [
+    '**/*.spec.{ts,js,mts,mjs,cts,cjs}',
+    '**/*.test.{ts,js,mts,mjs,cts,cjs}',
+  ],
   timeout: 60000,
   fullyParallel: true,
   forbidOnly: !!process.env.CI,
@@ -2674,33 +2748,31 @@ function ensurePlaywrightConfig(projectPath, projectInfo = {}, roles = []) {
     .filter((r) => r && r.loginVerified && r.storageStatePath)
     .map((r) => normalizeRoleLabel(r.role || r.name || 'user'));
 
+  if (verifiedRolesSummary.length === 0) {
+    removeHealixOwnedSupplementalAuthConfig(projectPath, 'no_verified_roles_for_current_run');
+  }
+
   // Check if config already exists
   for (const name of candidates) {
     const candidate = path.join(projectPath, name);
     if (fs.existsSync(candidate)) {
       // When the user has their own config we don't touch it. But if we have
       // verified roles we still need tierB-auth projects to exist somewhere, so
-      // emit a SIBLING `playwright.auth.config.ts` that the runner (and user)
-      // can opt-in via `--config=playwright.auth.config.ts`. The sibling never
-      // runs implicitly — it's an additive artifact that preserves the user's
-      // primary config as the single source of truth for their normal workflow.
+      // emit a current-run sibling `playwright.auth.config.ts`. The runner will
+      // execute it automatically for @auth/@tierB generated specs.
       let supplementalAuthConfigPath = null;
       if (verifiedRolesSummary.length > 0) {
         const verifiedRoles = (roles || []).filter((r) => r && r.loginVerified && r.storageStatePath);
         const baseURL = projectInfo.baseURL || 'http://localhost:3000';
         supplementalAuthConfigPath = writeSupplementalAuthConfig(projectPath, baseURL, verifiedRoles);
       }
-      // INFO (not debug): the user needs to see this because any tierB-auth
-      // projects we would have wired up are being skipped — their @auth-tagged
-      // tests will execute against tierA without a storageState and hit the
-      // login wall. See P0-2b for the supplemental-config follow-up.
       Logger.info('PipelineWorker', 'Existing Playwright config detected — skipping tier-aware config generation', {
         path: candidate,
         skippedTierBRoles: verifiedRolesSummary,
         supplementalAuthConfigPath,
         hint: verifiedRolesSummary.length > 0
           ? (supplementalAuthConfigPath
-              ? `User config preserved; @auth tier lives in ${path.basename(supplementalAuthConfigPath)} — run with --config=${path.basename(supplementalAuthConfigPath)} to exercise tierB-auth projects`
+              ? `User config preserved; Healix will run ${path.basename(supplementalAuthConfigPath)} automatically for @auth/@tierB tests`
               : 'User config will not auto-include storageState for verified roles; @auth tests may hit login redirects')
           : null,
       });
@@ -2715,6 +2787,7 @@ function ensurePlaywrightConfig(projectPath, projectInfo = {}, roles = []) {
   }
 
   // Generate playwright.config.ts
+  removeHealixOwnedSupplementalAuthConfig(projectPath, 'primary_tier_config_generated_for_current_run');
   const baseURL = projectInfo.baseURL || 'http://localhost:3000';
 
   // Phase D: emit tier-aware projects.
@@ -2965,7 +3038,7 @@ async function validateGeneratedTestsWithList({ projectPath, validateGeneratedTe
   }
 
   const testFiles = fs.readdirSync(generatedDir)
-    .filter((name) => /\.spec\.(ts|js)$/i.test(name));
+    .filter((name) => GENERATED_SPEC_FILE_PATTERN.test(name));
 
   if (testFiles.length === 0) {
     return { valid: false, reason: 'no_generated_tests' };
@@ -3005,7 +3078,7 @@ async function validateGeneratedTestsWithList({ projectPath, validateGeneratedTe
       clearTimeout(timer);
       const normalizedStdout = stdout.replace(/\u001b\[[0-9;]*m/g, '');
       const listLineMatches = normalizedStdout.match(/^[\s\S]*?$/gm) || [];
-      const listedCount = listLineMatches.filter((line) => /\b›\b|\b\.spec\.(ts|js)\b|\btest\(/i.test(line)).length;
+      const listedCount = listLineMatches.filter((line) => /\b›\b|\b\.(?:spec|test)\.(?:ts|js|mts|mjs|cts|cjs)\b|\btest\(/i.test(line)).length;
 
       if (code === 0 && listedCount > 0) {
         resolve({ valid: true, listedCount });
@@ -3043,7 +3116,7 @@ function buildPipelineDiagnostics({ projectPath, stage, reason, stderr, stdout, 
 
   try {
     if (generatedDir && fs.existsSync(generatedDir)) {
-      const files = fs.readdirSync(generatedDir).filter((name) => /\.spec\.(ts|js)$/i.test(name));
+      const files = fs.readdirSync(generatedDir).filter((name) => GENERATED_SPEC_FILE_PATTERN.test(name));
       generatedSpecCount = files.length;
       if (files.length > 0) {
         const firstPath = path.join(generatedDir, files[0]);
@@ -3287,16 +3360,150 @@ function extractGotoRoutes(content) {
   return routes.filter(Boolean);
 }
 
+function extractRouteForHashAudit(route) {
+  if (!route) return null;
+  try {
+    const parsed = new URL(route);
+    const raw = `${parsed.pathname || '/'}${parsed.hash || ''}`;
+    return raw || '/';
+  } catch {
+    const text = String(route).trim();
+    if (!text.startsWith('/')) return null;
+    return text.split('?')[0] || '/';
+  }
+}
+
 function normalizeRouteForAudit(route) {
   if (!route) return null;
   try {
     const parsed = new URL(route);
+    if (parsed.hash && parsed.hash.startsWith('#/')) {
+      return `${parsed.pathname || '/'}${parsed.hash.split('?')[0]}`;
+    }
     return parsed.pathname || '/';
   } catch {
     const text = String(route).trim();
     if (!text.startsWith('/')) return null;
-    return text.split(/[?#]/)[0] || '/';
+    const noQuery = text.split('?')[0] || '/';
+    if (noQuery.includes('#/')) return noQuery;
+    return noQuery.split('#')[0] || '/';
   }
+}
+
+function sourceLooksLikeAngularHashRouting(projectPath) {
+  const roots = ['src', 'app', 'client'];
+  const extensions = /\.(ts|tsx|js|jsx|mjs|cjs)$/i;
+  const ignored = new Set(['node_modules', 'dist', 'build', '.next', '.git', 'coverage']);
+  let scanned = 0;
+  const maxFiles = 500;
+
+  const walk = (dir) => {
+    if (scanned >= maxFiles) return false;
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return false; }
+    for (const entry of entries) {
+      if (scanned >= maxFiles) return false;
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (ignored.has(entry.name)) continue;
+        if (walk(full)) return true;
+      } else if (entry.isFile() && extensions.test(entry.name)) {
+        scanned += 1;
+        let content = '';
+        try { content = fs.readFileSync(full, 'utf-8'); } catch { continue; }
+        if (/withHashLocation\s*\(|HashLocationStrategy|useHash\s*:\s*true/i.test(content)) {
+          return true;
+        }
+      }
+    }
+    return false;
+  };
+
+  for (const root of roots) {
+    const full = path.join(projectPath, root);
+    if (fs.existsSync(full) && walk(full)) return true;
+  }
+  return false;
+}
+
+function projectSourceMatches(projectPath, pattern) {
+  if (!projectPath || !pattern) return false;
+  const roots = ['src', 'app', 'pages', 'components', 'client'];
+  const extensions = /\.(ts|tsx|js|jsx|vue|svelte|html)$/i;
+  const ignored = new Set(['node_modules', 'dist', 'build', '.next', '.git', 'coverage']);
+  let scanned = 0;
+  const maxFiles = 500;
+
+  const walk = (dir) => {
+    if (scanned >= maxFiles) return false;
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return false; }
+    for (const entry of entries) {
+      if (scanned >= maxFiles) return false;
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (ignored.has(entry.name)) continue;
+        if (walk(full)) return true;
+      } else if (entry.isFile() && extensions.test(entry.name)) {
+        scanned += 1;
+        let content = '';
+        try { content = fs.readFileSync(full, 'utf-8'); } catch { continue; }
+        if (pattern.test(content)) return true;
+      }
+    }
+    return false;
+  };
+
+  for (const root of roots) {
+    const full = path.join(projectPath, root);
+    if (fs.existsSync(full) && walk(full)) return true;
+  }
+  return false;
+}
+
+function extractLiteralEmailStrings(content) {
+  const emails = [];
+  for (const match of String(content || '').matchAll(/['"`]([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})['"`]/gi)) {
+    emails.push(match[1]);
+  }
+  return [...new Set(emails)];
+}
+
+function buildAllowedCredentialLiteralSets(roles = []) {
+  const emails = new Set();
+  const passwords = new Set();
+  for (const role of Array.isArray(roles) ? roles : []) {
+    if (role?.username) emails.add(String(role.username).toLowerCase());
+    if (role?.password) passwords.add(String(role.password));
+  }
+  return { emails, passwords };
+}
+
+function hasAuthTag(content) {
+  return /@auth|@tierB/i.test(String(content || ''));
+}
+
+function looksLikeCartAssertionWithoutSetup(blockContent) {
+  const text = String(blockContent || '');
+  const goesDirectlyToCart = /page\.goto\(\s*['"`][^'"`]*\/cart(?:[?#][^'"`]*)?['"`]\s*\)/i.test(text);
+  const assertsFilledCart = /subtotal|order\s+total|checkout|line\s+item|cart\s+total/i.test(text);
+  const hasSetup = /add\s+to\s+cart|cart\/items|\/api\/cart|request\.(?:post|put|patch)\(|localStorage\.setItem|sessionStorage\.setItem/i.test(text);
+  return goesDirectlyToCart && assertsFilledCart && !hasSetup;
+}
+
+function looksLikeAuthGatedReviewWithoutAuth(blockContent) {
+  const text = String(blockContent || '');
+  if (hasAuthTag(text)) return false;
+  return /#rating|getByLabel\([^)]*rating|getByRole\([^)]*(?:review|rating)|leave\s+a\s+review|submit\s+review/i.test(text);
+}
+
+function looksLikeUnprovenMissingCollectionError(content) {
+  const text = String(content || '');
+  const targetsMissingCollection =
+    /request\.get\(\s*['"`][^'"`]*\/api\/[a-z0-9_-]+s\/(?:nonexistent|missing|unknown|invalid|does-not-exist|999999|000000)/i.test(text) ||
+    /request\.get\(\s*`[^`]*\/api\/[a-z0-9_-]+s\/\$\{[^}]*nonexistent[^}]*\}[^`]*`/i.test(text);
+  const requires4xx = /toBeGreaterThanOrEqual\(\s*400\s*\)|toBeLessThan\(\s*500\s*\)|toBe\(\s*(?:400|404|422)\s*\)|status\(\)\)\.not\.toBe\(\s*200\s*\)/i.test(text);
+  return targetsMissingCollection && requires4xx;
 }
 
 function isIntentionalUnknownRouteTest(content, fileName) {
@@ -3380,7 +3587,7 @@ function auditGeneratedTestQuality({ projectPath, testType, context, exploration
     return { valid: false, ...summary };
   }
 
-  const files = fs.readdirSync(generatedDir).filter((name) => /\.spec\.(ts|js)$/i.test(name));
+  const files = fs.readdirSync(generatedDir).filter((name) => GENERATED_SPEC_FILE_PATTERN.test(name));
   summary.totalFiles = files.length;
   Logger.info('PipelineWorker', `[QUALITY AUDIT] Found ${files.length} spec file(s): ${files.join(', ') || '(none)'}`);
 
@@ -3405,6 +3612,8 @@ function auditGeneratedTestQuality({ projectPath, testType, context, exploration
   const inventedDueLabelPattern = /getByText\(\s*['"`]Due:\s*(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\b[^'"`]*['"`]/i;
   const ambiguousSingleWordTextPattern = /getByText\(\s*['"`](?:All|Standup|Planning|Review)['"`]\s*\)/i;
   const roleNameRegexPattern = /getByRole\(\s*['"`][^'"`]+['"`]\s*,\s*\{[\s\S]{0,320}?\bname\s*:\s*\/([^/\n]{12,220})\/[a-z]*/gi;
+  const logoutAsLinkPattern = /getByRole\(\s*['"`]link['"`]\s*,\s*\{[^}]*name\s*:\s*(?:['"`]Logout['"`]|\/logout\/i?)\s*[^}]*\}/i;
+  const hardcodedPasswordLiteralPattern = /(?:password|passwd|pwd)\s*:\s*['"`]([^'"`]{4,})['"`]|getBy(?:Label|Placeholder|Role)\([^)]*(?:password|passwd|pwd)[^)]*\)\s*\.\s*(?:fill|type)\(\s*['"`]([^'"`]{4,})['"`]\s*\)/gi;
   const riskyUiPattern = /page\.pause\(/i;
   const riskyPhrasesPattern = /(invalid credentials|email is required|password is required|network error|try again|not found|does not exist|cannot find)/gi;
   const strictConsoleErrorsPattern = /expect\(\s*\w*(?:console)?errors\w*\s*\)\.toEqual\(\s*\[\s*\]\s*\)/i;
@@ -3414,6 +3623,11 @@ function auditGeneratedTestQuality({ projectPath, testType, context, exploration
   const knownCorpus = new Set();
   const sourceCorpus = extractSourceLiteralCorpus(projectPath);
   const { corpus: knownUiCorpus, sourceFiles } = buildKnownUiCorpus({ projectPath, context, explorationArtifact });
+  const hashRoutingDetected =
+    sourceLooksLikeAngularHashRouting(projectPath) ||
+    Boolean(context?.sourceContext?.routingMode === 'hash') ||
+    [...(context?.sourceContext?.routePaths || [])].some((route) => String(route).includes('#/'));
+  const allowedCredentialLiterals = buildAllowedCredentialLiteralSets(roles);
   const knownRoutes = new Set(['/']);
   for (const route of explorationArtifact?.routes || context?.routes || []) {
     const normalizedRoute = normalizeRouteForAudit(route?.path);
@@ -3518,6 +3732,28 @@ function auditGeneratedTestQuality({ projectPath, testType, context, exploration
     summary.skippedTests += fileSkippedTests;
 
     const isApiFile = /request\.(get|post|put|patch|delete|fetch)\(/i.test(content) || /api/i.test(name);
+    const literalEmails = extractLiteralEmailStrings(content)
+      .filter((email) => !/example\.invalid$/i.test(email))
+      .filter((email) => !allowedCredentialLiterals.emails.has(String(email).toLowerCase()));
+    const literalPasswords = [];
+    for (const match of content.matchAll(hardcodedPasswordLiteralPattern)) {
+      const password = match[1] || match[2];
+      if (!password) continue;
+      if (allowedCredentialLiterals.passwords.has(String(password))) continue;
+      if (/invalid|wrong|bad|fake|placeholder|not-real/i.test(password)) continue;
+      literalPasswords.push(password);
+    }
+    if (
+      literalEmails.length > 0 &&
+      (
+        literalPasswords.length > 0 ||
+        /\/api\/(?:auth\/)?(?:login|signin|session)|getByRole\([^)]*(?:login|log in|sign in)|password/i.test(content)
+      )
+    ) {
+      summary.errors.push(`hardcoded_unverified_credentials:${name}:${literalEmails.slice(0, 3).join('|')}`);
+      summary.riskyFiles.push(name);
+    }
+
     if (isApiFile) {
       summary.apiFiles += 1;
       const burstMatch = /Promise\.all|HEALIX_API_STRESS_BURST|burst|p95|percentile/i.test(content);
@@ -3526,6 +3762,9 @@ function auditGeneratedTestQuality({ projectPath, testType, context, exploration
         Logger.info('PipelineWorker', `[QUALITY AUDIT]   ${name} → API file ✅ burst coverage detected`);
       } else {
         Logger.warn('PipelineWorker', `[QUALITY AUDIT]   ${name} → API file ⚠️  NO burst coverage (need Promise.all|HEALIX_API_STRESS_BURST|burst|p95|percentile)`);
+      }
+      if (looksLikeUnprovenMissingCollectionError(content)) {
+        recordBrittlePattern('brittle_unproven_collection_missing_id_status', name);
       }
     } else {
       summary.uiFiles += 1;
@@ -3589,6 +3828,25 @@ function auditGeneratedTestQuality({ projectPath, testType, context, exploration
         summary.errors.push(`ungrounded_route:${name}:${[...new Set(unknownRoutes)].slice(0, 3).join('|')}`);
       }
 
+      if (hashRoutingDetected) {
+        const hashRouteErrors = extractGotoRoutes(content)
+          .map((route) => ({ raw: extractRouteForHashAudit(route), normalized: normalizeRouteForAudit(route) }))
+          .filter((entry) =>
+            entry.raw &&
+            entry.normalized &&
+            /^\/admin\//i.test(entry.raw) &&
+            !entry.raw.includes('#/') &&
+            entry.normalized !== '/admin/login'
+          );
+        if (hashRouteErrors.length > 0) {
+          summary.ungroundedRouteFiles.push({
+            file: name,
+            routes: hashRouteErrors.map((entry) => entry.raw).slice(0, 5),
+          });
+          summary.errors.push(`hash_route_without_hash_fragment:${name}:${hashRouteErrors.map((entry) => entry.raw).slice(0, 3).join('|')}`);
+        }
+      }
+
       if (routeMockPattern.test(content)) {
         summary.warnings.push(`uses_route_mocking:${name}`);
       }
@@ -3625,6 +3883,38 @@ function auditGeneratedTestQuality({ projectPath, testType, context, exploration
           summary.authGatingFiles.push(name);
           summary.errors.push(`unblocked_protected_route_without_credentials:${name}:${unsafeBlocks.length}`);
         }
+      }
+
+      if (protectedRoutes.size > 0 && verifiedRoleCount > 0) {
+        const untaggedAuthBlocks = findGeneratedTestBlocks(content).filter((block) => {
+          const blockRoutes = extractGotoRoutes(block.content)
+            .map(normalizeRouteForAudit)
+            .filter(Boolean);
+          if (!blockRoutes.some((route) => protectedRoutes.has(route))) return false;
+          if (hasAuthTag(block.content) || /\btest\.skip\s*\(/.test(block.content)) return false;
+          return true;
+        });
+        if (untaggedAuthBlocks.length > 0) {
+          summary.authGatingFiles.push(name);
+          summary.errors.push(`protected_route_missing_auth_tag:${name}:${untaggedAuthBlocks.length}`);
+        }
+      }
+
+      const generatedBlocks = findGeneratedTestBlocks(content);
+      if (generatedBlocks.some((block) => looksLikeCartAssertionWithoutSetup(block.content))) {
+        recordBrittlePattern('brittle_cart_state_without_add_item_setup', name);
+      }
+
+      if (generatedBlocks.some((block) => looksLikeAuthGatedReviewWithoutAuth(block.content))) {
+        summary.authGatingFiles.push(name);
+        summary.errors.push(`auth_gated_review_form_without_auth_tag:${name}`);
+      }
+
+      if (
+        logoutAsLinkPattern.test(content) &&
+        projectSourceMatches(projectPath, /<button[\s\S]{0,300}Logout|button[\s\S]{0,160}Logout|Logout[\s\S]{0,160}<\/button>/i)
+      ) {
+        recordBrittlePattern('brittle_logout_role_mismatch_link_vs_button', name);
       }
 
       if (checkValidityPattern.test(content)) {
@@ -3820,7 +4110,7 @@ function installMissingDependencies(projectPath, testsDir) {
   };
 
   // Scan generated test files for imports
-  const testFiles = fs.readdirSync(testsDir).filter(f => /\.spec\.(ts|js)$/i.test(f));
+  const testFiles = fs.readdirSync(testsDir).filter(f => GENERATED_SPEC_FILE_PATTERN.test(f));
   const missingDeps = new Set();
 
   testFiles.forEach(file => {
@@ -6203,6 +6493,7 @@ async function runPipeline(config, runId) {
     // 4. Generate tests
     // -------------------------------------------------------
     if (config.generateTests) {
+      const rolesForGeneration = attachCredentialFixturesToRoles(roles, config.testCredentials);
       const generationComplexity = maybeExpandGenerationStageBudget({
         runBudget,
         config,
@@ -6235,7 +6526,7 @@ async function runPipeline(config, runId) {
             prdContent: combinedPrdContent,
             parsedPRD,
             explorationArtifact,
-            roles,
+            roles: rolesForGeneration,
             runBudget,
             projectInfo,
             statusDir,
@@ -6254,8 +6545,19 @@ async function runPipeline(config, runId) {
 
           // Ensure playwright.config.ts exists after test generation
           const playwrightConfigResult = ensurePlaywrightConfig(config.projectPath, projectInfo, roles);
+          const currentRunAuthConfigPath = playwrightConfigResult?.supplementalAuthConfigPath || null;
+          const currentRunTierBRoles = (playwrightConfigResult?.tierBRoles || playwrightConfigResult?.skippedTierBRoles || [])
+            .map((role) => normalizeRoleLabel(role));
+          config = {
+            ...config,
+            tierBAuthConfigPath: currentRunAuthConfigPath,
+            tierBRoles: currentRunTierBRoles,
+            playwrightConfigResult,
+          };
           if (generationMeta && playwrightConfigResult) {
             generationMeta.playwrightConfig = playwrightConfigResult;
+            generationMeta.tierBAuthConfigPath = currentRunAuthConfigPath;
+            generationMeta.tierBRoles = currentRunTierBRoles;
           }
 
           const qualityScan = collectGenerationQuality(config.projectPath, {
@@ -6753,6 +7055,9 @@ async function runPipeline(config, runId) {
       failed: testResults.failed,
     });
     phaseResults = testResults.phaseResults || null;
+    if (generationMeta && testResults.tierBAuthPass) {
+      generationMeta.tierBAuthPass = testResults.tierBAuthPass;
+    }
 
     let tierResults = null;
     try {

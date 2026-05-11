@@ -9,6 +9,9 @@ const net = require('net');
 const { spawn, execSync } = require('child_process');
 const Logger = require('./logger');
 
+const GENERATED_SPEC_FILE_PATTERN = /\.(?:spec|test)\.(?:ts|js|mts|mjs|cts|cjs)$/i;
+const AUTH_TAG_PATTERN = /@auth|@tierB/i;
+
 class PlaywrightIntegration {
   constructor(config = {}) {
     this.config = {
@@ -812,15 +815,79 @@ module.exports = defineConfig({
     return !!commandResult.timedOut || commandResult.code !== 0 || !!commandResult.signal;
   }
 
-  countGeneratedSpecFiles() {
+  listGeneratedSpecFiles() {
     const testsDir = path.join(this.config.projectPath, 'tests', 'generated');
     try {
       return fs.readdirSync(testsDir, { withFileTypes: true })
-        .filter((entry) => entry.isFile() && /\.spec\.(ts|js|mjs|cjs)$/i.test(entry.name))
-        .length;
+        .filter((entry) => entry.isFile() && GENERATED_SPEC_FILE_PATTERN.test(entry.name))
+        .map((entry) => path.join(testsDir, entry.name));
+    } catch {
+      return [];
+    }
+  }
+
+  countGeneratedSpecFiles() {
+    try {
+      return this.listGeneratedSpecFiles().length;
     } catch {
       return 0;
     }
+  }
+
+  scanGeneratedAuthTests() {
+    const files = this.listGeneratedSpecFiles();
+    const matchingFiles = [];
+    let authTaggedTestCount = 0;
+    for (const filePath of files) {
+      let content = '';
+      try {
+        content = fs.readFileSync(filePath, 'utf-8');
+      } catch {
+        continue;
+      }
+      if (!AUTH_TAG_PATTERN.test(content)) continue;
+      matchingFiles.push(path.basename(filePath));
+      const tests = content.match(/\btest(?:\.(?:only|fixme|fail|slow))?\s*\(/g) || [];
+      authTaggedTestCount += Math.max(1, tests.length);
+    }
+    return {
+      generatedSpecCount: files.length,
+      authTaggedFileCount: matchingFiles.length,
+      authTaggedTestCount,
+      files: matchingFiles,
+      hasAuthTaggedTests: authTaggedTestCount > 0,
+    };
+  }
+
+  resolveCurrentRunAuthConfig() {
+    const configured = this.config.tierBAuthConfigPath;
+    if (!configured) return null;
+    const candidate = path.isAbsolute(configured)
+      ? configured
+      : path.join(this.config.projectPath, configured);
+    if (!fs.existsSync(candidate)) return null;
+    return candidate;
+  }
+
+  buildTierBAuthPassError(code, message, authScan = {}, cause = null) {
+    const err = new Error(message);
+    err.code = code;
+    err.diagnostics = {
+      stage: 'execution',
+      reason: code,
+      tierBAuthPass: {
+        status: 'failed',
+        code,
+        configPath: this.config.tierBAuthConfigPath || null,
+        tierBRoles: Array.isArray(this.config.tierBRoles) ? this.config.tierBRoles : [],
+        generatedSpecCount: authScan.generatedSpecCount || 0,
+        authTaggedFileCount: authScan.authTaggedFileCount || 0,
+        authTaggedTestCount: authScan.authTaggedTestCount || 0,
+        files: authScan.files || [],
+      },
+      cause: cause ? { code: cause.code || null, message: cause.message || String(cause) } : null,
+    };
+    return err;
   }
 
   looksLikeNoTestsOutput(text) {
@@ -1317,7 +1384,7 @@ module.exports = defineConfig({
         return false;
       }
 
-      const files = fs.readdirSync(generatedDir).filter((name) => /\.spec\.(ts|js)$/i.test(name));
+      const files = fs.readdirSync(generatedDir).filter((name) => GENERATED_SPEC_FILE_PATTERN.test(name));
       const phaseTwoTagPattern = /@phase2|@deep|@stress|@matrix|@load|@api-stress|@api-negative|@api-auth|@api-contract/i;
 
       for (const file of files) {
@@ -1571,34 +1638,88 @@ test.describe('${this.sanitizeString(scenario.name)}', () => {
       await this.startServer();
     }
 
-    // When the user has their own playwright.config.* Healix writes a supplemental
-    // playwright.auth.config.ts that carries storageState for each verified role.
-    // The main config has no storageState, so @auth tests would redirect to /login
-    // and timeout. Detect the supplemental config and run it as a separate pass.
-    const authConfigPath = path.join(this.config.projectPath, 'playwright.auth.config.ts');
-    const hasSupplementalAuthConfig = fs.existsSync(authConfigPath);
+    // When the user has their own playwright.config.* Healix writes a current-run
+    // supplemental config that carries storageState for each verified role. Never
+    // auto-discover a root playwright.auth.config.ts here; stale configs from older
+    // runs can silently sideline Tier B or point at the wrong testDir.
+    const authConfigPath = this.resolveCurrentRunAuthConfig();
+    const authScan = authConfigPath
+      ? this.scanGeneratedAuthTests()
+      : { generatedSpecCount: this.countGeneratedSpecFiles(), authTaggedFileCount: 0, authTaggedTestCount: 0, files: [], hasAuthTaggedTests: false };
+    const shouldRunSupplementalAuthPass = !!authConfigPath && authScan.hasAuthTaggedTests;
 
     try {
       const phaseMode = String(this.config.phaseMode || 'two-phase').toLowerCase();
       const primary = phaseMode === 'two-phase'
-        ? await this.runTwoPhaseExecution({ excludeAuthTests: hasSupplementalAuthConfig })
+        ? await this.runTwoPhaseExecution({ excludeAuthTests: shouldRunSupplementalAuthPass })
         : await this.executePlaywright({
-          grepInvert: hasSupplementalAuthConfig ? '@auth|@tierB' : undefined,
+          grepInvert: shouldRunSupplementalAuthPass ? '@auth|@tierB' : undefined,
         });
 
-      if (hasSupplementalAuthConfig) {
+      if (authConfigPath && !authScan.hasAuthTaggedTests) {
+        primary.tierBAuthPass = {
+          status: 'skipped_no_auth_tests',
+          configPath: authConfigPath,
+          tierBRoles: Array.isArray(this.config.tierBRoles) ? this.config.tierBRoles : [],
+          generatedSpecCount: authScan.generatedSpecCount,
+          authTaggedFileCount: authScan.authTaggedFileCount,
+          authTaggedTestCount: authScan.authTaggedTestCount,
+        };
+        Logger.info('PlaywrightIntegration', 'Supplemental auth pass skipped — no @auth/@tierB generated tests found', {
+          config: authConfigPath,
+          generatedSpecCount: authScan.generatedSpecCount,
+        });
+      }
+
+      if (shouldRunSupplementalAuthPass) {
         Logger.info('PlaywrightIntegration', 'Running supplemental auth pass', { config: authConfigPath });
         try {
           const authResults = await this.executePlaywright({
             configPath: authConfigPath,
             outputDir: path.join(this.config.projectPath, 'healix-reports', 'results', 'auth'),
           });
+          if (Number(authResults.total || 0) === 0) {
+            throw this.buildTierBAuthPassError(
+              'TIER_B_AUTH_NO_MATCHING_TESTS',
+              `Supplemental auth pass matched zero tests even though ${authScan.authTaggedTestCount} @auth/@tierB test(s) exist.`,
+              authScan
+            );
+          }
           this._mergeTestRuns(primary, authResults);
+          primary.tierBAuthPass = {
+            status: 'executed',
+            configPath: authConfigPath,
+            tierBRoles: Array.isArray(this.config.tierBRoles) ? this.config.tierBRoles : [],
+            generatedSpecCount: authScan.generatedSpecCount,
+            authTaggedFileCount: authScan.authTaggedFileCount,
+            authTaggedTestCount: authScan.authTaggedTestCount,
+            total: Number(authResults.total || 0),
+            passed: Number(authResults.passed || 0),
+            failed: Number(authResults.failed || 0),
+            skipped: Number(authResults.skipped || 0),
+          };
           Logger.info('PlaywrightIntegration', 'Auth pass merged', {
             passed: authResults.passed, failed: authResults.failed, total: authResults.total,
           });
         } catch (err) {
-          Logger.warn('PlaywrightIntegration', 'Supplemental auth pass failed (non-fatal)', { reason: err.message });
+          const code = err?.code === 'NO_TESTS_TO_RUN'
+            ? (authScan.generatedSpecCount > 0 ? 'TIER_B_AUTH_CONFIG_NO_TEST_FILES' : 'TIER_B_AUTH_NO_MATCHING_TESTS')
+            : (err?.code || 'TIER_B_AUTH_PASS_FAILED');
+          const authErr = err?.diagnostics?.tierBAuthPass
+            ? err
+            : this.buildTierBAuthPassError(
+              code,
+              err?.message || 'Supplemental auth pass failed.',
+              authScan,
+              err
+            );
+          authErr.code = code;
+          Logger.error('PlaywrightIntegration', 'Supplemental auth pass failed', authErr, {
+            code,
+            config: authConfigPath,
+            authTaggedTestCount: authScan.authTaggedTestCount,
+          });
+          throw authErr;
         }
       }
 
