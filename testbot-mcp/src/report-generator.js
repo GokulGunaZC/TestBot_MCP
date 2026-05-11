@@ -442,6 +442,7 @@ class ReportGenerator {
     flakyCount,
     classifierVerdicts,
     failureClusters,
+    aiTriage,
     api_key,
     dashboard_url,
   }) {
@@ -471,6 +472,8 @@ class ReportGenerator {
     await this.copyArtifacts(testResults, reportsDir, projectPath);
     await this.copyPlaywrightHTMLReport(projectPath, reportsDir);
 
+    const normalizedAiTriage = this.stripAnsiAndNormalize(aiTriage || null);
+
     const report = {
       metadata: {
         timestamp,
@@ -482,6 +485,11 @@ class ReportGenerator {
         generationMeta: generationMeta || null,
         fallbackUsed: Boolean(fallbackUsed),
         routeAccessSummary: this.stripAnsiAndNormalize(routeAccessSummary || generationMeta?.routeAccessSummary || null),
+        aiTriage: normalizedAiTriage,
+        aiTriageStatus: normalizedAiTriage?.aiTriageStatus || null,
+        aiTriageReason: normalizedAiTriage?.aiTriageReason || null,
+        aiEligibleFailures: Number(normalizedAiTriage?.aiEligibleFailures || 0),
+        deterministicVerdicts: Number(normalizedAiTriage?.deterministicVerdicts || 0),
       },
       stats: {
         total: Number(testResults.total || 0),
@@ -496,7 +504,7 @@ class ReportGenerator {
           : 0,
       },
       tests: this.buildTestsList(testResults, aiAnalysis, jiraData),
-      aiSummary: aiAnalysis ? this.buildAISummary(aiAnalysis) : null,
+      aiSummary: Array.isArray(aiAnalysis) && aiAnalysis.length > 0 ? this.buildAISummary(aiAnalysis) : null,
       jiraSummary: jiraData ? this.buildJiraSummary(jiraData) : null,
       generationQuality: this.stripAnsiAndNormalize(generationQuality || null),
       requirementsCoverage: this.stripAnsiAndNormalize(requirementsCoverage || null),
@@ -508,6 +516,7 @@ class ReportGenerator {
         : this.stripAnsiAndNormalize(testResults.failures || []),
       classifierVerdicts: Array.isArray(classifierVerdicts) ? classifierVerdicts : [],
       failureClusters: Array.isArray(failureClusters) ? failureClusters : [],
+      aiTriage: normalizedAiTriage,
     };
 
     const reportFilename = `report-${timestamp.replace(/[:.]/g, '-')}.json`;

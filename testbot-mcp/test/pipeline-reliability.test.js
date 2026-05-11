@@ -18,6 +18,7 @@ const {
   estimateGenerationComplexity,
   extractQualityFailureFileNames,
   findGeneratedTestBlocks,
+  maybeRunFailureTriage,
   maybeExpandGenerationStageBudget,
   isRepairableGenerationFailure,
   isBrittleGeneratedTestBlock,
@@ -28,6 +29,7 @@ const {
   resolveGenerationAgentConcurrency,
   rewriteStartCommandForPort,
 } = require('../src/pipeline-worker');
+const ReportGenerator = require('../src/report-generator');
 
 function withGeneratedSuite(content, fn) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'healix-pipeline-'));
@@ -861,5 +863,60 @@ test('port conflict rewrite updates the dev start command with the reassigned po
     );
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('failure triage reports skipped status without creating AI analysis', async () => {
+  const disabled = await maybeRunFailureTriage({
+    config: { aiFailureAnalysis: false },
+    testResults: { failures: [] },
+    runBudget: null,
+    runId: 'triage-disabled',
+  });
+  assert.equal(disabled.analysis, null);
+  assert.equal(disabled.triage.aiTriageStatus, 'skipped_disabled');
+
+  const noFailures = await maybeRunFailureTriage({
+    config: { aiFailureAnalysis: true },
+    testResults: { failures: [] },
+    runBudget: null,
+    runId: 'triage-clean',
+  });
+  assert.equal(noFailures.analysis, null);
+  assert.equal(noFailures.triage.aiTriageStatus, 'skipped_no_failures');
+});
+
+test('report generator records triage metadata without empty AI summary', async () => {
+  const projectPath = fs.mkdtempSync(path.join(os.tmpdir(), 'healix-report-triage-'));
+  try {
+    const reportGen = new ReportGenerator();
+    const generated = await reportGen.generate({
+      projectPath,
+      projectName: 'triage-app',
+      runId: 'triage-report',
+      testResults: {
+        total: 1,
+        passed: 0,
+        failed: 1,
+        skipped: 0,
+        duration: 10,
+        tests: [{ title: 'fails', status: 'failed', file: 'tests/fails.spec.ts' }],
+        failures: [{ testName: 'fails', file: 'tests/fails.spec.ts', error: 'boom' }],
+      },
+      aiAnalysis: [],
+      aiTriage: {
+        aiTriageStatus: 'skipped_deterministic',
+        aiTriageReason: 'All failures were classified deterministically',
+        aiEligibleFailures: 0,
+        deterministicVerdicts: 1,
+      },
+    });
+    const report = JSON.parse(fs.readFileSync(generated.path, 'utf-8'));
+
+    assert.equal(report.aiSummary, null);
+    assert.equal(report.metadata.aiTriage.aiTriageStatus, 'skipped_deterministic');
+    assert.equal(report.aiTriage.deterministicVerdicts, 1);
+  } finally {
+    fs.rmSync(projectPath, { recursive: true, force: true });
   }
 });

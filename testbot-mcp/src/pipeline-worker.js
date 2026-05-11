@@ -4995,11 +4995,33 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
 
 async function maybeRunFailureTriage({ config, testResults, runBudget, runId }) {
   if (config.aiFailureAnalysis === false) {
-    return { analysis: null, evidenceBundles: [], verdicts: [], clusters: [] };
+    return {
+      analysis: null,
+      evidenceBundles: [],
+      verdicts: [],
+      clusters: [],
+      triage: {
+        aiTriageStatus: 'skipped_disabled',
+        aiTriageReason: 'AI failure analysis disabled by run config',
+        aiEligibleFailures: 0,
+        deterministicVerdicts: 0,
+      },
+    };
   }
 
   if (!testResults?.failures?.length) {
-    return { analysis: null, evidenceBundles: [], verdicts: [], clusters: [] };
+    return {
+      analysis: null,
+      evidenceBundles: [],
+      verdicts: [],
+      clusters: [],
+      triage: {
+        aiTriageStatus: 'skipped_no_failures',
+        aiTriageReason: 'No failed tests to analyze',
+        aiEligibleFailures: 0,
+        deterministicVerdicts: 0,
+      },
+    };
   }
 
   const limit = toFiniteNumber(config.aiFailureLimit || process.env.HEALIX_AI_TRIAGE_LIMIT, 8);
@@ -5055,6 +5077,14 @@ async function maybeRunFailureTriage({ config, testResults, runBudget, runId }) 
       evidenceBundles: bundleResult.bundles,
       verdicts: classifierResult.verdicts,
       clusters: classifierResult.clusters,
+      triage: {
+        aiTriageStatus: providerConfig.reason.includes('HEALIX_API_KEY')
+          ? 'skipped_missing_key'
+          : 'skipped_disabled',
+        aiTriageReason: providerConfig.reason,
+        aiEligibleFailures: classifierResult.aiEligibleIndexes.length,
+        deterministicVerdicts: classifierResult.verdicts.filter(Boolean).length,
+      },
     };
   }
 
@@ -5070,6 +5100,12 @@ async function maybeRunFailureTriage({ config, testResults, runBudget, runId }) 
       evidenceBundles: bundleResult.bundles,
       verdicts: classifierResult.verdicts,
       clusters: classifierResult.clusters,
+      triage: {
+        aiTriageStatus: 'skipped_deterministic',
+        aiTriageReason: 'All failures were classified deterministically',
+        aiEligibleFailures: 0,
+        deterministicVerdicts: classifierResult.verdicts.filter(Boolean).length,
+      },
     };
   }
 
@@ -5092,6 +5128,12 @@ async function maybeRunFailureTriage({ config, testResults, runBudget, runId }) 
       evidenceBundles: bundleResult.bundles,
       verdicts: classifierResult.verdicts,
       clusters: classifierResult.clusters,
+      triage: {
+        aiTriageStatus: 'completed',
+        aiTriageReason: null,
+        aiEligibleFailures: aiPayload.length,
+        deterministicVerdicts: classifierResult.verdicts.filter(Boolean).length,
+      },
     };
   });
 }
@@ -6258,6 +6300,7 @@ async function runPipeline(config, runId) {
     let evidenceBundles = [];
     let classifierVerdicts = [];
     let failureClusters = [];
+    let aiTriage = null;
     try {
       const triage = await maybeRunFailureTriage({
         config,
@@ -6269,12 +6312,19 @@ async function runPipeline(config, runId) {
       evidenceBundles = triage?.evidenceBundles ?? [];
       classifierVerdicts = triage?.verdicts ?? [];
       failureClusters = triage?.clusters ?? [];
+      aiTriage = triage?.triage ?? null;
     } catch (triageError) {
       Logger.warn('PipelineWorker', 'AI failure triage failed', { reason: triageError.message });
       aiAnalysis = null;
       evidenceBundles = [];
       classifierVerdicts = [];
       failureClusters = [];
+      aiTriage = {
+        aiTriageStatus: 'failed',
+        aiTriageReason: triageError.message,
+        aiEligibleFailures: 0,
+        deterministicVerdicts: 0,
+      };
     }
 
     // -------------------------------------------------------
@@ -6315,6 +6365,7 @@ async function runPipeline(config, runId) {
         flakyCount: testResults.flaky || 0,
         classifierVerdicts,
         failureClusters,
+        aiTriage,
         api_key: healixApiKey,
         dashboard_url: healixDashboardUrl,
       });
@@ -6626,6 +6677,12 @@ async function runPipeline(config, runId) {
         phaseResults,
         fallbackUsed,
         pipelineError,
+        aiTriage: {
+          aiTriageStatus: 'failed',
+          aiTriageReason: 'Pipeline failed before failure triage completed',
+          aiEligibleFailures: 0,
+          deterministicVerdicts: 0,
+        },
         api_key: healixApiKey,
         dashboard_url: healixDashboardUrl,
       });
@@ -6737,6 +6794,7 @@ module.exports = {
   rewriteStartCommandForPort,
   DEFAULT_STAGE_CAPS_MS,
   DEFAULT_TOTAL_BUDGET_MS,
+  maybeRunFailureTriage,
   maybeGenerateViaSaaS,
   pickAgentsForRun,
   rescuePartialGeneration,

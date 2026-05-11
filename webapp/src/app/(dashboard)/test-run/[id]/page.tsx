@@ -143,9 +143,9 @@ interface AiAnalysisItem {
   analysis?: string;
   root_cause?: string;
   rootCause?: string;
-  suggested_fix?: string;
-  suggestedFix?: string;
-  fix?: string;
+  suggested_fix?: unknown;
+  suggestedFix?: unknown;
+  fix?: unknown;
   testingRecommendations?: string;
   testing_recommendations?: string;
   confidence?: number | string;
@@ -210,6 +210,27 @@ function safeString(val: unknown): string | null {
     return JSON.stringify(val);
   }
   return String(val);
+}
+
+function hasMeaningfulAiAnalysis(item: AiAnalysisItem | null | undefined): boolean {
+  if (!item) return false;
+  if (safeString(item.analysis)?.trim()) return true;
+  if (safeString(item.root_cause ?? item.rootCause)?.trim()) return true;
+  if (safeString(item.testingRecommendations ?? item.testing_recommendations)?.trim()) return true;
+
+  const fix = item.suggested_fix ?? item.suggestedFix ?? item.fix;
+  if (typeof fix === 'string') return fix.trim().length > 0;
+  if (fix && typeof fix === 'object') {
+    const obj = fix as Record<string, unknown>;
+    return !!(
+      safeString(obj.description)?.trim()
+      || safeString(obj.summary)?.trim()
+      || safeString(obj.patch)?.trim()
+      || (Array.isArray(obj.changes) && obj.changes.length > 0)
+    );
+  }
+
+  return false;
 }
 
 function getConfidencePercent(confidence: number | string | null | undefined): number | null {
@@ -772,24 +793,40 @@ interface EvidenceShape {
   role?: string | null;
 }
 
+type EvidenceTabKey = 'test' | 'app' | 'ac' | 'patch';
+
+function EvidenceTabButton({
+  tabKey,
+  label,
+  activeTab,
+  onSelect,
+}: {
+  tabKey: EvidenceTabKey;
+  label: string;
+  activeTab: EvidenceTabKey;
+  onSelect: (tab: EvidenceTabKey) => void;
+}) {
+  return (
+    <button
+      onClick={(e) => { e.stopPropagation(); onSelect(tabKey); }}
+      className={`px-3 py-1.5 text-[11px] font-semibold uppercase tracking-wider rounded-t-md transition-colors ${
+        activeTab === tabKey
+          ? 'bg-white/10 text-[#F0F6FF] border-b-2 border-[#60A5FA]'
+          : 'text-[#4A6280] hover:text-[#8BA4C8]'
+      }`}
+    >
+      {label}
+    </button>
+  );
+}
+
 function EvidencePanel({ failure }: { failure: TestFailure }) {
-  const [tab, setTab] = useState<'test' | 'app' | 'ac' | 'patch'>('test');
+  const [tab, setTab] = useState<EvidenceTabKey>('test');
   const evidence: EvidenceShape = (failure.evidence ?? {}) as EvidenceShape;
   const patch = failure.suggested_patch as null | {
     file?: string; lineStart?: number; lineEnd?: number;
     oldCode?: string; newCode?: string; preservesRequirementTag?: boolean;
   };
-
-  const Tab = ({ k, label }: { k: typeof tab; label: string }) => (
-    <button
-      onClick={(e) => { e.stopPropagation(); setTab(k); }}
-      className={`px-3 py-1.5 text-[11px] font-semibold uppercase tracking-wider rounded-t-md transition-colors ${
-        tab === k
-          ? 'bg-white/10 text-[#F0F6FF] border-b-2 border-[#60A5FA]'
-          : 'text-[#4A6280] hover:text-[#8BA4C8]'
-      }`}
-    >{label}</button>
-  );
 
   const failedAction = evidence.trace?.failedAction;
   const dom = evidence.trace?.domAtFailure;
@@ -799,10 +836,10 @@ function EvidencePanel({ failure }: { failure: TestFailure }) {
   return (
     <div className="rounded-xl bg-white/[0.02] border border-white/10 overflow-hidden">
       <div className="flex items-center gap-1 px-3 pt-2 border-b border-white/5">
-        <Tab k="test"  label="Test asked for" />
-        <Tab k="app"   label="App rendered" />
-        <Tab k="ac"    label="AC says" />
-        <Tab k="patch" label={patch ? 'Suggested patch' : 'No patch'} />
+        <EvidenceTabButton tabKey="test" label="Test asked for" activeTab={tab} onSelect={setTab} />
+        <EvidenceTabButton tabKey="app" label="App rendered" activeTab={tab} onSelect={setTab} />
+        <EvidenceTabButton tabKey="ac" label="AC says" activeTab={tab} onSelect={setTab} />
+        <EvidenceTabButton tabKey="patch" label={patch ? 'Suggested patch' : 'No patch'} activeTab={tab} onSelect={setTab} />
       </div>
       <div className="p-3">
         {tab === 'test' && (
@@ -970,6 +1007,7 @@ function FailureClusterBanner({ clusters }: { clusters: Array<{ clusterId: strin
 function TestRow({ t, idx, indented = false, aiAnalysis = [], failure, runId, onOverride }: { t: NormalisedTest; idx: number; indented?: boolean; aiAnalysis?: AiAnalysisItem[]; failure?: TestFailure; runId?: string; onOverride?: (failureId: string, verdict: FailureVerdict) => void }) {
   const [expanded, setExpanded] = useState(false);
   const matchedAi = aiAnalysis.find(item => {
+    if (!hasMeaningfulAiAnalysis(item)) return false;
     const aiName = safeString(item.testName ?? item.test ?? item.test_name);
     if (!aiName) return false;
     return aiName.toLowerCase().trim() === t.name.toLowerCase().trim();
@@ -1171,7 +1209,7 @@ function TestRow({ t, idx, indented = false, aiAnalysis = [], failure, runId, on
                 )}
 
                 {/* Inline AI Analysis */}
-                {matchedAi && isFailed && (() => {
+                {matchedAi && isFailed && hasMeaningfulAiAnalysis(matchedAi) && (() => {
                   const analysis = safeString(matchedAi.analysis);
                   const rootCause = safeString(matchedAi.root_cause ?? matchedAi.rootCause);
                   const fix = safeString(matchedAi.suggested_fix ?? matchedAi.suggestedFix ?? matchedAi.fix);
@@ -1519,6 +1557,9 @@ function LiveTimeline({ events, liveFiles, pipelineEnded }: {
                     <circle cx="12" cy="12" r="10"/>
                     <polyline points="12 6 12 12 16 14"/>
                   </svg>
+                )}
+                {elapsedLabel && (
+                  <span className="text-blue-300/70 text-[10px] font-mono">{elapsedLabel}</span>
                 )}
               </div>
               {ev.message && (
@@ -2442,7 +2483,7 @@ export default function TestRunDetailPage() {
       evtSource.close();
       evtSourceRef.current = null;
     };
-  }, [id, isLiveDetailId]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [id, isLiveDetailId]);
 
   useEffect(() => {
     if (!id) return;
@@ -2770,12 +2811,7 @@ export default function TestRunDetailPage() {
     Array.isArray(aiRaw)
       ? aiRaw
       : (Array.isArray(aiRaw?.analyses) ? aiRaw.analyses : Array.isArray(aiRaw?.items) ? aiRaw.items : [])
-  ).filter((item: AiAnalysisItem) => (
-    !!safeString(item?.testName ?? item?.test ?? item?.test_name)
-    || !!safeString(item?.analysis)
-    || !!safeString(item?.rootCause ?? item?.root_cause)
-    || !!safeString(item?.suggestedFix ?? item?.suggested_fix ?? item?.fix)
-  ));
+  ).filter((item: AiAnalysisItem) => hasMeaningfulAiAnalysis(item));
 
   // Failure triage state — merge server rows with optimistic overrides
   const rawFailures: TestFailure[] = Array.isArray(testRun.test_failures) ? testRun.test_failures : [];

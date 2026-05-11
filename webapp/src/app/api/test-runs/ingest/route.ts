@@ -126,6 +126,29 @@ function normalizeConfidence(value: unknown): number {
   return 0
 }
 
+function hasMeaningfulText(value: unknown): boolean {
+  const text = toStringOrNull(value)
+  return !!text && text.trim().length > 0
+}
+
+function hasMeaningfulAnalysisContent(item: AiLikeItem): boolean {
+  if (hasMeaningfulText(item.analysis)) return true
+  if (hasMeaningfulText(item.rootCause ?? item.root_cause)) return true
+  if (hasMeaningfulText(item.testingRecommendations ?? item.testing_recommendations)) return true
+
+  const suggestedFix = item.suggestedFix ?? item.suggested_fix ?? item.fix
+  if (typeof suggestedFix === 'string') return suggestedFix.trim().length > 0
+  if (suggestedFix && typeof suggestedFix === 'object') {
+    const fix = suggestedFix as Record<string, unknown>
+    return hasMeaningfulText(fix.description)
+      || hasMeaningfulText(fix.summary)
+      || hasMeaningfulText(fix.patch)
+      || (Array.isArray(fix.changes) && fix.changes.length > 0)
+  }
+
+  return false
+}
+
 function normalizeAnalysisItem(item: AiLikeItem): Record<string, unknown> | null {
   const testName = toStringOrNull(item.testName ?? item.test ?? item.test_name)
   const file = toStringOrNull(item.file)
@@ -135,7 +158,7 @@ function normalizeAnalysisItem(item: AiLikeItem): Record<string, unknown> | null
   const testingRecommendations = toStringOrNull(item.testingRecommendations ?? item.testing_recommendations)
   const confidence = normalizeConfidence(item.confidence)
 
-  if (!testName && !analysis && !rootCause && !suggestedFix) {
+  if (!hasMeaningfulAnalysisContent(item)) {
     return null
   }
 
@@ -192,7 +215,7 @@ function buildAiAnalysisPayload(report: ReportPayload) {
 
   const analyses = [...dedupe.values()]
   if (analyses.length === 0) {
-    return summary || null
+    return null
   }
 
   const highConfidence = analyses.filter((item) => Number(item.confidence || 0) >= 0.8).length
