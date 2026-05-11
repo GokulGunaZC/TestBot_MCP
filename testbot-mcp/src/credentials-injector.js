@@ -38,8 +38,27 @@ const COMMON_LOGIN_PATHS = [
   '/account/login',
 ];
 
-const AUTH_STATE_NAME_RE = /(auth|session|token|jwt|supabase|sb-|next-auth|clerk|firebase|amplify|cognito|oidc|okta|access|refresh)/i;
+const AUTH_STATE_NAME_RE = /(auth|session|sess|sid|token|jwt|supabase|sb-|next-auth|clerk|firebase|amplify|cognito|oidc|okta|access|refresh|logged|identity|credential|current[_-]?user|user[_-]?(session|token|auth|id))/i;
 const WEAK_COOKIE_NAME_RE = /^(csrf|xsrf|_ga|_gid|_gat|ajs_|amplitude|intercom|visitor|locale|theme|pref)/i;
+const DEFAULT_USERNAME_SELECTORS = [
+  'input[type="email"]',
+  'input[name="email"]',
+  'input[name="username"]',
+  'input[name="user"]',
+  'input[name="login"]',
+  'input[id*="email" i]',
+  'input[id*="user" i]',
+  'input[autocomplete="username"]',
+  'input[autocomplete="email"]',
+  'input[type="text"]',
+];
+const DEFAULT_PASSWORD_SELECTORS = [
+  'input[type="password"]',
+  'input[name="password"]',
+  'input[id*="password" i]',
+  'input[autocomplete="current-password"]',
+  'input[autocomplete="password"]',
+];
 const DEFAULT_SUCCESS_LOCATORS = [
   'text=/log\\s*out/i',
   'text=/sign\\s*out/i',
@@ -207,6 +226,34 @@ function buildSuccessLocators(authFlow = null, credentials = {}) {
   return unique(locators);
 }
 
+function selectorCandidates(primary, defaults = []) {
+  return unique([
+    primary,
+    ...defaults,
+  ].map((item) => String(item || '').trim()).filter(Boolean));
+}
+
+async function fillFirstVisible(page, selectors = [], value, timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs;
+  let lastError = null;
+  for (const selector of unique(selectors)) {
+    const remaining = Math.max(500, deadline - Date.now());
+    try {
+      const locator = page.locator(selector).first();
+      await locator.waitFor({ state: 'visible', timeout: Math.min(remaining, 4_000) });
+      await locator.fill(value, { timeout: Math.min(Math.max(500, deadline - Date.now()), 5_000) });
+      return { ok: true, selector };
+    } catch (err) {
+      lastError = err;
+    }
+    if (Date.now() >= deadline) break;
+  }
+  return {
+    ok: false,
+    reason: lastError?.message || `No visible field matched ${selectors.join(', ')}`,
+  };
+}
+
 function shouldAcceptLoginVerification({
   urlChanged = false,
   successIndicatorVisible = false,
@@ -313,8 +360,14 @@ async function driveLogin({ baseURL, authFlow, credentials, storageStatePath }) 
   try {
     const cleanAuthFlow = sanitizeAuthFlow(authFlow);
     const effectiveAuthFlow = cleanAuthFlow || null;
-    const userField = effectiveAuthFlow?.credentialFields?.username || 'input[type="email"], input[name="email"], input[name="username"], input[autocomplete="username"]';
-    const passField = effectiveAuthFlow?.credentialFields?.password || 'input[type="password"], input[name="password"]';
+    const userFieldCandidates = selectorCandidates(
+      effectiveAuthFlow?.credentialFields?.username,
+      DEFAULT_USERNAME_SELECTORS,
+    );
+    const passFieldCandidates = selectorCandidates(
+      effectiveAuthFlow?.credentialFields?.password,
+      DEFAULT_PASSWORD_SELECTORS,
+    );
     const candidates = buildLoginCandidates(baseURL, authFlow);
     const attempted = [];
     let lastError = null;
@@ -334,9 +387,10 @@ async function driveLogin({ baseURL, authFlow, credentials, storageStatePath }) 
 
         // During discovery, do not spend 15s on a public home page that has no login form.
         const fieldTimeout = effectiveAuthFlow?.loginUrl ? 15_000 : 4_000;
-        await page.locator(userField).first().waitFor({ state: 'visible', timeout: fieldTimeout });
-        await page.fill(userField, credentials.username, { timeout: 10_000 });
-        await page.fill(passField, credentials.password, { timeout: 10_000 });
+        const usernameFill = await fillFirstVisible(page, userFieldCandidates, credentials.username, fieldTimeout);
+        if (!usernameFill.ok) throw new Error(usernameFill.reason);
+        const passwordFill = await fillFirstVisible(page, passFieldCandidates, credentials.password, 10_000);
+        if (!passwordFill.ok) throw new Error(passwordFill.reason);
 
         // Wait for SPA navigation to complete. Supabase fires router.replace() in the
         // .then() of signInWithPassword — this is async and fires AFTER the API response,
@@ -349,7 +403,7 @@ async function driveLogin({ baseURL, authFlow, credentials, storageStatePath }) 
             (url) => { try { return url.pathname !== loginPathname; } catch { return false; } },
             { timeout: 20_000 }
           ).catch(() => null),
-          page.locator(passField).first().press('Enter').catch(async () => {
+          page.locator(passwordFill.selector).first().press('Enter').catch(async () => {
             const submit = page.locator([
               'button[type="submit"]',
               'input[type="submit"]',

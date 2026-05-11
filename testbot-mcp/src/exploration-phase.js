@@ -179,8 +179,9 @@ async function runExplorationPhase({
   // an OPENAI_API_KEY on the user's machine.
   let result = await driveExploration({
     targetUrl: baseURL,
-    credentials: credsForAgent,
+    credentials: preAuthRoles.length > 0 ? undefined : credsForAgent,
     allCredentials: Array.isArray(credentials) ? credentials : (cred ? [cred] : []),
+    preAuthRoleCount: preAuthRoles.length,
     totalTimeoutMs,
     onHeartbeat: () => { /* noop — heartbeats could be surfaced to status later */ },
   });

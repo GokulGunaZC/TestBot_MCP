@@ -90,6 +90,7 @@ function driveExploration({
   targetUrl,
   credentials,
   allCredentials,
+  preAuthRoleCount = 0,
   totalTimeoutMs = DEFAULT_TIMEOUT_MS,
   onHeartbeat,
 } = {}) {
@@ -135,6 +136,7 @@ function driveExploration({
       HEALIX_TARGET_URL: targetUrl,
       HEALIX_LOGIN_USERNAME: credentials?.username || '',
       HEALIX_LOGIN_PASSWORD: credentials?.password || '',
+      HEALIX_PREAUTH_VERIFIED_ROLES: String(Math.max(0, Number(preAuthRoleCount) || 0)),
       HEALIX_TOTAL_TIMEOUT_S: String(Math.max(10, Math.round(totalTimeoutMs / 1000))),
       HEALIX_ALL_ROLES: allRoles,
       BROWSER_USE_API_KEY: process.env.BROWSER_USE_API_KEY || process.env.HEALIX_BROWSER_USE_API_KEY || '',

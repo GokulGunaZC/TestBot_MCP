@@ -87,6 +87,30 @@ test('credential injector recognizes common auth storage evidence', () => {
       storageKey: 'sb-otanlyuasavknmdnvzxz-auth-token',
     },
   );
+
+  assert.deepEqual(
+    summarizeAuthStateEvidence({
+      cookies: [{ name: 'connect.sid', value: 'signed-session' }],
+      storageKeys: [],
+    }),
+    {
+      hasAuthState: true,
+      cookieName: 'connect.sid',
+      storageKey: null,
+    },
+  );
+
+  assert.deepEqual(
+    summarizeAuthStateEvidence({
+      cookies: [{ name: 'csrf_token', value: 'csrf' }],
+      storageKeys: ['currentUser'],
+    }),
+    {
+      hasAuthState: true,
+      cookieName: null,
+      storageKey: 'currentUser',
+    },
+  );
 });
 
 test('credential injector treats discovered successIndicator as advisory', () => {

@@ -72,14 +72,24 @@ _ARTIFACT_TEMPLATE = {
 }
 
 
-def _build_task(target_url, username, password):
+def _build_task(target_url, username, password, preauth_verified=False):
     all_roles_raw = os.environ.get("HEALIX_ALL_ROLES", "")
     roles_note = (
         f" The app has multiple roles ({all_roles_raw}) — note any role-specific pages."
         if all_roles_raw else ""
     )
 
-    if username and password:
+    if preauth_verified:
+        login_block = (
+            f"\nSTEP 1 — AUTH CONTEXT:\n"
+            f"  Healix already verified at least one role with deterministic Playwright\n"
+            f"  storageState before this browser-use run. Do NOT submit the login form\n"
+            f"  again in browser-use. Start at {target_url}, record public routes and\n"
+            f"  any visible login form fields, then continue route mapping. Protected\n"
+            f"  routes will be explored by Healix's Playwright storageState pass.\n"
+        )
+        nav_start = "STEP 2"
+    elif username and password:
         login_block = (
             f"\nSTEP 1 — LOGIN (mandatory, do this first):\n"
             f"  Navigate to {target_url}.\n"
@@ -89,7 +99,11 @@ def _build_task(target_url, username, password):
             f"  Do NOT use register, signup, create-account, or onboarding forms\n"
             f"  as login forms. If both /login and /register exist, loginUrl MUST\n"
             f"  point to the sign-in/login page only.\n"
-            f"  Wait for the authenticated page to load before continuing.\n"
+            f"  Submit the login form at most ONE time. After submit, wait up to\n"
+            f"  5 seconds. If there is no visible invalid-credential/auth error, do\n"
+            f"  NOT retry login just because the navbar still shows Login/Sign up;\n"
+            f"  many SPAs repaint auth chrome asynchronously after cookies/session\n"
+            f"  are already set. Record the authFlow and continue route mapping.\n"
             f"  Record loginUrl, credentialFields selectors, successIndicator, failureIndicator.\n"
         )
         nav_start = "STEP 2"
@@ -268,7 +282,15 @@ async def _drive_agent(target_url, username, password, timeout_s):
     else:
         _emit({"type": "progress", "message": "LLM routed through Healix webapp proxy"})
 
-    task = _build_task(target_url, username, password)
+    preauth_verified_raw = os.environ.get("HEALIX_PREAUTH_VERIFIED_ROLES", "0")
+    try:
+        preauth_verified = int(preauth_verified_raw) > 0
+    except ValueError:
+        preauth_verified = False
+
+    task = _build_task(target_url, username, password, preauth_verified=preauth_verified)
+    if preauth_verified:
+        _emit({"type": "progress", "message": "pre-auth storageState verified; browser-use will not retry login"})
 
     # Build Agent kwargs with speed optimisations, falling back gracefully
     # when a browser-use version doesn't support a particular parameter.
