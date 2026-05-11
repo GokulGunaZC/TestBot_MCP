@@ -3232,6 +3232,10 @@ function auditGeneratedTestQuality({ projectPath, testType, context, exploration
       continue;
     }
 
+    if (/^fallback-|^template-/i.test(name) || /Fallback (frontend|workflow|API|checks)|fallbackReason|template fallback/i.test(content)) {
+      summary.errors.push(`fallback_or_template_spec:${name}`);
+    }
+
     const fileTests = countTestsInContent(content);
     const fileSkippedTests = Math.min(countSkippedTestsInContent(content), fileTests);
     summary.totalTests += fileTests;

@@ -1064,6 +1064,7 @@ class ContextGatherer {
     const pages = [];
     const routePatterns = [
       /path=["'`]([^"'`]+)["'`]/g,
+      /path\s*:\s*["'`]([^"'`]+)["'`]/g,
       /Route\s+path=["'`]([^"'`]+)["'`]/g,
       /<Route[^>]+path=["'`]([^"'`]+)["'`]/g,
     ];
@@ -1079,7 +1080,8 @@ class ContextGatherer {
         for (const pattern of routePatterns) {
           let match;
           while ((match = pattern.exec(content)) !== null) {
-            const routePath = match[1];
+            const rawRoutePath = match[1];
+            const routePath = rawRoutePath === '' ? '/' : (rawRoutePath.startsWith('/') ? rawRoutePath : `/${rawRoutePath}`);
             if (routePath && !routePath.includes('*') && !pages.some(p => p.path === routePath)) {
               const uiHints = this.extractPageUIHints(file);
               pages.push({
@@ -1399,6 +1401,13 @@ class ContextGatherer {
       php: [
         { regex: /Route::(get|post|put|patch|delete)\s*\(\s*["']([^"']+)["']/gi, methodIdx: 1, pathIdx: 2 },
       ],
+      csharp: [
+        { regex: /\[HttpGet(?:\(\s*["']([^"']*)["']\s*\))?\][\s\S]{0,600}?\[Route\s*\(\s*["']([^"']+)["']\s*\)\]/gi, method: 'GET', pathIdx: 2, optionalPathIdx: 1 },
+        { regex: /\[Route\s*\(\s*["']([^"']+)["']\s*\)\][\s\S]{0,600}?\[HttpGet(?:\(\s*["']([^"']*)["']\s*\))?\]/gi, method: 'GET', pathIdx: 1, optionalPathIdx: 2 },
+        { regex: /\[HttpPost(?:\(\s*["']([^"']*)["']\s*\))?\][\s\S]{0,600}?\[Route\s*\(\s*["']([^"']+)["']\s*\)\]/gi, method: 'POST', pathIdx: 2, optionalPathIdx: 1 },
+        { regex: /\[Route\s*\(\s*["']([^"']+)["']\s*\)\][\s\S]{0,600}?\[HttpPost(?:\(\s*["']([^"']*)["']\s*\))?\]/gi, method: 'POST', pathIdx: 1, optionalPathIdx: 2 },
+        { regex: /app\.Map(Get|Post|Put|Delete|Patch)\s*\(\s*["']([^"']+)["']/gi, methodIdx: 1, pathIdx: 2 },
+      ],
     };
 
     const patterns = endpointPatterns[lang] || [];
@@ -1416,7 +1425,11 @@ class ContextGatherer {
           patternDef.regex.lastIndex = 0;
           while ((match = patternDef.regex.exec(content)) !== null) {
             let method = patternDef.method || match[patternDef.methodIdx].toUpperCase();
-            const routePath = match[patternDef.pathIdx];
+            const basePath = match[patternDef.pathIdx];
+            const optionalPath = patternDef.optionalPathIdx ? match[patternDef.optionalPathIdx] : '';
+            const routePath = optionalPath
+              ? `${String(basePath || '').replace(/\/$/, '')}/${String(optionalPath).replace(/^\//, '')}`
+              : basePath;
 
             if (patternDef.parseMethodList) {
               // Parse methods=['GET', 'POST'] style

@@ -7,7 +7,8 @@
     "dev:webapp": "npm run dev -w webapp",
     "start:testbot": "npm start -w @testbot/mcp",
     "test:webapp": "npm run test -w webapp",
-    "test:testbot": "npm run test -w @testbot/mcp"
+    "test:testbot": "npm run test -w @testbot/mcp",
+    "compat:matrix": "node scripts/run-compat-matrix.mjs"
   },
   "workspaces": [
     "testbot-mcp",

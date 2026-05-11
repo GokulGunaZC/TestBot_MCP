@@ -249,7 +249,7 @@ class AutoDetector {
       ...(packageJson?.devDependencies || {}),
     };
 
-    const hasFrontend = !!(deps.next || deps.react || deps['react-dom'] || deps.vue || deps.svelte || deps.vite || deps['@remix-run/react'] || deps.expo);
+    const hasFrontend = !!(deps.next || deps.react || deps['react-dom'] || deps.vue || deps.svelte || deps.vite || deps['@remix-run/react'] || deps.expo || deps['@angular/core']);
     const hasBackend = !!(deps.express || deps.fastify || deps.koa || deps['@nestjs/core'] || deps['@nestjs/common'] || deps.hapi);
 
     // Next.js is fullstack by design (pages + API routes).
@@ -274,6 +274,7 @@ class AutoDetector {
       ...(packageJson?.devDependencies || {}),
     };
     if (deps.next) return 'next';
+    if (deps['@angular/core']) return 'angular';
     if (deps['@remix-run/react']) return 'remix';
     if (deps.vite && deps.react) return 'vite-react';
     if (deps.vite && deps.vue) return 'vite-vue';
@@ -291,6 +292,7 @@ class AutoDetector {
   detectLanguageAndEcosystem(projectPath) {
     const markers = [
       // JavaScript / Node.js
+      { file: 'tsconfig.json', language: 'typescript', ecosystem: 'node' },
       { file: 'package.json', language: 'javascript', ecosystem: 'node' },
       // Python
       { file: 'pyproject.toml', language: 'python', ecosystem: 'poetry' },
@@ -532,6 +534,7 @@ class AutoDetector {
     if (packageJson?.dependencies) {
       if (packageJson.dependencies.vite) return 5173;
       if (packageJson.dependencies.next) return 3000;
+      if (packageJson.dependencies['@angular/core']) return 4200;
       if (packageJson.dependencies['create-react-app']) return 3000;
       if (packageJson.dependencies.express) return 3000;
     }
