@@ -512,6 +512,12 @@ const CATEGORY_META: Record<string, { label: string; color: string; border: stri
   api_auth:          { label: 'API Auth',            color: 'text-[#8BA4C8]', border: 'border-[#8BA4C8]/30', dot: 'bg-[#8BA4C8]' },
   api_negative:      { label: 'API Negative',        color: 'text-[#8BA4C8]', border: 'border-[#8BA4C8]/30', dot: 'bg-[#8BA4C8]' },
   api_stress:        { label: 'API Stress',          color: 'text-[#8BA4C8]', border: 'border-[#8BA4C8]/30', dot: 'bg-[#8BA4C8]' },
+  smoke_coverage:    { label: 'Smoke Coverage',      color: 'text-[#8BA4C8]', border: 'border-[#8BA4C8]/30', dot: 'bg-[#8BA4C8]' },
+  frontend_coverage: { label: 'Frontend Coverage',   color: 'text-[#8BA4C8]', border: 'border-[#8BA4C8]/30', dot: 'bg-[#8BA4C8]' },
+  api_coverage:      { label: 'API Coverage',        color: 'text-[#8BA4C8]', border: 'border-[#8BA4C8]/30', dot: 'bg-[#8BA4C8]' },
+  workflow_coverage: { label: 'Workflow Coverage',   color: 'text-[#8BA4C8]', border: 'border-[#8BA4C8]/30', dot: 'bg-[#8BA4C8]' },
+  e2e_coverage:      { label: 'E2E Coverage',        color: 'text-[#8BA4C8]', border: 'border-[#8BA4C8]/30', dot: 'bg-[#8BA4C8]' },
+  test_coverage:     { label: 'Test Coverage',       color: 'text-[#8BA4C8]', border: 'border-[#8BA4C8]/30', dot: 'bg-[#8BA4C8]' },
   uncategorized:     { label: 'Uncategorized',       color: 'text-[#8BA4C8]', border: 'border-[#8BA4C8]/30', dot: 'bg-[#8BA4C8]' },
 };
 
@@ -599,6 +605,15 @@ function getMainTypeMeta(type: string) {
   return { label, color: 'text-[#C8DEFF]', bg: 'bg-white/[0.04]', dot: 'bg-[#C8DEFF]', order: 99 };
 }
 
+function fallbackSubcategoryForSection(type: string): string {
+  if (type === 'smoke') return 'smoke_coverage';
+  if (type === 'frontend') return 'frontend_coverage';
+  if (type === 'api') return 'api_coverage';
+  if (type === 'workflow') return 'workflow_coverage';
+  if (type === 'e2e') return 'e2e_coverage';
+  return 'test_coverage';
+}
+
 const SECTION_BORDER: Record<string, string> = {
   smoke:     'border-[#C8DEFF]/40',
   frontend:  'border-[#C8DEFF]/40',
@@ -637,6 +652,11 @@ function SectionOverview({ sections }: { sections: SectionDatum[] }) {
           totals.skipped > 0 ? `${totals.skipped} skipped` : null,
           totals.passed > 0 ? `${totals.passed} passed` : null,
         ].filter(Boolean).join(' · ');
+        const displaySubs = subs.length > 0
+          ? subs
+          : total > 0
+            ? [{ key: fallbackSubcategoryForSection(key), counts: totals }]
+            : [];
         return (
           <div key={key} className={`border-l-2 ${border} pl-3 flex flex-col gap-2`}>
             {/* Section header: name + overall inline */}
@@ -646,9 +666,9 @@ function SectionOverview({ sections }: { sections: SectionDatum[] }) {
               <span className="text-[#4A6280] text-[11px]">{subParts}</span>
             </div>
             {/* Subcategory arc-progress circles */}
-            {subs.length > 0 && (
+            {displaySubs.length > 0 && (
               <div className="flex flex-wrap gap-3">
-                {subs.map(({ key: subKey, counts }) => {
+                {displaySubs.map(({ key: subKey, counts }) => {
                   const subMeta = getCategoryMeta(subKey);
                   const subTotal = counts.passed + counts.failed + counts.skipped;
                   const subRate = subTotal > 0 ? Math.round((counts.passed / subTotal) * 100) : 0;
