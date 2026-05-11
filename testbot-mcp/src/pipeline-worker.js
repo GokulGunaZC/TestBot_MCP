@@ -35,6 +35,7 @@ const WebappClient = require('./webapp-client');
 const { startSecondaryServices, stopSecondaryServices, probeHttpReady, waitForServiceReady } = require('./multi-service-starter');
 const { runExplorationPhase, EMPTY_ARTIFACT } = require('./exploration-phase');
 const { injectCredentials, normalizeRoleLabel } = require('./credentials-injector');
+const { isUnsafeAuthFlow, sanitizeAuthFlow } = require('./auth-flow-utils');
 const Logger = require('./logger');
 const MCPTelemetryReporter = require('./mcp-telemetry');
 
@@ -463,7 +464,109 @@ function buildRouteAccessSummary(explorationArtifact) {
     publicRoutes: [...new Set(publicRoutes)],
     protectedRoutes: [...new Set(protectedRoutes)],
     totalObservedRoutes: routes.length,
+    authFlowRejected: explorationArtifact?.authFlowRejected || null,
   };
+}
+
+function roleKeyForAuth(role) {
+  return normalizeRoleLabel(role?.role || role?.name || role || 'user');
+}
+
+function hasVerifiedStorageState(role) {
+  return !!(
+    role &&
+    role.loginVerified &&
+    role.storageStatePath &&
+    fs.existsSync(role.storageStatePath)
+  );
+}
+
+function allCredentialsCoveredByPreAuth(credentials = [], preAuthRoles = []) {
+  if (!Array.isArray(credentials) || credentials.length === 0) return false;
+  return Array.isArray(preAuthRoles) && preAuthRoles.length > 0 && credentials.every((cred) => {
+    const key = roleKeyForAuth(cred);
+    return preAuthRoles.some((role) => roleKeyForAuth(role) === key && hasVerifiedStorageState(role));
+  });
+}
+
+function shouldTrustDiscoveredAuthFlow(authFlow = null) {
+  if (!authFlow) return false;
+  if (isUnsafeAuthFlow(authFlow)) return false;
+  return !!sanitizeAuthFlow(authFlow);
+}
+
+function mergeCredentialInjectionRoles({ freshRoles = [], preAuthRoles = [] } = {}) {
+  const byRole = new Map();
+  const reusedPreAuthRoles = [];
+  const failedFreshRoles = [];
+
+  for (const role of Array.isArray(preAuthRoles) ? preAuthRoles : []) {
+    const key = roleKeyForAuth(role);
+    if (!byRole.has(key)) {
+      byRole.set(key, {
+        ...role,
+        role: key,
+        name: key,
+        reusedFromPreAuth: false,
+      });
+    }
+  }
+
+  for (const fresh of Array.isArray(freshRoles) ? freshRoles : []) {
+    const key = roleKeyForAuth(fresh);
+    if (hasVerifiedStorageState(fresh)) {
+      byRole.set(key, {
+        ...fresh,
+        role: key,
+        name: key,
+        reusedFromPreAuth: false,
+      });
+      continue;
+    }
+
+    failedFreshRoles.push({
+      role: key,
+      reason: fresh?.reason || 'fresh_auth_failed',
+    });
+    const preAuth = (Array.isArray(preAuthRoles) ? preAuthRoles : [])
+      .find((role) => roleKeyForAuth(role) === key && hasVerifiedStorageState(role));
+    if (preAuth) {
+      byRole.set(key, {
+        ...preAuth,
+        role: key,
+        name: key,
+        loginVerified: true,
+        reusedFromPreAuth: true,
+        reinjectionFailureReason: fresh?.reason || null,
+      });
+      reusedPreAuthRoles.push(key);
+    } else {
+      byRole.set(key, {
+        ...fresh,
+        role: key,
+        name: key,
+        loginVerified: false,
+        storageStatePath: null,
+        reusedFromPreAuth: false,
+      });
+    }
+  }
+
+  const roles = Array.from(byRole.values());
+  return {
+    roles,
+    reusedPreAuthRoles: [...new Set(reusedPreAuthRoles)],
+    failedFreshRoles,
+  };
+}
+
+function summarizeAuthRoles(roles = []) {
+  return (Array.isArray(roles) ? roles : []).map((role) => ({
+    role: roleKeyForAuth(role),
+    loginVerified: !!role?.loginVerified,
+    reason: role?.reason || role?.reinjectionFailureReason || null,
+    reusedFromPreAuth: !!role?.reusedFromPreAuth,
+  }));
 }
 
 function hasBackendService(projectInfo = {}) {
@@ -6000,6 +6103,7 @@ async function runPipeline(config, runId) {
           routeCount: (result.artifact?.routes || []).length,
           keyFlowCount: (result.artifact?.keyFlows || []).length,
           routeAccessSummary,
+          authFlowRejected: explorationArtifact?.authFlowRejected || null,
         }, telemetryReporter);
       } catch (explErr) {
         Logger.warn('PipelineWorker', 'Exploration phase failed (best-effort)', { reason: explErr.message });
@@ -6022,46 +6126,52 @@ async function runPipeline(config, runId) {
     let roles = [];
     if (Array.isArray(config.testCredentials) && config.testCredentials.length > 0) {
       const preAuthRoles = Array.isArray(config._preAuthRoles) ? config._preAuthRoles : [];
-      const allPreAuthVerified = preAuthRoles.length > 0
-        && config.testCredentials.every((cred) => {
-          const role = normalizeRoleLabel(cred.role || cred.name || 'user');
-          return preAuthRoles.some((r) => normalizeRoleLabel(r.role || r.name || 'user') === role && r.loginVerified);
-        });
-      const hasAuthFlow = !!(explorationArtifact?.authFlow);
+      const allPreAuthVerified = allCredentialsCoveredByPreAuth(config.testCredentials, preAuthRoles);
+      const hasTrustedAuthFlow = shouldTrustDiscoveredAuthFlow(explorationArtifact?.authFlow);
 
-      if (allPreAuthVerified && !hasAuthFlow) {
+      if (allPreAuthVerified && !hasTrustedAuthFlow) {
         // Pre-auth storageStates are sufficient and there is no better authFlow
         // from exploration — skip the redundant login round-trip.
-        roles = preAuthRoles;
+        roles = preAuthRoles.map((role) => ({ ...role, reusedFromPreAuth: true }));
         Logger.info('PipelineWorker', 'Reusing pre-auth storageStates — skipping duplicate credential injection', {
-          roles: roles.map((r) => normalizeRoleLabel(r.role || r.name || 'user')),
+          roles: roles.map((r) => roleKeyForAuth(r)),
+          authFlowRejected: explorationArtifact?.authFlowRejected || null,
         });
         updateStatus(statusDir, 'auth_injected', {
           runId,
           message: `${roles.filter((r) => r.loginVerified).length}/${roles.length} role login(s) verified (reused from pre-auth)`,
-          roles: roles.map((r) => ({ role: normalizeRoleLabel(r.role || r.name || 'user'), loginVerified: !!r.loginVerified, reason: r.reason || null })),
+          roles: summarizeAuthRoles(roles),
+          authFlowRejected: explorationArtifact?.authFlowRejected || null,
         }, telemetryReporter);
       } else {
         // Either pre-auth failed for some roles OR exploration found a richer
         // authFlow — run a fresh injection so storageStates use the best available selectors.
         updateStatus(statusDir, 'auth_injecting', {
           runId,
-          message: hasAuthFlow
+          message: hasTrustedAuthFlow
             ? `Re-injecting credentials with discovered authFlow for ${config.testCredentials.length} role(s)...`
             : `Verifying credentials for ${config.testCredentials.length} role(s)...`,
+          authFlowRejected: explorationArtifact?.authFlowRejected || null,
         }, telemetryReporter);
         try {
-          roles = await injectCredentials({
+          const freshRoles = await injectCredentials({
             projectPath: config.projectPath,
             baseURL: config.baseURL,
             credentials: config.testCredentials,
-            authFlow: explorationArtifact?.authFlow || null,
+            authFlow: hasTrustedAuthFlow ? explorationArtifact?.authFlow : null,
           });
+          const mergedAuth = mergeCredentialInjectionRoles({ freshRoles, preAuthRoles });
+          roles = mergedAuth.roles;
           const verifiedCount = roles.filter((r) => r.loginVerified).length;
           updateStatus(statusDir, 'auth_injected', {
             runId,
-            message: `${verifiedCount}/${roles.length} role login(s) verified`,
-            roles: roles.map((r) => ({ role: normalizeRoleLabel(r.role || r.name || 'user'), loginVerified: !!r.loginVerified, reason: r.reason || null })),
+            message: mergedAuth.reusedPreAuthRoles.length > 0
+              ? `${verifiedCount}/${roles.length} role login(s) verified (${mergedAuth.reusedPreAuthRoles.length} reused from pre-auth after reinjection failure)`
+              : `${verifiedCount}/${roles.length} role login(s) verified`,
+            roles: summarizeAuthRoles(roles),
+            reusedPreAuthRoles: mergedAuth.reusedPreAuthRoles,
+            failedFreshRoles: mergedAuth.failedFreshRoles,
+            authFlowRejected: explorationArtifact?.authFlowRejected || null,
           }, telemetryReporter);
         } catch (credErr) {
           Logger.warn('PipelineWorker', 'Credential injection failed (best-effort)', { reason: credErr.message });
@@ -6540,27 +6650,45 @@ async function runPipeline(config, runId) {
     // redirect tests to /login or /signup.
     if (Array.isArray(config.testCredentials) && config.testCredentials.length > 0) {
       try {
+        const preAuthRoles = Array.isArray(config._preAuthRoles) ? config._preAuthRoles : [];
+        const hasTrustedAuthFlow = shouldTrustDiscoveredAuthFlow(explorationArtifact?.authFlow);
         updateStatus(statusDir, 'auth_refreshing', {
           runId,
           message: `Refreshing auth tokens before execution for ${config.testCredentials.length} role(s)...`,
+          authFlowRejected: explorationArtifact?.authFlowRejected || null,
         }, telemetryReporter);
         const freshRoles = await injectCredentials({
           projectPath: config.projectPath,
           baseURL: config.baseURL,
           credentials: config.testCredentials,
-          authFlow: explorationArtifact?.authFlow || null,
+          authFlow: hasTrustedAuthFlow ? explorationArtifact?.authFlow : null,
         });
-        const verifiedFresh = freshRoles.filter((r) => r.loginVerified);
-        if (verifiedFresh.length > 0) {
-          roles = freshRoles;
+        const mergedAuth = mergeCredentialInjectionRoles({
+          freshRoles,
+          preAuthRoles: roles.filter(hasVerifiedStorageState).length > 0 ? roles : preAuthRoles,
+        });
+        const verifiedFresh = freshRoles.filter(hasVerifiedStorageState);
+        const verifiedMerged = mergedAuth.roles.filter(hasVerifiedStorageState);
+        if (verifiedMerged.length > 0) {
+          roles = mergedAuth.roles;
           // Rewrite the fixture file so it embeds the freshest storageState paths
           // (paths don't change but this ensures the file exists post-generation).
-          ensureHealixFixtureImports({ projectPath: config.projectPath, roles: verifiedFresh });
+          ensureHealixFixtureImports({ projectPath: config.projectPath, roles: verifiedMerged });
         }
         Logger.info('PipelineWorker', 'Pre-execution auth refresh complete', {
           verified: verifiedFresh.length,
           total: freshRoles.length,
+          reusedPreAuthRoles: mergedAuth.reusedPreAuthRoles,
         });
+        if (mergedAuth.reusedPreAuthRoles.length > 0) {
+          updateStatus(statusDir, 'auth_refresh_reused_preauth', {
+            runId,
+            message: `${mergedAuth.reusedPreAuthRoles.length} role(s) kept verified pre-auth storageState after refresh failed`,
+            roles: summarizeAuthRoles(roles),
+            reusedPreAuthRoles: mergedAuth.reusedPreAuthRoles,
+            failedFreshRoles: mergedAuth.failedFreshRoles,
+          }, telemetryReporter);
+        }
       } catch (refreshErr) {
         Logger.warn('PipelineWorker', 'Pre-execution auth refresh failed — using existing storageState', {
           reason: refreshErr.message,
@@ -7177,6 +7305,9 @@ module.exports = {
   countTestsInContent,
   countSkippedTestsInContent,
   buildRouteAccessSummary,
+  allCredentialsCoveredByPreAuth,
+  mergeCredentialInjectionRoles,
+  shouldTrustDiscoveredAuthFlow,
   hasApiSurfaceForGeneration,
   effectiveApiEndpoints,
   isSyntheticHealthEndpoint,

@@ -21,6 +21,9 @@
 const fs = require('fs');
 const path = require('path');
 const Logger = require('./logger');
+const {
+  sanitizeAuthFlow,
+} = require('./auth-flow-utils');
 
 const AUTH_DIR_NAME = '.healix';
 const STATE_FILE_PREFIX = 'auth-state-';
@@ -30,6 +33,9 @@ const COMMON_LOGIN_PATHS = [
   '/sign-in',
   '/auth/login',
   '/auth/signin',
+  '/auth/sign-in',
+  '/users/sign_in',
+  '/account/login',
 ];
 
 function authDirFor(projectPath) {
@@ -74,8 +80,10 @@ function buildLoginCandidates(baseURL, authFlow = null) {
     } catch { /* ignore invalid candidate */ }
   };
 
-  if (authFlow?.loginUrl) {
-    pushUrl(authFlow.loginUrl);
+  const cleanAuthFlow = sanitizeAuthFlow(authFlow);
+
+  if (cleanAuthFlow?.loginUrl) {
+    pushUrl(cleanAuthFlow.loginUrl);
   } else {
     pushUrl(baseURL);
     for (const loginPath of COMMON_LOGIN_PATHS) pushUrl(loginPath);
@@ -126,8 +134,10 @@ async function driveLogin({ baseURL, authFlow, credentials, storageStatePath }) 
   const page = await context.newPage();
 
   try {
-    const userField = authFlow?.credentialFields?.username || 'input[type="email"], input[name="email"], input[name="username"], input[autocomplete="username"]';
-    const passField = authFlow?.credentialFields?.password || 'input[type="password"], input[name="password"]';
+    const cleanAuthFlow = sanitizeAuthFlow(authFlow);
+    const effectiveAuthFlow = cleanAuthFlow || null;
+    const userField = effectiveAuthFlow?.credentialFields?.username || 'input[type="email"], input[name="email"], input[name="username"], input[autocomplete="username"]';
+    const passField = effectiveAuthFlow?.credentialFields?.password || 'input[type="password"], input[name="password"]';
     const candidates = buildLoginCandidates(baseURL, authFlow);
     const attempted = [];
     let lastError = null;
@@ -146,7 +156,7 @@ async function driveLogin({ baseURL, authFlow, credentials, storageStatePath }) 
         const loginPathname = (() => { try { return new URL(page.url()).pathname; } catch { return candidatePathname; } })();
 
         // During discovery, do not spend 15s on a public home page that has no login form.
-        const fieldTimeout = authFlow?.loginUrl ? 15_000 : 4_000;
+        const fieldTimeout = effectiveAuthFlow?.loginUrl ? 15_000 : 4_000;
         await page.locator(userField).first().waitFor({ state: 'visible', timeout: fieldTimeout });
         await page.fill(userField, credentials.username, { timeout: 10_000 });
         await page.fill(passField, credentials.password, { timeout: 10_000 });
@@ -182,16 +192,16 @@ async function driveLogin({ baseURL, authFlow, credentials, storageStatePath }) 
         let loginVerified = finalPathname !== loginPathname;
 
         // Secondary signal: if a custom success indicator was provided, that overrides.
-        if (authFlow?.successIndicator) {
-          loginVerified = await page.locator(authFlow.successIndicator).first().isVisible({ timeout: 5_000 }).catch(() => false);
-        } else if (loginVerified && authFlow?.failureIndicator) {
+        if (effectiveAuthFlow?.successIndicator) {
+          loginVerified = await page.locator(effectiveAuthFlow.successIndicator).first().isVisible({ timeout: 5_000 }).catch(() => false);
+        } else if (loginVerified && effectiveAuthFlow?.failureIndicator) {
           // URL changed but still check no failure banner appeared (e.g. wrong-role redirect to error page)
-          const failureVisible = await page.locator(authFlow.failureIndicator).first().isVisible({ timeout: 1_000 }).catch(() => false);
+          const failureVisible = await page.locator(effectiveAuthFlow.failureIndicator).first().isVisible({ timeout: 1_000 }).catch(() => false);
           if (failureVisible) loginVerified = false;
         }
 
         if (!loginVerified) {
-          const visibleError = await readVisibleAuthError(page, authFlow);
+          const visibleError = await readVisibleAuthError(page, effectiveAuthFlow);
           return {
             ok: false,
             reason: visibleError

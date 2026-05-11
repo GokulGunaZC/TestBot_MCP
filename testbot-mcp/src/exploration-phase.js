@@ -23,6 +23,7 @@ const Logger = require('./logger');
 const { driveExploration } = require('./browser-use-driver');
 const { exploreWithPlaywright, enrichRoutesWithDOM } = require('./playwright-explorer');
 const { injectCredentials } = require('./credentials-injector');
+const { isUnsafeAuthFlow, sanitizeAuthFlow } = require('./auth-flow-utils');
 
 const EMPTY_ARTIFACT = Object.freeze({
   routes: [],
@@ -62,6 +63,34 @@ function primaryCredential(credentials) {
   }
   if (credentials.username && credentials.password) return credentials;
   return null;
+}
+
+function normalizeExplorationArtifact(rawArtifact = {}, source = 'unknown') {
+  const rawAuthFlow = rawArtifact?.authFlow || null;
+  const authFlow = sanitizeAuthFlow(rawAuthFlow);
+  const authFlowRejected = !!rawAuthFlow && !authFlow;
+  const observedErrors = Array.isArray(rawArtifact?.observedErrors) ? [...rawArtifact.observedErrors] : [];
+  if (authFlowRejected) {
+    const reason = isUnsafeAuthFlow(rawAuthFlow)
+      ? `Rejected non-login authFlow from ${source}: ${rawAuthFlow.loginUrl}`
+      : `Rejected low-confidence authFlow from ${source}: ${rawAuthFlow.loginUrl || 'unknown'}`;
+    observedErrors.push(reason);
+  }
+  return {
+    routes: Array.isArray(rawArtifact?.routes) ? rawArtifact.routes : [],
+    forms: Array.isArray(rawArtifact?.forms) ? rawArtifact.forms : [],
+    authFlow,
+    keyFlows: Array.isArray(rawArtifact?.keyFlows) ? rawArtifact.keyFlows : [],
+    observedErrors,
+    errorProbe: rawArtifact?.errorProbe || null,
+    authFlowRejected: authFlowRejected
+      ? {
+          loginUrl: rawAuthFlow.loginUrl || null,
+          reason: isUnsafeAuthFlow(rawAuthFlow) ? 'registration_or_signup_flow' : 'low_confidence_login_flow',
+          source,
+        }
+      : null,
+  };
 }
 
 async function runExplorationPhase({
@@ -161,14 +190,7 @@ async function runExplorationPhase({
     }
   }
 
-  const artifact = {
-    routes: Array.isArray(result.artifact?.routes) ? result.artifact.routes : [],
-    forms: Array.isArray(result.artifact?.forms) ? result.artifact.forms : [],
-    authFlow: result.artifact?.authFlow || null,
-    keyFlows: Array.isArray(result.artifact?.keyFlows) ? result.artifact.keyFlows : [],
-    observedErrors: Array.isArray(result.artifact?.observedErrors) ? result.artifact.observedErrors : [],
-    errorProbe: result.artifact?.errorProbe || null,
-  };
+  const artifact = normalizeExplorationArtifact(result.artifact, source);
 
   if (statusDir) {
     try {
@@ -188,4 +210,5 @@ async function runExplorationPhase({
 module.exports = {
   runExplorationPhase,
   EMPTY_ARTIFACT,
+  normalizeExplorationArtifact,
 };

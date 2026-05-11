@@ -21,6 +21,11 @@
  */
 
 const fs = require('fs');
+const {
+  chooseBetterAuthFlow,
+  sanitizeAuthFlow,
+  scoreAuthFlowCandidate,
+} = require('./auth-flow-utils');
 
 const MAX_ROUTES_PER_WALK = 12;
 const GOTO_TIMEOUT_MS = 15_000;
@@ -120,8 +125,47 @@ async function _collectRouteSignals(page) {
       }))
       .filter((e) => e.name);
 
-    return { anchors, forms, authElements, landmarks };
+    const headings = Array.from(document.querySelectorAll('h1, h2, h3'))
+      .map((el) => safeText(el))
+      .filter(Boolean)
+      .slice(0, 8);
+    const buttonTexts = landmarks.map((el) => el.name).filter(Boolean).slice(0, 20);
+    const title = document.title || '';
+
+    return { anchors, forms, authElements, landmarks, headings, buttonTexts, title };
   });
+}
+
+function _buildAuthFlowCandidate({ resolvedPathname, signals }) {
+  if (!signals?.authElements) return null;
+  const submitLabels = (signals.forms || []).map((form) => form.submitLabel).filter(Boolean);
+  const fields = (signals.forms || []).flatMap((form) =>
+    (form.fields || []).map((field) => `${field.name || ''} ${field.type || ''}`)
+  );
+  const credentialFields = {
+    username: signals.authElements.usernameSelector,
+    password: signals.authElements.passwordSelector,
+  };
+  const scored = scoreAuthFlowCandidate({
+    loginUrl: resolvedPathname,
+    credentialFields,
+    submitLabels,
+    headings: signals.headings || [],
+    buttonTexts: signals.buttonTexts || [],
+    title: signals.title || '',
+    fields,
+    hasPasswordField: true,
+  });
+  return {
+    loginUrl: resolvedPathname,
+    credentialFields,
+    successIndicator: '',
+    failureIndicator: '[role="alert"], .error, .alert-danger',
+    intent: scored.intent,
+    confidence: scored.confidence,
+    score: scored.score,
+    scoreReasons: scored.reasons,
+  };
 }
 
 /**
@@ -194,16 +238,11 @@ async function _walkRoutes({ browser, contextOptions, baseURL, origin, credentia
         formsOut.push({ route: pathKey, fields: form.fields, submitLabel: form.submitLabel });
       }
 
-      if (!authFlow && signals.authElements) {
-        authFlow = {
-          loginUrl: resolvedPathname,
-          credentialFields: {
-            username: signals.authElements.usernameSelector,
-            password: signals.authElements.passwordSelector,
-          },
-          successIndicator: '',
-          failureIndicator: '[role="alert"], .error, .alert-danger',
-        };
+      if (signals.authElements) {
+        authFlow = chooseBetterAuthFlow(
+          authFlow,
+          _buildAuthFlowCandidate({ resolvedPathname, signals })
+        );
       }
 
       for (const a of signals.anchors || []) {
@@ -240,7 +279,7 @@ async function _walkRoutes({ browser, contextOptions, baseURL, origin, credentia
       });
     }
 
-    return { routes, forms: formsOut, authFlow, keyFlows, observedErrors };
+    return { routes, forms: formsOut, authFlow: sanitizeAuthFlow(authFlow), keyFlows, observedErrors };
   } finally {
     try { await context.close(); } catch { /* ignore */ }
   }
@@ -275,7 +314,7 @@ function _mergeWalks(walks) {
     for (const form of walk.forms || []) {
       if (!formMap.has(form.route)) formMap.set(form.route, form);
     }
-    if (!authFlow && walk.authFlow) authFlow = walk.authFlow;
+    authFlow = chooseBetterAuthFlow(authFlow, walk.authFlow);
     for (const kf of walk.keyFlows || []) {
       if (!keyFlowNames.has(kf.name)) {
         keyFlowNames.add(kf.name);
@@ -290,7 +329,7 @@ function _mergeWalks(walks) {
   return {
     routes: Array.from(routeMap.values()),
     forms: Array.from(formMap.values()),
-    authFlow,
+    authFlow: sanitizeAuthFlow(authFlow),
     keyFlows,
     observedErrors: Array.from(errorSet).slice(0, 20),
   };
@@ -462,4 +501,6 @@ async function enrichRoutesWithDOM({ baseURL, routes = [], storageStatePaths = [
 module.exports = {
   exploreWithPlaywright,
   enrichRoutesWithDOM,
+  _buildAuthFlowCandidate,
+  _mergeWalks,
 };

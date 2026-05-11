@@ -86,6 +86,9 @@ def _build_task(target_url, username, password):
             f"  If you land on a login page OR get redirected to one, fill in\n"
             f"  the username/email field with {username!r} and the password field\n"
             f"  with {password!r}, then click the submit button.\n"
+            f"  Do NOT use register, signup, create-account, or onboarding forms\n"
+            f"  as login forms. If both /login and /register exist, loginUrl MUST\n"
+            f"  point to the sign-in/login page only.\n"
             f"  Wait for the authenticated page to load before continuing.\n"
             f"  Record loginUrl, credentialFields selectors, successIndicator, failureIndicator.\n"
         )
@@ -160,10 +163,27 @@ def _normalize_artifact(parsed):
 
 
 def _build_llm():
-    """Construct the ChatOpenAI LLM instance via the Healix webapp proxy."""
+    """Construct the browser-use LLM instance.
+
+    Prefer Browser Use Cloud's optimized model when BROWSER_USE_API_KEY is
+    present. Otherwise route OpenAI-compatible calls through the Healix webapp
+    proxy so users do not need a local OPENAI_API_KEY.
+    """
     model = os.environ.get("HEALIX_BROWSER_USE_MODEL", "gpt-4o-mini")
     api_key = os.environ.get("HEALIX_API_KEY")
     base_url = os.environ.get("HEALIX_LLM_PROXY_URL")
+
+    if os.environ.get("BROWSER_USE_API_KEY") or os.environ.get("HEALIX_BROWSER_USE_API_KEY"):
+        for import_path, ctor in (
+            ("browser_use.llm", "ChatBrowserUse"),
+            ("browser_use", "ChatBrowserUse"),
+        ):
+            try:
+                module = __import__(import_path, fromlist=[ctor])
+                cls = getattr(module, ctor)
+                return cls()
+            except Exception:
+                continue
 
     # temperature=0 gives deterministic, faster responses (no sampling overhead).
     for import_path, ctor in (
@@ -191,10 +211,13 @@ async def _drive_agent(target_url, username, password, timeout_s):
 
     llm = _build_llm()
     if llm is None:
-        _emit({"type": "error", "reason": "Could not construct LLM — check HEALIX_API_KEY and HEALIX_LLM_PROXY_URL"})
+        _emit({"type": "error", "reason": "Could not construct LLM — check BROWSER_USE_API_KEY or HEALIX_API_KEY/HEALIX_LLM_PROXY_URL"})
         return None
 
-    _emit({"type": "progress", "message": "LLM routed through Healix webapp proxy"})
+    if os.environ.get("BROWSER_USE_API_KEY") or os.environ.get("HEALIX_BROWSER_USE_API_KEY"):
+        _emit({"type": "progress", "message": "LLM routed through Browser Use Cloud"})
+    else:
+        _emit({"type": "progress", "message": "LLM routed through Healix webapp proxy"})
 
     task = _build_task(target_url, username, password)
 
@@ -289,11 +312,13 @@ def main():
         })
         sys.exit(2)
 
-    if not os.environ.get("HEALIX_API_KEY") or not os.environ.get("HEALIX_LLM_PROXY_URL"):
+    has_browser_use_key = os.environ.get("BROWSER_USE_API_KEY") or os.environ.get("HEALIX_BROWSER_USE_API_KEY")
+    has_healix_proxy = os.environ.get("HEALIX_API_KEY") and os.environ.get("HEALIX_LLM_PROXY_URL")
+    if not has_browser_use_key and not has_healix_proxy:
         _emit({
             "type": "error",
             "reason": (
-                "HEALIX_API_KEY or HEALIX_LLM_PROXY_URL not set."
+                "BROWSER_USE_API_KEY or HEALIX_API_KEY/HEALIX_LLM_PROXY_URL not set."
                 " The Node driver sets these automatically from your MCP config."
                 " The driver will fall back to heuristic Playwright exploration."
             ),

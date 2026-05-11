@@ -29,6 +29,13 @@ const RUNNER_SCRIPT = path.join(__dirname, '..', 'scripts', 'browser_use_runner.
 const DEFAULT_TIMEOUT_MS = 180_000;
 
 function resolvePython() {
+  const configured = process.env.HEALIX_BROWSER_USE_PYTHON || process.env.BROWSER_USE_PYTHON;
+  if (configured) {
+    try {
+      const res = spawnSync(configured, ['--version'], { stdio: 'ignore' });
+      if (res.status === 0) return configured;
+    } catch { /* fall through to PATH candidates */ }
+  }
   const candidates = process.platform === 'win32'
     ? ['py', 'python', 'python3']
     : ['python3', 'python'];
@@ -107,6 +114,8 @@ function driveExploration({
       HEALIX_LOGIN_PASSWORD: credentials?.password || '',
       HEALIX_TOTAL_TIMEOUT_S: String(Math.max(10, Math.round(totalTimeoutMs / 1000))),
       HEALIX_ALL_ROLES: allRoles,
+      BROWSER_USE_API_KEY: process.env.BROWSER_USE_API_KEY || process.env.HEALIX_BROWSER_USE_API_KEY || '',
+      HEALIX_BROWSER_USE_API_KEY: process.env.HEALIX_BROWSER_USE_API_KEY || process.env.BROWSER_USE_API_KEY || '',
       // Proxy-mode credentials — forwarded to browser_use_runner.py so it
       // authenticates LLM calls via the Healix webapp rather than a local key.
       HEALIX_LLM_PROXY_URL: llmProxyUrl,

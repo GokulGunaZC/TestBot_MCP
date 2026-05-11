@@ -11,6 +11,7 @@ const {
 
 const {
   buildRouteAccessSummary,
+  allCredentialsCoveredByPreAuth,
   buildGenerationRepairContext,
   minimumUsefulRunnableFloor,
   adaptiveRunnableFloor,
@@ -29,6 +30,7 @@ const {
   getCursorFixtureContent,
   maybeRunFailureTriage,
   maybeExpandGenerationStageBudget,
+  mergeCredentialInjectionRoles,
   isRepairableGenerationFailure,
   isBrittleGeneratedTestBlock,
   isSyntheticHealthEndpoint,
@@ -37,6 +39,7 @@ const {
   quarantineGeneratedSpecFiles,
   resolveGenerationAgentConcurrency,
   shouldAutoSwitchPortForConflict,
+  shouldTrustDiscoveredAuthFlow,
   buildTargetPortInUseError,
   rewriteStartCommandForPort,
   writeSupplementalAuthConfig,
@@ -945,6 +948,46 @@ test('route access summary marks reachable public apps without auth flow', () =>
   assert.equal(summary.authFlowDetected, false);
   assert.deepEqual(summary.publicRoutes, ['/', '/projects']);
   assert.deepEqual(summary.protectedRoutes, ['/admin']);
+});
+
+test('auth reinjection merge preserves verified pre-auth storageState when fresh login fails', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'healix-auth-merge-'));
+  try {
+    const statePath = path.join(root, 'auth-state-admin.json');
+    fs.writeFileSync(statePath, JSON.stringify({ cookies: [], origins: [] }));
+    const preAuthRoles = [
+      { role: 'admin', storageStatePath: statePath, loginVerified: true },
+    ];
+    const freshRoles = [
+      { role: 'admin', storageStatePath: null, loginVerified: false, reason: 'Login failed on /register: email_in_use' },
+    ];
+
+    assert.equal(allCredentialsCoveredByPreAuth([{ role: 'admin' }], preAuthRoles), true);
+    const merged = mergeCredentialInjectionRoles({ freshRoles, preAuthRoles });
+
+    assert.equal(merged.roles.length, 1);
+    assert.equal(merged.roles[0].loginVerified, true);
+    assert.equal(merged.roles[0].storageStatePath, statePath);
+    assert.equal(merged.roles[0].reusedFromPreAuth, true);
+    assert.deepEqual(merged.reusedPreAuthRoles, ['admin']);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('pipeline trusts login authFlow but refuses register authFlow for reinjection', () => {
+  assert.equal(shouldTrustDiscoveredAuthFlow({
+    loginUrl: '/login',
+    credentialFields: { username: 'input[name="email"]', password: 'input[type="password"]' },
+    score: 120,
+    intent: 'login',
+  }), true);
+  assert.equal(shouldTrustDiscoveredAuthFlow({
+    loginUrl: '/register',
+    credentialFields: { username: 'input[name="email"]', password: 'input[type="password"]' },
+    score: -50,
+    intent: 'register',
+  }), false);
 });
 
 test('generation repair context feeds quality failures back into the next generation call', () => {
