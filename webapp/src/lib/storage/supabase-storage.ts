@@ -6,23 +6,28 @@
 import { createClient } from '@supabase/supabase-js'
 import { createHash } from 'crypto'
 
-const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL!
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!
 const BUCKET_NAME = 'test-artifacts'
 
-if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-  console.warn('[SupabaseStorage] Missing Supabase configuration - storage uploads will be skipped')
-  console.warn('[SupabaseStorage] SUPABASE_URL present:', !!SUPABASE_URL)
-  console.warn('[SupabaseStorage] SUPABASE_SERVICE_ROLE_KEY present:', !!SUPABASE_SERVICE_ROLE_KEY)
+// Lazily-initialised admin client — createClient() must NOT run at module load
+// time because SUPABASE_SERVICE_ROLE_KEY is absent during `next build` (it is a
+// runtime secret, not a build-time ARG). Calling getSupabaseAdmin() at request
+// time ensures the env var is populated before the client is constructed.
+let _supabaseAdmin: ReturnType<typeof createClient> | null = null
+function getSupabaseAdmin() {
+  if (_supabaseAdmin) return _supabaseAdmin
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY
+  if (!url || !key) {
+    console.warn('[SupabaseStorage] Missing Supabase configuration - storage uploads will be skipped')
+    console.warn('[SupabaseStorage] SUPABASE_URL present:', !!url)
+    console.warn('[SupabaseStorage] SUPABASE_SERVICE_ROLE_KEY present:', !!key)
+    throw new Error('Supabase not configured - set NEXT_PUBLIC_SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY')
+  }
+  _supabaseAdmin = createClient(url, key, {
+    auth: { autoRefreshToken: false, persistSession: false },
+  })
+  return _supabaseAdmin
 }
-
-// Create admin client with service role for server-side uploads
-const supabaseAdmin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
-  auth: {
-    autoRefreshToken: false,
-    persistSession: false,
-  },
-})
 
 export interface UploadArtifactParams {
   runId: string
@@ -46,11 +51,11 @@ export interface UploadedArtifact {
  * Ensure the test-artifacts bucket exists
  */
 export async function ensureBucketExists(): Promise<void> {
-  const { data: buckets } = await supabaseAdmin.storage.listBuckets()
-  const bucketExists = buckets?.some((b) => b.name === BUCKET_NAME)
+  const { data: buckets } = await getSupabaseAdmin().storage.listBuckets()
+  const bucketExists = buckets?.some((b: { name: string }) => b.name === BUCKET_NAME)
 
   if (!bucketExists) {
-    const { error } = await supabaseAdmin.storage.createBucket(BUCKET_NAME, {
+    const { error } = await getSupabaseAdmin().storage.createBucket(BUCKET_NAME, {
       public: false, // Private bucket - use signed URLs
       fileSizeLimit: 157286400, // 150MB per file
       allowedMimeTypes: [
@@ -80,7 +85,7 @@ async function uploadWithRetry(
   maxRetries = 3
 ): Promise<{ error: Error | null }> {
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    const result = await supabaseAdmin.storage.from(bucket).upload(path, buffer, options)
+    const result = await getSupabaseAdmin().storage.from(bucket).upload(path, buffer, options)
     
     if (!result.error) {
       return result
@@ -106,11 +111,6 @@ async function uploadWithRetry(
 
 export async function uploadArtifact(params: UploadArtifactParams): Promise<UploadedArtifact> {
   const { runId, testName, artifactType, fileName, fileBuffer, contentType } = params
-
-  // Check if Supabase is configured
-  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-    throw new Error('Supabase not configured - set NEXT_PUBLIC_SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY')
-  }
 
   // Generate a short deterministic hash from testName to make paths unique per test.
   // This prevents collisions for generic Playwright filenames like video.webm / test-failed-1.png.
@@ -146,7 +146,7 @@ export async function uploadArtifact(params: UploadArtifactParams): Promise<Uplo
   console.log(`[SupabaseStorage] Successfully uploaded ${fileName}`)
 
   // Get signed URL (valid for 1 year)
-  const { data, error: signError } = await supabaseAdmin.storage
+  const { data, error: signError } = await getSupabaseAdmin().storage
     .from(BUCKET_NAME)
     .createSignedUrl(storagePath, 31536000) // 1 year in seconds
 
@@ -193,7 +193,7 @@ export async function uploadArtifactsBatch(
  * Delete artifacts for a test run
  */
 export async function deleteArtifactsForRun(runId: string): Promise<void> {
-  const { data: files, error: listError } = await supabaseAdmin.storage
+  const { data: files, error: listError } = await getSupabaseAdmin().storage
     .from(BUCKET_NAME)
     .list(runId, {
       limit: 1000,
@@ -207,9 +207,9 @@ export async function deleteArtifactsForRun(runId: string): Promise<void> {
     return
   }
 
-  const filePaths = files.map((file) => `${runId}/${file.name}`)
+  const filePaths = files.map((file: { name: string }) => `${runId}/${file.name}`)
 
-  const { error: deleteError } = await supabaseAdmin.storage.from(BUCKET_NAME).remove(filePaths)
+  const { error: deleteError } = await getSupabaseAdmin().storage.from(BUCKET_NAME).remove(filePaths)
 
   if (deleteError) {
     throw new Error(`Failed to delete artifacts: ${deleteError.message}`)
@@ -220,7 +220,7 @@ export async function deleteArtifactsForRun(runId: string): Promise<void> {
  * Get signed URL for an artifact (valid for 1 year)
  */
 export async function getArtifactSignedUrl(storagePath: string): Promise<string> {
-  const { data, error } = await supabaseAdmin.storage
+  const { data, error } = await getSupabaseAdmin().storage
     .from(BUCKET_NAME)
     .createSignedUrl(storagePath, 31536000) // 1 year in seconds
 

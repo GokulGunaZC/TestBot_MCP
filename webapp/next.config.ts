@@ -2,6 +2,14 @@ import type { NextConfig } from "next";
 import path from "path";
 
 const nextConfig: NextConfig = {
+  // Produces a self-contained server at .next/standalone — used by the
+  // Docker runner stage so we ship compiled JS only, no TypeScript source.
+  output: 'standalone',
+  // Trace files from the monorepo root, not the webapp/ subdir, so the
+  // standalone server bundles shared workspace files correctly.
+  outputFileTracingRoot: path.resolve(__dirname, '..'),
+  // Never ship source maps to clients — they de-obfuscate the bundle.
+  productionBrowserSourceMaps: false,
   turbopack: {
     root: path.resolve(__dirname, '..'),
   },

@@ -1,0 +1,72 @@
+# =============================================================================
+# Dockerfile.dockerignore — build-context filter for webapp/Dockerfile.
+#
+# IMPORTANT: This file sits adjacent to webapp/Dockerfile. BuildKit uses it
+# instead of a root .dockerignore when the build is run with:
+#   docker build -f webapp/Dockerfile .
+# All paths are relative to the BUILD CONTEXT ROOT (the monorepo root).
+#
+# Two goals:
+#   1. Keep the context small (skip node_modules, .next, test artefacts).
+#   2. Never let .env.local or other secret files reach any image layer.
+# =============================================================================
+
+# ── Dependencies (re-installed inside the image) ────────────────────────────
+**/node_modules
+**/.pnp
+**/.pnp.*
+
+# ── Build output (rebuilt inside the image) ─────────────────────────────────
+webapp/.next
+webapp/out
+webapp/build
+dist
+
+# ── Environment / secrets (CRITICAL — never enter the image) ────────────────
+**/.env
+**/.env.*
+# Explicitly re-allow the example templates (harmless, no real values).
+!webapp/.env.example
+!webapp/.env.docker.example
+
+# ── Docker artefacts (not needed inside the context) ────────────────────────
+webapp/Dockerfile*
+webapp/docker-compose*.yml
+webapp/Dockerfile.dockerignore
+
+# ── Source control / IDE / CI ───────────────────────────────────────────────
+.git
+.gitignore
+.github
+.vscode
+.idea
+.claude
+.windsurf
+.cursor
+**/.DS_Store
+**/Thumbs.db
+
+# ── Test artefacts ───────────────────────────────────────────────────────────
+webapp/tests
+webapp/playwright-report
+webapp/test-results
+webapp/healix-reports
+webapp/.healix
+webapp/coverage
+testbot-mcp/tests
+
+# ── TypeScript build cache ───────────────────────────────────────────────────
+**/*.tsbuildinfo
+webapp/next-env.d.ts
+
+# ── Logs ────────────────────────────────────────────────────────────────────
+**/*.log
+**/npm-debug.log*
+
+# ── Notebooks / local scripts ────────────────────────────────────────────────
+notebooks
+scripts
+
+# ── Docs / markdown (optional — saves context size) ─────────────────────────
+*.md
+docs
