@@ -12,6 +12,7 @@ const {
   _mergeWalks,
 } = require('../src/playwright-explorer');
 const {
+  artifactHasUsefulContext,
   normalizeExplorationArtifact,
 } = require('../src/exploration-phase');
 
@@ -83,4 +84,13 @@ test('exploration artifact normalizer drops unsafe browser-use authFlow', () => 
   assert.equal(artifact.authFlow, null);
   assert.equal(artifact.authFlowRejected.reason, 'registration_or_signup_flow');
   assert.match(artifact.observedErrors.join('\n'), /Rejected non-login authFlow/);
+});
+
+test('exploration useful-context gate rejects empty browser-use artifacts', () => {
+  assert.equal(artifactHasUsefulContext({ routes: [], forms: [], keyFlows: [], authFlow: null }), false);
+  assert.equal(artifactHasUsefulContext({ routes: [{ path: '/login', requiresAuth: false }], authFlow: { loginUrl: '/login' } }), false);
+  assert.equal(artifactHasUsefulContext({ authFlow: { loginUrl: '/login' } }), false);
+  assert.equal(artifactHasUsefulContext({ routes: [{ path: '/', requiresAuth: false }] }), true);
+  assert.equal(artifactHasUsefulContext({ forms: [{ route: '/', fields: [] }] }), true);
+  assert.equal(artifactHasUsefulContext({ keyFlows: [{ name: 'checkout', steps: [] }] }), true);
 });

@@ -159,6 +159,7 @@ function driveExploration({
     let artifact = null;
     let errorReason = null;
     let buffer = '';
+    const runnerErrors = [];
 
     const proc = spawn(pythonCmd, [RUNNER_SCRIPT], { env, stdio: ['ignore', 'pipe', 'pipe'] });
 
@@ -192,6 +193,7 @@ function driveExploration({
         }
         if (event?.type === 'error' && event.reason) {
           errorReason = event.reason;
+          runnerErrors.push(String(event.reason).slice(0, 240));
         }
       }
     });
@@ -202,6 +204,15 @@ function driveExploration({
 
     proc.on('close', (code) => {
       if (artifact) {
+        if (runnerErrors.length > 0) {
+          artifact = {
+            ...artifact,
+            observedErrors: [
+              ...(Array.isArray(artifact.observedErrors) ? artifact.observedErrors : []),
+              ...runnerErrors.map((reason) => `browser-use warning: ${reason}`),
+            ],
+          };
+        }
         settle({ available: true, artifact });
         return;
       }

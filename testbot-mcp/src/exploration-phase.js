@@ -93,6 +93,34 @@ function normalizeExplorationArtifact(rawArtifact = {}, source = 'unknown') {
   };
 }
 
+function artifactHasUsefulContext(artifact = {}) {
+  if (!artifact || typeof artifact !== 'object') return false;
+  const routes = Array.isArray(artifact.routes) ? artifact.routes : [];
+  const nonAuthRouteCount = routes.filter((route) => {
+    const pathValue = String(route?.path || route?.url || '').toLowerCase();
+    return pathValue && !/(^|\/|#)(login|sign-in|signin|auth|register|signup|sign-up)(\/|$|\?)/.test(pathValue);
+  }).length;
+  const formCount = Array.isArray(artifact.forms) ? artifact.forms.length : 0;
+  const keyFlowCount = Array.isArray(artifact.keyFlows) ? artifact.keyFlows.length : 0;
+  // An authFlow or login-only route is not enough; that is exactly the
+  // failure mode where browser-use stalled before mapping the application.
+  return Boolean(nonAuthRouteCount > 0 || formCount > 0 || keyFlowCount > 0);
+}
+
+async function runPlaywrightFallback({ baseURL, credsForAgent, preAuthRoles }) {
+  const fallback = await exploreWithPlaywright({
+    baseURL,
+    credentials: credsForAgent,
+    storageStatePaths: preAuthRoles,
+    onHeartbeat: () => { /* noop */ },
+  });
+  if (!fallback.available) return fallback;
+  return {
+    ...fallback,
+    artifact: await _applyDOMEnrichment(fallback.artifact, { baseURL, preAuthRoles }),
+  };
+}
+
 async function runExplorationPhase({
   statusDir,
   baseURL,
@@ -154,28 +182,61 @@ async function runExplorationPhase({
   let source = 'browser-use';
 
   if (result.available) {
-    // Playwright DOM enrichment runs after browser-use to capture labels,
-    // select options, button disabled state, headings, and error probe text.
-    result = {
-      ...result,
-      artifact: await _applyDOMEnrichment(result.artifact, { baseURL, preAuthRoles }),
-    };
-    source = 'browser-use+playwright-enrichment';
+    if (artifactHasUsefulContext(result.artifact)) {
+      // Playwright DOM enrichment runs after browser-use to capture labels,
+      // select options, button disabled state, headings, and error probe text.
+      result = {
+        ...result,
+        artifact: await _applyDOMEnrichment(result.artifact, { baseURL, preAuthRoles }),
+      };
+      source = 'browser-use+playwright-enrichment';
+    } else {
+      Logger.warn('ExplorationPhase', 'browser-use returned no usable context — falling back to Playwright heuristic', {
+        observedErrors: result.artifact?.observedErrors || [],
+      });
+      const fallback = await runPlaywrightFallback({ baseURL, credsForAgent, preAuthRoles });
+      if (fallback.available) {
+        const fallbackArtifact = fallback.artifact || {};
+        const browserAuthFlow = result.artifact?.authFlow || null;
+        const observedErrors = [
+          ...(Array.isArray(result.artifact?.observedErrors) ? result.artifact.observedErrors : []),
+          'browser-use returned no usable context; used Playwright heuristic fallback',
+          ...(Array.isArray(fallbackArtifact.observedErrors) ? fallbackArtifact.observedErrors : []),
+        ];
+        result = {
+          ...fallback,
+          artifact: {
+            ...fallbackArtifact,
+            authFlow: fallbackArtifact.authFlow || browserAuthFlow,
+            observedErrors,
+          },
+        };
+        source = 'browser-use-empty+playwright-heuristic+enrichment';
+      } else {
+        Logger.warn('ExplorationPhase', 'No exploration available after empty browser-use result — degrading to empty artifact', {
+          fallbackReason: fallback.reason,
+        });
+        return {
+          artifact: {
+            ...EMPTY_ARTIFACT,
+            observedErrors: [
+              ...(Array.isArray(result.artifact?.observedErrors) ? result.artifact.observedErrors : []),
+              `Playwright fallback unavailable after empty browser-use result: ${fallback.reason || 'unknown'}`,
+            ],
+          },
+          source: 'unavailable',
+          reason: fallback.reason || 'browser-use returned no usable context',
+          preAuthRoles,
+        };
+      }
+    }
   } else {
     Logger.info('ExplorationPhase', 'browser-use unavailable — falling back to Playwright heuristic', {
       reason: result.reason,
     });
-    const fallback = await exploreWithPlaywright({
-      baseURL,
-      credentials: credsForAgent,
-      storageStatePaths: preAuthRoles,
-      onHeartbeat: () => { /* noop */ },
-    });
+    const fallback = await runPlaywrightFallback({ baseURL, credsForAgent, preAuthRoles });
     if (fallback.available) {
-      result = {
-        ...fallback,
-        artifact: await _applyDOMEnrichment(fallback.artifact, { baseURL, preAuthRoles }),
-      };
+      result = fallback;
       source = 'playwright-heuristic+enrichment';
     } else {
       Logger.warn('ExplorationPhase', 'No exploration available — degrading to empty artifact', {
@@ -211,4 +272,5 @@ module.exports = {
   runExplorationPhase,
   EMPTY_ARTIFACT,
   normalizeExplorationArtifact,
+  artifactHasUsefulContext,
 };

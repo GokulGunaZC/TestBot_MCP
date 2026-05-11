@@ -355,8 +355,11 @@ async def _drive_agent(target_url, username, password, timeout_s):
 
     parsed = _extract_json(text)
     if parsed is None:
-        _emit({"type": "progress", "message": "agent returned no parseable JSON — emitting empty artifact"})
-        return dict(_ARTIFACT_TEMPLATE)
+        reason = "agent returned no parseable JSON"
+        _emit({"type": "error", "reason": reason})
+        artifact = dict(_ARTIFACT_TEMPLATE)
+        artifact["observedErrors"] = [f"browser-use: {reason}"]
+        return artifact
     return _normalize_artifact(parsed)
 
 
