@@ -29,6 +29,18 @@
 
 const CLASSIFIERS = [
   {
+    id: 'hardcoded_base_url_mismatch',
+    // Generated specs must use Playwright's configured baseURL or relative
+    // routes. A hardcoded external origin is a generation-quality failure, not
+    // a Playwright crash or target-app failure.
+    test: (s) => /HARDCODED_BASE_URL_MISMATCH/i.test(s)
+      || /Generated suite hardcoded a different app origin than baseURL/i.test(s)
+      || /hardcoded a different app origin/i.test(s),
+    stage: 'generation',
+    errorCode: 'HARDCODED_BASE_URL_MISMATCH',
+    userFacingMessage: 'Generated tests used an absolute URL whose origin does not match the configured baseURL. Healix blocked execution because those tests would exercise the wrong app. Regenerate with source-grounded routes and relative page.goto("/route") calls.',
+  },
+  {
     id: 'fixture_module_type_mismatch',
     // The smoking gun for the pm-app regression: Node parsed the generated
     // __healix-fixture.js as ESM but the body used module.exports (CJS).

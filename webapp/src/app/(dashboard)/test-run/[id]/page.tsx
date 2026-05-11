@@ -2044,6 +2044,17 @@ function buildSuggestedFix(error: PipelineErrorShape): SuggestedFix | null {
     };
   }
 
+  if (code === 'HARDCODED_BASE_URL_MISMATCH') {
+    return {
+      title: 'Suggested fix — generated tests targeted the wrong origin',
+      steps: [
+        { action: 'Regenerate source-grounded tests', detail: 'The suite contained absolute URLs outside the configured baseURL. Healix should regenerate tests that use observed routes from the target app only.' },
+        { action: 'Use relative navigation in generated specs', code: "await page.goto('/actual-route-from-context');" },
+        { action: 'Do not use placeholder hosts', detail: 'Generated tests must not call `https://example.com`, guessed localhost ports, or any origin other than the configured baseURL unless the target app source explicitly defines that external API contract.' },
+      ],
+    };
+  }
+
   if (code === 'PLAYWRIGHT_DEPENDENCY_MISSING') {
     return {
       title: 'Suggested fix — install @playwright/test',
@@ -2181,9 +2192,16 @@ function PipelineErrorBanner({ error, runId }: { error: PipelineErrorShape; runI
   const [specOpen, setSpecOpen] = useState(false);
   const [copied, setCopied] = useState(false);
 
-  const stage = error.stage || 'unknown';
-  const reason = error.reason || 'unknown_reason';
   const code = error.errorCode || null;
+  const isHardcodedBaseUrlMismatch = code === 'HARDCODED_BASE_URL_MISMATCH'
+    || /Generated suite hardcoded a different app origin than baseURL|hardcoded a different app origin/i.test(
+      `${error.userFacingMessage ?? ''} ${error.stderr ?? ''} ${error.reason ?? ''}`
+    );
+  const stage = isHardcodedBaseUrlMismatch ? 'generation' : (error.stage || 'unknown');
+  const reason = isHardcodedBaseUrlMismatch ? 'hardcoded_base_url_mismatch' : (error.reason || 'unknown_reason');
+  const displayMessage = isHardcodedBaseUrlMismatch && !error.userFacingMessage
+    ? 'Generated tests used an absolute URL outside the configured baseURL. Healix blocked execution so results do not come from the wrong target app.'
+    : error.userFacingMessage;
 
   const errorBlob = `${code ?? ''} ${error.userFacingMessage ?? ''} ${error.stderr ?? ''} ${reason}`;
   const isCreditsError = /INSUFFICIENT_CREDITS|No credits remaining|Insufficient credits/i.test(errorBlob);
@@ -2192,6 +2210,7 @@ function PipelineErrorBanner({ error, runId }: { error: PipelineErrorShape; runI
   }
 
   const stageLabel =
+    code === 'HARDCODED_BASE_URL_MISMATCH' ? 'Generated tests targeted the wrong app origin' :
     stage === 'validation' ? 'Generated tests failed Playwright validation' :
     stage === 'generation' ? 'Test generation failed' :
     stage === 'server_start' ? 'Dev server failed to start' :
@@ -2200,9 +2219,9 @@ function PipelineErrorBanner({ error, runId }: { error: PipelineErrorShape; runI
 
   const promptForAgent = [
     `Healix pipeline failed at stage: ${stage} (${reason}${code ? ' · ' + code : ''}).`,
-    error.userFacingMessage ? `Summary: ${error.userFacingMessage}` : '',
+    displayMessage ? `Summary: ${displayMessage}` : '',
     '',
-    'Playwright stderr:',
+    stage === 'execution' ? 'Playwright stderr:' : 'Pipeline diagnostics:',
     '```',
     (error.stderr || '(none)').slice(0, 3000),
     '```',
@@ -2270,9 +2289,9 @@ function PipelineErrorBanner({ error, runId }: { error: PipelineErrorShape; runI
         </button>
       </div>
 
-      {error.userFacingMessage && (
+      {displayMessage && (
         <div className="px-5 py-3 text-[13px] text-[#D8E8FF]/85 border-b border-red-500/10 leading-relaxed">
-          {error.userFacingMessage}
+          {displayMessage}
         </div>
       )}
 
@@ -2293,7 +2312,7 @@ function PipelineErrorBanner({ error, runId }: { error: PipelineErrorShape; runI
             onClick={() => setStderrOpen(o => !o)}
             className="w-full px-5 py-2.5 text-left text-[11px] uppercase tracking-wider text-[#FCA5A5] font-semibold flex items-center justify-between hover:bg-white/[0.02] transition-colors"
           >
-            <span>Playwright stderr</span>
+            <span>{stage === 'execution' ? 'Playwright stderr' : 'Pipeline diagnostics'}</span>
             <span className="text-[#FCA5A5]/70">{stderrOpen ? '▾' : '▸'}</span>
           </button>
           {stderrOpen && (

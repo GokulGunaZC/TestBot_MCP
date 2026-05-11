@@ -5,6 +5,10 @@ const path = require('node:path');
 const test = require('node:test');
 
 const {
+  classifyPipelineErrorFromStderr,
+} = require('../src/failure-triage/pipeline-error-classifier');
+
+const {
   buildRouteAccessSummary,
   buildGenerationRepairContext,
   collectGenerationQuality,
@@ -145,6 +149,47 @@ test('quality gates reject hardcoded origins that do not match configured baseUR
     const gate = evaluateGenerationQualityGates({
       config: { testType: 'frontend', coverageProfile: 'balanced', baseURL: 'http://localhost:5173' },
       context: { pages: [{ path: '/calendar' }] },
+      quality,
+      prdContent: '',
+      parsedPRD: {},
+      requirementsCoverage: {},
+    });
+
+    assert.equal(gate.ok, false);
+    assert.equal(gate.error.code, 'HARDCODED_BASE_URL_MISMATCH');
+    assert.equal(gate.error.diagnostics.stage, 'generation');
+    assert.equal(gate.error.diagnostics.reason, 'hardcoded_base_url_mismatch');
+    assert.equal(gate.error.diagnostics.errorCode, 'HARDCODED_BASE_URL_MISMATCH');
+  });
+});
+
+test('pipeline error classifier treats hardcoded baseURL mismatch as generation quality failure', () => {
+  const classified = classifyPipelineErrorFromStderr({
+    stderr: 'Generated suite hardcoded a different app origin than baseURL (api-suite.spec.ts:https://example.com).',
+    hintedStage: null,
+  });
+
+  assert.equal(classified.stage, 'generation');
+  assert.equal(classified.reason, 'hardcoded_base_url_mismatch');
+  assert.equal(classified.errorCode, 'HARDCODED_BASE_URL_MISMATCH');
+});
+
+test('quality gates reject placeholder external API hosts even without a configured baseURL', () => {
+  withGeneratedSuite(`
+    import { test, expect, request } from '@playwright/test';
+
+    test('placeholder api contract', async ({ request }) => {
+      const response = await request.get('https://example.com/api/tasks');
+      expect(response.status()).toBe(200);
+    });
+  `, (projectPath) => {
+    const quality = collectGenerationQuality(projectPath, {});
+    assert.equal(quality.hardcodedBaseUrlMismatches.length, 1);
+    assert.equal(quality.hardcodedBaseUrlMismatches[0].placeholderExternalUrl, true);
+
+    const gate = evaluateGenerationQualityGates({
+      config: { testType: 'backend', coverageProfile: 'balanced', projectPath },
+      context: { apiEndpoints: [{ method: 'GET', path: '/api/tasks' }] },
       quality,
       prdContent: '',
       parsedPRD: {},

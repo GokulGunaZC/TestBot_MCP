@@ -1093,22 +1093,25 @@ function collectGenerationQuality(projectPath, options = {}) {
       }
     }
 
-    if (expectedOrigin) {
-      const hardcodedUrlMatches = content.matchAll(/(['"`])(https?:\/\/[^'"`\s]+)\1/g);
-      const seenUrls = new Set();
-      for (const match of hardcodedUrlMatches) {
-        const url = match[2];
-        if (seenUrls.has(url)) continue;
-        seenUrls.add(url);
-        const actualOrigin = originFromUrl(url);
-        if (actualOrigin && actualOrigin !== expectedOrigin) {
-          hardcodedBaseUrlMismatches.push({
-            file: path.basename(filePath),
-            url,
-            expectedOrigin,
-            actualOrigin,
-          });
-        }
+    const hardcodedUrlMatches = content.matchAll(/(['"`])(https?:\/\/[^'"`\s]+)\1/g);
+    const seenUrls = new Set();
+    for (const match of hardcodedUrlMatches) {
+      const url = match[2];
+      if (seenUrls.has(url)) continue;
+      seenUrls.add(url);
+      const actualOrigin = originFromUrl(url);
+      const isPlaceholderExternalUrl = /https?:\/\/(?:www\.)?(?:example\.(?:com|org|net)|httpbin\.org|jsonplaceholder\.typicode\.com|reqres\.in)\b/i.test(url);
+      if (
+        isPlaceholderExternalUrl ||
+        (actualOrigin && expectedOrigin && actualOrigin !== expectedOrigin)
+      ) {
+        hardcodedBaseUrlMismatches.push({
+          file: path.basename(filePath),
+          url,
+          expectedOrigin: expectedOrigin || 'configured baseURL',
+          actualOrigin,
+          placeholderExternalUrl: isPlaceholderExternalUrl,
+        });
       }
     }
   }
@@ -1405,6 +1408,16 @@ function evaluateGenerationQualityGates({ config, context, quality, prdContent, 
       minRunnableRatio,
       coverageProfile: profile,
     };
+    error.diagnostics = buildPipelineDiagnostics({
+      projectPath: config.projectPath,
+      stage: 'generation',
+      reason: 'hardcoded_base_url_mismatch',
+      stderr: error.message,
+      qualityAudit: {
+        errors: [`hardcoded_base_url_mismatch:${sample}`],
+        hardcodedBaseUrlMismatches: quality.hardcodedBaseUrlMismatches,
+      },
+    });
     return { ok: false, error };
   }
 
@@ -1833,6 +1846,9 @@ function classifyErrorCode(error) {
   if (message.includes('runnable coverage too low')) {
     return 'RUNNABLE_COVERAGE_TOO_LOW';
   }
+  if (message.includes('hardcoded a different app origin') || message.includes('hardcoded_base_url_mismatch')) {
+    return 'HARDCODED_BASE_URL_MISMATCH';
+  }
   if (message.includes('all observed routes require authentication')) {
     return 'AUTH_REQUIRED_NO_CREDENTIALS';
   }
@@ -1933,6 +1949,10 @@ function buildUserFacingPipelineError(errorCode, error) {
 
   if (errorCode === 'RUNNABLE_COVERAGE_TOO_LOW') {
     return `Healix generated too many skipped tests for the available app surface. ${normalizedMessage}`;
+  }
+
+  if (errorCode === 'HARDCODED_BASE_URL_MISMATCH') {
+    return `Generated tests used an absolute URL outside the configured baseURL. Healix blocked execution so results do not come from the wrong target app. ${normalizedMessage}`;
   }
 
   if (errorCode === 'AUTH_REQUIRED_NO_CREDENTIALS') {
@@ -2824,12 +2844,12 @@ async function validateGeneratedTestsWithList({ projectPath, validateGeneratedTe
  * dependencies" message with no way to diagnose further.
  */
 function buildPipelineDiagnostics({ projectPath, stage, reason, stderr, stdout, qualityAudit } = {}) {
-  const generatedDir = path.join(projectPath, 'tests', 'generated');
+  const generatedDir = projectPath ? path.join(projectPath, 'tests', 'generated') : null;
   let firstSpecPreview = null;
   let generatedSpecCount = 0;
 
   try {
-    if (fs.existsSync(generatedDir)) {
+    if (generatedDir && fs.existsSync(generatedDir)) {
       const files = fs.readdirSync(generatedDir).filter((name) => /\.spec\.(ts|js)$/i.test(name));
       generatedSpecCount = files.length;
       if (files.length > 0) {
