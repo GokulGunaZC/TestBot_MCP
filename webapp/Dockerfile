@@ -107,7 +107,11 @@ COPY --from=builder --chown=nextjs:nodejs /workspace/webapp/public ./webapp/publ
 COPY --from=builder --chown=nextjs:nodejs /workspace/webapp/drizzle ./webapp/drizzle
 COPY --chown=nextjs:nodejs webapp/docker/migrate.mjs ./webapp/docker/migrate.mjs
 COPY --chown=nextjs:nodejs webapp/docker/entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN chmod +x /usr/local/bin/entrypoint.sh
+# Strip ALL server-side source maps — they can be used to reconstruct the
+# original TypeScript source. productionBrowserSourceMaps:false only removes
+# client-side maps; server maps must be deleted manually.
+RUN find /app -name "*.js.map" -delete \
+ && chmod +x /usr/local/bin/entrypoint.sh
 
 USER nextjs
 EXPOSE 3000
