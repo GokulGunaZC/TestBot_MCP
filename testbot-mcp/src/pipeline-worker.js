@@ -6487,6 +6487,148 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
         }
       }
 
+      const remainingErrors = Array.isArray(qualityAudit.errors) ? qualityAudit.errors : [];
+      const onlyMissingQaContractCoverage =
+        remainingErrors.length > 0 &&
+        remainingErrors.every((error) => /^missing_qa_contract_coverage:/i.test(String(error || '')));
+      if (onlyMissingQaContractCoverage) {
+        const qaContractRecovery = {
+          type: 'qa_contract_recovery',
+          reason: 'missing_qa_contract_coverage',
+          missing: remainingErrors.map((error) => String(error).replace(/^missing_qa_contract_coverage:/i, '')),
+          status: 'started',
+        };
+        try {
+          const recoveredPack = ensureQaContractSpec({
+            projectPath: config.projectPath,
+            context,
+            roles,
+            testType: config.testType,
+          });
+          qaContractRecovery.qaContractPack = {
+            written: recoveredPack.written,
+            filename: recoveredPack.filename,
+            generatedTests: recoveredPack.generatedTests,
+            generatedContracts: recoveredPack.generatedContracts,
+          };
+          generationMeta.qaContractPack = recoveredPack;
+          generationMeta.qaContractSummary = recoveredPack.qaContractSummary;
+          generationMeta.qaContractQuestions = recoveredPack.qaContractQuestions;
+          generationMeta.qaContractWarnings = recoveredPack.qaContractWarnings;
+
+          if (recoveredPack.written && recoveredPack.generatedTests > 0) {
+            const verifiedRoles = (roles || []).filter((role) => role && role.loginVerified && role.storageStatePath);
+            recoveredPack.fixtureWiring = ensureHealixFixtureImports({
+              projectPath: config.projectPath,
+              roles: verifiedRoles,
+            });
+            const recoveredValidation = await validateGeneratedTestsWithList({
+              projectPath: config.projectPath,
+              validateGeneratedTests,
+              timeoutMs: validationTimeoutMs(),
+              testTarget: recoveredPack.filename,
+            });
+            recoveredPack.listValidation = recoveredValidation;
+            generationMeta.qaContractPackListStatus = recoveredValidation.valid ? 'listed' : 'failed';
+            generationMeta.qaContractPackListError = recoveredValidation.valid
+              ? null
+              : {
+                  reason: recoveredValidation.reason || 'validation_failed',
+                  stderr: recoveredValidation.stderr || null,
+                  stdout: recoveredValidation.stdout || null,
+                };
+            generationMeta.qaContractPackListedTests = recoveredValidation.valid
+              ? recoveredValidation.listedCount || recoveredPack.generatedTests
+              : 0;
+
+            if (recoveredValidation.valid) {
+              if (!protectedSpecFiles.includes(recoveredPack.filename)) {
+                protectedSpecFiles.push(recoveredPack.filename);
+              }
+              qaContractRecovery.status = 'listed';
+              qualityRecoveryEvents.push(qaContractRecovery);
+              Logger.warn('PipelineWorker', 'Recovered missing QA contract coverage with deterministic contract pack', {
+                generator,
+                filename: recoveredPack.filename,
+                generatedTests: recoveredPack.generatedTests,
+                missing: qaContractRecovery.missing,
+              });
+              if (statusDir) {
+                updateStatus(statusDir, 'generation_quality_recovered', {
+                  runId,
+                  message: `Recovered missing QA contract coverage with ${recoveredPack.generatedTests} deterministic test(s).`,
+                  qaContractPack: qaContractRecovery.qaContractPack,
+                  missingQaContracts: qaContractRecovery.missing,
+                }, telemetryReporter);
+              }
+
+              validation = await validateSuiteOrSalvage({
+                stage: 'validation_after_qa_contract_recovery',
+                qualityAudit,
+                qualityRecovery: qaContractRecovery,
+              });
+              if (!validation.valid) {
+                throwValidationFailure({
+                  validation,
+                  stage: 'validation_after_qa_contract_recovery',
+                  qualityAudit,
+                  qualityRecovery: qaContractRecovery,
+                  messageSuffix: ' after QA contract recovery',
+                });
+              }
+
+              qualityAudit = auditGeneratedTestQuality({
+                projectPath: config.projectPath,
+                testType: config.testType,
+                context,
+                explorationArtifact,
+                roles,
+              });
+              qualityAudit.qualityRecovery = qaContractRecovery;
+              generationMeta.qaContractCoverage = qualityAudit.qaContractCoverage || null;
+              generationMeta.qaContractSummary = qualityAudit.qaContractSummary || generationMeta.qaContractSummary || null;
+              generationMeta.qaContractWarnings = qualityAudit.qaContractWarnings || [];
+              generationMeta.qaContractQuestions = qualityAudit.qaContractQuestions || generationMeta.qaContractQuestions || [];
+
+              Logger.info('PipelineWorker', '[QUALITY GATE] post-QA-contract recovery auditGeneratedTestQuality result', {
+                valid: qualityAudit.valid,
+                errors: qualityAudit.errors,
+                totalFiles: qualityAudit.totalFiles,
+                totalTests: qualityAudit.totalTests,
+                runnableTests: qualityAudit.runnableTests,
+                qaContractCoverage: qualityAudit.qaContractCoverage,
+              });
+
+              if (qualityAudit.valid) {
+                return {
+                  ...validation,
+                  qualityAudit,
+                  qualityRecovery: qaContractRecovery,
+                };
+              }
+            } else {
+              qaContractRecovery.status = 'validation_failed';
+              qaContractRecovery.validation = generationMeta.qaContractPackListError;
+              qualityRecoveryEvents.push(qaContractRecovery);
+            }
+          } else {
+            qaContractRecovery.status = 'no_runnable_contract_pack';
+            qualityRecoveryEvents.push(qaContractRecovery);
+          }
+        } catch (recoveryErr) {
+          if (recoveryErr?.code === 'GENERATION_VALIDATION_FAILED') {
+            throw recoveryErr;
+          }
+          qaContractRecovery.status = 'failed';
+          qaContractRecovery.error = recoveryErr?.message || String(recoveryErr);
+          qualityRecoveryEvents.push(qaContractRecovery);
+          Logger.warn('PipelineWorker', 'Missing QA contract recovery failed', {
+            generator,
+            reason: qaContractRecovery.error,
+          });
+        }
+      }
+
       Logger.error('PipelineWorker', `[QUALITY GATE] ❌ Quality audit FAILED for generator="${generator}" — errors: ${qualityAudit.errors.join(', ')}`, null, {
         generator,
         errors: qualityAudit.errors,

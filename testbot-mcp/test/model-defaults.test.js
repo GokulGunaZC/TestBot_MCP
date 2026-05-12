@@ -58,3 +58,14 @@ test('old OpenAI model defaults are not used by runtime configuration', () => {
 
   assert.deepEqual(failures, []);
 });
+
+test('gpt-5 family calls do not send unsupported custom temperature on fallback paths', () => {
+  const openaiClient = read('webapp/src/lib/test-generation/openai-client.ts');
+  const browserRunner = read('testbot-mcp/scripts/browser_use_runner.py');
+
+  assert.match(openaiClient, /function shouldSendCustomTemperature/);
+  assert.match(openaiClient, /gpt-5\|o\[1-9\]\|codex/);
+  assert.match(openaiClient, /body\.temperature = this\.config\.temperature/);
+  assert.match(browserRunner, /startswith\(\("gpt-5", "o1", "o3", "o4", "codex"\)\)/);
+  assert.match(browserRunner, /kwargs\["temperature"\] = 0/);
+});

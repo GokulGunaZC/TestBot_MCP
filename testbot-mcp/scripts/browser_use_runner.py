@@ -210,7 +210,9 @@ def _build_openai_compatible_llm(model, api_key, base_url=None):
         try:
             module = __import__(import_path, fromlist=[ctor])
             cls = getattr(module, ctor)
-            kwargs = {"model": model, "api_key": api_key, "temperature": 0}
+            kwargs = {"model": model, "api_key": api_key}
+            if not str(model or "").lower().startswith(("gpt-5", "o1", "o3", "o4", "codex")):
+                kwargs["temperature"] = 0
             if base_url:
                 kwargs["base_url"] = base_url
             llm = cls(**kwargs)

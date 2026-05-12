@@ -7,6 +7,15 @@
 import type { OpenAIClientConfig, OpenAIMessage, OpenAIUsage, OpenAICallResult } from './types'
 import { resolveConfiguredOpenAIModel, resolveProviderOpenAIModel } from '@/lib/model-defaults'
 
+function shouldSendCustomTemperature(model: string, temperature: number): boolean {
+  const normalized = String(model || '').toLowerCase()
+  // GPT-5 family chat-completions fallbacks reject non-default temperatures.
+  // The Responses API path is the primary path and does not send temperature;
+  // keep the chat fallback equally model-safe for parse-prd/planner/generation.
+  if (/^(gpt-5|o[1-9]|codex)/.test(normalized)) return false
+  return Number.isFinite(temperature)
+}
+
 export class OpenAIClient {
   config: Required<OpenAIClientConfig>
   private baseUrl = 'https://api.openai.com/v1'
@@ -253,19 +262,23 @@ export class OpenAIClient {
     const { signal, cleanup } = this.composeAbortSignal(externalSignal)
 
     try {
+      const body: Record<string, unknown> = {
+        model,
+        messages,
+        // Same hard ceiling as the Responses API path — see comment above.
+        max_completion_tokens: this.config.maxTokens,
+      }
+      if (shouldSendCustomTemperature(model, this.config.temperature)) {
+        body.temperature = this.config.temperature
+      }
+
       const response = await fetch(`${this.baseUrl}/chat/completions`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${this.config.apiKey}`,
         },
-        body: JSON.stringify({
-          model,
-          messages,
-          temperature: this.config.temperature,
-          // Same hard ceiling as the Responses API path — see comment above.
-          max_completion_tokens: this.config.maxTokens,
-        }),
+        body: JSON.stringify(body),
         signal,
       })
 
