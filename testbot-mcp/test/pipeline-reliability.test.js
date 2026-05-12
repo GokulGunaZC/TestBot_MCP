@@ -9,6 +9,7 @@ const {
   classifyPipelineErrorFromStderr,
 } = require('../src/failure-triage/pipeline-error-classifier');
 const PlaywrightIntegration = require('../src/playwright-integration');
+const ContextGatherer = require('../src/context-gatherer');
 
 const {
   buildRouteAccessSummary,
@@ -42,6 +43,8 @@ const {
   quarantineGeneratedSpecFiles,
   filterDeltaTopUpTests,
   salvageGeneratedTestValidation,
+  ensureHealixValidationConfig,
+  safeWriteGeneratedTest,
   resolveGenerationAgentConcurrency,
   shouldAutoSwitchPortForConflict,
   shouldTrustDiscoveredAuthFlow,
@@ -167,6 +170,111 @@ test('QA contracts detect Spring @RequestParam equality filters', () => {
     assert.equal(qaContracts.filterContracts.length, 1);
     assert.equal(qaContracts.filterContracts[0].queryParam, 'status');
     assert.equal(qaContracts.filterContracts[0].responseField, 'status');
+  });
+});
+
+test('QA contracts skip unresolved root-mounted API filters', () => {
+  withTempProject((projectPath) => {
+    const srcDir = path.join(projectPath, 'src');
+    fs.mkdirSync(srcDir, { recursive: true });
+    fs.writeFileSync(path.join(srcDir, 'activity.ts'), `
+      router.get("/", (req, res) => {
+        const projectSlug = req.query.projectSlug;
+        const rows = projectSlug ? db.prepare("select * from activity where project_slug = ?").all(projectSlug) : [];
+        res.json(rows);
+      });
+    `);
+
+    const qaContracts = extractQaContracts({
+      projectPath,
+      context: {
+        apiEndpoints: [{
+          method: 'GET',
+          path: '/',
+          source: 'src/activity.ts',
+        }],
+      },
+    });
+
+    assert.equal(qaContracts.filterContracts.length, 0);
+  });
+});
+
+test('QA form contracts infer admin route base without marking login as protected', () => {
+  withTempProject((projectPath) => {
+    const qaContracts = extractQaContracts({
+      projectPath,
+      context: {
+        pages: [],
+        forms: [
+          {
+            file: 'admin-angular/src/app/login/login.component.ts',
+            fields: [{ name: 'email', required: true }],
+            submitButtons: ['Log in'],
+          },
+          {
+            file: 'admin-angular/src/app/members/members.component.ts',
+            fields: [{ name: 'name', required: true }],
+            submitButtons: ['Invite'],
+          },
+        ],
+      },
+    });
+
+    const byRoute = new Map(qaContracts.formValidationContracts.map((contract) => [contract.route, contract]));
+    assert.ok(byRoute.has('/admin/login'));
+    assert.ok(byRoute.has('/admin/members'));
+    assert.equal(byRoute.get('/admin/login').requiresAuth, false);
+    assert.equal(byRoute.get('/admin/members').requiresAuth, true);
+  });
+});
+
+test('polyglot context derives Spring filter contracts from repository search params', async () => {
+  await withTempProject(async (projectPath) => {
+    const javaDir = path.join(projectPath, 'services', 'issues-java', 'src', 'main', 'java', 'demo');
+    fs.mkdirSync(javaDir, { recursive: true });
+    fs.writeFileSync(path.join(javaDir, 'IssueController.java'), `
+      @RestController
+      @RequestMapping("/api/issues")
+      public class IssueController {
+        @GetMapping
+        public List<IssueDto> list(
+          @RequestParam(required = false) String status,
+          @RequestParam(required = false) String priority,
+          @RequestParam(required = false) String assignee
+        ) {
+          return repo.search(status, priority, assignee).stream().map(IssueDto::from).toList();
+        }
+      }
+    `);
+    fs.writeFileSync(path.join(javaDir, 'IssueRepository.java'), `
+      public interface IssueRepository {
+        @Query("""
+          SELECT i FROM Issue i
+          WHERE (:status IS NULL OR i.status = :status)
+            AND (:priority IS NULL OR i.priority = i.priority)
+            AND (:assignee IS NULL OR i.assigneeEmail = :assignee)
+        """)
+        List<Issue> search(
+          @Param("status") String status,
+          @Param("priority") String priority,
+          @Param("assignee") String assignee
+        );
+      }
+    `);
+
+    const gatherer = new ContextGatherer({ projectPath });
+    const context = await gatherer.gatherRichContext();
+    const issuesEndpoint = context.apiEndpoints.find((endpoint) =>
+      endpoint.method === 'GET' && endpoint.path === '/api/issues'
+    );
+
+    assert.ok(issuesEndpoint, 'Spring root @GetMapping should be detected in a JS/polyglot repo');
+    const qaContracts = extractQaContracts({ projectPath, context });
+    const contracts = qaContracts.filterContracts.filter((contract) => contract.path === '/api/issues');
+    assert.deepEqual(contracts.map((contract) => contract.queryParam).sort(), ['assignee', 'priority', 'status']);
+    assert.equal(contracts.find((contract) => contract.queryParam === 'assignee').responseField, 'assigneeEmail');
+    assert.equal(contracts.find((contract) => contract.queryParam === 'priority').responseField, 'priority');
   });
 });
 
@@ -390,6 +498,90 @@ test('validation salvage quarantines bad specs and preserves valid specs', async
     assert.deepEqual(salvage.quarantinedSpecFiles.map((file) => file.filename), ['bad.spec.ts']);
     assert.equal(fs.existsSync(path.join(generatedDir, 'valid.spec.ts')), true);
     assert.equal(fs.existsSync(path.join(generatedDir, 'bad.spec.ts')), false);
+  });
+});
+
+test('Healix validation config targets generated specs without positional path arguments', async () => {
+  await withTempProject(async (projectPath) => {
+    const generatedDir = path.join(projectPath, 'tests', 'generated');
+    fs.mkdirSync(generatedDir, { recursive: true });
+    fs.writeFileSync(path.join(generatedDir, 'valid.spec.ts'), `
+      import { test, expect } from '@playwright/test';
+      test('valid listed test', async () => expect(true).toBeTruthy());
+    `);
+
+    const allConfig = ensureHealixValidationConfig({ projectPath });
+    const singleConfig = ensureHealixValidationConfig({ projectPath, targetFilename: 'valid.spec.ts' });
+    const allContent = fs.readFileSync(allConfig.configPath, 'utf-8');
+    const singleContent = fs.readFileSync(singleConfig.configPath, 'utf-8');
+
+    assert.match(allContent, /testDir:/);
+    assert.match(allContent, /tests[\\/]generated/);
+    assert.match(allContent, /spec\|test/);
+    assert.ok(singleContent.includes('valid\\\\.spec\\\\.ts$'));
+    assert.doesNotMatch(singleContent, /tests\/generated\/valid\.spec\.ts --list/);
+  });
+});
+
+test('generated spec writer recreates missing tests/generated directory before writing', async () => {
+  await withTempProject(async (projectPath) => {
+    const generatedDir = path.join(projectPath, 'tests', 'generated');
+    fs.rmSync(generatedDir, { recursive: true, force: true });
+    const written = safeWriteGeneratedTest(
+      generatedDir,
+      {
+        filename: 'smoke.spec.ts',
+        content: `
+          import { test, expect } from '@playwright/test';
+          test('smoke', async () => expect(true).toBeTruthy());
+        `,
+      },
+      0,
+      'smoke',
+      new Set()
+    );
+
+    assert.equal(written.filename, 'smoke.spec.ts');
+    assert.equal(fs.existsSync(written.path), true);
+    assert.match(fs.readFileSync(written.path, 'utf-8'), /test\('smoke'/);
+  });
+});
+
+test('validation salvage protects previously listed QA contract specs while quarantining bad AI specs', async () => {
+  await withTempProject(async (projectPath) => {
+    const generatedDir = path.join(projectPath, 'tests', 'generated');
+    fs.mkdirSync(generatedDir, { recursive: true });
+    fs.writeFileSync(path.join(generatedDir, 'healix-qa-contracts.spec.ts'), `
+      import { test, expect } from '@playwright/test';
+      test('[QAC:qac-form-validation-x] valid contract', async () => expect(true).toBeTruthy());
+    `);
+    fs.writeFileSync(path.join(generatedDir, 'bad-topup.spec.ts'), `
+      export const helper = true;
+    `);
+
+    const validator = async ({ testTarget }) => {
+      if (testTarget && /bad-topup\.spec\.ts$/.test(testTarget)) {
+        return { valid: false, reason: 'no_tests_listed', stderr: 'No tests found.' };
+      }
+      if (testTarget && /healix-qa-contracts\.spec\.ts$/.test(testTarget)) {
+        return { valid: false, reason: 'playwright_list_failed', stderr: 'transient unrelated list failure' };
+      }
+      return { valid: true, listedCount: 1 };
+    };
+
+    const salvage = await salvageGeneratedTestValidation({
+      projectPath,
+      originalValidation: { valid: false, reason: 'playwright_list_failed', stderr: 'No tests found.' },
+      validator,
+      protectedSpecFiles: ['healix-qa-contracts.spec.ts'],
+    });
+
+    assert.equal(salvage.recovered, true);
+    assert.deepEqual(salvage.keptSpecFiles.map((file) => file.filename), ['healix-qa-contracts.spec.ts']);
+    assert.equal(salvage.keptSpecFiles[0].protected, true);
+    assert.deepEqual(salvage.quarantinedSpecFiles.map((file) => file.filename), ['bad-topup.spec.ts']);
+    assert.equal(fs.existsSync(path.join(generatedDir, 'healix-qa-contracts.spec.ts')), true);
+    assert.equal(fs.existsSync(path.join(generatedDir, 'bad-topup.spec.ts')), false);
   });
 });
 
@@ -1921,9 +2113,9 @@ test('pipeline trusts login authFlow but refuses register authFlow for reinjecti
   }), false);
 });
 
-test('generation repair context feeds quality failures back into the next generation call', () => {
-  const error = new Error('Generated suite has zero runnable tests');
-  error.code = 'ZERO_RUNNABLE_TESTS';
+test('generation repair context is reserved for true zero-output generation', () => {
+  const error = new Error('All generation agents returned zero tests');
+  error.code = 'AGENTS_RETURNED_ZERO_TESTS';
   const context = buildGenerationRepairContext({
     context: { pages: [{ path: '/' }] },
     error,
@@ -1945,7 +2137,10 @@ test('generation repair context feeds quality failures back into the next genera
   });
 
   assert.equal(isRepairableGenerationFailure(error), true);
-  assert.equal(context.generationFeedback.previousFailureCode, 'ZERO_RUNNABLE_TESTS');
+  const validationError = new Error('Generated tests failed Playwright validation');
+  validationError.code = 'GENERATION_VALIDATION_FAILED';
+  assert.equal(isRepairableGenerationFailure(validationError), false);
+  assert.equal(context.generationFeedback.previousFailureCode, 'AGENTS_RETURNED_ZERO_TESTS');
   assert.equal(context.generationFeedback.quality.runnableTests, 0);
   assert.deepEqual(context.generationFeedback.quality.missingCategories, ['ui_flow', 'workflow_journey']);
   assert.ok(

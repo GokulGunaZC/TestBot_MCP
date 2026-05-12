@@ -69,7 +69,7 @@ class ContextGatherer {
   /**
    * Get source file extensions based on project language
    */
-  getSourceExtensions() {
+  getSourceExtensions(language = this.config.language) {
     const extensionMap = {
       javascript: ['.js', '.jsx', '.ts', '.tsx', '.mjs'],
       python: ['.py'],
@@ -84,7 +84,7 @@ class ContextGatherer {
       swift: ['.swift'],
       unknown: ['.js', '.jsx', '.ts', '.tsx', '.py', '.java', '.go', '.rb', '.php'],
     };
-    return extensionMap[this.config.language] || extensionMap.unknown;
+    return extensionMap[language] || extensionMap.unknown;
   }
 
   /**
@@ -1482,13 +1482,8 @@ class ContextGatherer {
    */
   async findMultiLangEndpoints(projectPath) {
     const endpoints = [];
-    const lang = this.config.language;
-    if (lang === 'javascript') return endpoints; // Already handled
-
-    const extensions = this.getSourceExtensions();
     const srcDir = path.join(projectPath, 'src');
     const searchDir = fs.existsSync(srcDir) ? srcDir : projectPath;
-    const files = this.findFiles(searchDir, extensions);
 
     const endpointPatterns = {
       python: [
@@ -1523,58 +1518,98 @@ class ContextGatherer {
       ],
     };
 
-    const patterns = endpointPatterns[lang] || [];
-    if (patterns.length === 0) return endpoints;
+    const configuredLanguage = this.config.language || 'javascript';
+    const languages = configuredLanguage === 'javascript'
+      ? ['python', 'java', 'go', 'ruby', 'php', 'csharp']
+      : [configuredLanguage];
 
-    for (const file of files.slice(0, this.config.maxFiles)) {
-      if (file.includes('node_modules') || file.includes('test') || file.includes('spec') || file.includes('migration')) continue;
-      try {
-        const content = this.readFileCached(file);
-        if (!content) continue;
-        const hasAuth = content.includes('auth') || content.includes('token') || content.includes('permission');
+    const joinRoutePaths = (base, child) => {
+      const left = String(base || '').trim();
+      const right = String(child || '').trim();
+      const joined = `${left ? `/${left.replace(/^\/+|\/+$/g, '')}` : ''}${right ? `/${right.replace(/^\/+/, '')}` : ''}`;
+      return joined.replace(/\/+/g, '/') || '/';
+    };
 
-        for (const patternDef of patterns) {
-          let match;
-          patternDef.regex.lastIndex = 0;
-          while ((match = patternDef.regex.exec(content)) !== null) {
-            let method = patternDef.method || match[patternDef.methodIdx].toUpperCase();
-            const basePath = match[patternDef.pathIdx];
-            const optionalPath = patternDef.optionalPathIdx ? match[patternDef.optionalPathIdx] : '';
-            const routePath = optionalPath
-              ? `${String(basePath || '').replace(/\/$/, '')}/${String(optionalPath).replace(/^\//, '')}`
-              : basePath;
+    for (const lang of languages) {
+      const patterns = endpointPatterns[lang] || [];
+      if (patterns.length === 0) continue;
 
-            if (patternDef.parseMethodList) {
-              // Parse methods=['GET', 'POST'] style
-              const methods = routePath; // In this pattern pathIdx=1, methodIdx=2
-              const methodList = match[patternDef.methodIdx].replace(/["'\s]/g, '').split(',');
-              for (const m of methodList) {
-                if (!endpoints.some(e => e.method === m.toUpperCase() && e.path === match[patternDef.pathIdx])) {
-                  endpoints.push({
-                    method: m.toUpperCase(),
-                    path: match[patternDef.pathIdx],
-                    description: `${m.toUpperCase()} ${match[patternDef.pathIdx]}`,
-                    requiresAuth: hasAuth,
-                    source: path.relative(projectPath, file),
-                  });
-                }
+      const extensions = this.getSourceExtensions(lang);
+      const files = this.findFiles(searchDir, extensions);
+
+      for (const file of files.slice(0, this.config.maxFiles)) {
+        if (file.includes('node_modules') || file.includes('test') || file.includes('spec') || file.includes('migration')) continue;
+        try {
+          const content = this.readFileCached(file);
+          if (!content) continue;
+          const hasAuth = content.includes('auth') || content.includes('token') || content.includes('permission');
+
+          if (lang === 'java') {
+            const baseMatch = content.match(/@RequestMapping\s*\(\s*(?:value\s*=\s*)?["']([^"']+)["']/i);
+            const classBasePath = baseMatch?.[1] || '';
+            const springMethodPattern = /@(Get|Post|Put|Delete|Patch)Mapping(?:\s*\(\s*(?:value\s*=\s*)?["']([^"']*)["'][^)]*\))?/gi;
+            for (const match of content.matchAll(springMethodPattern)) {
+              const method = match[1].toUpperCase();
+              const localPath = match[2] || '';
+              const fullPath = joinRoutePaths(classBasePath, localPath);
+              if (!endpoints.some(e => e.method === method && e.path === fullPath)) {
+                endpoints.push({
+                  method,
+                  path: fullPath,
+                  description: `${method} ${fullPath}`,
+                  requiresAuth: hasAuth,
+                  source: path.relative(projectPath, file),
+                  sourceRoutePath: localPath,
+                  sourceRouteBase: classBasePath,
+                });
               }
-              continue;
             }
+            continue;
+          }
 
-            const fullPath = routePath.startsWith('/') ? routePath : `/${routePath}`;
-            if (!endpoints.some(e => e.method === method && e.path === fullPath)) {
-              endpoints.push({
-                method,
-                path: fullPath,
-                description: `${method} ${fullPath}`,
-                requiresAuth: hasAuth,
-                source: path.relative(projectPath, file),
-              });
+          for (const patternDef of patterns) {
+            let match;
+            patternDef.regex.lastIndex = 0;
+            while ((match = patternDef.regex.exec(content)) !== null) {
+              let method = patternDef.method || match[patternDef.methodIdx].toUpperCase();
+              const basePath = match[patternDef.pathIdx];
+              const optionalPath = patternDef.optionalPathIdx ? match[patternDef.optionalPathIdx] : '';
+              const routePath = optionalPath
+                ? `${String(basePath || '').replace(/\/$/, '')}/${String(optionalPath).replace(/^\//, '')}`
+                : basePath;
+
+              if (patternDef.parseMethodList) {
+                // Parse methods=['GET', 'POST'] style
+                const methods = routePath; // In this pattern pathIdx=1, methodIdx=2
+                const methodList = match[patternDef.methodIdx].replace(/["'\s]/g, '').split(',');
+                for (const m of methodList) {
+                  if (!endpoints.some(e => e.method === m.toUpperCase() && e.path === match[patternDef.pathIdx])) {
+                    endpoints.push({
+                      method: m.toUpperCase(),
+                      path: match[patternDef.pathIdx],
+                      description: `${m.toUpperCase()} ${match[patternDef.pathIdx]}`,
+                      requiresAuth: hasAuth,
+                      source: path.relative(projectPath, file),
+                    });
+                  }
+                }
+                continue;
+              }
+
+              const fullPath = routePath.startsWith('/') ? routePath : `/${routePath}`;
+              if (!endpoints.some(e => e.method === method && e.path === fullPath)) {
+                endpoints.push({
+                  method,
+                  path: fullPath,
+                  description: `${method} ${fullPath}`,
+                  requiresAuth: hasAuth,
+                  source: path.relative(projectPath, file),
+                });
+              }
             }
           }
-        }
-      } catch (e) { /* ignore */ }
+        } catch (e) { /* ignore */ }
+      }
     }
 
     return endpoints;

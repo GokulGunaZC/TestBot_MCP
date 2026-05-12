@@ -61,12 +61,48 @@ function findQuotedPathIndex(content, endpointPath) {
   return -1;
 }
 
+function sliceEndpointSourceFrom(content, startIndex) {
+  const routeStartPattern = /(?:\b(?:app|router)\s*\.\s*(?:get|post|put|patch|delete)\s*\(|@(?:Get|Post|Put|Patch|Delete|Request)Mapping\b|\b(?:GET|POST|PUT|PATCH|DELETE)\s*\()/g;
+  let next = -1;
+  routeStartPattern.lastIndex = Math.max(0, startIndex + 1);
+  const match = routeStartPattern.exec(content);
+  if (match && typeof match.index === 'number') next = match.index;
+  const end = next > startIndex ? next : Math.min(content.length, startIndex + 3000);
+  return content.slice(startIndex, end);
+}
+
+function findSpringEndpointIndex(content, endpoint = {}) {
+  const method = normalizeMethod(endpoint.method);
+  const annotation = `${method[0]}${method.slice(1).toLowerCase()}Mapping`;
+  if (!/Mapping$/.test(annotation)) return -1;
+  const localPath = endpoint.sourceRoutePath;
+  if (localPath !== undefined && localPath !== null) {
+    const suffix = String(localPath || '');
+    if (!suffix) {
+      const barePattern = new RegExp(`@${annotation}(?!\\s*\\()`, 'i');
+      const bare = content.match(barePattern);
+      if (bare && typeof bare.index === 'number') return bare.index;
+      const emptyPattern = new RegExp(`@${annotation}\\s*\\(\\s*\\)`, 'i');
+      const empty = content.match(emptyPattern);
+      if (empty && typeof empty.index === 'number') return empty.index;
+    } else {
+      const quotedPattern = new RegExp(`@${annotation}\\s*\\([^)]*(['"\`])${escapeRegExp(suffix)}\\1`, 'i');
+      const quoted = content.match(quotedPattern);
+      if (quoted && typeof quoted.index === 'number') return quoted.index;
+    }
+  }
+  return -1;
+}
+
 function extractEndpointSource(content, endpoint = {}) {
   if (!content) return '';
+  const springIndex = findSpringEndpointIndex(content, endpoint);
+  if (springIndex >= 0) return sliceEndpointSourceFrom(content, springIndex);
+
   const pathIndex = findQuotedPathIndex(content, endpoint.path);
   if (pathIndex < 0) return content;
 
-  const routeStartPattern = /(?:\b(?:app|router)\s*\.\s*(?:get|post|put|patch|delete)\s*\(|@(?:Get|Post|Put|Patch|Delete|Request)Mapping\s*\(|\b(?:GET|POST|PUT|PATCH|DELETE)\s*\()/g;
+  const routeStartPattern = /(?:\b(?:app|router)\s*\.\s*(?:get|post|put|patch|delete)\s*\(|@(?:Get|Post|Put|Patch|Delete|Request)Mapping\b|\b(?:GET|POST|PUT|PATCH|DELETE)\s*\()/g;
   let start = 0;
   let next = -1;
   for (const match of content.matchAll(routeStartPattern)) {
@@ -89,7 +125,8 @@ function extractQueryParams(content) {
     /\b(?:req|request)\.query\s*\[\s*['"`]([^'"`]+)['"`]\s*\]/g,
     /\bsearchParams\.get\s*\(\s*['"`]([^'"`]+)['"`]\s*\)/g,
     /\bnextUrl\.searchParams\.get\s*\(\s*['"`]([^'"`]+)['"`]\s*\)/g,
-    /@RequestParam(?:\s*\([^)]*?(?:value\s*=\s*)?['"`]([^'"`]+)['"`][^)]*\))?\s+(?:final\s+)?(?:[\w<>, ?]+\s+)+([a-zA-Z_][\w]*)/g,
+    /@RequestParam\s*\([^)]*?(?:value\s*=\s*)?['"`]([^'"`]+)['"`][^)]*\)\s+(?:final\s+)?[\w<>, ?]+\s+([a-zA-Z_][\w]*)/g,
+    /@RequestParam(?:\s*\([^)]*\))?\s+(?:final\s+)?[\w<>, ?]+\s+([a-zA-Z_][\w]*)/g,
   ];
   for (const pattern of patterns) {
     pattern.lastIndex = 0;
@@ -113,6 +150,81 @@ function sourceProvesEqualityFilter(content, param) {
     new RegExp(`\\b${escaped}\\s*:\\s*\\{\\s*(?:equals|eq)\\s*:\\s*${escaped}\\b`, 'i'),
   ];
   return patterns.some((pattern) => pattern.test(content));
+}
+
+function sourceReferencesFilterParam(content, param) {
+  const escaped = escapeRegExp(param);
+  const patterns = [
+    new RegExp(`@RequestParam[\\s\\S]{0,120}\\b${escaped}\\b`, 'i'),
+    new RegExp(`@Param\\s*\\(\\s*['"\`]${escaped}['"\`]\\s*\\)`, 'i'),
+    new RegExp(`:${escaped}\\b`, 'i'),
+    new RegExp(`\\b${escaped}(?:Enum)?\\b`, 'i'),
+  ];
+  return patterns.some((pattern) => pattern.test(content));
+}
+
+function inferResponseFieldFromSource(content, param) {
+  const escaped = escapeRegExp(param);
+  const patterns = [
+    new RegExp(`\\b\\w+\\.([A-Za-z_][\\w]*)\\s*=\\s*:${escaped}\\b`, 'i'),
+    new RegExp(`\\b([A-Za-z_][\\w]*)\\s*=\\s*:${escaped}\\b`, 'i'),
+    new RegExp(`\\bwhere\\s+[\\w"'\`.]*([A-Za-z_][\\w]*)\\s*=\\s*\\?`, 'i'),
+    new RegExp(`\\b([A-Za-z_][\\w]*)\\s*:\\s*${escaped}\\b`, 'i'),
+  ];
+  for (const pattern of patterns) {
+    const match = content.match(pattern);
+    if (match?.[1]) return match[1];
+  }
+  return String(param);
+}
+
+function findProjectSourceFiles(rootDir, limit = 250) {
+  const files = [];
+  const skipDirs = new Set(['node_modules', '.git', '.next', 'dist', 'build', 'coverage', 'out', 'target', 'vendor', '.healix', 'healix-reports', 'tests']);
+  const exts = new Set(['.java', '.kt', '.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs', '.py', '.go', '.rb', '.php', '.cs']);
+  const walk = (dir) => {
+    if (files.length >= limit) return;
+    let entries = [];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (files.length >= limit) return;
+      if (entry.name.startsWith('.DS_Store')) continue;
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (skipDirs.has(entry.name)) continue;
+        walk(full);
+        continue;
+      }
+      if (entry.isFile() && exts.has(path.extname(entry.name))) files.push(full);
+    }
+  };
+  walk(rootDir);
+  return files;
+}
+
+function findProjectFilterEvidence({ projectPath, param, readFile }) {
+  const projectRoot = path.resolve(projectPath || process.cwd());
+  for (const file of findProjectSourceFiles(projectRoot)) {
+    const sourceRel = path.relative(projectRoot, file);
+    const content = typeof readFile === 'function'
+      ? readFile(file, { allowLarge: true })
+      : (() => {
+          try { return fs.readFileSync(file, 'utf-8'); } catch { return ''; }
+        })();
+    if (!content || !sourceReferencesFilterParam(content, param)) continue;
+    if (!sourceProvesEqualityFilter(content, param) && !new RegExp(`@Param\\s*\\(\\s*['"\`]${escapeRegExp(param)}['"\`]\\s*\\)|:${escapeRegExp(param)}\\b`, 'i').test(content)) {
+      continue;
+    }
+    return {
+      sourceFile: sourceRel,
+      responseField: inferResponseFieldFromSource(content, param),
+    };
+  }
+  return null;
 }
 
 function extractStatusCodes(content) {
@@ -149,32 +261,58 @@ function deleteLooksBodyless(content) {
   return /delete|remove|destroy|noContent|sendStatus\s*\(\s*204|\.end\s*\(|new\s+Response\s*\(\s*null|ResponseEntity<\s*Void\s*>/i.test(content);
 }
 
+function sourceSuggestsRouteBase(file) {
+  const segments = String(file || '')
+    .replace(/\\/g, '/')
+    .split('/')
+    .map((segment) => segment.toLowerCase())
+    .filter(Boolean);
+  if (segments.some((segment) => segment === 'admin' || /^admin[-_]/.test(segment) || /[-_]admin$/.test(segment))) {
+    return '/admin';
+  }
+  return null;
+}
+
+function normalizeRoute(route) {
+  const value = String(route || '/').trim();
+  const withSlash = value.startsWith('/') ? value : `/${value}`;
+  return withSlash.replace(/\/+$/, '') || '/';
+}
+
+function applySourceRouteBase(route, file) {
+  const normalizedRoute = normalizeRoute(route);
+  const base = sourceSuggestsRouteBase(file);
+  if (!base) return normalizedRoute;
+  if (normalizedRoute === base || normalizedRoute.startsWith(`${base}/`)) return normalizedRoute;
+  return normalizedRoute === '/' ? base : `${base}${normalizedRoute}`;
+}
+
 function routeFromFormFile(form, pages = []) {
   const file = form?.file || form?.sourceFile || '';
   const matchingPage = pages.find((page) =>
     page?.sourceFile && file && String(page.sourceFile) === String(file)
   );
-  if (matchingPage?.path) return matchingPage.path;
-  if (form?.path || form?.route) return form.path || form.route;
-  if (form?.action && String(form.action).startsWith('/')) return form.action;
+  if (matchingPage?.path) return applySourceRouteBase(matchingPage.path, file);
+  if (form?.path || form?.route) return applySourceRouteBase(form.path || form.route, file);
+  if (form?.action && String(form.action).startsWith('/')) return applySourceRouteBase(form.action, file);
 
   const normalized = String(file).replace(/\\/g, '/');
   const appMatch = normalized.match(/(?:^|\/)(?:src\/)?app\/(.+?)\/page\.(?:tsx?|jsx?)$/);
   if (appMatch) {
     const parts = appMatch[1].split('/').filter((part) => part && !/^\(.+\)$/.test(part));
-    return `/${parts.join('/')}`.replace(/\/$/, '') || '/';
+    return applySourceRouteBase(`/${parts.join('/')}`.replace(/\/$/, '') || '/', file);
   }
   const appComponentMatch = normalized.match(/(?:^|\/)(?:src\/)?app\/(.+?)\/[^/]+\.(?:tsx?|jsx?)$/);
   if (appComponentMatch) {
     const parts = appComponentMatch[1].split('/').filter((part) => part && !/^\(.+\)$/.test(part));
-    return `/${parts.join('/')}`.replace(/\/$/, '') || '/';
+    return applySourceRouteBase(`/${parts.join('/')}`.replace(/\/$/, '') || '/', file);
   }
   const pagesMatch = normalized.match(/(?:^|\/)(?:src\/)?pages\/(.+?)\.(?:tsx?|jsx?)$/);
   if (pagesMatch) {
     const page = pagesMatch[1].replace(/\/index$/, '').replace(/^index$/, '');
-    return page ? `/${page}` : '/';
+    return applySourceRouteBase(page ? `/${page}` : '/', file);
   }
-  return '/';
+  return applySourceRouteBase('/', file);
 }
 
 function routeHasDynamicSegment(route) {
@@ -212,6 +350,7 @@ function formRequiresAuth(form, pages = []) {
   const matchingPage = pages.find((page) => page?.path === route);
   if (matchingPage?.requiresAuth === true || matchingPage?.authRequired === true || matchingPage?.protected === true) return true;
   if (matchingPage?.requiresAuth === false || matchingPage?.authRequired === false || matchingPage?.protected === false) return false;
+  if (/(^|\/)(login|log-in|signin|sign-in|sign_in|register|signup|sign-up)(\/|$)/i.test(route)) return false;
   return /(^|\/)(admin|account|dashboard|settings|profile|checkout)(\/|$)/i.test(route);
 }
 
@@ -232,20 +371,40 @@ function extractQaContracts({ projectPath, context = {}, readFile } = {}) {
     if (!content) continue;
 
     if (method === 'GET') {
+      const endpointPath = normalizeRoute(endpoint.path || '/');
+      if (endpointPath === '/') continue;
       for (const queryParam of extractQueryParams(content)) {
-        if (!sourceProvesEqualityFilter(content, queryParam)) continue;
+        let filterEvidence = null;
+        if (sourceProvesEqualityFilter(content, queryParam)) {
+          filterEvidence = {
+            sourceFile,
+            responseField: inferResponseFieldFromSource(content, queryParam),
+          };
+        }
+        if (!filterEvidence) {
+          filterEvidence = findProjectFilterEvidence({ projectPath, param: queryParam, readFile });
+        }
+        if (!filterEvidence && sourceReferencesFilterParam(content, queryParam)) {
+          filterEvidence = {
+            sourceFile,
+            responseField: inferResponseFieldFromSource(content, queryParam),
+          };
+        }
+        if (!filterEvidence) continue;
+        const responseField = filterEvidence.responseField || queryParam;
+        const id = contractId(['qac', 'filter', method, endpointPath, queryParam]);
         filterContracts.push({
-          id: contractId(['qac', 'filter', method, endpoint.path, queryParam]),
+          id,
           type: 'filter',
           method,
-          path: endpoint.path || '/',
+          path: endpointPath,
           queryParam,
-          responseField: queryParam,
+          responseField,
           operator: 'equals',
-          sourceFile,
+          sourceFile: filterEvidence.sourceFile || sourceFile,
           requiresAuth: Boolean(endpoint.requiresAuth || endpoint.authRequired),
           runnable: !Boolean(endpoint.requiresAuth || endpoint.authRequired),
-          marker: `[QAC:${contractId(['qac', 'filter', method, endpoint.path, queryParam])}]`,
+          marker: `[QAC:${id}]`,
         });
       }
     }
