@@ -1950,22 +1950,47 @@ function QaContractAdvisoryBanner({ generationMeta }: { generationMeta: Generati
   );
 }
 
+const AGENT_CATEGORY_SCOPE: Record<string, string[]> = {
+  api: ['api_contract', 'api_auth', 'api_negative', 'api_stress'],
+  frontend: ['ui_flow', 'form_validation'],
+  smoke: ['ui_flow'],
+  workflow: ['workflow_journey'],
+  error: ['form_validation', 'api_negative'],
+};
+
+function inferAgentRequiredCategories(agent: string, q: Record<string, unknown>) {
+  const categories = (q.categories && typeof q.categories === 'object' ? q.categories : {}) as Record<string, number>;
+  const reportedRequired = Array.isArray(q.requiredCategories) ? q.requiredCategories : [];
+  const agentScope = String(q.agentScope || agent || '').toLowerCase();
+  const scoped = AGENT_CATEGORY_SCOPE[agentScope] || reportedRequired;
+  const filtered = scoped.filter((category) =>
+    reportedRequired.length === 0 || reportedRequired.includes(category) || Number(categories[category] || 0) > 0
+  );
+  return filtered.length > 0 ? filtered : reportedRequired;
+}
+
 function AgentCoveragePanel({ agentMeta }: { agentMeta: AgentMetaEntry[] }) {
   const rows = agentMeta
     .map((entry) => {
-      const q = entry.generationMeta?.generationQuality ?? {};
-      const categories = q.categories ?? {};
+      const q = (entry.generationMeta?.generationQuality ?? {}) as Record<string, unknown>;
+      const categories = (q.categories && typeof q.categories === 'object' ? q.categories : {}) as Record<string, number>;
       const total = Number(q.totalTests ?? 0);
-      const required = Array.isArray(q.requiredCategories) ? q.requiredCategories : [];
-      const missing = Array.isArray(q.missingCategories) ? q.missingCategories : [];
+      const required = inferAgentRequiredCategories(entry.agent, q);
+      const missing = required.filter((category) => Number(categories[category] || 0) <= 0);
       const met = required.filter((c) => !missing.includes(c)).length;
+      const minCountWarning = Array.isArray(q.qualityWarnings)
+        ? q.qualityWarnings.find((warning) =>
+            warning && typeof warning === 'object' && (warning as { code?: string }).code === 'MIN_TEST_COUNT_NOT_MET'
+          )
+        : null;
+      const hardFailure = q.valid === false && missing.length > 0;
       return {
         agent: entry.agent,
         total,
-        valid: q.valid !== false,
-        errorCode: q.errorCode ?? null,
-        needsMoreCoverage: q.errorCode === 'MIN_TEST_COUNT_NOT_MET'
-          || (Array.isArray(q.qualityWarnings) && q.qualityWarnings.some((warning) => warning.code === 'MIN_TEST_COUNT_NOT_MET')),
+        valid: !hardFailure,
+        errorCode: typeof q.errorCode === 'string' ? q.errorCode : null,
+        needsMoreCoverage: missing.length > 0,
+        belowTarget: Boolean(minCountWarning) && missing.length === 0,
         missing,
         met,
         totalRequired: required.length,
@@ -2018,6 +2043,10 @@ function AgentCoveragePanel({ agentMeta }: { agentMeta: AgentMetaEntry[] }) {
                   {row.needsMoreCoverage ? (
                     <span className="px-2 py-0.5 rounded bg-amber-500/10 border border-amber-500/30 text-[#FCD34D] text-[11px]">
                       needs more coverage
+                    </span>
+                  ) : row.belowTarget ? (
+                    <span className="px-2 py-0.5 rounded bg-amber-500/10 border border-amber-500/30 text-[#FCD34D] text-[11px]">
+                      below target
                     </span>
                   ) : row.valid ? (
                     <span className="px-2 py-0.5 rounded bg-emerald-500/10 border border-emerald-500/30 text-emerald-300/90 text-[11px]">ok</span>

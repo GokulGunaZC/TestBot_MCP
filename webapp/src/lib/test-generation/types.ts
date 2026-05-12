@@ -292,6 +292,7 @@ export interface GenerationQuality {
   executionAllowedDespiteWarnings?: boolean
   minRunnableRatio?: number
   coverageProfile: string
+  agentScope?: string
   minCategoryHits: number
   requiredCategories: string[]
   missingCategories: string[]

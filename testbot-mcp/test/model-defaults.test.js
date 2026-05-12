@@ -69,3 +69,15 @@ test('gpt-5 family calls do not send unsupported custom temperature on fallback 
   assert.match(browserRunner, /startswith\(\("gpt-5", "o1", "o3", "o4", "codex"\)\)/);
   assert.match(browserRunner, /kwargs\["temperature"\] = 0/);
 });
+
+test('per-agent generation quality uses agent-scoped category expectations', () => {
+  const openaiGenerator = read('webapp/src/lib/test-generation/openai-generator.ts');
+  const dashboardRunPage = read('webapp/src/app/(dashboard)/test-run/[id]/page.tsx');
+
+  assert.match(openaiGenerator, /requiredCategoriesForAgentScope/);
+  assert.match(openaiGenerator, /agentScope:\s*scopedAgent/);
+  assert.match(openaiGenerator, /agent === 'api'[\s\S]*api_contract[\s\S]*api_stress/);
+  assert.match(openaiGenerator, /agent === 'smoke'[\s\S]*ui_flow/);
+  assert.match(dashboardRunPage, /AGENT_CATEGORY_SCOPE/);
+  assert.match(dashboardRunPage, /inferAgentRequiredCategories/);
+});

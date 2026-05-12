@@ -373,12 +373,17 @@ export class OpenAITestGenerator {
         throw strictError
       }
 
+      const scopedAgent = agentsAllowlist && agentsAllowlist.size === 1
+        ? Array.from(agentsAllowlist)[0]
+        : null
+
       let generationQuality = this.evaluateSuiteQuality({
         testType,
         minGeneratedTests,
         strictAIGeneration,
         context,
         coverageProfile: options.coverageProfile || 'qa-max',
+        agentScope: scopedAgent,
       })
 
       // Expansion loop runs for both aggregated and per-agent scoped calls.
@@ -422,6 +427,7 @@ export class OpenAITestGenerator {
             strictAIGeneration,
             context,
             coverageProfile: options.coverageProfile || 'qa-max',
+            agentScope: scopedAgent,
           })
         }
       }
@@ -3272,18 +3278,62 @@ test.describe('Fallback error handling checks', () => {
     return required
   }
 
+  requiredCategoriesForAgentScope({
+    agentScope,
+    testType,
+    context = {},
+  }: {
+    agentScope?: string | null
+    testType: string
+    context?: CapturedContext
+  }): string[] {
+    const agent = String(agentScope || '').toLowerCase()
+    if (!agent) return this.requiredCategoriesForContext({ testType, context })
+
+    const global = new Set(this.requiredCategoriesForContext({ testType, context }))
+    const keep = (categories: string[]) => categories.filter((category) => global.has(category))
+
+    if (agent === 'api') {
+      const apiRequired = keep(['api_contract', 'api_auth', 'api_negative', 'api_stress'])
+      return apiRequired.length > 0 ? apiRequired : ['api_contract']
+    }
+    if (agent === 'workflow') {
+      const workflowRequired = keep(['workflow_journey'])
+      return workflowRequired.length > 0 ? workflowRequired : ['workflow_journey']
+    }
+    if (agent === 'smoke') {
+      const smokeRequired = keep(['ui_flow'])
+      return smokeRequired.length > 0 ? smokeRequired : ['ui_flow']
+    }
+    if (agent === 'frontend') {
+      const frontendRequired = keep(['ui_flow', 'form_validation'])
+      return frontendRequired.length > 0 ? frontendRequired : ['ui_flow']
+    }
+    if (agent === 'error') {
+      const errorRequired = keep(['form_validation', 'api_negative'])
+      return errorRequired.length > 0 ? errorRequired : keep(['ui_flow', 'api_contract'])
+    }
+    if (agent === 'expansion') {
+      return this.requiredCategoriesForContext({ testType, context })
+    }
+
+    return this.requiredCategoriesForContext({ testType, context })
+  }
+
   evaluateSuiteQuality({
     testType,
     minGeneratedTests = 0,
     strictAIGeneration = false,
     context = {},
     coverageProfile = 'qa-max',
+    agentScope = null,
   }: {
     testType: string
     minGeneratedTests?: number
     strictAIGeneration?: boolean
     context?: CapturedContext
     coverageProfile?: string
+    agentScope?: string | null
   }): GenerationQuality {
     const categories: Record<string, number> = {
       ui_flow: 0,
@@ -3318,7 +3368,7 @@ test.describe('Fallback error handling checks', () => {
     const minCategoryHits = normalizedProfile === 'exhaustive' ? 2 : 1
     const minRunnableRatio = normalizedProfile === 'balanced' ? 0.25 : 0.5
     const usefulFloor = minimumUsefulRunnableFloor(minGeneratedTests)
-    const requiredCategories = this.requiredCategoriesForContext({ testType, context })
+    const requiredCategories = this.requiredCategoriesForAgentScope({ agentScope, testType, context })
     const missingCategories = requiredCategories.filter(
       (category) => (categories[category] || 0) < minCategoryHits
     )
@@ -3375,6 +3425,7 @@ test.describe('Fallback error handling checks', () => {
       executionAllowedDespiteWarnings: errors.length === 0 && qualityWarnings.length > 0,
       minRunnableRatio,
       coverageProfile: normalizedProfile,
+      agentScope: agentScope || undefined,
       minCategoryHits,
       requiredCategories,
       missingCategories,
