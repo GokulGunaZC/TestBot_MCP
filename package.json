@@ -8,7 +8,10 @@
     "start:testbot": "npm start -w @testbot/mcp",
     "test:webapp": "npm run test -w webapp",
     "test:testbot": "npm run test -w @testbot/mcp",
-    "compat:matrix": "node scripts/run-compat-matrix.mjs"
+    "compat:matrix": "node scripts/run-compat-matrix.mjs",
+    "docker:build": "./webapp/docker/build.sh",
+    "docker:run": "./webapp/docker/build.sh --run",
+    "docker:migrate-run": "./webapp/docker/build.sh --run --migrate"
   },
   "workspaces": [
     "testbot-mcp",
