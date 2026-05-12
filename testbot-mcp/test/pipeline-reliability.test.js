@@ -46,6 +46,12 @@ const {
   rewriteStartCommandForPort,
   writeSupplementalAuthConfig,
 } = require('../src/pipeline-worker');
+const {
+  extractQaContracts,
+  buildQaContractSpec,
+  ensureQaContractSpec,
+  auditQaContractCoverage,
+} = require('../src/qa-contracts');
 const { startSecondaryServices } = require('../src/multi-service-starter');
 const ReportGenerator = require('../src/report-generator');
 
@@ -60,6 +66,263 @@ function withGeneratedSuite(content, fn) {
     fs.rmSync(root, { recursive: true, force: true });
   }
 }
+
+function withTempProject(fn) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'healix-project-'));
+  try {
+    return fn(root);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
+test('QA contracts detect source-derived filter, delete, and form obligations', () => {
+  withTempProject((projectPath) => {
+    const srcDir = path.join(projectPath, 'src');
+    fs.mkdirSync(srcDir, { recursive: true });
+    fs.writeFileSync(path.join(srcDir, 'routes.js'), `
+      app.get('/api/cards', (req, res) => {
+        const status = req.query.status;
+        const rows = db.prepare('select * from cards where status = ?').all(status);
+        res.json(rows);
+      });
+      app.get('/api/users', async (req, res) => {
+        const role = new URL(req.url, 'http://local').searchParams.get('role');
+        const rows = await prisma.user.findMany({ where: { role } });
+        res.json({ data: rows });
+      });
+      app.delete('/api/cards/:id', (req, res) => {
+        store.delete(req.params.id);
+        res.status(200).end();
+      });
+    `);
+    fs.writeFileSync(path.join(srcDir, 'TaskForm.tsx'), `
+      export function TaskForm() {
+        return <form><input name="title" required /><button type="submit">Save</button></form>;
+      }
+    `);
+
+    const qaContracts = extractQaContracts({
+      projectPath,
+      context: {
+        apiEndpoints: [
+          { method: 'GET', path: '/api/cards', source: 'src/routes.js' },
+          { method: 'GET', path: '/api/users', source: 'src/routes.js' },
+          { method: 'DELETE', path: '/api/cards/:id', source: 'src/routes.js' },
+        ],
+        pages: [{ path: '/tasks/new', sourceFile: 'src/TaskForm.tsx', requiresAuth: false }],
+        forms: [{
+          file: 'src/TaskForm.tsx',
+          fields: [{ name: 'title', required: true }],
+          submitButtons: ['Save'],
+        }],
+      },
+    });
+
+    assert.equal(qaContracts.filterContracts.length, 2);
+    assert.deepEqual(qaContracts.filterContracts.map((contract) => contract.queryParam).sort(), ['role', 'status']);
+    assert.equal(qaContracts.deleteStatusContracts.length, 1);
+    assert.equal(qaContracts.deleteStatusContracts[0].requiresConfirmation, true);
+    assert.equal(qaContracts.deleteStatusContracts[0].expectedStatus, 204);
+    assert.equal(qaContracts.formValidationContracts.length, 1);
+    assert.equal(qaContracts.formValidationContracts[0].route, '/tasks/new');
+    assert.equal(qaContracts.summary.advisoryQuestions, 1);
+  });
+});
+
+test('QA contracts detect Spring @RequestParam equality filters', () => {
+  withTempProject((projectPath) => {
+    const srcDir = path.join(projectPath, 'src', 'main', 'java', 'demo');
+    fs.mkdirSync(srcDir, { recursive: true });
+    fs.writeFileSync(path.join(srcDir, 'OrderController.java'), `
+      @GetMapping("/api/orders")
+      public List<Order> list(@RequestParam("status") String status) {
+        return entityManager.createQuery("select o from Order o where o.status = :status")
+          .setParameter("status", status)
+          .getResultList();
+      }
+    `);
+
+    const qaContracts = extractQaContracts({
+      projectPath,
+      context: {
+        apiEndpoints: [{
+          method: 'GET',
+          path: '/api/orders',
+          source: 'src/main/java/demo/OrderController.java',
+        }],
+      },
+    });
+
+    assert.equal(qaContracts.filterContracts.length, 1);
+    assert.equal(qaContracts.filterContracts[0].queryParam, 'status');
+    assert.equal(qaContracts.filterContracts[0].responseField, 'status');
+  });
+});
+
+test('deterministic QA contract spec uses live property checks and accessible form validation', () => {
+  const spec = buildQaContractSpec({
+    qaContracts: {
+      filterContracts: [{
+        id: 'qac-filter-get-api-cards-status',
+        marker: '[QAC:qac-filter-get-api-cards-status]',
+        method: 'GET',
+        path: '/api/cards',
+        queryParam: 'status',
+        responseField: 'status',
+        sourceFile: 'src/routes.js',
+        runnable: true,
+      }],
+      formValidationContracts: [{
+        id: 'qac-form-validation-tasks-new',
+        marker: '[QAC:qac-form-validation-tasks-new]',
+        route: '/tasks/new',
+        requiredFields: [{ name: 'title' }],
+        sourceFile: 'src/TaskForm.tsx',
+        runnable: true,
+      }],
+    },
+    roles: [],
+    testType: 'both',
+  });
+
+  assert.ok(spec);
+  assert.match(spec.content, /\[QAC:qac-filter-get-api-cards-status\]/);
+  assert.match(spec.content, /for \(const row of filteredRows\)/);
+  assert.match(spec.content, /row must satisfy status=/);
+  assert.match(spec.content, /\[role="alert"\], \[aria-invalid="true"\]/);
+  assert.match(spec.content, /requestSubmit\(\)/);
+  assert.doesNotMatch(spec.content, /checkValidity\(/);
+});
+
+test('quality audit requires runnable QA filter and form contracts to be covered', () => {
+  withGeneratedSuite(`
+    import { test, expect } from '@playwright/test';
+    test('[SRC:src/App.tsx] source-grounded smoke', async ({ page }) => {
+      await page.goto('/tasks/new');
+      await expect(page.getByRole('heading', { name: 'Tasks' })).toBeVisible();
+    });
+  `, (projectPath) => {
+    fs.mkdirSync(path.join(projectPath, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(projectPath, 'src', 'App.tsx'), `
+      export function App(){ return <main><h1>Tasks</h1><form><input name="title" required /><button>Save</button></form></main> }
+    `);
+    fs.writeFileSync(path.join(projectPath, 'src', 'routes.js'), `
+      app.get('/api/cards', (req, res) => {
+        const status = req.query.status;
+        res.json(db.prepare('select * from cards where status = ?').all(status));
+      });
+    `);
+
+    const qaContracts = extractQaContracts({
+      projectPath,
+      context: {
+        apiEndpoints: [{ method: 'GET', path: '/api/cards', source: 'src/routes.js' }],
+        pages: [{ path: '/tasks/new', sourceFile: 'src/App.tsx', requiresAuth: false }],
+        forms: [{ file: 'src/App.tsx', fields: [{ name: 'title', required: true }] }],
+      },
+    });
+
+    const missingAudit = auditGeneratedTestQuality({
+      projectPath,
+      testType: 'both',
+      context: {
+        qaContracts,
+        pages: [{ path: '/tasks/new', sourceFile: 'src/App.tsx' }],
+        sourceContext: {
+          files: [{ file: 'src/App.tsx', routePaths: ['/tasks/new'], assertableText: ['Tasks'] }],
+          routePaths: ['/tasks/new'],
+          assertableText: ['Tasks'],
+        },
+      },
+    });
+    assert.equal(missingAudit.valid, false);
+    assert.ok(missingAudit.errors.some((error) => error.startsWith('missing_qa_contract_coverage:qac-filter-get-api-cards-status')));
+
+    const pack = ensureQaContractSpec({
+      projectPath,
+      context: { qaContracts },
+      roles: [],
+      testType: 'both',
+    });
+    assert.equal(pack.written, true);
+    assert.equal(pack.generatedTests, 2);
+
+    const coveredAudit = auditQaContractCoverage({
+      context: { qaContracts },
+      roles: [],
+      testType: 'both',
+      contents: [
+        fs.readFileSync(path.join(projectPath, 'tests', 'generated', 'generated.spec.ts'), 'utf-8'),
+        fs.readFileSync(pack.path, 'utf-8'),
+      ],
+    });
+    assert.equal(coveredAudit.valid, true);
+    assert.deepEqual(coveredAudit.missing, []);
+  });
+});
+
+test('DELETE no-body status contracts create advisory questions without failing coverage', () => {
+  const qaContracts = {
+    filterContracts: [],
+    formValidationContracts: [],
+    deleteStatusContracts: [{
+      id: 'qac-delete-status-delete-api-cards-id',
+      method: 'DELETE',
+      path: '/api/cards/:id',
+      sourceFile: 'src/routes.js',
+      expectedStatus: 204,
+      explicitStatuses: [200],
+      requiresConfirmation: true,
+      question: 'DELETE /api/cards/:id appears to return no body. Should Healix expect HTTP 204?',
+    }],
+  };
+
+  const coverage = auditQaContractCoverage({
+    context: { qaContracts },
+    roles: [],
+    contents: [],
+    testType: 'backend',
+  });
+
+  assert.equal(coverage.valid, true);
+  assert.deepEqual(coverage.required, []);
+  assert.equal(coverage.questions.length, 1);
+  assert.equal(coverage.warnings[0].code, 'QAC_DELETE_STATUS_NEEDS_CONFIRMATION');
+});
+
+test('Pulseboard planted-bug fixture derives runnable filter/form contracts and DELETE advisory', () => {
+  const projectPath = path.resolve(__dirname, '..', '..', 'compat-fixtures', 'pulseboard-planted-bugs');
+  const qaContracts = extractQaContracts({
+    projectPath,
+    context: {
+      apiEndpoints: [
+        { method: 'GET', path: '/api/cards', source: 'src/server.js' },
+        { method: 'DELETE', path: '/api/cards/:id', source: 'src/server.js' },
+      ],
+      pages: [{ path: '/', sourceFile: 'src/App.tsx', requiresAuth: false }],
+      forms: [{
+        file: 'src/App.tsx',
+        fields: [
+          { name: 'title', required: true },
+          { name: 'status', required: true },
+        ],
+        submitButtons: ['Create card'],
+      }],
+    },
+  });
+
+  assert.equal(qaContracts.filterContracts.length, 1);
+  assert.equal(qaContracts.filterContracts[0].queryParam, 'status');
+  assert.equal(qaContracts.formValidationContracts.length, 1);
+  assert.equal(qaContracts.deleteStatusContracts.length, 1);
+  assert.equal(qaContracts.questions.length, 1);
+
+  const spec = buildQaContractSpec({ qaContracts, testType: 'both' });
+  assert.match(spec.content, /\[QAC:qac-filter-get-api-cards-status\]/);
+  assert.match(spec.content, /\[QAC:qac-form-validation-root-src-app-tsx\]/);
+  assert.match(spec.content, /row must satisfy status=/);
+});
 
 test('counts runnable declarations separately from skipped declarations and runtime skips', () => {
   const content = `

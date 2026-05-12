@@ -130,8 +130,60 @@ export interface AuthPattern {
 export interface MockableApiContract {
   method: string
   path: string
+  sourceFile?: string | null
   request?: { fields?: string[] }
   responses?: number[]
+}
+
+export interface QaFilterContract {
+  id: string
+  type: 'filter'
+  method: string
+  path: string
+  queryParam: string
+  responseField: string
+  operator?: 'equals' | string
+  sourceFile?: string | null
+  requiresAuth?: boolean
+  runnable?: boolean
+  marker?: string
+}
+
+export interface QaDeleteStatusContract {
+  id: string
+  type: 'delete_status'
+  method: string
+  path: string
+  sourceFile?: string | null
+  explicitStatuses?: number[]
+  noBody?: boolean
+  expectedStatus?: number | null
+  advisory?: boolean
+  requiresConfirmation?: boolean
+  runnable?: boolean
+  marker?: string
+  question?: string | null
+}
+
+export interface QaFormValidationContract {
+  id: string
+  type: 'form_validation'
+  route: string
+  sourceFile?: string | null
+  requiredFields: Array<{ name: string; label?: string | null; placeholder?: string | null; testId?: string | null; role?: string | null }>
+  submitButtons?: Array<{ text?: string; type?: string; testId?: string | null; ariaLabel?: string | null }>
+  selectorHints?: string[]
+  requiresAuth?: boolean
+  runnable?: boolean
+  marker?: string
+}
+
+export interface QaContracts {
+  filterContracts?: QaFilterContract[]
+  deleteStatusContracts?: QaDeleteStatusContract[]
+  formValidationContracts?: QaFormValidationContract[]
+  summary?: Record<string, number>
+  questions?: Array<Record<string, unknown>>
 }
 
 export interface NavigationGraph {
@@ -150,6 +202,7 @@ export interface CapturedContext {
   navigationGraph?: NavigationGraph
   selectorHints?: string[]
   mockableApiContracts?: MockableApiContract[]
+  qaContracts?: QaContracts
   dataModels?: unknown[]
   fileContents?: Record<string, string>
   sourceContext?: SourceContext

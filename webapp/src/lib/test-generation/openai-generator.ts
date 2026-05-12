@@ -1191,9 +1191,50 @@ IMPORTANT: Return ONLY valid JSON.`
     const apiContracts = realApiContracts.slice(0, 25).map((contract) => ({
       method: contract.method,
       path: contract.path,
+      sourceFile: contract.sourceFile || null,
       requestFields: (contract.request?.fields || []).slice(0, 12),
       responses: (contract.responses || []).slice(0, 10),
     }))
+
+    const qaContracts = context.qaContracts
+      ? {
+          summary: context.qaContracts.summary || null,
+          questions: (context.qaContracts.questions || []).slice(0, 20),
+          filterContracts: (context.qaContracts.filterContracts || []).slice(0, 25).map((contract) => ({
+            id: contract.id,
+            marker: contract.marker || `[QAC:${contract.id}]`,
+            method: contract.method,
+            path: contract.path,
+            queryParam: contract.queryParam,
+            responseField: contract.responseField,
+            operator: contract.operator || 'equals',
+            sourceFile: contract.sourceFile || null,
+            requiresAuth: !!contract.requiresAuth,
+            runnable: contract.runnable !== false,
+          })),
+          deleteStatusContracts: (context.qaContracts.deleteStatusContracts || []).slice(0, 25).map((contract) => ({
+            id: contract.id,
+            marker: contract.marker || `[QAC:${contract.id}]`,
+            method: contract.method,
+            path: contract.path,
+            sourceFile: contract.sourceFile || null,
+            explicitStatuses: contract.explicitStatuses || [],
+            noBody: !!contract.noBody,
+            expectedStatus: contract.expectedStatus || null,
+            requiresConfirmation: !!contract.requiresConfirmation,
+            question: contract.question || null,
+          })),
+          formValidationContracts: (context.qaContracts.formValidationContracts || []).slice(0, 25).map((contract) => ({
+            id: contract.id,
+            marker: contract.marker || `[QAC:${contract.id}]`,
+            route: contract.route,
+            sourceFile: contract.sourceFile || null,
+            requiredFields: (contract.requiredFields || []).slice(0, 12),
+            requiresAuth: !!contract.requiresAuth,
+            runnable: contract.runnable !== false,
+          })),
+        }
+      : null
 
     const workflows = (context.workflows || []).slice(0, 12).map((workflow) => {
       if (typeof workflow === 'string') {
@@ -1362,6 +1403,7 @@ IMPORTANT: Return ONLY valid JSON.`
         authPatterns: (context.authPatterns || []).slice(0, 8),
         ...(isFrontendAgent ? {} : { apiSchemas: (context.apiSchemas || []).slice(0, 10) }),
         ...(isFrontendAgent ? {} : { mockableApiContracts: apiContracts }),
+        ...(qaContracts ? { qaContracts } : {}),
         componentDetails,
         ...(sourceContext ? { sourceContext } : {}),
         navigationGraph: context.navigationGraph || null,
@@ -1396,6 +1438,7 @@ IMPORTANT: Return ONLY valid JSON.`
       'A button click or form submit does not imply navigation. Only assert a URL change when OBSERVED_FLOWS endCondition, routeAccess, or sourceContext proves that exact action navigates; otherwise assert visible in-place feedback, changed button state, toast/dialog/inline message, or continued page usability.',
       'Do not assert conditional UI before triggering its condition. Menus, dropdowns, dialogs, accordions, drawers, mobile nav, filters, tabs, and collapsed panels must be opened/selected first, then asserted within the opened container.',
       'Avoid contradictory before/after assertions. After a transition, assert either the pre-state remains because the app stayed in place, or the post-state appears because the transition completed; never both in the same success path.',
+      'When CONTEXT_JSON.context.qaContracts is present, generated tests may include the listed [QAC:<id>] markers and must follow those source-derived contracts exactly. Filter contracts assert every returned row satisfies the inferred field equality; form-validation contracts assert role="alert" or aria-invalid="true" after empty required submit; delete-status contracts with requiresConfirmation are advisory and must not be turned into hard failures unless source explicitly requires 204.',
     )
     const payloadObj = payload as { prd?: string } | null
     if (payloadObj?.prd && String(payloadObj.prd).trim()) {

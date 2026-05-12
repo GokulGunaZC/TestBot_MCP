@@ -36,6 +36,12 @@ const { startSecondaryServices, stopSecondaryServices, probeHttpReady, waitForSe
 const { runExplorationPhase, EMPTY_ARTIFACT, artifactHasUsefulContext } = require('./exploration-phase');
 const { injectCredentials, normalizeRoleLabel } = require('./credentials-injector');
 const { isUnsafeAuthFlow, sanitizeAuthFlow } = require('./auth-flow-utils');
+const {
+  ensureQaContractSpec,
+  auditQaContractCoverage,
+  summarizeQaContracts,
+  buildQaContractQuestions,
+} = require('./qa-contracts');
 const Logger = require('./logger');
 const MCPTelemetryReporter = require('./mcp-telemetry');
 
@@ -3696,6 +3702,10 @@ function auditGeneratedTestQuality({ projectPath, testType, context, exploration
     brittlePatternFiles: [],
     sourceMismatchFiles: [],
     authGatingFiles: [],
+    qaContractSummary: summarizeQaContracts(context?.qaContracts || {}),
+    qaContractCoverage: null,
+    qaContractWarnings: [],
+    qaContractQuestions: buildQaContractQuestions(context?.qaContracts || {}),
     errors: [],
     warnings: [],
   };
@@ -3830,6 +3840,7 @@ function auditGeneratedTestQuality({ projectPath, testType, context, exploration
   (context?.selectorHints || []).forEach(collectKnownText);
 
   let uiFilesWithPreferredSelectors = 0;
+  const generatedContents = [];
 
   for (const name of files) {
     const fullPath = path.join(generatedDir, name);
@@ -3840,6 +3851,7 @@ function auditGeneratedTestQuality({ projectPath, testType, context, exploration
       summary.warnings.push(`failed_to_read:${name}`);
       continue;
     }
+    generatedContents.push(content);
 
     if (/^fallback-|^template-/i.test(name) || /Fallback (frontend|workflow|API|checks)|fallbackReason|template fallback/i.test(content)) {
       summary.errors.push(`fallback_or_template_spec:${name}`);
@@ -4212,6 +4224,23 @@ function auditGeneratedTestQuality({ projectPath, testType, context, exploration
 
   if ((testType === 'frontend' || testType === 'both') && sourceCorpus.size > 0 && summary.ungroundedUiFiles.length > 0) {
     summary.errors.push(`ungrounded_ui_files:${summary.ungroundedUiFiles.slice(0, 5).join(',')}`);
+  }
+
+  const qaCoverage = auditQaContractCoverage({
+    context,
+    roles,
+    contents: generatedContents,
+    testType,
+  });
+  summary.qaContractSummary = qaCoverage.summary;
+  summary.qaContractCoverage = qaCoverage;
+  summary.qaContractWarnings = qaCoverage.warnings || [];
+  summary.qaContractQuestions = qaCoverage.questions || [];
+  for (const warning of summary.qaContractWarnings) {
+    summary.warnings.push(`${warning.code}:${warning.contractId}`);
+  }
+  for (const missingContractId of qaCoverage.missing || []) {
+    summary.errors.push(`missing_qa_contract_coverage:${missingContractId}`);
   }
 
   summary.riskyFiles = [...new Set(summary.riskyFiles)];
@@ -5484,6 +5513,49 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
   const qualityRecoveryEvents = [];
 
   const runValidation = async (generator) => withStageBudget(runBudget, 'validation', async () => {
+    const qaContractPack = ensureQaContractSpec({
+      projectPath: config.projectPath,
+      context,
+      roles,
+      testType: config.testType,
+    });
+    if (qaContractPack.written) {
+      Logger.info('PipelineWorker', 'Wrote deterministic QA contract spec', {
+        filename: qaContractPack.filename,
+        generatedTests: qaContractPack.generatedTests,
+        qaContractSummary: qaContractPack.qaContractSummary,
+      });
+      try {
+        const verifiedRoles = (roles || []).filter((role) => role && role.loginVerified && role.storageStatePath);
+        qaContractPack.fixtureWiring = ensureHealixFixtureImports({
+          projectPath: config.projectPath,
+          roles: verifiedRoles,
+        });
+      } catch (fixtureError) {
+        qaContractPack.fixtureWiring = {
+          applied: false,
+          reason: 'qa_contract_fixture_patch_failed',
+          error: fixtureError.message,
+        };
+        Logger.warn('PipelineWorker', 'Failed to wire Healix fixture after QA contract generation', {
+          generator,
+          reason: fixtureError.message,
+        });
+      }
+      if (statusDir) {
+        updateStatus(statusDir, 'generation_quality_recovered', {
+          runId,
+          message: `Added ${qaContractPack.generatedTests} source-derived QA contract test(s).`,
+          qaContractSummary: qaContractPack.qaContractSummary,
+          qaContractQuestions: qaContractPack.qaContractQuestions,
+        }, telemetryReporter);
+      }
+    }
+    generationMeta.qaContractPack = qaContractPack;
+    generationMeta.qaContractSummary = qaContractPack.qaContractSummary;
+    generationMeta.qaContractQuestions = qaContractPack.qaContractQuestions;
+    generationMeta.qaContractWarnings = qaContractPack.qaContractWarnings;
+
     let validation = await validateGeneratedTestsWithList({
       projectPath: config.projectPath,
       validateGeneratedTests,
@@ -5521,7 +5593,12 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
       hasApiBurstCoverage: qualityAudit.hasApiBurstCoverage,
       selectorCoverageRatio: qualityAudit.selectorCoverageRatio,
       totalFiles: qualityAudit.totalFiles,
+      qaContractCoverage: qualityAudit.qaContractCoverage,
     });
+    generationMeta.qaContractCoverage = qualityAudit.qaContractCoverage || null;
+    generationMeta.qaContractSummary = qualityAudit.qaContractSummary || generationMeta.qaContractSummary || null;
+    generationMeta.qaContractWarnings = qualityAudit.qaContractWarnings || [];
+    generationMeta.qaContractQuestions = qualityAudit.qaContractQuestions || generationMeta.qaContractQuestions || [];
 
     if (!qualityAudit.valid) {
       const pruning = pruneGeneratedTestsByQuality({
@@ -5838,6 +5915,49 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
             );
             // fall through to the normal failure path below
           }
+        }
+      }
+
+      const hasQaContracts =
+        (context?.qaContracts?.filterContracts || []).length > 0 ||
+        (context?.qaContracts?.formValidationContracts || []).length > 0;
+      if (hasQaContracts && ['ALL_AGENTS_FAILED', 'GENERATION_FAILED'].includes(errorCode)) {
+        try {
+          const validation = await runValidation(`${generatorName}-qa-contracts`);
+          generationMeta.provider = generatorName;
+          generationMeta.selectedGenerator = `${generatorName}-qa-contracts`;
+          generationMeta.fallbackUsed = false;
+          generationMeta.partialGenerationWarning = {
+            reason: 'ai_generation_empty_qa_contract_rescue',
+            generator: generatorName,
+            partialsWrittenCount: validation.qualityAudit?.totalFiles || 0,
+            message: 'AI generation returned no usable files; proceeding with deterministic source-derived QA contract tests.',
+          };
+          generationMeta.attempts.push({
+            generator: generatorName,
+            status: 'partial',
+            reason: 'qa_contract_rescue',
+            rawReason: normalizeErrorText(error?.message),
+            errorCode,
+            generated: validation.qualityAudit?.totalFiles || 0,
+            validation,
+            durationMs: Date.now() - startedAt,
+          });
+          return {
+            generated: validation.qualityAudit?.totalFiles || 0,
+            files: listGeneratedTestFiles(config.projectPath).map((filePath) => ({
+              path: filePath,
+              filename: path.basename(filePath),
+              type: 'qa_contract',
+            })),
+            provider: generatorName,
+            generationMeta,
+          };
+        } catch (qaRescueErr) {
+          Logger.warn('PipelineWorker', 'QA contract rescue failed after empty AI generation', {
+            generator: generatorName,
+            reason: qaRescueErr?.message,
+          });
         }
       }
 

@@ -8,6 +8,7 @@
 const fs = require('fs');
 const path = require('path');
 const Logger = require('./logger');
+const { extractQaContracts } = require('./qa-contracts');
 
 class ContextGatherer {
   constructor(config = {}) {
@@ -103,6 +104,7 @@ class ContextGatherer {
       forms: [],
       dataModels: [],
       authPatterns: [],
+      qaContracts: null,
       projectStructure: {},
     };
     
@@ -132,6 +134,9 @@ class ContextGatherer {
     // Identify common workflows from routes
     context.workflows = this.inferWorkflows(context.pages, context.apiEndpoints, context.forms);
     Logger.info('ContextGatherer', `Inferred workflows`, { count: context.workflows.length });
+
+    context.qaContracts = this.extractQaContracts(projectPath, context);
+    Logger.info('ContextGatherer', 'Derived QA contracts', context.qaContracts?.summary || {});
     
     return context;
   }
@@ -198,6 +203,7 @@ class ContextGatherer {
       richContext.forms
     );
     richContext.sourceContext = this.extractSourceContext(projectPath, richContext.pages);
+    richContext.qaContracts = this.extractQaContracts(projectPath, richContext);
     richContext.extractionConfidence = {
       selectorHints: richContext.selectorHints.length > 0 ? 0.9 : 0.5,
       navigationGraph: (richContext.navigationGraph.edges || []).length > 0 ? 0.85 : 0.4,
@@ -211,9 +217,18 @@ class ContextGatherer {
       forms: 'jsx-tsx-form-parsing',
       apiContracts: 'endpoint-handler-parsing',
       sourceContext: 'route-source-and-component-literal-parsing',
+      qaContracts: 'source-derived-filter-delete-form-contracts',
     };
     
     return richContext;
+  }
+
+  extractQaContracts(projectPath, context) {
+    return extractQaContracts({
+      projectPath,
+      context,
+      readFile: (filePath, options) => this.readFileCached(filePath, options),
+    });
   }
 
   /**

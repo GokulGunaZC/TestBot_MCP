@@ -121,6 +121,24 @@ interface GenerationMetaShape {
   partialsWrittenCount?: number;
   partialGenerationWarning?: PartialGenerationWarning;
   qualityWarning?: QualityWarning;
+  qaContractQuestions?: Array<{
+    id?: string;
+    type?: string;
+    severity?: string;
+    method?: string;
+    path?: string;
+    sourceFile?: string | null;
+    expectedStatus?: number;
+    explicitStatuses?: number[];
+    question?: string;
+  }>;
+  qaContractCoverage?: {
+    required?: string[];
+    covered?: string[];
+    missing?: string[];
+    blocked?: string[];
+  } | null;
+  qaContractSummary?: Record<string, number> | null;
   [key: string]: unknown;
 }
 
@@ -1841,6 +1859,87 @@ function QualityWarningBanner({ warning }: { warning: QualityWarning }) {
   );
 }
 
+function QaContractAdvisoryBanner({ generationMeta }: { generationMeta: GenerationMetaShape }) {
+  const questions = Array.isArray(generationMeta.qaContractQuestions)
+    ? generationMeta.qaContractQuestions
+    : [];
+  const coverage = generationMeta.qaContractCoverage || null;
+  const summary = generationMeta.qaContractSummary || null;
+  if (questions.length === 0) return null;
+
+  const required = Array.isArray(coverage?.required) ? coverage.required.length : 0;
+  const covered = Array.isArray(coverage?.covered) ? coverage.covered.length : 0;
+  const missing = Array.isArray(coverage?.missing) ? coverage.missing.length : 0;
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: -6 }}
+      animate={{ opacity: 1, y: 0 }}
+      className="glass-card rounded-2xl overflow-hidden border border-amber-500/25 bg-amber-500/[0.04]"
+    >
+      <div className="px-5 py-4 flex items-start gap-3">
+        <div className="w-9 h-9 rounded-lg flex items-center justify-center flex-shrink-0 mt-0.5 bg-amber-500/15 border border-amber-500/30">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#FBBF24" strokeWidth="2.2">
+            <circle cx="12" cy="12" r="10" />
+            <path d="M12 7v6" />
+            <path d="M12 17h.01" />
+          </svg>
+        </div>
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <div className="font-semibold text-[15px] text-[#FDE68A]">
+              QA contract needs confirmation
+            </div>
+            <span className="px-2 py-0.5 rounded-md bg-amber-500/10 border border-amber-500/25 text-[#FCD34D] text-[11px] font-mono">
+              {questions.length} question{questions.length === 1 ? '' : 's'}
+            </span>
+            {required > 0 && (
+              <span className="px-2 py-0.5 rounded-md bg-white/5 border border-white/10 text-[#D8E8FF]/70 text-[11px] font-mono">
+                QAC covered: {covered}/{required}
+              </span>
+            )}
+            {missing > 0 && (
+              <span className="px-2 py-0.5 rounded-md bg-red-500/10 border border-red-500/25 text-red-300 text-[11px] font-mono">
+                missing: {missing}
+              </span>
+            )}
+            {summary?.deleteStatusContracts ? (
+              <span className="px-2 py-0.5 rounded-md bg-white/5 border border-white/10 text-[#D8E8FF]/70 text-[11px] font-mono">
+                delete contracts: {summary.deleteStatusContracts}
+              </span>
+            ) : null}
+          </div>
+          <p className="text-[#F0F6FF]/85 text-sm mt-1">
+            Healix found source-derived DELETE no-body status conventions that should be confirmed by the app owner. These are advisory and separate from app/test failures unless the source or PRD explicitly requires a status.
+          </p>
+          <div className="mt-3 space-y-2">
+            {questions.slice(0, 4).map((question, index) => (
+              <div
+                key={question.id || `${question.method || 'DELETE'}-${question.path || index}`}
+                className="rounded-xl border border-amber-500/15 bg-black/15 px-3 py-2"
+              >
+                <div className="flex flex-wrap items-center gap-2 text-[11px] font-mono text-[#FCD34D]">
+                  <span>{question.method || 'DELETE'}</span>
+                  <span>{question.path || '/'}</span>
+                  {question.sourceFile && <span className="text-[#D8E8FF]/55">[{question.sourceFile}]</span>}
+                </div>
+                <div className="text-[13px] text-[#F0F6FF]/85 mt-1">
+                  {question.question || 'Confirm whether this no-body DELETE endpoint should return HTTP 204.'}
+                </div>
+              </div>
+            ))}
+            {questions.length > 4 && (
+              <div className="text-[12px] text-[#D8E8FF]/55">
+                +{questions.length - 4} more confirmation item{questions.length - 4 === 1 ? '' : 's'} in the full report metadata.
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    </motion.div>
+  );
+}
+
 function AgentCoveragePanel({ agentMeta }: { agentMeta: AgentMetaEntry[] }) {
   const rows = agentMeta
     .map((entry) => {
@@ -3041,6 +3140,10 @@ export default function TestRunDetailPage() {
         (qualityWarning.suggestions?.length || 0) > 0 || (qualityWarning.qualityWarnings?.length || 0) > 0
       ) && (
         <QualityWarningBanner warning={qualityWarning} />
+      )}
+
+      {!pipelineError && generationMeta && Array.isArray(generationMeta.qaContractQuestions) && generationMeta.qaContractQuestions.length > 0 && (
+        <QaContractAdvisoryBanner generationMeta={generationMeta} />
       )}
 
       {Array.isArray(generationMeta?.agentMeta) && generationMeta!.agentMeta!.length > 0 && (
