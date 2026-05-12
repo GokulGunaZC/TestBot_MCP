@@ -11,6 +11,7 @@
 
 import { z } from 'zod'
 import { OpenAIClient } from './openai-client'
+import { resolveConfiguredOpenAIModel } from '@/lib/model-defaults'
 import type {
   AgentName,
   CapturedContext,
@@ -133,7 +134,7 @@ export class OpenAITestGenerator {
 
     this.config = {
       apiKey: config.apiKey || process.env.OPENAI_API_KEY || '',
-      model: config.model || process.env.OPENAI_MODEL || 'gpt-4.1-mini',
+      model: resolveConfiguredOpenAIModel(config.model),
       maxTokens: config.maxTokens || (Number.isFinite(envMaxTokens) ? envMaxTokens : 12000),
       temperature:
         config.temperature !== undefined
@@ -1280,7 +1281,7 @@ IMPORTANT: Return ONLY valid JSON.`
 
     // Frontend tests only need UI-facing context. Dropping API contracts and
     // schemas for the frontend agent cuts prompt tokens by ~30%, which reduces
-    // gpt-5.4-mini reasoning time enough to stay within the webapp-client timeout.
+    // gpt-5.5-mini reasoning time enough to stay within the webapp-client timeout.
     const isFrontendAgent = ['frontend', 'smoke', 'workflow', 'error', 'expansion'].includes(testKind)
 
     // Build auth context so the model knows exactly which roles have verified

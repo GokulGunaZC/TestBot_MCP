@@ -7,6 +7,7 @@ import { parsePRD, hashPRD } from '@/lib/prd-parser'
 import { checkRateLimit } from '@/lib/rate-limit'
 import { checkTokenBalance, recordTokenUsage, MIN_TOKENS_PARSE_PRD, REC_TOKENS_PARSE_PRD } from '@/lib/tokens'
 import { resolveModel } from '@/lib/pricing'
+import { resolveConfiguredOpenAIModel } from '@/lib/model-defaults'
 import { checkConcurrencyLimit } from '@/lib/concurrency-limit'
 import { checkAiGuard, recordAiCall } from '@/lib/ai-guard'
 import { logBlockedRequest } from '@/lib/security-logger'
@@ -137,7 +138,7 @@ export async function POST(request: NextRequest) {
 
     const { parsedPRD, tokenUsage } = await parsePRD(prdText, {
       openaiApiKey: process.env.OPENAI_API_KEY,
-      model: process.env.OPENAI_MODEL || 'gpt-4.1-mini',
+      model: resolveConfiguredOpenAIModel(),
     })
 
     if (tokenUsage.totalTokens > 0) {

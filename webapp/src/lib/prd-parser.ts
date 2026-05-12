@@ -103,7 +103,7 @@ export async function parsePRD(
     apiKey: opts.openaiApiKey,
     model: opts.model,
     temperature: 0.1,
-    timeout: opts.timeoutMs ?? 300_000, // gpt-5.4-mini reasoning:medium needs up to ~3 min
+    timeout: opts.timeoutMs ?? 300_000, // gpt-5.5-mini reasoning:medium needs up to ~3 min
   })
 
   const messages: OpenAIMessage[] = [

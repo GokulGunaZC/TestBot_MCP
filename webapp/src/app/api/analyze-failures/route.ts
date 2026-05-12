@@ -6,6 +6,7 @@ import { hashApiKey } from '@/lib/utils/api-keys'
 import { checkRateLimit } from '@/lib/rate-limit'
 import { checkTokenBalance, recordTokenUsage, MIN_TOKENS_ANALYZE, REC_TOKENS_ANALYZE } from '@/lib/tokens'
 import { resolveModel } from '@/lib/pricing'
+import { resolveConfiguredOpenAIModel } from '@/lib/model-defaults'
 import { checkIdempotency, storeIdempotencyResult } from '@/lib/idempotency'
 import { validateAnalyzeFailures } from '@/lib/validation'
 import { checkAiGuard, recordAiCall } from '@/lib/ai-guard'
@@ -23,8 +24,8 @@ import {
 const ENDPOINT = '/api/analyze-failures'
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY
-const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4.1-mini'
-// gpt-5.4-mini with reasoning:high can run 5+ minutes on evidence-heavy triage.
+const OPENAI_MODEL = resolveConfiguredOpenAIModel()
+// gpt-5.5-mini with reasoning:high can run 5+ minutes on evidence-heavy triage.
 const OPENAI_TIMEOUT = 540_000 // 9 minutes
 
 const MAX_FAILURES = 8

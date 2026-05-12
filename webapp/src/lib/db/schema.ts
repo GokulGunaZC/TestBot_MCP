@@ -312,7 +312,7 @@ export const projectUsage = pgTable(
 /**
  * P1.5 planner-pass cache. Each user's (prd + parsedPRD + contextDigest +
  * projectInfoDigest + roles) hash maps to a single cached GenerationPlan
- * for 24h. Skipping the planner on a cache hit eliminates two gpt-5.4-mini calls
+ * for 24h. Skipping the planner on a cache hit eliminates two gpt-5.5-mini calls
  * per pipeline run for repeat generations against the same repo snapshot.
  */
 export const generationPlans = pgTable(
@@ -408,7 +408,7 @@ export const tokenLedger = pgTable(
     entryType: text('entry_type').notNull(), // 'debit' | 'credit'
     endpoint: text('endpoint'),              // '/api/generate-tests' etc.; null on credits
     agent: text('agent'),                    // 'smoke'|'frontend'|'api'|...; null on credits
-    model: text('model'),                    // 'gpt-5.4' etc.; null on credits
+    model: text('model'),                    // runtime model id; null on credits
     tokensInput: bigint('tokens_input', { mode: 'number' }).default(0).notNull(),
     tokensOutput: bigint('tokens_output', { mode: 'number' }).default(0).notNull(),
     tokensTotal: bigint('tokens_total', { mode: 'number' }).default(0).notNull(),

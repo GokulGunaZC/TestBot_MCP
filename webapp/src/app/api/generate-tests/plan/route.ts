@@ -31,7 +31,7 @@ import { logBlockedRequest } from '@/lib/security-logger'
 const ENDPOINT = '/api/generate-tests/plan'
 
 // Raised from 60 (Vercel Hobby) to 600 to match vercel.json and give
-// gpt-5.4-mini enough runway on complex PRDs. Local Next.js ignores this.
+// gpt-5.5-mini enough runway on complex PRDs. Local Next.js ignores this.
 export const maxDuration = 600
 
 function canonicalJSON(value: unknown): string {

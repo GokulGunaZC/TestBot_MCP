@@ -196,7 +196,7 @@ function row(label: string, value: string): string {
 function getPlanFeatures(plan: string): string[] {
   const features: Record<string, string[]> = {
     starter: [
-      'Advanced AI models (GPT-5.4)',
+      'Advanced AI models (gpt-5.5-mini)',
       'All test types + self-healing',
       'Jira / ADO integration',
       'Priority support',

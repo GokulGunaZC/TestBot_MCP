@@ -5,6 +5,7 @@
  */
 
 import type { OpenAIClientConfig, OpenAIMessage, OpenAIUsage, OpenAICallResult } from './types'
+import { resolveConfiguredOpenAIModel } from '@/lib/model-defaults'
 
 export class OpenAIClient {
   config: Required<OpenAIClientConfig>
@@ -17,10 +18,10 @@ export class OpenAIClient {
         ? Number(config.timeout)
         : Number.isFinite(envTimeout) && envTimeout > 0
           ? envTimeout
-          : 540_000 // 9 min — gpt-5.4-mini can take minutes per call at reasoning:high
+          : 540_000 // 9 min — gpt-5.5-mini can take minutes per call at reasoning:high
 
     const envEffort = String(process.env.OPENAI_REASONING_EFFORT || '').toLowerCase()
-    // Default 'medium' for gpt-5.4-mini: 2–3× faster than 'high' and 'high' occasionally
+    // Default 'medium' for gpt-5.5-mini: 2-3x faster than 'high' and 'high' occasionally
     // emits only a reasoning block with no message (→ tests:[] → pipeline failure).
     // Medium returns a message reliably in ~2s. Override via OPENAI_REASONING_EFFORT
     // or the per-client config option.
@@ -30,7 +31,7 @@ export class OpenAIClient {
         ? (envEffort as 'low' | 'medium' | 'high')
         : 'medium')
 
-    const resolvedModel = config.model || process.env.OPENAI_MODEL || 'gpt-4.1-mini'
+    const resolvedModel = resolveConfiguredOpenAIModel(config.model)
     this.config = {
       apiKey: config.apiKey,
       model: resolvedModel,
@@ -191,7 +192,7 @@ export class OpenAIClient {
             input: this.buildResponsesInput(messages),
             reasoning: { effort: this.config.reasoningEffort || 'high' },
             // Hard ceiling on output tokens. Output is 6× the price of input
-            // on gpt-5.4-mini, so a runaway agent (we saw 47K out on the
+            // on gpt-5.5-mini, so a runaway agent (we saw 47K out on the
             // workflow agent during demo) can blow $0.20+ per call. Cap is
             // sourced from this.config.maxTokens (env: OPENAI_MAX_TOKENS;
             // default 12K — see constructor) so it can be tuned without code

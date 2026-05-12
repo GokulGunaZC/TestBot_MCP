@@ -4,7 +4,7 @@
 -- per-agent generation fan-out. The plan hash hashes
 --   { prd, parsedPRD, contextDigest, projectInfoDigest, roles }
 -- so repeat pipeline runs against the same repo snapshot skip the two
--- gpt-5.4 planner calls. Rows older than 24h are ignored by the route
+-- gpt-5.5-mini planner calls. Rows older than 24h are ignored by the route
 -- (SELECT ... WHERE created_at > now() - interval '24 hours'); we keep
 -- older rows for post-mortem debugging rather than auto-deleting.
 --

@@ -39,7 +39,7 @@ const SCENARIOS: Record<string, {
     updates: { credits_remaining: 0 },
   },
   starter: {
-    description: 'Starter plan — 2.4M tokens ($15/month, $12 cost at GPT-5.4 80/20 split)',
+    description: 'Starter plan — 2.4M tokens ($15/month, model cost based on gpt-5.5-mini)',
     updates: { plan: 'starter', tokens_remaining: 2400000, tokens_total: 2400000 },
   },
   'no-onboarding': {

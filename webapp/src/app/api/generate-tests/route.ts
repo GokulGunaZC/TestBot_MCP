@@ -19,6 +19,7 @@ import { CURRENT_PLAN_VERSION } from '@/lib/test-generation/plan-schema'
 import { checkRateLimit } from '@/lib/rate-limit'
 import { checkTokenBalance, recordTokenUsage, MIN_TOKENS_GENERATE, REC_TOKENS_GENERATE } from '@/lib/tokens'
 import { resolveModel } from '@/lib/pricing'
+import { resolveConfiguredOpenAIModel } from '@/lib/model-defaults'
 import { checkConcurrencyLimit } from '@/lib/concurrency-limit'
 import { checkIdempotency, storeIdempotencyResult } from '@/lib/idempotency'
 import { validateGenerateTests } from '@/lib/validation'
@@ -29,7 +30,7 @@ import { logBlockedRequest } from '@/lib/security-logger'
 const ENDPOINT = '/api/generate-tests'
 
 // Matches vercel.json maxDuration for this route. Previously set to 60 (Hobby
-// ceiling) but that silently killed agents before gpt-5.4-mini could respond.
+// ceiling) but that silently killed agents before gpt-5.5-mini could respond.
 // Set to 800 to match vercel.json; local Next.js ignores this entirely.
 export const maxDuration = 800
 
@@ -409,13 +410,13 @@ export async function POST(request: NextRequest) {
       abortSignal: generationAbort.signal,
       generatorConfig: {
         apiKey: process.env.OPENAI_API_KEY,
-        model: process.env.OPENAI_MODEL || 'gpt-4.1-mini',
+        model: resolveConfiguredOpenAIModel(),
         fallbackOnFailure: genOptions.strictAIGeneration !== true,
         enforceValidation: true,
         syntaxValidationMode: 'fail-open',
         strictAIGeneration: genOptions.strictAIGeneration === true,
         // Localhost-first: generation legitimately runs for minutes under
-        // gpt-5.4-mini high-reasoning, especially for the frontend and error
+        // gpt-5.5-mini high-reasoning, especially for the frontend and error
         // agents. HEALIX_OPENAI_TIMEOUT_MS lets operators tighten this
         // when running behind a reverse proxy with its own budget.
         timeout: Number(process.env.HEALIX_OPENAI_TIMEOUT_MS) || 540_000,
