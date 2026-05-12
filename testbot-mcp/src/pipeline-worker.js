@@ -33,7 +33,7 @@ const DashboardLauncher = require('./dashboard-launcher');
 const AIAnalyzer = require('./ai-providers/index');
 const WebappClient = require('./webapp-client');
 const { startSecondaryServices, stopSecondaryServices, probeHttpReady, waitForServiceReady } = require('./multi-service-starter');
-const { runExplorationPhase, EMPTY_ARTIFACT } = require('./exploration-phase');
+const { runExplorationPhase, EMPTY_ARTIFACT, artifactHasUsefulContext } = require('./exploration-phase');
 const { injectCredentials, normalizeRoleLabel } = require('./credentials-injector');
 const { isUnsafeAuthFlow, sanitizeAuthFlow } = require('./auth-flow-utils');
 const Logger = require('./logger');
@@ -468,6 +468,75 @@ function buildRouteAccessSummary(explorationArtifact) {
     protectedRoutes: [...new Set(protectedRoutes)],
     totalObservedRoutes: routes.length,
     authFlowRejected: explorationArtifact?.authFlowRejected || null,
+  };
+}
+
+function synthesizeExplorationArtifactFromContext(context = {}, previousArtifact = null) {
+  const pages = Array.isArray(context?.pages) ? context.pages : [];
+  const existingRoutes = Array.isArray(previousArtifact?.routes) ? previousArtifact.routes : [];
+  const seen = new Set(existingRoutes.map((route) => String(route?.path || route?.url || '')).filter(Boolean));
+  const routes = [...existingRoutes];
+
+  for (const page of pages) {
+    const rawPath = String(page?.path || page?.route || page?.url || '').trim();
+    if (!rawPath || !rawPath.startsWith('/') || rawPath.includes('*') || seen.has(rawPath)) continue;
+    const requiresAuth = page?.requiresAuth === true || page?.authRequired === true || page?.protected === true;
+    seen.add(rawPath);
+    routes.push({
+      path: rawPath,
+      requiresAuth,
+      source: 'static_context',
+      sourceFile: page?.sourceFile || page?.file || null,
+      elements: Array.isArray(page?.uiHints?.elements) ? page.uiHints.elements.slice(0, 8) : [],
+      headings: Array.isArray(page?.headings) ? page.headings.slice(0, 8) : [],
+      buttons: Array.isArray(page?.buttons) ? page.buttons.slice(0, 8) : [],
+      links: Array.isArray(page?.links) ? page.links.slice(0, 8) : [],
+      testIds: Array.isArray(page?.testIds) ? page.testIds.slice(0, 8) : [],
+      selectorHints: Array.isArray(page?.selectorHints) ? page.selectorHints.slice(0, 8) : [],
+    });
+  }
+
+  const forms = Array.isArray(previousArtifact?.forms) ? [...previousArtifact.forms] : [];
+  if (forms.length === 0 && Array.isArray(context?.forms)) {
+    for (const form of context.forms.slice(0, 20)) {
+      forms.push({
+        source: 'static_context',
+        path: form?.path || form?.route || null,
+        sourceFile: form?.sourceFile || form?.file || null,
+        fields: Array.isArray(form?.fields) ? form.fields.slice(0, 12) : [],
+        buttons: Array.isArray(form?.buttons) ? form.buttons.slice(0, 8) : [],
+        validationRules: Array.isArray(form?.validationRules) ? form.validationRules.slice(0, 12) : [],
+      });
+    }
+  }
+
+  const keyFlows = Array.isArray(previousArtifact?.keyFlows) ? [...previousArtifact.keyFlows] : [];
+  if (keyFlows.length === 0 && Array.isArray(context?.workflows)) {
+    for (const workflow of context.workflows.slice(0, 12)) {
+      keyFlows.push({
+        source: 'static_context',
+        name: workflow?.name || workflow?.description || 'source workflow',
+        steps: Array.isArray(workflow?.steps) ? workflow.steps.slice(0, 12) : [],
+        routes: Array.isArray(workflow?.routes) ? workflow.routes.slice(0, 12) : [],
+      });
+    }
+  }
+
+  const observedErrors = [
+    ...(Array.isArray(previousArtifact?.observedErrors) ? previousArtifact.observedErrors : []),
+  ];
+  if (routes.length > existingRoutes.length || forms.length > (previousArtifact?.forms?.length || 0) || keyFlows.length > (previousArtifact?.keyFlows?.length || 0)) {
+    observedErrors.push('exploration fallback: synthesized route/form/workflow access from static code context');
+  }
+
+  return {
+    routes,
+    forms,
+    authFlow: previousArtifact?.authFlow || null,
+    keyFlows,
+    observedErrors,
+    errorProbe: previousArtifact?.errorProbe || null,
+    authFlowRejected: previousArtifact?.authFlowRejected || null,
   };
 }
 
@@ -6464,6 +6533,19 @@ async function runPipeline(config, runId) {
           totalTimeoutMs: 120_000,
         });
         explorationArtifact = result.artifact;
+        let explorationSource = result.source;
+        let explorationReason = result.reason || null;
+        if (!artifactHasUsefulContext(explorationArtifact) && Array.isArray(codebaseContext?.pages) && codebaseContext.pages.length > 0) {
+          explorationArtifact = synthesizeExplorationArtifactFromContext(codebaseContext, explorationArtifact);
+          explorationSource = `${result.source || 'unknown'}+static-context`;
+          explorationReason = explorationReason || 'browser exploration returned no useful app context';
+          Logger.warn('PipelineWorker', 'Exploration returned no useful app context; synthesized route/form context from static code analysis', {
+            originalSource: result.source,
+            routeCount: (explorationArtifact?.routes || []).length,
+            formCount: (explorationArtifact?.forms || []).length,
+            keyFlowCount: (explorationArtifact?.keyFlows || []).length,
+          });
+        }
         routeAccessSummary = buildRouteAccessSummary(explorationArtifact);
         // preAuthRoles carries the storageState files written during the
         // exploration pre-auth pass — used in step 3c to skip redundant logins.
@@ -6472,16 +6554,32 @@ async function runPipeline(config, runId) {
         }
         updateStatus(statusDir, 'explored', {
           runId,
-          message: `Exploration ${result.source}${result.reason ? ` (${result.reason})` : ''}`,
-          source: result.source,
-          reason: result.reason || null,
-          routeCount: (result.artifact?.routes || []).length,
-          keyFlowCount: (result.artifact?.keyFlows || []).length,
+          message: `Exploration ${explorationSource}${explorationReason ? ` (${explorationReason})` : ''}`,
+          source: explorationSource,
+          reason: explorationReason,
+          routeCount: (explorationArtifact?.routes || []).length,
+          keyFlowCount: (explorationArtifact?.keyFlows || []).length,
+          formCount: (explorationArtifact?.forms || []).length,
           routeAccessSummary,
           authFlowRejected: explorationArtifact?.authFlowRejected || null,
         }, telemetryReporter);
       } catch (explErr) {
         Logger.warn('PipelineWorker', 'Exploration phase failed (best-effort)', { reason: explErr.message });
+        if (Array.isArray(codebaseContext?.pages) && codebaseContext.pages.length > 0) {
+          explorationArtifact = synthesizeExplorationArtifactFromContext(codebaseContext, explorationArtifact);
+          routeAccessSummary = buildRouteAccessSummary(explorationArtifact);
+          updateStatus(statusDir, 'explored', {
+            runId,
+            message: `Exploration failed; using static code context (${explErr.message})`,
+            source: 'failed+static-context',
+            reason: explErr.message,
+            routeCount: (explorationArtifact?.routes || []).length,
+            keyFlowCount: (explorationArtifact?.keyFlows || []).length,
+            formCount: (explorationArtifact?.forms || []).length,
+            routeAccessSummary,
+            authFlowRejected: explorationArtifact?.authFlowRejected || null,
+          }, telemetryReporter);
+        }
       }
     }
 
@@ -7695,6 +7793,7 @@ module.exports = {
   countTestsInContent,
   countSkippedTestsInContent,
   buildRouteAccessSummary,
+  synthesizeExplorationArtifactFromContext,
   allCredentialsCoveredByPreAuth,
   mergeCredentialInjectionRoles,
   shouldTrustDiscoveredAuthFlow,

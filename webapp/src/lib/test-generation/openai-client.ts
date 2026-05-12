@@ -5,7 +5,7 @@
  */
 
 import type { OpenAIClientConfig, OpenAIMessage, OpenAIUsage, OpenAICallResult } from './types'
-import { resolveConfiguredOpenAIModel } from '@/lib/model-defaults'
+import { resolveConfiguredOpenAIModel, resolveProviderOpenAIModel } from '@/lib/model-defaults'
 
 export class OpenAIClient {
   config: Required<OpenAIClientConfig>
@@ -58,8 +58,9 @@ export class OpenAIClient {
     } = {},
   ): Promise<OpenAICallResult> {
     const model = this.config.model
+    const providerModel = resolveProviderOpenAIModel(model)
     try {
-      const result = await this.callResponsesAPI(messages, model, options.signal)
+      const result = await this.callResponsesAPI(messages, providerModel, options.signal)
       return { text: result.text, usage: result.usage, modelUsed: model }
     } catch (err) {
       // Bubble user-initiated aborts — never fall back to Chat Completions on
@@ -71,7 +72,7 @@ export class OpenAIClient {
       // fall back to Chat Completions so the pipeline keeps working.
       const msg = err instanceof Error ? err.message : String(err)
       console.warn(`[openai-client] Responses API failed (${msg}), falling back to Chat Completions`)
-      const result = await this.callChatCompletionsAPI(messages, model, options.signal)
+      const result = await this.callChatCompletionsAPI(messages, providerModel, options.signal)
       return { text: result.text, usage: result.usage, modelUsed: model }
     }
   }

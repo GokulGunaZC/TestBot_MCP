@@ -65,5 +65,7 @@ test('browser-use defaults to gpt-5.5-mini for JSON-stable exploration', () => {
   const driverSource = fs.readFileSync(driverPath, 'utf-8');
 
   assert.match(runnerSource, /HEALIX_BROWSER_USE_MODEL",\s*"gpt-5\.5-mini"/);
+  assert.match(runnerSource, /"gpt-5\.5-mini":\s*"gpt-5-mini"/);
+  assert.match(runnerSource, /_provider_model\(model\)/);
   assert.match(driverSource, /HEALIX_BROWSER_USE_MODEL:\s*process\.env\.HEALIX_BROWSER_USE_MODEL\s*\|\|\s*'gpt-5\.5-mini'/);
 });

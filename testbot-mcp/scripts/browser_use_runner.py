@@ -71,6 +71,14 @@ _ARTIFACT_TEMPLATE = {
     "observedErrors": [],
 }
 
+_PROVIDER_MODEL_ALIASES = {
+    "gpt-5.5-mini": "gpt-5-mini",
+}
+
+
+def _provider_model(model):
+    return _PROVIDER_MODEL_ALIASES.get(model, model)
+
 
 def _build_task(target_url, username, password, preauth_verified=False):
     all_roles_raw = os.environ.get("HEALIX_ALL_ROLES", "")
@@ -221,6 +229,7 @@ def _build_llm():
     the server-side OpenAI configuration.
     """
     model = os.environ.get("HEALIX_BROWSER_USE_MODEL", "gpt-5.5-mini")
+    provider_model = _provider_model(model)
     api_key = os.environ.get("HEALIX_API_KEY")
     base_url = os.environ.get("HEALIX_LLM_PROXY_URL")
     openai_api_key = os.environ.get("OPENAI_API_KEY")
@@ -231,17 +240,17 @@ def _build_llm():
     has_direct_openai = bool(openai_api_key)
 
     if has_proxy and provider not in {"cloud", "browser-use", "browser_use"}:
-        llm = _build_openai_compatible_llm(model, api_key, base_url)
+        llm = _build_openai_compatible_llm(provider_model, api_key, base_url)
         if llm is not None:
             return llm, "healix_proxy"
 
     if has_direct_openai and provider in {"openai", "direct", "local"}:
-        llm = _build_openai_compatible_llm(model, openai_api_key, openai_base_url)
+        llm = _build_openai_compatible_llm(provider_model, openai_api_key, openai_base_url)
         if llm is not None:
             return llm, "direct_openai"
 
     if has_direct_openai and provider not in {"cloud", "browser-use", "browser_use"}:
-        llm = _build_openai_compatible_llm(model, openai_api_key, openai_base_url)
+        llm = _build_openai_compatible_llm(provider_model, openai_api_key, openai_base_url)
         if llm is not None:
             return llm, "direct_openai"
 
@@ -251,12 +260,12 @@ def _build_llm():
             return llm, "browser_use_cloud"
 
     if has_direct_openai:
-        llm = _build_openai_compatible_llm(model, openai_api_key, openai_base_url)
+        llm = _build_openai_compatible_llm(provider_model, openai_api_key, openai_base_url)
         if llm is not None:
             return llm, "direct_openai"
 
     if has_proxy:
-        llm = _build_openai_compatible_llm(model, api_key, base_url)
+        llm = _build_openai_compatible_llm(provider_model, api_key, base_url)
         if llm is not None:
             return llm, "healix_proxy"
 

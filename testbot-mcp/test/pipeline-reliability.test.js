@@ -12,6 +12,7 @@ const PlaywrightIntegration = require('../src/playwright-integration');
 
 const {
   buildRouteAccessSummary,
+  synthesizeExplorationArtifactFromContext,
   allCredentialsCoveredByPreAuth,
   buildGenerationRepairContext,
   minimumUsefulRunnableFloor,
@@ -81,6 +82,63 @@ test('counts runnable declarations separately from skipped declarations and runt
 
   assert.equal(countTestsInContent(content), 3);
   assert.equal(countSkippedTestsInContent(content), 2);
+});
+
+test('exploration fallback synthesizes source-grounded route context when browser exploration is empty', () => {
+  const artifact = synthesizeExplorationArtifactFromContext({
+    pages: [
+      {
+        path: '/',
+        sourceFile: 'src/App.tsx',
+        headings: ['Home'],
+        buttons: ['Start'],
+        testIds: ['home-shell'],
+      },
+      {
+        path: '/products',
+        sourceFile: 'src/App.tsx',
+        links: ['Products'],
+      },
+      {
+        path: '/admin',
+        sourceFile: 'src/Admin.tsx',
+        requiresAuth: true,
+      },
+      {
+        path: '*',
+        sourceFile: 'src/App.tsx',
+      },
+    ],
+    forms: [
+      {
+        path: '/login',
+        sourceFile: 'src/Login.tsx',
+        fields: [{ name: 'email', type: 'email' }],
+      },
+    ],
+    workflows: [
+      {
+        name: 'browse products',
+        routes: ['/', '/products'],
+        steps: ['open home', 'open products'],
+      },
+    ],
+  }, {
+    routes: [],
+    observedErrors: ['browser-use error: model_not_found'],
+  });
+
+  assert.equal(artifact.routes.length, 3);
+  assert.equal(artifact.forms.length, 1);
+  assert.equal(artifact.keyFlows.length, 1);
+  assert.equal(artifact.routes.find((route) => route.path === '/admin').requiresAuth, true);
+  assert.equal(artifact.routes.find((route) => route.path === '/products').sourceFile, 'src/App.tsx');
+  assert.ok(artifact.observedErrors.some((error) => /static code context/.test(error)));
+
+  const summary = buildRouteAccessSummary(artifact);
+  assert.equal(summary.authMode, 'public_app');
+  assert.deepEqual(summary.publicRoutes.sort(), ['/', '/products'].sort());
+  assert.deepEqual(summary.protectedRoutes, ['/admin']);
 });
 
 test('quality gates reject all-skipped generated suites', () => {

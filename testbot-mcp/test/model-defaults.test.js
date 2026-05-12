@@ -14,11 +14,16 @@ test('webapp and browser-use runtime defaults use gpt-5.5-mini', () => {
   const browserDriver = read('testbot-mcp/src/browser-use-driver.js');
   const browserRunner = read('testbot-mcp/scripts/browser_use_runner.py');
   const pricing = read('webapp/src/lib/pricing.ts');
+  const llmProxy = read('webapp/src/app/api/llm-proxy/chat/completions/route.ts');
 
   assert.match(modelDefaults, /DEFAULT_OPENAI_MODEL\s*=\s*'gpt-5\.5-mini'/);
+  assert.match(modelDefaults, /'gpt-5\.5-mini':\s*'gpt-5-mini'/);
+  assert.match(modelDefaults, /resolveProviderOpenAIModel/);
   assert.match(browserDriver, /HEALIX_BROWSER_USE_MODEL:\s*process\.env\.HEALIX_BROWSER_USE_MODEL\s*\|\|\s*'gpt-5\.5-mini'/);
   assert.match(browserRunner, /HEALIX_BROWSER_USE_MODEL",\s*"gpt-5\.5-mini"/);
   assert.match(pricing, /'gpt-5\.5-mini':\s*\{/);
+  assert.match(pricing, /'gpt-5\.5-mini':\s*\{[\s\S]*outputUsdPerToken:\s*2\.00\s*\/\s*PER_MILLION/);
+  assert.match(llmProxy, /resolveProviderOpenAIModel\(parsed\.model\)/);
 });
 
 test('old OpenAI model defaults are not used by runtime configuration', () => {

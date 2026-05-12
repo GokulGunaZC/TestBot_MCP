@@ -5,6 +5,7 @@ import { eq, and } from 'drizzle-orm'
 import { hashApiKey } from '@/lib/utils/api-keys'
 import { checkRateLimit } from '@/lib/rate-limit'
 import { logBlockedRequest } from '@/lib/security-logger'
+import { resolveProviderOpenAIModel } from '@/lib/model-defaults'
 
 const ENDPOINT = '/api/llm-proxy/chat/completions'
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY
@@ -78,11 +79,18 @@ export async function POST(request: NextRequest) {
       )
     }
 
-    // 4. Read raw body — forward as-is to OpenAI, preserving model/messages/stream exactly
+    // 4. Read raw body. Preserve the OpenAI-compatible shape, but normalize
+    // Healix model aliases before forwarding to OpenAI.
     const rawBody = await request.text()
     let isStream = false
+    let upstreamBody = rawBody
     try {
-      isStream = (JSON.parse(rawBody) as { stream?: boolean })?.stream === true
+      const parsed = JSON.parse(rawBody) as { stream?: boolean; model?: unknown }
+      isStream = parsed?.stream === true
+      if (typeof parsed?.model === 'string') {
+        parsed.model = resolveProviderOpenAIModel(parsed.model)
+        upstreamBody = JSON.stringify(parsed)
+      }
     } catch { /* not JSON or missing stream field — treat as non-streaming */ }
 
     // 5. Forward to OpenAI with server-side OPENAI_API_KEY
@@ -92,7 +100,7 @@ export async function POST(request: NextRequest) {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${OPENAI_API_KEY}`,
       },
-      body: rawBody,
+      body: upstreamBody,
     })
 
     // 6. Propagate upstream errors in OpenAI error format

@@ -6,7 +6,7 @@ import { hashApiKey } from '@/lib/utils/api-keys'
 import { checkRateLimit } from '@/lib/rate-limit'
 import { checkTokenBalance, recordTokenUsage, MIN_TOKENS_ANALYZE, REC_TOKENS_ANALYZE } from '@/lib/tokens'
 import { resolveModel } from '@/lib/pricing'
-import { resolveConfiguredOpenAIModel } from '@/lib/model-defaults'
+import { resolveConfiguredOpenAIModel, resolveProviderOpenAIModel } from '@/lib/model-defaults'
 import { checkIdempotency, storeIdempotencyResult } from '@/lib/idempotency'
 import { validateAnalyzeFailures } from '@/lib/validation'
 import { checkAiGuard, recordAiCall } from '@/lib/ai-guard'
@@ -77,7 +77,7 @@ async function callOpenAI(messages: Array<{ role: string; content: string }>): P
         Authorization: `Bearer ${OPENAI_API_KEY}`,
       },
       body: JSON.stringify({
-        model: OPENAI_MODEL,
+        model: resolveProviderOpenAIModel(OPENAI_MODEL),
         input: messagesToResponsesInput(messages),
         reasoning: { effort: 'high' },
       }),
