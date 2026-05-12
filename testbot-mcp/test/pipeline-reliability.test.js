@@ -1448,6 +1448,40 @@ test('quality audit allows exact supplied credential fixtures for API auth setup
   });
 });
 
+test('quality audit rejects invented API auth endpoints on page routes', () => {
+  withGeneratedSuite(`
+    import { test, expect } from '@playwright/test';
+    test('[CAT:api_auth] logs in through page route and reads dashboard', async ({ request }) => {
+      const login = await request.post('/login', {
+        form: { email: 'admin@pulseboard.test', password: 'Admin123!' },
+        maxRedirects: 0,
+      });
+      expect(login.status()).toBeLessThan(400);
+      const dashboard = await request.get('/dashboard');
+      expect(dashboard.status()).toBe(200);
+    });
+  `, (projectPath) => {
+    const audit = auditGeneratedTestQuality({
+      projectPath,
+      testType: 'both',
+      context: {
+        apiEndpoints: [
+          { method: 'POST', path: '/api/auth/login' },
+          { method: 'GET', path: '/api/issues' },
+        ],
+        pages: [
+          { path: '/login', sourceFile: 'src/Login.tsx', requiresAuth: false },
+          { path: '/dashboard', sourceFile: 'src/Dashboard.tsx', requiresAuth: true },
+        ],
+      },
+      roles: [{ role: 'admin', loginVerified: true, storageStatePath: '/tmp/auth.json', username: 'admin@pulseboard.test', password: 'Admin123!' }],
+    });
+
+    assert.ok(audit.errors.some((error) => error.startsWith('ungrounded_api_endpoint:generated.spec.ts:')));
+    assert.match(audit.errors.join('\n'), /POST \/login/);
+  });
+});
+
 test('quality audit rejects Angular hash routes rewritten as path routes', () => {
   withGeneratedSuite(`
     import { test, expect } from '@playwright/test';

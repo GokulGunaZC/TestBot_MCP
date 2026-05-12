@@ -737,6 +737,72 @@ function normalizeGeneratedRoute(value) {
   }
 }
 
+function normalizeApiPathForAudit(value) {
+  const route = normalizeGeneratedRoute(value);
+  if (!route) return null;
+  const withoutHash = String(route).split('#')[0];
+  const withoutQuery = withoutHash.split('?')[0] || '/';
+  try {
+    return decodeURIComponent(withoutQuery).replace(/\/+$/, '') || '/';
+  } catch {
+    return withoutQuery.replace(/\/+$/, '') || '/';
+  }
+}
+
+function apiPathPatternToRegex(pathValue) {
+  const normalized = normalizeApiPathForAudit(pathValue);
+  if (!normalized) return null;
+  const escaped = normalized
+    .replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    .replace(/\\\{[A-Za-z_][\w-]*\\\}/g, '[^/]+')
+    .replace(/:[A-Za-z_][\w-]*/g, '[^/]+')
+    .replace(/\\\[[^\]]+\\\]/g, '[^/]+');
+  return new RegExp(`^${escaped}$`, 'i');
+}
+
+function buildKnownApiEndpointMatchers(context = {}) {
+  return effectiveApiEndpoints(context)
+    .map((endpoint) => {
+      const method = String(endpoint?.method || 'GET').toUpperCase();
+      const normalizedPath = normalizeApiPathForAudit(endpoint?.path || '/');
+      const regex = apiPathPatternToRegex(normalizedPath);
+      if (!normalizedPath || !regex) return null;
+      return { method, path: normalizedPath, regex };
+    })
+    .filter(Boolean);
+}
+
+function apiRequestMatchesKnownEndpoint(signature, matchers = []) {
+  const [rawMethod, ...routeParts] = String(signature || '').split(/\s+/);
+  const method = String(rawMethod || 'GET').toUpperCase();
+  const route = normalizeApiPathForAudit(routeParts.join(' '));
+  if (!route) return false;
+  return matchers.some((matcher) => {
+    const methodMatches = method === 'FETCH' || matcher.method === method;
+    return methodMatches && matcher.regex.test(route);
+  });
+}
+
+function isIntentionalUnknownApiProbe(signature, content) {
+  const [rawMethod, ...routeParts] = String(signature || '').split(/\s+/);
+  const method = String(rawMethod || 'GET').toUpperCase();
+  const route = normalizeApiPathForAudit(routeParts.join(' ')) || '';
+  if (method !== 'GET') return false;
+  const text = String(content || '');
+  if (/@api_auth|api_auth/i.test(text)) return false;
+  const mentionsMissingRoute = /unknown route|missing route|not found|404|nonexistent|does not exist|should-not-exist|random-missing/i.test(text);
+  const routeLooksIntentionallyMissing = /does-not-exist|should-not-exist|missing|unknown|nonexistent|random/i.test(route);
+  return mentionsMissingRoute || routeLooksIntentionallyMissing;
+}
+
+function findUngroundedApiRequests(content, context = {}) {
+  const matchers = buildKnownApiEndpointMatchers(context);
+  const signals = extractSpecSignals(content);
+  return (signals.apiEndpoints || [])
+    .filter((signature) => !apiRequestMatchesKnownEndpoint(signature, matchers))
+    .filter((signature) => !isIntentionalUnknownApiProbe(signature, content));
+}
+
 function extractGeneratedTestTitles(content) {
   const titles = [];
   const pattern = /\btest(?:\.(?:only|fixme|fail|slow|skip))?\s*\(\s*(['"`])([\s\S]*?)\1/g;
@@ -4245,6 +4311,7 @@ function auditGeneratedTestQuality({ projectPath, testType, context, exploration
     invalidSourceReferenceFiles: [],
     ungroundedSelectorFiles: [],
     ungroundedRouteFiles: [],
+    ungroundedApiEndpointFiles: [],
     brittlePatternFiles: [],
     sourceMismatchFiles: [],
     authGatingFiles: [],
@@ -4464,6 +4531,14 @@ function auditGeneratedTestQuality({ projectPath, testType, context, exploration
       }
       if (looksLikeUnprovenMissingCollectionError(content)) {
         recordBrittlePattern('brittle_unproven_collection_missing_id_status', name);
+      }
+      const ungroundedApiEndpoints = findUngroundedApiRequests(content, context);
+      if (ungroundedApiEndpoints.length > 0) {
+        summary.ungroundedApiEndpointFiles.push({
+          file: name,
+          endpoints: ungroundedApiEndpoints.slice(0, 8),
+        });
+        summary.errors.push(`ungrounded_api_endpoint:${name}:${ungroundedApiEndpoints.slice(0, 4).join('|')}`);
       }
       if (
         generatedBlocks.some((block) => looksLikeIncompleteProductCreateSuccessAssertion(block.content)) &&
