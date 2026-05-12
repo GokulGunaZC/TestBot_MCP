@@ -164,12 +164,47 @@ function routeFromFormFile(form, pages = []) {
     const parts = appMatch[1].split('/').filter((part) => part && !/^\(.+\)$/.test(part));
     return `/${parts.join('/')}`.replace(/\/$/, '') || '/';
   }
+  const appComponentMatch = normalized.match(/(?:^|\/)(?:src\/)?app\/(.+?)\/[^/]+\.(?:tsx?|jsx?)$/);
+  if (appComponentMatch) {
+    const parts = appComponentMatch[1].split('/').filter((part) => part && !/^\(.+\)$/.test(part));
+    return `/${parts.join('/')}`.replace(/\/$/, '') || '/';
+  }
   const pagesMatch = normalized.match(/(?:^|\/)(?:src\/)?pages\/(.+?)\.(?:tsx?|jsx?)$/);
   if (pagesMatch) {
     const page = pagesMatch[1].replace(/\/index$/, '').replace(/^index$/, '');
     return page ? `/${page}` : '/';
   }
   return '/';
+}
+
+function routeHasDynamicSegment(route) {
+  return /\[[^\]]+\]|:[A-Za-z_][\w-]*/.test(String(route || ''));
+}
+
+function dynamicRouteToRegex(route) {
+  const escaped = escapeRegExp(String(route || '/'))
+    .replace(/\\\[\.{3}[^\\\]]+\\\]/g, '.+')
+    .replace(/\\\[[^\\\]]+\\\]/g, '[^/]+')
+    .replace(/:[A-Za-z_][\w-]*/g, '[^/]+');
+  return new RegExp(`^${escaped}$`);
+}
+
+function concreteRouteForForm(route, form = {}, pages = []) {
+  if (!routeHasDynamicSegment(route)) return route;
+  for (const candidate of [form.observedRoute, form.concreteRoute, form.sampleRoute]) {
+    if (candidate && String(candidate).startsWith('/') && !routeHasDynamicSegment(candidate)) {
+      return String(candidate);
+    }
+  }
+  const pattern = dynamicRouteToRegex(route);
+  const file = form?.file || form?.sourceFile || '';
+  const match = (pages || [])
+    .filter((page) => page?.path && !routeHasDynamicSegment(page.path))
+    .find((page) =>
+      pattern.test(String(page.path)) &&
+      (!file || !page.sourceFile || String(page.sourceFile) === String(file))
+    );
+  return match?.path || null;
 }
 
 function formRequiresAuth(form, pages = []) {
@@ -246,12 +281,17 @@ function extractQaContracts({ projectPath, context = {}, readFile } = {}) {
   for (const form of forms) {
     const requiredFields = (form.fields || []).filter((field) => field?.required === true);
     if (requiredFields.length === 0) continue;
-    const route = routeFromFormFile(form, pages);
+    const inferredRoute = routeFromFormFile(form, pages);
+    const concreteRoute = concreteRouteForForm(inferredRoute, form, pages);
+    const requiresConcreteRoute = routeHasDynamicSegment(inferredRoute) && !concreteRoute;
+    const route = concreteRoute || inferredRoute;
     const requiresAuth = formRequiresAuth(form, pages);
+    const id = contractId(['qac', 'form-validation', route, form.file || form.sourceFile || 'form']);
     formValidationContracts.push({
-      id: contractId(['qac', 'form-validation', route, form.file || form.sourceFile || 'form']),
+      id,
       type: 'form_validation',
       route,
+      inferredRoute,
       sourceFile: form.file || form.sourceFile || null,
       requiredFields: requiredFields.map((field) => ({
         name: field.name,
@@ -263,8 +303,12 @@ function extractQaContracts({ projectPath, context = {}, readFile } = {}) {
       submitButtons: form.submitButtons || [],
       selectorHints: form.selectorHints || [],
       requiresAuth,
-      runnable: !requiresAuth,
-      marker: `[QAC:${contractId(['qac', 'form-validation', route, form.file || form.sourceFile || 'form'])}]`,
+      requiresConcreteRoute,
+      runnable: !requiresAuth && !requiresConcreteRoute,
+      marker: `[QAC:${id}]`,
+      question: requiresConcreteRoute
+        ? `Form validation contract ${inferredRoute} uses a dynamic route. Provide or explore a concrete URL so Healix can run the empty-submit validation test.`
+        : null,
     });
   }
 
@@ -288,7 +332,7 @@ function summarizeQaContracts(qaContracts = {}) {
 }
 
 function buildQaContractQuestions(qaContracts = {}) {
-  return (qaContracts.deleteStatusContracts || [])
+  const deleteQuestions = (qaContracts.deleteStatusContracts || [])
     .filter((contract) => contract?.requiresConfirmation && contract.question)
     .map((contract) => ({
       id: contract.id,
@@ -301,6 +345,18 @@ function buildQaContractQuestions(qaContracts = {}) {
       explicitStatuses: contract.explicitStatuses || [],
       question: contract.question,
     }));
+  const formQuestions = (qaContracts.formValidationContracts || [])
+    .filter((contract) => contract?.requiresConcreteRoute && contract.question)
+    .map((contract) => ({
+      id: contract.id,
+      type: 'dynamic_form_route_sample_needed',
+      severity: 'needs_context',
+      route: contract.route,
+      inferredRoute: contract.inferredRoute || contract.route,
+      sourceFile: contract.sourceFile || null,
+      question: contract.question,
+    }));
+  return [...deleteQuestions, ...formQuestions];
 }
 
 function getVerifiedRoleCount(roles = []) {
@@ -312,7 +368,7 @@ function runnableQaObligations(qaContracts = {}, roles = []) {
   const filters = (qaContracts.filterContracts || [])
     .filter((contract) => contract.runnable !== false && (!contract.requiresAuth || verifiedRoleCount > 0));
   const forms = (qaContracts.formValidationContracts || [])
-    .filter((contract) => contract.runnable !== false || (contract.requiresAuth && verifiedRoleCount > 0));
+    .filter((contract) => !contract.requiresConcreteRoute && (contract.runnable !== false || (contract.requiresAuth && verifiedRoleCount > 0)));
   const blocked = [
     ...(qaContracts.filterContracts || []).filter((contract) => contract.requiresAuth && verifiedRoleCount === 0),
     ...(qaContracts.formValidationContracts || []).filter((contract) => contract.requiresAuth && verifiedRoleCount === 0),

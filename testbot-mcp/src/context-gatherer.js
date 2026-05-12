@@ -269,6 +269,34 @@ class ContextGatherer {
       const match = String(tag || '').match(new RegExp(`\\b${attrName}=["']([^"']*)["']`, 'i'));
       return match?.[1] || null;
     };
+    const fieldRequiredByValidation = (fieldName, tag = '') => {
+      const name = String(fieldName || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const rawTag = String(tag || '');
+      if (/\brequired(?:\s*=\s*(?:\{?\s*true\s*\}?|["']true["']))?\b/i.test(rawTag)) return true;
+      if (/\baria-required\s*=\s*(?:["']true["']|\{\s*true\s*\})/i.test(rawTag)) return true;
+      if (/\brules\s*=\s*\{\s*\{[\s\S]{0,180}\brequired\b/i.test(rawTag)) return true;
+      if (!name) return false;
+      const registerPattern = new RegExp(`\\bregister\\s*\\(\\s*['"\`]${name}['"\`]\\s*,\\s*\\{[\\s\\S]{0,240}\\brequired\\b`, 'i');
+      if (registerPattern.test(content)) return true;
+      const controllerPattern = new RegExp(`\\bname\\s*=\\s*['"\`]${name}['"\`][\\s\\S]{0,320}\\brules\\s*=\\s*\\{\\s*\\{[\\s\\S]{0,180}\\brequired\\b`, 'i');
+      if (controllerPattern.test(content)) return true;
+      const zodPattern = new RegExp(`\\b${name}\\s*:\\s*z\\.(?:string|number|coerce\\.number)\\s*\\([^)]*\\)(?:\\s*\\.\\s*(?:min\\s*\\(\\s*1\\b|nonempty\\s*\\(|email\\s*\\())`, 'i');
+      return zodPattern.test(content);
+    };
+    const upsertField = (field) => {
+      const key = String(field.name || field.id || '').trim();
+      if (!key) return;
+      const existing = fields.find((item) => item.name === key);
+      if (existing) {
+        existing.required = Boolean(existing.required || field.required);
+        existing.label = existing.label || field.label || null;
+        existing.placeholder = existing.placeholder || field.placeholder || null;
+        existing.testId = existing.testId || field.testId || null;
+        existing.ariaLabel = existing.ariaLabel || field.ariaLabel || null;
+        return;
+      }
+      fields.push(field);
+    };
 
     const labelMatches = content.matchAll(/<label\b([^>]*)>([\s\S]*?)<\/label>/gi);
     for (const match of labelMatches) {
@@ -293,10 +321,10 @@ class ContextGatherer {
       const placeholder = attrValue(tag, 'placeholder');
       const testId = attrValue(tag, 'data-testid');
       const ariaLabel = attrValue(tag, 'aria-label');
-      fields.push({
+      upsertField({
         name,
         type,
-        required: tag.includes('required'),
+        required: fieldRequiredByValidation(name, tag),
         id: id || null,
         label: labelsMap.get(id || '') || null,
         placeholder: placeholder || null,
@@ -315,10 +343,10 @@ class ContextGatherer {
       const id = attrValue(tag, 'id');
       const testId = attrValue(tag, 'data-testid');
       const ariaLabel = attrValue(tag, 'aria-label');
-      fields.push({
+      upsertField({
         name,
         type: 'select',
-        required: tag.includes('required'),
+        required: fieldRequiredByValidation(name, tag),
         id: id || null,
         label: labelsMap.get(id || '') || null,
         placeholder: null,
@@ -338,15 +366,73 @@ class ContextGatherer {
       const placeholder = attrValue(tag, 'placeholder');
       const testId = attrValue(tag, 'data-testid');
       const ariaLabel = attrValue(tag, 'aria-label');
-      fields.push({
+      upsertField({
         name,
         type: 'textarea',
-        required: tag.includes('required'),
+        required: fieldRequiredByValidation(name, tag),
         id: id || null,
         label: labelsMap.get(id || '') || null,
         placeholder: placeholder || null,
         testId: testId || null,
         ariaLabel: ariaLabel || null,
+        role: 'textbox',
+      });
+    }
+
+    const genericFieldMatches = content.matchAll(/<(?:Controller|FormField|Field|TextField|Input|Textarea|Select)\b[^>]*\bname=["']([^"']+)["'][^>]*>/gi);
+    for (const match of genericFieldMatches) {
+      const tag = match[0];
+      const name = String(match[1] || '').trim();
+      if (!name) continue;
+      const id = attrValue(tag, 'id');
+      const placeholder = attrValue(tag, 'placeholder');
+      const testId = attrValue(tag, 'data-testid');
+      const ariaLabel = attrValue(tag, 'aria-label');
+      upsertField({
+        name,
+        type: /Select/i.test(tag) ? 'select' : (/Textarea/i.test(tag) ? 'textarea' : 'text'),
+        required: fieldRequiredByValidation(name, tag),
+        id: id || null,
+        label: labelsMap.get(id || '') || null,
+        placeholder: placeholder || null,
+        testId: testId || null,
+        ariaLabel: ariaLabel || null,
+        role: /Select/i.test(tag) ? 'combobox' : 'textbox',
+      });
+    }
+
+    const registerMatches = content.matchAll(/\bregister\s*\(\s*['"`]([^'"`]+)['"`](?:\s*,\s*\{([\s\S]{0,300}?)\})?/gi);
+    for (const match of registerMatches) {
+      const name = String(match[1] || '').trim();
+      if (!name) continue;
+      const options = String(match[2] || '');
+      upsertField({
+        name,
+        type: /email/i.test(name) ? 'email' : 'text',
+        required: /\brequired\b/i.test(options) || fieldRequiredByValidation(name),
+        id: null,
+        label: null,
+        placeholder: null,
+        testId: null,
+        ariaLabel: null,
+        role: 'textbox',
+      });
+    }
+
+    const zodFieldMatches = content.matchAll(/\b([A-Za-z_][\w]*)\s*:\s*z\.(?:string|number|coerce\.number)\s*\([^)]*\)((?:\s*\.\s*\w+\s*\([^)]*\))*)/g);
+    for (const match of zodFieldMatches) {
+      const name = String(match[1] || '').trim();
+      const chain = String(match[2] || '');
+      if (!name || !/(?:\.min\s*\(\s*1\b|\.nonempty\s*\(|\.email\s*\()/i.test(chain)) continue;
+      upsertField({
+        name,
+        type: /\.email\s*\(/i.test(chain) || /email/i.test(name) ? 'email' : 'text',
+        required: true,
+        id: null,
+        label: null,
+        placeholder: null,
+        testId: null,
+        ariaLabel: null,
         role: 'textbox',
       });
     }

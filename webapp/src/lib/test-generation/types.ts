@@ -213,6 +213,7 @@ export interface CapturedContext {
   frontendInteractions?: unknown[]
   testDataSuggestions?: unknown
   generationFeedback?: {
+    mode?: string | null
     attempt?: number
     previousFailureCode?: string | null
     previousFailureMessage?: string | null
@@ -225,6 +226,7 @@ export interface CapturedContext {
       errors?: string[]
     }
     routeAccessSummary?: unknown
+    existingSuiteManifest?: unknown
     instructions?: string[]
   }
   projectStructure?: {

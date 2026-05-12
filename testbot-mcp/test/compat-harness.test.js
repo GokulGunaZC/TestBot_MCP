@@ -116,6 +116,30 @@ test('form extraction uses real name/id attributes and preserves input types', (
   assert.ok(!forms[0].fields.some((field) => String(field.name).includes('rounded-xl')));
 });
 
+test('form extraction detects React hook and Zod required fields', () => {
+  const gatherer = new ContextGatherer({ projectPath: process.cwd(), language: 'typescript' });
+  const forms = gatherer.extractFormsFromFile(`
+    const schema = z.object({
+      title: z.string().min(1, 'Title is required'),
+      email: z.string().email(),
+    });
+    export default function NewIssuePage() {
+      const { register } = useForm({ resolver: zodResolver(schema) });
+      return (
+        <form>
+          <Input {...register('title', { required: true })} />
+          <Controller name="email" rules={{ required: 'Email is required' }} render={() => <Input />} />
+          <button type="submit">Create issue</button>
+        </form>
+      );
+    }
+  `, path.join(process.cwd(), 'app/projects/[slug]/issues/new/page.tsx'));
+
+  assert.equal(forms.length, 1);
+  assert.ok(forms[0].fields.some((field) => field.name === 'title' && field.required === true));
+  assert.ok(forms[0].fields.some((field) => field.name === 'email' && field.required === true));
+});
+
 test('quality audit rejects fallback or template generated specs for compatibility runs', () => {
   const root = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'healix-compat-audit-'));
   try {

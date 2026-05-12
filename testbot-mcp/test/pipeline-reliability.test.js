@@ -19,6 +19,7 @@ const {
   adaptiveRunnableFloor,
   shouldAttemptCoverageTopUp,
   collectGenerationQuality,
+  buildExistingSuiteManifest,
   countSkippedTestsInContent,
   countTestsInContent,
   evaluateGenerationQualityGates,
@@ -39,6 +40,8 @@ const {
   pickAgentsForRun,
   pruneGeneratedTestsByQuality,
   quarantineGeneratedSpecFiles,
+  filterDeltaTopUpTests,
+  salvageGeneratedTestValidation,
   resolveGenerationAgentConcurrency,
   shouldAutoSwitchPortForConflict,
   shouldTrustDiscoveredAuthFlow,
@@ -69,10 +72,17 @@ function withGeneratedSuite(content, fn) {
 
 function withTempProject(fn) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'healix-project-'));
+  const cleanup = () => fs.rmSync(root, { recursive: true, force: true });
   try {
-    return fn(root);
-  } finally {
-    fs.rmSync(root, { recursive: true, force: true });
+    const result = fn(root);
+    if (result && typeof result.then === 'function') {
+      return result.finally(cleanup);
+    }
+    cleanup();
+    return result;
+  } catch (error) {
+    cleanup();
+    throw error;
   }
 }
 
@@ -195,6 +205,44 @@ test('deterministic QA contract spec uses live property checks and accessible fo
   assert.doesNotMatch(spec.content, /checkValidity\(/);
 });
 
+test('QA form contracts require concrete URLs for dynamic Next routes', () => {
+  withTempProject((projectPath) => {
+    const qaContracts = extractQaContracts({
+      projectPath,
+      context: {
+        pages: [],
+        forms: [{
+          file: 'app/projects/[slug]/issues/new/page.tsx',
+          fields: [{ name: 'title', required: true }],
+          submitButtons: ['Create issue'],
+        }],
+      },
+    });
+
+    assert.equal(qaContracts.formValidationContracts.length, 1);
+    assert.equal(qaContracts.formValidationContracts[0].route, '/projects/[slug]/issues/new');
+    assert.equal(qaContracts.formValidationContracts[0].requiresConcreteRoute, true);
+    assert.equal(qaContracts.formValidationContracts[0].runnable, false);
+    assert.equal(qaContracts.questions[0].type, 'dynamic_form_route_sample_needed');
+
+    const concreteContracts = extractQaContracts({
+      projectPath,
+      context: {
+        pages: [{ path: '/projects/demo/issues/new', sourceFile: 'app/projects/[slug]/issues/new/page.tsx', requiresAuth: false }],
+        forms: [{
+          file: 'app/projects/[slug]/issues/new/page.tsx',
+          fields: [{ name: 'title', required: true }],
+          submitButtons: ['Create issue'],
+        }],
+      },
+    });
+
+    assert.equal(concreteContracts.formValidationContracts[0].route, '/projects/demo/issues/new');
+    assert.equal(concreteContracts.formValidationContracts[0].requiresConcreteRoute, false);
+    assert.equal(concreteContracts.formValidationContracts[0].runnable, true);
+  });
+});
+
 test('quality audit requires runnable QA filter and form contracts to be covered', () => {
   withGeneratedSuite(`
     import { test, expect } from '@playwright/test';
@@ -259,6 +307,89 @@ test('quality audit requires runnable QA filter and form contracts to be covered
     });
     assert.equal(coveredAudit.valid, true);
     assert.deepEqual(coveredAudit.missing, []);
+  });
+});
+
+test('delta top-up manifest rejects duplicate/generated-noise and keeps missing-surface tests', () => {
+  withGeneratedSuite(`
+    import { test, expect } from '@playwright/test';
+    test('[REQ:F1] [CAT:ui_flow] existing dashboard route', async ({ page }) => {
+      await page.goto('/dashboard');
+      await expect(page.getByRole('heading', { name: 'Dashboard' })).toBeVisible();
+    });
+  `, (projectPath) => {
+    const manifest = buildExistingSuiteManifest({
+      projectPath,
+      context: {
+        pages: [{ path: '/dashboard' }, { path: '/reports' }],
+        apiEndpoints: [],
+        forms: [],
+        workflows: [],
+      },
+      testType: 'frontend',
+      routeAccessSummary: { publicRoutes: ['/dashboard', '/reports'], protectedRoutes: [] },
+    });
+
+    assert.deepEqual(manifest.missing.routes, ['/reports']);
+    const result = filterDeltaTopUpTests({
+      existingSuiteManifest: manifest,
+      usedFilenames: new Set(['generated.spec.ts']),
+      incoming: [
+        {
+          filename: 'generated.spec.ts',
+          content: `import { test } from '@playwright/test'; test('[REQ:F1] duplicate', async ({ page }) => { await page.goto('/dashboard'); });`,
+        },
+        {
+          filename: 'reports.spec.ts',
+          content: `import { test, expect } from '@playwright/test'; test('[REQ:F2] [CAT:ui_flow] reports route', async ({ page }) => { await page.goto('/reports'); await expect(page.getByRole('heading', { name: /Reports/i })).toBeVisible(); });`,
+        },
+        {
+          filename: 'qac.spec.ts',
+          content: `import { test } from '@playwright/test'; test('[QAC:qac-form-validation-x] should not be AI owned', async ({ page }) => { await page.goto('/reports'); });`,
+        },
+      ],
+    });
+
+    assert.equal(result.accepted.length, 1);
+    assert.match(result.accepted[0].filename, /^healix-topup-/);
+    assert.equal(result.rejected.length, 2);
+    assert.ok(result.rejected.some((item) => item.reason === 'duplicate_filename'));
+    assert.ok(result.rejected.some((item) => item.reason === 'qa_contracts_owned_by_deterministic_pack'));
+  });
+});
+
+test('validation salvage quarantines bad specs and preserves valid specs', async () => {
+  await withTempProject(async (projectPath) => {
+    const generatedDir = path.join(projectPath, 'tests', 'generated');
+    fs.mkdirSync(generatedDir, { recursive: true });
+    fs.writeFileSync(path.join(generatedDir, 'valid.spec.ts'), `
+      import { test, expect } from '@playwright/test';
+      test('valid listed test', async ({ page }) => {
+        await page.goto('/');
+        expect(true).toBeTruthy();
+      });
+    `);
+    fs.writeFileSync(path.join(generatedDir, 'bad.spec.ts'), `
+      export const helper = true;
+    `);
+
+    const validator = async ({ testTarget }) => {
+      if (testTarget && /valid\.spec\.ts$/.test(testTarget)) return { valid: true, listedCount: 1 };
+      if (testTarget && /bad\.spec\.ts$/.test(testTarget)) return { valid: false, reason: 'no_tests_listed', stderr: 'No tests found.' };
+      return { valid: true, listedCount: 1 };
+    };
+
+    const salvage = await salvageGeneratedTestValidation({
+      projectPath,
+      originalValidation: { valid: false, reason: 'playwright_list_failed', stderr: 'No tests found.' },
+      validator,
+    });
+
+    assert.equal(salvage.recovered, true);
+    assert.deepEqual(salvage.keptSpecFiles.map((file) => file.filename), ['valid.spec.ts']);
+    assert.deepEqual(salvage.quarantinedSpecFiles.map((file) => file.filename), ['bad.spec.ts']);
+    assert.equal(fs.existsSync(path.join(generatedDir, 'valid.spec.ts')), true);
+    assert.equal(fs.existsSync(path.join(generatedDir, 'bad.spec.ts')), false);
   });
 });
 

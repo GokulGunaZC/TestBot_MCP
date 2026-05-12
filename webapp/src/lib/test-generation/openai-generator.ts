@@ -1361,11 +1361,13 @@ IMPORTANT: Return ONLY valid JSON.`
     }
     const feedback = context.generationFeedback
       ? {
+          mode: context.generationFeedback.mode || null,
           attempt: context.generationFeedback.attempt || null,
           previousFailureCode: context.generationFeedback.previousFailureCode || null,
           previousFailureMessage: context.generationFeedback.previousFailureMessage || null,
           quality: context.generationFeedback.quality || null,
           routeAccessSummary: context.generationFeedback.routeAccessSummary || null,
+          existingSuiteManifest: context.generationFeedback.existingSuiteManifest || null,
           instructions: (context.generationFeedback.instructions || []).slice(0, 12),
         }
       : null
@@ -1485,6 +1487,13 @@ IMPORTANT: Return ONLY valid JSON.`
         'Do not generate shallow navigation-only tests. Every runnable test must include meaningful assertions against observed headings, buttons, form behavior, URL transitions, API status/body, or visible error states.',
         'If previousFailureCode is ZERO_RUNNABLE_TESTS or RUNNABLE_COVERAGE_TOO_LOW, remove credential-driven skips from public routes and produce runnable tests for every public route listed in routeAccess.publicRoutes.',
       )
+      if (generationFeedback.mode === 'coverage_top_up_delta') {
+        promptRequirements.push(
+          'This is a delta top-up, not a full-suite regeneration. Use CONTEXT_JSON.meta.generationFeedback.existingSuiteManifest as the source of already-covered files, titles, markers, routes, and endpoints.',
+          'Return only new append-only files named healix-topup-*.spec.ts. Do not overwrite or restate any existing filename, test title, [REQ:*], route-only smoke check, or API endpoint already covered in existingSuiteManifest.covered.',
+          'Every top-up test must target at least one item in existingSuiteManifest.missing: a missing route, API endpoint, category, or new requirement marker. If a QA contract is missing, do not write [QAC:*] tests; Healix emits deterministic QA-contract specs separately.',
+        )
+      }
       for (const instruction of generationFeedback.instructions || []) {
         promptRequirements.push(String(instruction))
       }

@@ -1665,6 +1665,16 @@ interface PipelineErrorShape {
   stdout?: string | null;
   firstSpecPreview?: { file?: string; lines?: string } | null;
   generatedSpecCount?: number;
+  keptSpecCount?: number | null;
+  quarantinedSpecCount?: number | null;
+  validationSalvage?: {
+    attempted?: boolean;
+    recovered?: boolean;
+    status?: string;
+    originalSpecCount?: number;
+    keptSpecFiles?: Array<{ filename?: string }>;
+    quarantinedSpecFiles?: Array<{ filename?: string; reason?: string }>;
+  } | null;
   qualityAuditErrors?: string[] | null;
   generationQuality?: {
     totalTests?: number;
@@ -2406,6 +2416,12 @@ function PipelineErrorBanner({ error, runId }: { error: PipelineErrorShape; runI
   const displayedGeneratedSpecCount = typeof error.generatedSpecCount === 'number' && error.generatedSpecCount > 0
     ? error.generatedSpecCount
     : (typeof generatedFromQuality === 'number' ? generatedFromQuality : error.generatedSpecCount);
+  const keptSpecCount = typeof error.keptSpecCount === 'number'
+    ? error.keptSpecCount
+    : (Array.isArray(error.validationSalvage?.keptSpecFiles) ? error.validationSalvage.keptSpecFiles.length : null);
+  const quarantinedSpecCount = typeof error.quarantinedSpecCount === 'number'
+    ? error.quarantinedSpecCount
+    : (Array.isArray(error.validationSalvage?.quarantinedSpecFiles) ? error.validationSalvage.quarantinedSpecFiles.length : null);
   const usefulFloor = error.generationQuality?.minimumUsefulRunnableFloor
     ?? error.generationQuality?.adaptiveRunnableFloor
     ?? null;
@@ -2495,6 +2511,16 @@ function PipelineErrorBanner({ error, runId }: { error: PipelineErrorShape; runI
               {typeof displayedGeneratedSpecCount === 'number' && (
                 <span className="px-2 py-0.5 rounded-md bg-white/5 border border-white/10 text-[#D8E8FF]/70 text-[11px] font-mono">
                   generated: {displayedGeneratedSpecCount} spec{displayedGeneratedSpecCount === 1 ? '' : 's'}
+                </span>
+              )}
+              {typeof keptSpecCount === 'number' && keptSpecCount > 0 && (
+                <span className="px-2 py-0.5 rounded-md bg-emerald-500/10 border border-emerald-500/25 text-[#86EFAC] text-[11px] font-mono">
+                  kept: {keptSpecCount}
+                </span>
+              )}
+              {typeof quarantinedSpecCount === 'number' && quarantinedSpecCount > 0 && (
+                <span className="px-2 py-0.5 rounded-md bg-amber-500/10 border border-amber-500/25 text-[#FDE68A] text-[11px] font-mono">
+                  quarantined: {quarantinedSpecCount}
                 </span>
               )}
               {typeof runnableFromQuality === 'number' && (

@@ -715,6 +715,172 @@ function listGeneratedTestFiles(projectPath) {
     .map((name) => path.join(generatedDir, name));
 }
 
+function extractBracketMarkers(text, prefix) {
+  const markers = [];
+  const pattern = new RegExp(`\\[${prefix}:([^\\]]+)\\]`, 'gi');
+  for (const match of String(text || '').matchAll(pattern)) {
+    const value = String(match[1] || '').trim();
+    if (value) markers.push(value);
+  }
+  return [...new Set(markers)];
+}
+
+function normalizeGeneratedRoute(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return null;
+  try {
+    const parsed = new URL(raw, 'http://healix.local');
+    return `${parsed.pathname}${parsed.search || ''}${parsed.hash || ''}` || '/';
+  } catch {
+    if (!raw.startsWith('/')) return null;
+    return raw;
+  }
+}
+
+function extractGeneratedTestTitles(content) {
+  const titles = [];
+  const pattern = /\btest(?:\.(?:only|fixme|fail|slow|skip))?\s*\(\s*(['"`])([\s\S]*?)\1/g;
+  for (const match of String(content || '').matchAll(pattern)) {
+    const title = String(match[2] || '').replace(/\s+/g, ' ').trim();
+    if (title) titles.push(title);
+  }
+  return [...new Set(titles)];
+}
+
+function extractSpecSignals(content, filename = null) {
+  const text = String(content || '');
+  const routes = [];
+  const apiEndpoints = [];
+
+  for (const match of text.matchAll(/\bpage\.goto\s*\(\s*(['"`])([^'"`]+)\1/g)) {
+    const route = normalizeGeneratedRoute(match[2]);
+    if (route) routes.push(route);
+  }
+
+  for (const match of text.matchAll(/\brequest\.(get|post|put|patch|delete|fetch)\s*\(\s*(['"`])([^'"`]+)\2/gi)) {
+    const method = String(match[1] || 'GET').toUpperCase();
+    const route = normalizeGeneratedRoute(match[3]);
+    if (route) apiEndpoints.push(`${method} ${route}`);
+  }
+
+  const totalTests = countTestsInContent(text);
+  const skippedTests = countSkippedTestsInContent(text);
+  return {
+    filename,
+    testTitles: extractGeneratedTestTitles(text),
+    reqMarkers: extractBracketMarkers(text, 'REQ'),
+    qacMarkers: extractBracketMarkers(text, 'QAC'),
+    catMarkers: extractBracketMarkers(text, 'CAT'),
+    routes: [...new Set(routes)],
+    apiEndpoints: [...new Set(apiEndpoints)],
+    sourceRefs: extractBracketMarkers(text, 'SRC'),
+    authTagged: /@auth|@tierB/i.test(text),
+    totalTests,
+    skippedTests,
+    runnableTests: Math.max(0, totalTests - skippedTests),
+  };
+}
+
+function buildExistingSuiteManifest({
+  projectPath,
+  context = {},
+  roles = [],
+  testType = 'both',
+  quality = null,
+  routeAccessSummary = null,
+} = {}) {
+  const files = listGeneratedTestFiles(projectPath);
+  const contents = [];
+  const fileManifests = [];
+  const covered = {
+    testTitles: new Set(),
+    reqMarkers: new Set(),
+    qacMarkers: new Set(),
+    catMarkers: new Set(),
+    routes: new Set(),
+    apiEndpoints: new Set(),
+    sourceRefs: new Set(),
+  };
+
+  for (const filePath of files) {
+    let content = '';
+    try {
+      content = fs.readFileSync(filePath, 'utf-8');
+    } catch {
+      continue;
+    }
+    contents.push(content);
+    const signals = extractSpecSignals(content, path.basename(filePath));
+    fileManifests.push(signals);
+    for (const key of Object.keys(covered)) {
+      for (const value of signals[key] || []) covered[key].add(value);
+    }
+  }
+
+  const qaCoverage = auditQaContractCoverage({
+    context,
+    roles,
+    contents,
+    testType,
+  });
+
+  const routeCandidates = [
+    ...(Array.isArray(routeAccessSummary?.publicRoutes) ? routeAccessSummary.publicRoutes : []),
+    ...(Array.isArray(routeAccessSummary?.protectedRoutes) ? routeAccessSummary.protectedRoutes : []),
+    ...(Array.isArray(context.pages) ? context.pages.map((page) => page?.path).filter(Boolean) : []),
+  ]
+    .map(normalizeGeneratedRoute)
+    .filter(Boolean)
+    .filter((route) => !/\[[^\]]+\]/.test(route));
+
+  const apiCandidates = effectiveApiEndpoints(context)
+    .map((endpoint) => `${String(endpoint.method || 'GET').toUpperCase()} ${normalizeGeneratedRoute(endpoint.path || '/') || '/'}`);
+
+  const requiredCategories = requiredCategoriesForRun({ testType, context });
+  const missing = {
+    routes: [...new Set(routeCandidates)].filter((route) => !covered.routes.has(route)).slice(0, 30),
+    apiEndpoints: [...new Set(apiCandidates)].filter((endpoint) => !covered.apiEndpoints.has(endpoint)).slice(0, 30),
+    categories: requiredCategories.filter((category) => !covered.catMarkers.has(category)).slice(0, 20),
+    qaContracts: (qaCoverage.missing || []).slice(0, 50),
+  };
+
+  const totals = quality || collectGenerationQuality(projectPath, {});
+  return {
+    files: fileManifests.map((file) => ({
+      filename: file.filename,
+      testTitles: file.testTitles.slice(0, 40),
+      reqMarkers: file.reqMarkers.slice(0, 30),
+      qacMarkers: file.qacMarkers.slice(0, 30),
+      catMarkers: file.catMarkers.slice(0, 20),
+      routes: file.routes.slice(0, 30),
+      apiEndpoints: file.apiEndpoints.slice(0, 30),
+      sourceRefs: file.sourceRefs.slice(0, 30),
+      authTagged: file.authTagged,
+      totalTests: file.totalTests,
+      skippedTests: file.skippedTests,
+      runnableTests: file.runnableTests,
+    })),
+    totals: {
+      totalFiles: totals.totalFiles ?? files.length,
+      totalTests: totals.totalTests ?? 0,
+      skippedTests: totals.skippedTests ?? 0,
+      runnableTests: totals.runnableTests ?? 0,
+      runnableRatio: totals.runnableRatio ?? 0,
+    },
+    covered: {
+      testTitles: [...covered.testTitles].slice(0, 120),
+      reqMarkers: [...covered.reqMarkers].slice(0, 120),
+      qacMarkers: [...covered.qacMarkers].slice(0, 120),
+      catMarkers: [...covered.catMarkers].slice(0, 60),
+      routes: [...covered.routes].slice(0, 120),
+      apiEndpoints: [...covered.apiEndpoints].slice(0, 120),
+      sourceRefs: [...covered.sourceRefs].slice(0, 120),
+    },
+    missing,
+    qaContractCoverage: qaCoverage,
+  };
+}
+
 function extractQualityFailureFileNames(qualityAudit = {}) {
   const names = new Set();
   const add = (value) => {
@@ -1840,6 +2006,8 @@ function buildGenerationRepairContext({
   routeAccessSummary,
   attempt,
   testType,
+  existingSuiteManifest = null,
+  mode = null,
 }) {
   const base = context && typeof context === 'object' ? { ...context } : {};
   const code = error?.code || classifyErrorCode(error);
@@ -1860,6 +2028,11 @@ function buildGenerationRepairContext({
     'Use the previous generation failure as feedback and generate a materially different suite.',
     'Every runnable test must assert real target-app behavior, not just page load or status code.',
   ];
+  if (mode === 'coverage_top_up_delta' && existingSuiteManifest) {
+    instructions.push('This is an append-only coverage top-up. Do not regenerate, replace, or restate tests already present in existingSuiteManifest.');
+    instructions.push('Return only new delta spec files named healix-topup-*.spec.ts. Do not reuse existing test titles, [REQ:*] markers, routes, or API endpoints unless the same test also covers a listed missing target.');
+    instructions.push('Do not generate [QAC:*] tests; Healix emits deterministic QA-contract specs separately. Focus on missing routes, API endpoints, categories, requirements, and workflows from existingSuiteManifest.missing.');
+  }
   if (publicRoutes.length > 0) {
     instructions.push(`Generate runnable public-route tests for: ${publicRoutes.slice(0, 12).join(', ')}.`);
     instructions.push('Do not add credential-driven skips to public routes; only protected routes may be skipped.');
@@ -1926,6 +2099,22 @@ function buildGenerationRepairContext({
         errors,
       },
       routeAccessSummary: routeAccessSummary || null,
+      mode: mode || null,
+      existingSuiteManifest: existingSuiteManifest ? {
+        totals: existingSuiteManifest.totals || null,
+        covered: existingSuiteManifest.covered || null,
+        missing: existingSuiteManifest.missing || null,
+        files: (existingSuiteManifest.files || []).slice(0, 25).map((file) => ({
+          filename: file.filename,
+          testTitles: (file.testTitles || []).slice(0, 20),
+          reqMarkers: (file.reqMarkers || []).slice(0, 20),
+          qacMarkers: (file.qacMarkers || []).slice(0, 20),
+          catMarkers: (file.catMarkers || []).slice(0, 12),
+          routes: (file.routes || []).slice(0, 20),
+          apiEndpoints: (file.apiEndpoints || []).slice(0, 20),
+          authTagged: file.authTagged,
+        })),
+      } : null,
       instructions,
     },
   };
@@ -2733,6 +2922,130 @@ function safeWriteGeneratedTest(testsDir, test, index, fallbackPrefix, usedFilen
   };
 }
 
+function buildTopUpTargetHits(signals, manifest = {}) {
+  const missing = manifest.missing || {};
+  const covered = manifest.covered || {};
+  const hits = [];
+
+  const missingRoutes = new Set(missing.routes || []);
+  const missingApis = new Set(missing.apiEndpoints || []);
+  const missingCategories = new Set(missing.categories || []);
+  const coveredReqs = new Set(covered.reqMarkers || []);
+
+  for (const route of signals.routes || []) {
+    if (missingRoutes.has(route)) hits.push(`route:${route}`);
+  }
+  for (const endpoint of signals.apiEndpoints || []) {
+    if (missingApis.has(endpoint)) hits.push(`api:${endpoint}`);
+  }
+  for (const category of signals.catMarkers || []) {
+    if (missingCategories.has(category)) hits.push(`category:${category}`);
+  }
+  for (const req of signals.reqMarkers || []) {
+    if (!coveredReqs.has(req)) hits.push(`requirement:${req}`);
+  }
+
+  return [...new Set(hits)];
+}
+
+function normalizeTopUpFilename(test, index) {
+  const raw = sanitizeGeneratedFilename(test?.filename, 'healix-topup', index);
+  const withoutSpec = raw.replace(GENERATED_SPEC_FILE_PATTERN, '');
+  const suffix = withoutSpec.replace(/^healix-topup-?/i, '').replace(/[^a-zA-Z0-9_-]+/g, '-');
+  return sanitizeGeneratedFilename(`healix-topup-${suffix || index + 1}.spec.ts`, 'healix-topup', index);
+}
+
+function filterDeltaTopUpTests({ incoming = [], existingSuiteManifest = {}, usedFilenames = new Set() } = {}) {
+  const covered = existingSuiteManifest.covered || {};
+  const existingTitles = new Set(covered.testTitles || []);
+  const existingReqs = new Set(covered.reqMarkers || []);
+  const existingQacs = new Set(covered.qacMarkers || []);
+  const existingRoutes = new Set(covered.routes || []);
+  const existingApis = new Set(covered.apiEndpoints || []);
+  const accepted = [];
+  const rejected = [];
+  const acceptedTitles = new Set();
+  const acceptedReqs = new Set();
+  const acceptedQacs = new Set();
+  const acceptedFiles = new Set();
+
+  for (const [index, test] of incoming.entries()) {
+    const content = String(test?.content || '').trim();
+    const rawFilename = sanitizeGeneratedFilename(test?.filename, 'healix-topup', index);
+    const filename = normalizeTopUpFilename(test, index);
+    const lowerFilename = filename.toLowerCase();
+    const signals = extractSpecSignals(content, filename);
+    const reject = (reason, details = {}) => {
+      rejected.push({
+        filename: test?.filename || filename,
+        normalizedFilename: filename,
+        reason,
+        ...details,
+      });
+    };
+
+    if (!content || signals.totalTests <= 0) {
+      reject('no_discoverable_tests');
+      continue;
+    }
+    if (usedFilenames.has(String(rawFilename).toLowerCase())) {
+      reject('duplicate_filename');
+      continue;
+    }
+    if (usedFilenames.has(lowerFilename) || acceptedFiles.has(lowerFilename)) {
+      reject('duplicate_filename');
+      continue;
+    }
+
+    const duplicateTitles = signals.testTitles.filter((title) =>
+      existingTitles.has(title) || acceptedTitles.has(title)
+    );
+    if (duplicateTitles.length > 0) {
+      reject('duplicate_test_title', { duplicateTitles: duplicateTitles.slice(0, 5) });
+      continue;
+    }
+
+    const duplicateReqs = signals.reqMarkers.filter((marker) =>
+      existingReqs.has(marker) || acceptedReqs.has(marker)
+    );
+    const duplicateQacs = signals.qacMarkers.filter((marker) =>
+      existingQacs.has(marker) || acceptedQacs.has(marker)
+    );
+    if (duplicateQacs.length > 0 || signals.qacMarkers.length > 0) {
+      reject('qa_contracts_owned_by_deterministic_pack', {
+        duplicateQacs: duplicateQacs.slice(0, 5),
+        qacMarkers: signals.qacMarkers.slice(0, 5),
+      });
+      continue;
+    }
+    if (duplicateReqs.length > 0 && duplicateReqs.length === signals.reqMarkers.length) {
+      reject('duplicate_requirement_markers', { duplicateReqs: duplicateReqs.slice(0, 5) });
+      continue;
+    }
+
+    const targetHits = buildTopUpTargetHits(signals, existingSuiteManifest);
+    const addsNewRoute = (signals.routes || []).some((route) => !existingRoutes.has(route));
+    const addsNewApi = (signals.apiEndpoints || []).some((endpoint) => !existingApis.has(endpoint));
+    if (targetHits.length === 0 && !addsNewRoute && !addsNewApi) {
+      reject('no_missing_surface_targeted');
+      continue;
+    }
+
+    accepted.push({
+      ...test,
+      filename,
+      content,
+      deltaTargets: targetHits,
+    });
+    acceptedFiles.add(lowerFilename);
+    for (const title of signals.testTitles) acceptedTitles.add(title);
+    for (const marker of signals.reqMarkers) acceptedReqs.add(marker);
+    for (const marker of signals.qacMarkers) acceptedQacs.add(marker);
+  }
+
+  return { accepted, rejected };
+}
+
 function removeHealixOwnedSupplementalAuthConfig(projectPath, reason = 'stale') {
   const authConfigPath = path.join(projectPath, 'playwright.auth.config.ts');
   if (!fs.existsSync(authConfigPath)) return { removed: false, reason: 'missing' };
@@ -3112,7 +3425,7 @@ function buildPlaywrightEnv(projectPath, cliPath = null) {
   };
 }
 
-async function validateGeneratedTestsWithList({ projectPath, validateGeneratedTests = true, timeoutMs = 90000 }) {
+async function validateGeneratedTestsWithList({ projectPath, validateGeneratedTests = true, timeoutMs = 90000, testTarget = 'tests/generated' }) {
   if (!validateGeneratedTests) {
     return { valid: true, skipped: true, listedCount: 0 };
   }
@@ -3130,7 +3443,7 @@ async function validateGeneratedTestsWithList({ projectPath, validateGeneratedTe
   }
 
   return new Promise((resolve) => {
-    const testArgs = ['test', 'tests/generated', '--list'];
+    const testArgs = ['test', testTarget, '--list'];
     const configPath = resolvePlaywrightConfig(projectPath);
     if (configPath) {
       testArgs.push('--config', configPath);
@@ -3185,6 +3498,138 @@ async function validateGeneratedTestsWithList({ projectPath, validateGeneratedTe
   });
 }
 
+function validationCanBeSalvaged(validation = {}) {
+  const reason = String(validation?.reason || '');
+  const stderr = String(validation?.stderr || '');
+  const stdout = String(validation?.stdout || '');
+  return [
+    'playwright_list_failed',
+    'no_tests_listed',
+    'no_tests_loaded',
+    'validation_spawn_failed',
+  ].includes(reason) || /No tests found|No tests loaded/i.test(`${stderr}\n${stdout}`);
+}
+
+function quarantineGeneratedSpecFilesByName({ projectPath, files = [], reason = 'validation_salvage' } = {}) {
+  const generatedDir = path.join(projectPath, 'tests', 'generated');
+  if (!fs.existsSync(generatedDir)) {
+    return { applied: false, reason: 'generated_dir_missing', quarantinedFiles: [] };
+  }
+  const safeReason = String(reason || 'validation_salvage').replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 80);
+  const quarantineDir = path.join(projectPath, 'tests', '.healix-quarantine', `${Date.now()}-${safeReason}`);
+  const quarantinedFiles = [];
+  for (const file of files) {
+    const filename = path.basename(file?.filename || file);
+    if (!GENERATED_SPEC_FILE_PATTERN.test(filename)) continue;
+    const source = path.join(generatedDir, filename);
+    if (!fs.existsSync(source)) continue;
+    ensureDir(quarantineDir);
+    let target = path.join(quarantineDir, filename);
+    let suffix = 1;
+    while (fs.existsSync(target)) {
+      target = path.join(quarantineDir, filename.replace(GENERATED_SPEC_FILE_PATTERN, `-${suffix}.spec.ts`));
+      suffix += 1;
+    }
+    fs.renameSync(source, target);
+    quarantinedFiles.push({
+      filename,
+      path: target,
+      reason: file?.reason || 'validation_failed',
+      stderr: file?.stderr || null,
+      stdout: file?.stdout || null,
+    });
+  }
+  return {
+    applied: quarantinedFiles.length > 0,
+    reason,
+    quarantineDir: quarantinedFiles.length > 0 ? quarantineDir : null,
+    quarantinedFiles,
+  };
+}
+
+async function salvageGeneratedTestValidation({
+  projectPath,
+  originalValidation = {},
+  validateGeneratedTests = true,
+  timeoutMs = 90000,
+  validator = validateGeneratedTestsWithList,
+} = {}) {
+  const specFiles = listGeneratedTestFiles(projectPath);
+  const event = {
+    attempted: false,
+    recovered: false,
+    status: 'not_attempted',
+    originalReason: originalValidation?.reason || null,
+    originalSpecCount: specFiles.length,
+    keptSpecFiles: [],
+    quarantinedSpecFiles: [],
+    invalidSpecFiles: [],
+    finalValidation: null,
+  };
+
+  if (!validateGeneratedTests || specFiles.length === 0 || !validationCanBeSalvaged(originalValidation)) {
+    return event;
+  }
+
+  event.attempted = true;
+  event.status = 'scanning_specs';
+  const perFileTimeout = Math.max(5000, Math.min(20000, Math.floor(timeoutMs / Math.max(1, specFiles.length))));
+  for (const filePath of specFiles) {
+    const filename = path.basename(filePath);
+    const relTarget = path.relative(projectPath, filePath).replace(/\\/g, '/');
+    const validation = await validator({
+      projectPath,
+      validateGeneratedTests,
+      timeoutMs: perFileTimeout,
+      testTarget: relTarget,
+    });
+    if (validation?.valid && Number(validation.listedCount || 0) > 0) {
+      event.keptSpecFiles.push({
+        filename,
+        listedCount: validation.listedCount || 0,
+      });
+    } else {
+      event.invalidSpecFiles.push({
+        filename,
+        reason: validation?.reason || 'validation_failed',
+        stderr: validation?.stderr || null,
+        stdout: validation?.stdout || null,
+      });
+    }
+  }
+
+  if (event.invalidSpecFiles.length === 0) {
+    event.status = 'all_specs_valid_individually';
+    return event;
+  }
+
+  const quarantine = quarantineGeneratedSpecFilesByName({
+    projectPath,
+    files: event.invalidSpecFiles,
+    reason: 'validation_salvage',
+  });
+  event.quarantinedSpecFiles = quarantine.quarantinedFiles || [];
+
+  if (event.keptSpecFiles.length === 0) {
+    event.status = 'no_valid_specs_remaining';
+    return event;
+  }
+
+  const finalValidation = await validator({
+    projectPath,
+    validateGeneratedTests,
+    timeoutMs: Math.max(5000, timeoutMs),
+  });
+  event.finalValidation = finalValidation;
+  if (finalValidation?.valid) {
+    event.status = 'recovered';
+    event.recovered = true;
+  } else {
+    event.status = 'post_salvage_validation_failed';
+  }
+  return event;
+}
+
 /**
  * Build a structured diagnostics blob for pipeline-level failures — the things
  * that go wrong BEFORE any test actually runs (validation, quality audit,
@@ -3194,7 +3639,7 @@ async function validateGeneratedTestsWithList({ projectPath, validateGeneratedTe
  * user sees only the generic "usually caused by missing test runner
  * dependencies" message with no way to diagnose further.
  */
-function buildPipelineDiagnostics({ projectPath, stage, reason, stderr, stdout, qualityAudit } = {}) {
+function buildPipelineDiagnostics({ projectPath, stage, reason, stderr, stdout, qualityAudit, validationSalvage = null } = {}) {
   const generatedDir = projectPath ? path.join(projectPath, 'tests', 'generated') : null;
   let firstSpecPreview = null;
   let generatedSpecCount = 0;
@@ -3233,7 +3678,10 @@ function buildPipelineDiagnostics({ projectPath, stage, reason, stderr, stdout, 
     stderr: truncate(stderr, 4000),
     stdout: truncate(stdout, 4000),
     firstSpecPreview,
-    generatedSpecCount,
+    generatedSpecCount: validationSalvage?.originalSpecCount || generatedSpecCount,
+    keptSpecCount: Array.isArray(validationSalvage?.keptSpecFiles) ? validationSalvage.keptSpecFiles.length : null,
+    quarantinedSpecCount: Array.isArray(validationSalvage?.quarantinedSpecFiles) ? validationSalvage.quarantinedSpecFiles.length : null,
+    validationSalvage,
     qualityAuditErrors: qualityAudit?.errors || null,
     generationQuality: qualityAudit || null,
   };
@@ -4633,6 +5081,14 @@ async function maybeRunCoverageTopUp({
     Math.min(20, decision.target - before.totalTests),
   );
   const routeAccessSummary = buildRouteAccessSummary(sharedPayload?.explorationArtifact || null);
+  const existingSuiteManifest = buildExistingSuiteManifest({
+    projectPath: config.projectPath,
+    context: sharedPayload?.context || {},
+    roles: sharedPayload?.roles || [],
+    testType: sharedPayload?.testType || config.testType,
+    quality: before,
+    routeAccessSummary,
+  });
   let preTopUpAudit = null;
   try {
     preTopUpAudit = auditGeneratedTestQuality({
@@ -4668,6 +5124,8 @@ async function maybeRunCoverageTopUp({
     routeAccessSummary,
     attempt: 1,
     testType: sharedPayload?.testType,
+    existingSuiteManifest,
+    mode: 'coverage_top_up_delta',
   });
 
   if (statusDir) {
@@ -4678,6 +5136,7 @@ async function maybeRunCoverageTopUp({
       minimumUsefulRunnableFloor: decision.minimumUsefulRunnableFloor,
       runnableTests: before.runnableTests,
       totalTests: before.totalTests,
+      missingTargets: existingSuiteManifest.missing,
     }, telemetryReporter);
   }
 
@@ -4690,6 +5149,9 @@ async function maybeRunCoverageTopUp({
     target: decision.target,
     minimumUsefulRunnableFloor: decision.minimumUsefulRunnableFloor,
     addedFiles: [],
+    rejectedFiles: [],
+    topUpMode: 'coverage_top_up_delta',
+    existingSuiteManifest,
     error: null,
   };
 
@@ -4722,8 +5184,14 @@ async function maybeRunCoverageTopUp({
     });
 
     const incoming = Array.isArray(payload?.tests) ? payload.tests : [];
+    const delta = filterDeltaTopUpTests({
+      incoming,
+      existingSuiteManifest,
+      usedFilenames,
+    });
+    event.rejectedFiles = delta.rejected;
     const beforeFileCount = files.length;
-    for (const test of incoming) {
+    for (const test of delta.accepted) {
       try {
         const written = safeWriteGeneratedTest(
           testsDir,
@@ -4748,7 +5216,7 @@ async function maybeRunCoverageTopUp({
     event.after = after;
     event.status = after.runnableTests > before.runnableTests
       ? 'added'
-      : (files.length > beforeFileCount ? 'added_files_pending_quality' : 'no_new_valid_tests');
+      : (files.length > beforeFileCount ? 'added_files_pending_quality' : 'no_new_valid_delta');
 
     if (statusDir) {
       updateStatus(statusDir, 'generation_top_up_complete', {
@@ -4758,6 +5226,7 @@ async function maybeRunCoverageTopUp({
           : 'Coverage top-up completed without increasing runnable tests; continuing with the best valid suite.',
         status: event.status,
         addedFiles: event.addedFiles,
+        rejectedFiles: event.rejectedFiles,
         before: {
           totalTests: before.totalTests,
           runnableTests: before.runnableTests,
@@ -4780,12 +5249,14 @@ async function maybeRunCoverageTopUp({
         message: `Coverage top-up generated ${event.addedFiles.length} spec file${event.addedFiles.length === 1 ? '' : 's'}`,
         metadata: {
           files: event.addedFiles,
-          generatedCount: files.length,
-          target: decision.target,
-          minimumUsefulRunnableFloor: decision.minimumUsefulRunnableFloor,
-        },
-      });
-    }
+            generatedCount: files.length,
+            target: decision.target,
+            minimumUsefulRunnableFloor: decision.minimumUsefulRunnableFloor,
+            topUpMode: event.topUpMode,
+            rejectedFiles: event.rejectedFiles,
+          },
+        });
+      }
 
     return event;
   } catch (err) {
@@ -5555,6 +6026,7 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
     generationMeta.qaContractSummary = qaContractPack.qaContractSummary;
     generationMeta.qaContractQuestions = qaContractPack.qaContractQuestions;
     generationMeta.qaContractWarnings = qaContractPack.qaContractWarnings;
+    generationMeta.qaContractPackListedTests = qaContractPack.written ? qaContractPack.generatedTests : 0;
 
     let validation = await validateGeneratedTestsWithList({
       projectPath: config.projectPath,
@@ -5563,15 +6035,49 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
     });
 
     if (!validation.valid) {
+      const salvage = await salvageGeneratedTestValidation({
+        projectPath: config.projectPath,
+        originalValidation: validation,
+        validateGeneratedTests,
+        timeoutMs: Math.min(getBudgetRemainingMs(runBudget), runBudget.stageCaps.validation),
+      });
+      generationMeta.validationSalvage = salvage;
+      if (salvage.recovered && salvage.finalValidation?.valid) {
+        validation = {
+          ...salvage.finalValidation,
+          validationSalvage: salvage,
+        };
+        qualityRecoveryEvents.push({
+          type: 'validation_salvage',
+          ...salvage,
+        });
+        Logger.warn('PipelineWorker', 'Recovered generated suite after Playwright list validation failure', {
+          generator,
+          keptSpecFiles: salvage.keptSpecFiles.map((file) => file.filename),
+          quarantinedSpecFiles: salvage.quarantinedSpecFiles.map((file) => file.filename),
+        });
+        if (statusDir) {
+          updateStatus(statusDir, 'generation_quality_recovered', {
+            runId,
+            message: `Generated specs failed validation; kept ${salvage.keptSpecFiles.length} valid spec(s) and quarantined ${salvage.quarantinedSpecFiles.length} invalid spec(s).`,
+            validationSalvage: salvage,
+          }, telemetryReporter);
+        }
+      }
+    }
+
+    if (!validation.valid) {
       const error = new Error(`${generator} generation failed validation: ${validation.reason || 'unknown'}`);
       error.code = 'GENERATION_VALIDATION_FAILED';
       error.validation = validation;
+      error.validationSalvage = generationMeta.validationSalvage || null;
       error.diagnostics = buildPipelineDiagnostics({
         projectPath: config.projectPath,
         stage: 'validation',
         reason: validation.reason,
         stderr: validation.stderr,
         stdout: validation.stdout,
+        validationSalvage: generationMeta.validationSalvage || null,
       });
       throw error;
     }
@@ -7805,6 +8311,9 @@ async function runPipeline(config, runId) {
         stdout: error.diagnostics?.stdout || null,
         firstSpecPreview: error.diagnostics?.firstSpecPreview || null,
         generatedSpecCount,
+        keptSpecCount: error.diagnostics?.keptSpecCount ?? null,
+        quarantinedSpecCount: error.diagnostics?.quarantinedSpecCount ?? null,
+        validationSalvage: error.validationSalvage || error.diagnostics?.validationSalvage || null,
         qualityAuditErrors: error.diagnostics?.qualityAuditErrors || null,
         generationQuality: error.generationQuality || error.diagnostics?.generationQuality || null,
       };
@@ -7926,6 +8435,11 @@ module.exports = {
   shouldAttemptCoverageTopUp,
   isRepairableGenerationFailure,
   collectGenerationQuality,
+  buildExistingSuiteManifest,
+  extractSpecSignals,
+  filterDeltaTopUpTests,
+  salvageGeneratedTestValidation,
+  validateGeneratedTestsWithList,
   evaluateGenerationQualityGates,
   buildRequirementsCoverage,
   auditGeneratedTestQuality,
