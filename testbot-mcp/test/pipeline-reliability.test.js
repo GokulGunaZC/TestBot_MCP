@@ -1035,7 +1035,7 @@ test('QA contracts normalize mounted router paths and do not infer auth from unr
           router.get('/issue/:id', (req, res) => res.json([]));
           router.post('/issue/:id', requireAuth, (req, res) => {
             const { body } = req.body;
-            if (!body || !body.trim()) return res.status(400).json({ error: 'required' });
+            if (typeof body !== 'string' || body.length === 0) return res.status(400).json({ error: 'required' });
             res.status(201).json({ id: 'c1', body });
           });
           router.delete('/:id', requireAuth, (req, res) => res.status(204).end());
@@ -1084,6 +1084,7 @@ test('QA contracts normalize mounted router paths and do not infer auth from unr
 
   assert.ok(qaContracts.boundaryValidationContracts.some((contract) => contract.path === '/api/comments/issue/:id'));
   assert.ok(qaContracts.deleteStatusContracts.some((contract) => contract.path === '/api/comments/:id'));
+  assert.ok(qaContracts.questions.some((question) => question.type === 'dynamic_endpoint_fixture_needed' && question.contractId === 'qac-boundary-validation-post-api-comments-issue-id'));
   assert.equal(qaContracts.boundaryValidationContracts.some((contract) => contract.path === '/api/issues/:id'), false);
   assert.equal(qaContracts.rbacContracts.some((contract) => contract.path === '/api/projects'), false);
   assert.equal(qaContracts.rbacContracts.some((contract) => contract.path === '/api/auth/login'), false);
@@ -1101,6 +1102,7 @@ test('QA contracts normalize mounted router paths and do not infer auth from unr
   assert.match(spec.content, /@auth @tierB \[QAC:qac-post-status-post-api-comments-issue-id\]/);
   assert.match(spec.content, /@auth @tierB \[QAC:qac-boundary-validation-post-api-comments-issue-id\]/);
   assert.match(spec.content, /resolveApiPathFromPage\(page, "\/api\/comments\/issue\/:id"\)/);
+  assert.match(spec.content, /return '\/api\/issues'/);
   assert.match(spec.content, /apiFetchFromPage\(page, concretePath/);
   assert.equal(spec.content.includes('await resolveApiPathFromPage(page, "/api/issues"),'), false);
   assert.equal(spec.content.includes('request.post("/api/issues"'), false);
@@ -1132,6 +1134,54 @@ test('QA contracts detect free-text search filters as contains predicates', () =
 
   const spec = buildQaContractSpec({ qaContracts, testType: 'backend' });
   assert.match(spec.content, /toContain\(value\.toLowerCase\(\)\)/);
+});
+
+test('QA filter contracts prefer authoritative backend source over public compiled bundles', async () => {
+  await withTempProject(async (projectPath) => {
+    fs.mkdirSync(path.join(projectPath, 'frontend-next', 'public', 'admin'), { recursive: true });
+    fs.mkdirSync(path.join(projectPath, 'services', 'issues-java', 'src', 'main', 'java', 'io', 'pulseboard', 'issues', 'repo'), { recursive: true });
+    fs.writeFileSync(path.join(projectPath, 'frontend-next', 'public', 'admin', 'chunk-OAV6GBGH.js'), 'function x(){const q=searchParams.get("q"); return { name: q }}');
+    fs.writeFileSync(path.join(projectPath, 'services', 'issues-java', 'src', 'main', 'java', 'io', 'pulseboard', 'issues', 'repo', 'IssueRepository.java'), `
+      import org.springframework.data.repository.query.Param;
+      public interface IssueRepository {
+        @Query("""
+          SELECT i FROM Issue i
+          WHERE (:q IS NULL OR i.title IS NOT NULL)
+        """)
+        List<Issue> search(@Param("q") String q);
+      }
+    `);
+
+    const qaContracts = extractQaContracts({
+      projectPath,
+      context: {
+        apiEndpoints: [{
+          method: 'GET',
+          path: '/api/issues',
+          source: 'services/issues-java/src/main/java/io/pulseboard/issues/controller/IssueController.java',
+        }],
+      },
+      readFile(filePath) {
+        if (String(filePath).endsWith('IssueController.java')) {
+          return `
+            @RequestMapping("/api/issues")
+            class IssueController {
+              @GetMapping
+              List<IssueDto> list(@RequestParam(required = false) String q) {
+                return repo.search(q).stream().map(IssueDto::from).toList();
+              }
+            }
+          `;
+        }
+        try { return fs.readFileSync(filePath, 'utf8'); } catch { return ''; }
+      },
+    });
+
+    const filter = qaContracts.filterContracts.find((contract) => contract.id === 'qac-filter-get-api-issues-q');
+    assert.equal(filter?.responseField, 'title');
+    assert.equal(filter?.operator, 'contains');
+    assert.equal(filter?.sourceFile, 'services/issues-java/src/main/java/io/pulseboard/issues/repo/IssueRepository.java');
+  });
 });
 
 test('context gatherer scans nested Next app/api directories and ignores type-only routes', async () => {
@@ -3439,16 +3489,18 @@ test('report generator only persists deterministic or classifier-confirmed app f
       projectName: 'findings-app',
       runId: 'findings-report',
       testResults: {
-        total: 4,
+        total: 6,
         passed: 0,
-        failed: 4,
-        skipped: 0,
+        failed: 5,
+        skipped: 1,
         duration: 10,
         tests: [
           { title: '[QAC:a11y-home] icon button has an accessible name', status: 'failed', file: 'tests/generated/healix-qa-contracts.spec.ts', error: 'missing accessible name' },
+          { title: '[QAC:qac-a11y-search] [CAT:a11y] /search interactive elements have accessible names', status: 'failed', file: 'tests/generated/healix-qa-contracts.spec.ts', error: 'missing accessible name' },
           { title: '[QAC:qac-form-validation-admin-login] [CAT:form_validation] /admin/login requires accessible inline validation', status: 'failed', file: 'tests/generated/healix-qa-contracts.spec.ts', error: 'missing role alert' },
           { title: 'AI workflow failed but untriaged', status: 'failed', file: 'tests/generated/workflow.spec.ts', error: 'locator mismatch' },
           { title: 'AI API check found app bug', status: 'failed', file: 'tests/generated/api.spec.ts', error: 'expected 201 received 200' },
+          { title: '[QAC:qac-rbac-put-api-issues-id] [CAT:api_auth] role matrix for PUT /api/issues/:id', status: 'skipped', file: 'tests/generated/healix-qa-contracts.spec.ts', error: 'No live fixture row available for dynamic RBAC endpoint.' },
         ],
         failures: [],
       },
@@ -3458,13 +3510,16 @@ test('report generator only persists deterministic or classifier-confirmed app f
     });
     const report = JSON.parse(fs.readFileSync(generated.path, 'utf-8'));
 
-    assert.equal(report.qaFindings.length, 3);
-    assert.equal(report.findingSummary.total, 3);
+    assert.equal(report.qaFindings.length, 4);
+    assert.equal(report.findingSummary.total, 4);
     assert.equal(report.findingSummary.status, 'completed_with_findings');
     assert.ok(report.qaFindings.some((finding) => finding.findingType === 'deterministic_contract'));
     assert.ok(report.qaFindings.some((finding) => finding.findingType === 'app_is_wrong'));
     assert.ok(report.qaFindings.some((finding) => finding.category === 'a11y' && finding.severity === 'P2'));
     assert.ok(report.qaFindings.some((finding) => finding.category === 'validation' && finding.severity === 'P1'));
+    assert.ok(!report.qaFindings.some((finding) => finding.testTitle.includes('qac-form-validation-admin-login') && finding.category === 'authz'));
+    assert.equal(report.skipSummary.total, 1);
+    assert.equal(report.skipSummary.byReason.missing_fixture_or_dynamic_sample, 1);
     assert.ok(!report.qaFindings.some((finding) => finding.testTitle === 'AI workflow failed but untriaged'));
   } finally {
     fs.rmSync(projectPath, { recursive: true, force: true });

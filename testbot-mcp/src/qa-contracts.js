@@ -29,6 +29,7 @@ function escapeRegExp(value) {
 
 function readSource(projectPath, sourceRel, readFile) {
   if (!sourceRel) return '';
+  if (sourceFileLooksNonAuthoritative(sourceRel)) return '';
   const sourcePath = path.resolve(projectPath, sourceRel);
   const projectRoot = path.resolve(projectPath);
   const relative = path.relative(projectRoot, sourcePath);
@@ -202,6 +203,8 @@ function inferResponseFieldFromSource(content, param) {
     new RegExp(`\\b([A-Za-z_][\\w]*)\\s*:\\s*\\{\\s*(?:contains|search|startsWith|endsWith)\\s*:\\s*${escaped}\\b`, 'i'),
     new RegExp(`\\b\\w+\\.([A-Za-z_][\\w]*)\\s*=\\s*:${escaped}\\b`, 'i'),
     new RegExp(`\\b([A-Za-z_][\\w]*)\\s*=\\s*:${escaped}\\b`, 'i'),
+    new RegExp(`\\b\\w+\\.([A-Za-z_][\\w]*)\\s+IS\\s+NOT\\s+NULL[\\s\\S]{0,220}:${escaped}\\b`, 'i'),
+    new RegExp(`:${escaped}\\b[\\s\\S]{0,220}\\b\\w+\\.([A-Za-z_][\\w]*)\\s+IS\\s+NOT\\s+NULL`, 'i'),
     new RegExp(`\\bwhere\\s+[\\w"'\`.]*([A-Za-z_][\\w]*)\\s*=\\s*\\?`, 'i'),
     new RegExp(`\\b([A-Za-z_][\\w]*)\\s*:\\s*${escaped}\\b`, 'i'),
   ];
@@ -219,7 +222,7 @@ function inferResponseFieldFromSource(content, param) {
 
 function findProjectSourceFiles(rootDir, limit = 250) {
   const files = [];
-  const skipDirs = new Set(['node_modules', '.git', '.next', 'dist', 'build', 'coverage', 'out', 'target', 'vendor', '.healix', 'healix-reports', 'tests']);
+  const skipDirs = new Set(['node_modules', '.git', '.next', 'dist', 'build', 'coverage', 'out', 'target', 'vendor', 'public', 'static', 'assets', '.healix', 'healix-reports', 'tests']);
   const exts = new Set(['.java', '.kt', '.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs', '.py', '.go', '.rb', '.php', '.cs']);
   const walk = (dir) => {
     if (files.length >= limit) return;
@@ -238,11 +241,11 @@ function findProjectSourceFiles(rootDir, limit = 250) {
         walk(full);
         continue;
       }
-      if (entry.isFile() && exts.has(path.extname(entry.name))) files.push(full);
+      if (entry.isFile() && exts.has(path.extname(entry.name)) && !sourceFileLooksNonAuthoritative(full)) files.push(full);
     }
   };
   walk(rootDir);
-  return files;
+  return files.sort((a, b) => sourceAuthorityScore(a) - sourceAuthorityScore(b) || a.localeCompare(b));
 }
 
 function findProjectFilterEvidence({ projectPath, param, readFile }) {
@@ -261,6 +264,7 @@ function findProjectFilterEvidence({ projectPath, param, readFile }) {
     return {
       sourceFile: sourceRel,
       responseField: inferResponseFieldFromSource(content, param),
+      operator: /^(q|query|search|term)$/i.test(param) || sourceProvesContainsFilter(content, param) ? 'contains' : 'equals',
     };
   }
   return null;
@@ -333,6 +337,30 @@ function sourceFileLooksTypeOnly(sourceFile) {
     /\.d\.ts$/i.test(normalized) ||
     /(?:^|\/)(?:node_modules|\.next|dist|build|coverage|out|vendor|target)(?:\/|$)/i.test(normalized)
   );
+}
+
+function sourceFileLooksNonAuthoritative(sourceFile) {
+  const normalized = String(sourceFile || '').replace(/\\/g, '/');
+  return (
+    sourceFileLooksTypeOnly(normalized) ||
+    /(?:^|\/)(?:public|static|assets|generated|gen)(?:\/|$)/i.test(normalized) ||
+    /(?:^|\/)(?:package-lock|yarn\.lock|pnpm-lock)\./i.test(normalized) ||
+    /\.(?:min|bundle|chunk|compiled)\.(?:mjs|cjs|jsx?|tsx?)$/i.test(normalized) ||
+    /(?:^|\/)chunk-[A-Z0-9_-]+\.(?:mjs|cjs|jsx?)$/i.test(normalized)
+  );
+}
+
+function sourceAuthorityScore(filePath) {
+  const normalized = String(filePath || '').replace(/\\/g, '/');
+  if (sourceFileLooksNonAuthoritative(normalized)) return 10_000;
+  if (/\/services\/[^/]+\/src\//i.test(normalized)) return 0;
+  if (/\/src\/main\/(?:java|kotlin)\//i.test(normalized)) return 0;
+  if (/(?:^|\/)(?:src\/)?app\/api\/.+\/route\.(?:tsx?|jsx?)$/i.test(normalized)) return 1;
+  if (/(?:^|\/)(?:src\/)?pages\/api\//i.test(normalized)) return 1;
+  if (/(?:^|\/)(?:controllers?|routes?|handlers?)\//i.test(normalized)) return 2;
+  if (/(?:^|\/)(?:repositories?|repos?|dao)\//i.test(normalized)) return 3;
+  if (/(?:^|\/)(?:src|app|lib)\//i.test(normalized)) return 5;
+  return 20;
 }
 
 function apiPrefixFromSourceFile(sourceFile) {
@@ -519,7 +547,7 @@ function extractRequiredStringFieldsFromSource(content) {
   for (const match of String(content || '').matchAll(/\b(?:const|let|var)\s*\{\s*([^}]{2,300})\s*\}\s*=\s*(?:await\s+)?(?:req|request)?\.?(?:body|json\s*\(\s*\)|parse\s*\()/g)) {
     for (const part of String(match[1] || '').split(',')) {
       const name = part.split(':')[0].trim();
-      if (new RegExp(`!\\s*${escapeRegExp(name)}\\b|${escapeRegExp(name)}\\s*==={0,1}\\s*['"\`]\\s*['"\`]|${escapeRegExp(name)}\\.trim\\s*\\(\\s*\\)`, 'i').test(content)) {
+      if (new RegExp(`!\\s*${escapeRegExp(name)}\\b|${escapeRegExp(name)}\\s*==={0,1}\\s*['"\`]\\s*['"\`]|${escapeRegExp(name)}\\.trim\\s*\\(\\s*\\)|${escapeRegExp(name)}\\.length\\s*={2,3}\\s*0|typeof\\s+${escapeRegExp(name)}\\s*!={1,2}\\s*['"\`]string['"\`]`, 'i').test(content)) {
         add(name, 'required_guard', { allowGenericName: true });
       }
     }
@@ -653,12 +681,16 @@ function extractQaContracts({ projectPath, context = {}, readFile } = {}) {
         }
         if (!filterEvidence) {
           filterEvidence = findProjectFilterEvidence({ projectPath, param: queryParam, readFile });
+          if (filterEvidence?.operator) operator = filterEvidence.operator;
         }
         if (!filterEvidence && sourceReferencesFilterParam(content, queryParam)) {
           filterEvidence = {
             sourceFile,
             responseField: inferResponseFieldFromSource(content, queryParam),
           };
+          if (/^(q|query|search|term)$/i.test(queryParam)) {
+            operator = 'contains';
+          }
         }
         if (!filterEvidence) continue;
         const responseField = filterEvidence.responseField || queryParam;
@@ -854,7 +886,23 @@ function buildQaContractQuestions(qaContracts = {}) {
       sourceFile: contract.sourceFile || null,
       question: contract.question,
     }));
-  return [...deleteQuestions, ...formQuestions];
+  const dynamicEndpointQuestions = [
+    ...(qaContracts.statusCodeContracts || []),
+    ...(qaContracts.boundaryValidationContracts || []),
+    ...(qaContracts.rbacContracts || []),
+  ]
+    .filter((contract) => contract?.path && routeHasDynamicSegment(contract.path))
+    .map((contract) => ({
+      id: `${contract.id}:fixture`,
+      contractId: contract.id,
+      type: 'dynamic_endpoint_fixture_needed',
+      severity: 'needs_context',
+      method: contract.method,
+      path: contract.path,
+      sourceFile: contract.sourceFile || null,
+      question: `QA contract ${contract.id} targets dynamic endpoint ${contract.method} ${contract.path}. If Healix cannot resolve a live fixture ID from list endpoints, provide a seed fixture or create/delete setup policy for this endpoint.`,
+    }));
+  return [...deleteQuestions, ...formQuestions, ...dynamicEndpointQuestions];
 }
 
 function getVerifiedRoleCount(roles = []) {
@@ -952,6 +1000,8 @@ function fillDynamicPath(pathname: string, value: string | number): string {
 }
 
 function collectionPathForDynamic(pathname: string): string {
+  const normalized = String(pathname);
+  if (/^\/api\/comments\/issue\/[:{]/.test(normalized)) return '/api/issues';
   return pathname
     .replace(/(?:\\/\\{[^}]+\\}|\\/:[A-Za-z_][\\w-]*)(?:\\/.*)?$/, '') || '/';
 }
@@ -1347,8 +1397,10 @@ function auditQaContractCoverage({ context = {}, roles = [], contents = [], test
       message: `QA contract ${contract.id} requires verified auth and was blocked.`,
     })),
     ...questions.map((question) => ({
-      code: 'QAC_DELETE_STATUS_NEEDS_CONFIRMATION',
-      contractId: question.id,
+      code: question.type === 'delete_status_confirmation'
+        ? 'QAC_DELETE_STATUS_NEEDS_CONFIRMATION'
+        : 'QAC_CONTEXT_NEEDED',
+      contractId: question.contractId || question.id,
       message: question.question,
     })),
   ];

@@ -32,6 +32,11 @@ class ContextGatherer {
       'out',
       'vendor',
       'target',
+      'public',
+      'static',
+      'assets',
+      'generated',
+      'gen',
     ]);
   }
 
@@ -1810,7 +1815,11 @@ class ContextGatherer {
    * Helper: Check if file is a page file
    */
   isPageFile(filename) {
-    return /\.(js|jsx|ts|tsx)$/.test(filename) && !/\.d\.ts$/i.test(filename) && !filename.includes('.test.') && !filename.includes('.spec.');
+    return /\.(js|jsx|ts|tsx)$/.test(filename)
+      && !/\.d\.ts$/i.test(filename)
+      && !/\.(?:min|bundle|chunk|compiled)\.(?:mjs|cjs|jsx?|tsx?)$/i.test(filename)
+      && !filename.includes('.test.')
+      && !filename.includes('.spec.');
   }
 
   findNestedFrameworkDirs(projectPath, relativeCandidates, maxDepth = 2) {

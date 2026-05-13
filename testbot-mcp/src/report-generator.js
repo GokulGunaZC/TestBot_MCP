@@ -424,14 +424,68 @@ class ReportGenerator {
     return crypto.createHash('sha256').update(String(value || '')).digest('hex').slice(0, length);
   }
 
+  categoryFromCatTag(value = '') {
+    const match = String(value || '').match(/\[CAT:([^\]]+)\]/i);
+    if (!match) return null;
+    const cat = match[1].trim().toLowerCase();
+    if (cat === 'a11y' || cat === 'accessibility') return 'a11y';
+    if (cat === 'form_validation' || cat === 'api_negative' || cat === 'boundary_validation') return 'validation';
+    if (cat === 'api_auth' || cat === 'rbac' || cat === 'authz') return 'authz';
+    if (cat === 'filter_logic') return 'filter_logic';
+    if (cat === 'api_contract') {
+      if (/qac-filter|filter|query|search/i.test(value)) return 'filter_logic';
+      return 'http_contract';
+    }
+    return cat.replace(/[^a-z0-9_]+/g, '_') || null;
+  }
+
   inferQaCategory(test = {}) {
-    const text = `${test.title || ''} ${test.file || ''} ${test.suite || ''}`.toLowerCase();
+    const rawText = `${test.title || ''} ${test.file || ''} ${test.suite || ''}`;
+    const taggedCategory = this.categoryFromCatTag(rawText);
+    if (taggedCategory) return taggedCategory;
+    const text = rawText.toLowerCase();
     if (/form_validation|form-validation|boundary|validation|required|string|whitespace|api_negative/.test(text)) return 'validation';
     if (/a11y|accessib|aria|interactive/.test(text)) return 'a11y';
     if (/rbac|authz|api_auth|forbidden|unauthorized/.test(text)) return 'authz';
     if (/filter|query|search/.test(text)) return 'filter_logic';
     if (/status|201|202|204|api_contract|contract/.test(text)) return 'http_contract';
     return 'functional';
+  }
+
+  buildSkipSummary(tests = []) {
+    const skipped = (tests || []).filter((test) => this.normalizeStatus(test.status) === 'skipped');
+    const byCategory = {};
+    const byReason = {};
+    const examples = [];
+    for (const test of skipped) {
+      const category = this.inferQaCategory(test);
+      byCategory[category] = (byCategory[category] || 0) + 1;
+      const text = `${test.error || test.errorMessage || test.title || ''}`;
+      const reason = /fixture|sample|dynamic|No live fixture/i.test(text)
+        ? 'missing_fixture_or_dynamic_sample'
+        : /auth|storage|role/i.test(text)
+          ? 'missing_auth_context'
+          : /skip/i.test(text)
+            ? 'explicit_skip'
+            : 'unspecified_skip';
+      byReason[reason] = (byReason[reason] || 0) + 1;
+      if (examples.length < 8) {
+        examples.push({
+          title: this.stripAnsiAndNormalize(test.title || test.name || 'Unnamed skipped test'),
+          file: this.normalizePathForReport(test.file || ''),
+          category,
+          reason,
+        });
+      }
+    }
+    const total = skipped.length;
+    return {
+      total,
+      byCategory,
+      byReason,
+      examples,
+      status: total >= 10 || total / Math.max(1, tests.length) > 0.25 ? 'coverage_degraded' : 'ok',
+    };
   }
 
   severityForQaCategory(category, test = {}) {
@@ -598,6 +652,7 @@ class ReportGenerator {
       projectName,
       tests: normalizedTestsForFindings,
     });
+    const skipSummary = this.buildSkipSummary(normalizedTestsForFindings);
 
     const report = {
       metadata: {
@@ -624,6 +679,7 @@ class ReportGenerator {
         aiEligibleFailures: Number(normalizedAiTriage?.aiEligibleFailures || 0),
         deterministicVerdicts: Number(normalizedAiTriage?.deterministicVerdicts || 0),
         findingSummary,
+        skipSummary,
       },
       stats: {
         total: Number(testResults.total || 0),
@@ -653,6 +709,7 @@ class ReportGenerator {
       aiTriage: normalizedAiTriage,
       qaFindings: this.stripAnsiAndNormalize(qaFindings),
       findingSummary: this.stripAnsiAndNormalize(findingSummary),
+      skipSummary: this.stripAnsiAndNormalize(skipSummary),
       qaTestCaseRuns: this.stripAnsiAndNormalize(qaTestCaseRuns),
     };
 
