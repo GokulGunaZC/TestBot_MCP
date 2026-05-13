@@ -6,6 +6,7 @@
 
 const path = require('path');
 const fs = require('fs');
+const crypto = require('crypto');
 const { spawn, execSync, spawnSync } = require('child_process');
 
 // Load environment variables from multiple paths
@@ -2782,6 +2783,261 @@ function emitPipelineTelemetry(reporter, payload) {
       stageBudget: payload.stageBudget || null,
     },
   });
+}
+
+const PIPELINE_DECISION_LOG = 'pipeline-events.jsonl';
+const MAX_DECISION_STRING = 1200;
+const MAX_DECISION_TEXT_PREVIEW = 600;
+const MAX_DECISION_ARRAY_ITEMS = 60;
+const MAX_DECISION_OBJECT_KEYS = 80;
+const MAX_DECISION_METADATA_BYTES = 24000;
+const SECRET_DECISION_KEY_RE = /(?:password|passwd|pwd|secret|api[_-]?key|authorization|cookie|session|token|credential|storage[_-]?state|supabase.*key|anon[_-]?key)/i;
+const LARGE_TEXT_KEY_RE = /(?:content|source|code|lines|spec|preview|stdout|stderr|stack|body|html)/i;
+
+function hashDecisionText(value) {
+  return crypto.createHash('sha256').update(String(value)).digest('hex').slice(0, 16);
+}
+
+function truncateDecisionString(value, max = MAX_DECISION_STRING) {
+  const str = String(value);
+  if (str.length <= max) return str;
+  return `${str.slice(0, max)}...[truncated ${str.length - max} chars]`;
+}
+
+function summarizeDecisionText(value, max = MAX_DECISION_TEXT_PREVIEW) {
+  const str = String(value);
+  return {
+    sha256: hashDecisionText(str),
+    length: str.length,
+    preview: truncateDecisionString(str, max),
+  };
+}
+
+function sanitizeDecisionValue(value, key = '', depth = 0, seen = new WeakSet()) {
+  if (value === null || value === undefined) return value;
+  if (SECRET_DECISION_KEY_RE.test(String(key))) return '[REDACTED]';
+  if (typeof value === 'bigint') return value.toString();
+  if (typeof value === 'function') return undefined;
+  if (Buffer.isBuffer(value)) return `[Buffer(${value.length})]`;
+  if (value instanceof Error) {
+    return {
+      name: value.name,
+      code: value.code || undefined,
+      message: truncateDecisionString(value.message || ''),
+    };
+  }
+  if (typeof value === 'string') {
+    if (LARGE_TEXT_KEY_RE.test(String(key)) && value.length > MAX_DECISION_TEXT_PREVIEW) {
+      return summarizeDecisionText(value);
+    }
+    return truncateDecisionString(value);
+  }
+  if (typeof value !== 'object') return value;
+  if (seen.has(value)) return '[Circular]';
+  seen.add(value);
+  if (depth >= 5) return '[MaxDepth]';
+  if (Array.isArray(value)) {
+    const arr = value.slice(0, MAX_DECISION_ARRAY_ITEMS)
+      .map((item, index) => sanitizeDecisionValue(item, `${key}[${index}]`, depth + 1, seen))
+      .filter((item) => item !== undefined);
+    if (value.length > MAX_DECISION_ARRAY_ITEMS) {
+      arr.push(`[truncated ${value.length - MAX_DECISION_ARRAY_ITEMS} item(s)]`);
+    }
+    return arr;
+  }
+  const out = {};
+  const entries = Object.entries(value).slice(0, MAX_DECISION_OBJECT_KEYS);
+  for (const [childKey, childValue] of entries) {
+    const sanitized = sanitizeDecisionValue(childValue, childKey, depth + 1, seen);
+    if (sanitized !== undefined) out[childKey] = sanitized;
+  }
+  const totalKeys = Object.keys(value).length;
+  if (totalKeys > MAX_DECISION_OBJECT_KEYS) {
+    out.__truncatedKeys = totalKeys - MAX_DECISION_OBJECT_KEYS;
+  }
+  return out;
+}
+
+function boundDecisionMetadata(metadata = {}) {
+  const sanitized = sanitizeDecisionValue(metadata) || {};
+  try {
+    const serialized = JSON.stringify(sanitized);
+    if (serialized.length <= MAX_DECISION_METADATA_BYTES) return sanitized;
+    return {
+      __truncated: true,
+      sha256: hashDecisionText(serialized),
+      preview: serialized.slice(0, MAX_DECISION_METADATA_BYTES),
+    };
+  } catch {
+    return { __serializationError: true };
+  }
+}
+
+function normalizeDecisionStatus(status) {
+  const normalized = String(status || '').toLowerCase();
+  if (['error', 'failed', 'failure'].includes(normalized)) return 'error';
+  if (['warn', 'warning', 'blocked'].includes(normalized)) return 'warning';
+  if (['success', 'passed', 'ok', 'complete', 'completed'].includes(normalized)) return 'success';
+  return 'info';
+}
+
+function inferDecisionStatus(decisionType, metadata = {}, status) {
+  if (status) return normalizeDecisionStatus(status);
+  if (metadata.errorCode || metadata.error || metadata.failed === true) return 'error';
+  if (
+    metadata.warning ||
+    metadata.warn ||
+    metadata.topUpStatus === 'no_new_valid_delta' ||
+    metadata.continuedWithPreTopUpSuite ||
+    Number(metadata.quarantinedSpecCount || metadata.quarantinedFiles?.length || 0) > 0 ||
+    String(decisionType || '').includes('quality_recovery')
+  ) {
+    return 'warning';
+  }
+  return 'info';
+}
+
+function decisionLogPathFor(statusDir) {
+  return statusDir ? path.join(statusDir, PIPELINE_DECISION_LOG) : null;
+}
+
+function recordRunDecision(statusDir, telemetryReporter, event = {}) {
+  if (!statusDir || !event) return null;
+  const decisionType = String(event.decisionType || event.type || 'pipeline_decision');
+  const metadata = boundDecisionMetadata(event.metadata || {});
+  const status = inferDecisionStatus(decisionType, metadata, event.status);
+  const runId = event.runId || path.basename(statusDir);
+  const payload = {
+    schemaVersion: 1,
+    eventType: 'pipeline_decision',
+    decisionType,
+    runId,
+    phase: event.phase || decisionType,
+    status,
+    timestamp: event.timestamp || new Date().toISOString(),
+    message: truncateDecisionString(event.message || decisionType, 2000),
+    errorCode: event.errorCode || metadata.errorCode || null,
+    reason: event.reason || metadata.reason || null,
+    metadata,
+  };
+
+  try {
+    fs.mkdirSync(statusDir, { recursive: true });
+    fs.appendFileSync(decisionLogPathFor(statusDir), `${JSON.stringify(payload)}\n`, 'utf-8');
+  } catch (err) {
+    Logger.warn('PipelineWorker', 'Failed to append pipeline decision log', {
+      decisionType,
+      reason: err?.message,
+    });
+  }
+
+  try {
+    if (telemetryReporter && telemetryReporter.isEnabled()) {
+      telemetryReporter.emitBackground({
+        toolName: 'healix_test_my_app',
+        eventType: 'pipeline_decision',
+        runId,
+        phase: payload.phase,
+        status,
+        success: status !== 'error',
+        errorCode: payload.errorCode || undefined,
+        reason: payload.reason || undefined,
+        message: payload.message,
+        metadata: {
+          decisionType,
+          ...metadata,
+        },
+      });
+    }
+  } catch {
+    // telemetry is best-effort
+  }
+  return payload;
+}
+
+function readRunDecisionEvents(statusDir) {
+  const logPath = decisionLogPathFor(statusDir);
+  if (!logPath || !fs.existsSync(logPath)) return [];
+  try {
+    return fs.readFileSync(logPath, 'utf-8')
+      .split(/\r?\n/)
+      .filter(Boolean)
+      .map((line) => {
+        try { return JSON.parse(line); } catch { return null; }
+      })
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function buildPipelineDecisionSummary(statusDir) {
+  const events = readRunDecisionEvents(statusDir);
+  const byType = {};
+  const byStatus = {};
+  for (const event of events) {
+    byType[event.decisionType] = (byType[event.decisionType] || 0) + 1;
+    byStatus[event.status] = (byStatus[event.status] || 0) + 1;
+  }
+  const notable = events
+    .filter((event) => ['error', 'warning'].includes(event.status))
+    .slice(-10);
+  const latest = events.slice(-12);
+  const finalGating = [...events].reverse().find((event) => event.decisionType === 'final_gating_decision') || null;
+  return {
+    total: events.length,
+    byType,
+    byStatus,
+    finalGating,
+    notable,
+    latest,
+    logPath: decisionLogPathFor(statusDir),
+  };
+}
+
+function attachPipelineDecisionSummary(target, statusDir) {
+  if (!target || typeof target !== 'object') return target;
+  const summary = buildPipelineDecisionSummary(statusDir);
+  target.pipelineDecisionSummary = summary;
+  target.pipelineDecisionLogPath = summary.logPath;
+  return target;
+}
+
+function patchReportWithPipelineDecisionSummary(reportPath, statusDir) {
+  if (!reportPath || !fs.existsSync(reportPath)) return null;
+  const summary = buildPipelineDecisionSummary(statusDir);
+  const patchOne = (targetPath) => {
+    if (!targetPath || !fs.existsSync(targetPath)) return;
+    try {
+      const report = JSON.parse(fs.readFileSync(targetPath, 'utf-8'));
+      report.metadata = {
+        ...(report.metadata || {}),
+        pipelineDecisionSummary: summary,
+        pipelineDecisionLogPath: summary.logPath,
+        generationMeta: {
+          ...((report.metadata || {}).generationMeta || {}),
+          pipelineDecisionSummary: summary,
+          pipelineDecisionLogPath: summary.logPath,
+        },
+      };
+      if (report.pipelineError) {
+        report.pipelineError = {
+          ...report.pipelineError,
+          pipelineDecisionSummary: summary,
+          pipelineDecisionHighlights: summary.notable,
+        };
+      }
+      fs.writeFileSync(targetPath, JSON.stringify(report, null, 2), 'utf-8');
+    } catch (err) {
+      Logger.warn('PipelineWorker', 'Failed to patch report with pipeline decision summary', {
+        reportPath: targetPath,
+        reason: err?.message,
+      });
+    }
+  };
+  patchOne(reportPath);
+  patchOne(path.join(path.dirname(reportPath), 'latest.json'));
+  return summary;
 }
 
 // Optional fire-and-forget durable phase reporter. Populates
@@ -6060,6 +6316,36 @@ async function maybeRunCoverageTopUp({
           runnableTests: after.runnableTests,
         },
       }, telemetryReporter);
+      recordRunDecision(statusDir, telemetryReporter, {
+        runId,
+        decisionType: 'top_up_decision',
+        phase: 'generation_top_up_complete',
+        status: event.status === 'added' ? 'success' : 'warning',
+        message: event.status === 'added'
+          ? 'Coverage top-up added runnable tests.'
+          : 'Coverage top-up produced no new valid delta; pre-top-up suite remains eligible.',
+        metadata: {
+          target: decision.target,
+          minimumUsefulRunnableFloor: decision.minimumUsefulRunnableFloor,
+          requestedAdditional,
+          topUpStatus: event.status,
+          continuedWithPreTopUpSuite: event.continuedWithPreTopUpSuite,
+          before: {
+            totalTests: before.totalTests,
+            runnableTests: before.runnableTests,
+            categories: before.categories,
+          },
+          after: {
+            totalTests: after.totalTests,
+            runnableTests: after.runnableTests,
+            categories: after.categories,
+          },
+          addedFiles: event.addedFiles,
+          rejectedFiles: event.rejectedFiles,
+          missingTargets: existingSuiteManifest.missing,
+          retryAvailable: Boolean(event.coverageRetry?.available),
+        },
+      });
     }
 
     if (telemetryReporter && telemetryReporter.isEnabled() && event.addedFiles.length > 0) {
@@ -6118,6 +6404,32 @@ async function maybeRunCoverageTopUp({
         target: decision.target,
         minimumUsefulRunnableFloor: decision.minimumUsefulRunnableFloor,
       }, telemetryReporter);
+      recordRunDecision(statusDir, telemetryReporter, {
+        runId,
+        decisionType: 'top_up_decision',
+        phase: 'generation_top_up_failed',
+        status: event.continuedWithPreTopUpSuite ? 'warning' : 'error',
+        errorCode: event.error.code,
+        reason: event.error.message,
+        message: event.continuedWithPreTopUpSuite
+          ? 'Coverage top-up failed; continuing with the pre-top-up suite.'
+          : 'Coverage top-up failed and the pre-top-up suite is below the useful floor.',
+        metadata: {
+          target: decision.target,
+          minimumUsefulRunnableFloor: decision.minimumUsefulRunnableFloor,
+          requestedAdditional,
+          topUpStatus: event.status,
+          topUpErrorCode: event.error.code,
+          continuedWithPreTopUpSuite: event.continuedWithPreTopUpSuite,
+          before: {
+            totalTests: before.totalTests,
+            runnableTests: before.runnableTests,
+            categories: before.categories,
+          },
+          missingTargets: existingSuiteManifest.missing,
+          retryAvailable: Boolean(event.coverageRetry?.available),
+        },
+      });
     }
     return event;
   }
@@ -6313,6 +6625,26 @@ async function runPhase1FanOut({
           },
         });
       }
+      if (statusDir) {
+        recordRunDecision(statusDir, telemetryReporter, {
+          runId,
+          decisionType: 'generation_agent_result',
+          phase: 'generating_tests',
+          status: 'success',
+          message: `${agent} generation completed`,
+          metadata: {
+            agent,
+            generatedFiles: agentFiles,
+            agentGeneratedCount: agentFiles.length,
+            totalGeneratedFiles: files.length,
+            agentsCompleted: doneCount,
+            totalAgents: agents.length,
+            attempts: payload?.generationMeta?.attempts || [],
+            rejections: payload?.generationMeta?.rejections || [],
+            generationQuality: payload?.generationMeta?.generationQuality || null,
+          },
+        });
+      }
       return { agent, count: tests.length };
     } catch (err) {
       agentFailures.push({
@@ -6320,6 +6652,23 @@ async function runPhase1FanOut({
         code: err?.code || 'AGENT_FAILED',
         message: err?.message || String(err),
       });
+      if (statusDir) {
+        recordRunDecision(statusDir, telemetryReporter, {
+          runId,
+          decisionType: 'generation_agent_result',
+          phase: 'generating_tests',
+          status: 'error',
+          errorCode: err?.code || 'AGENT_FAILED',
+          reason: err?.message || String(err),
+          message: `${agent} generation failed`,
+          metadata: {
+            agent,
+            agentsCompleted: doneCount,
+            totalAgents: agents.length,
+            generatedCount: files.length,
+          },
+        });
+      }
       throw err;
     }
   }
@@ -6779,6 +7128,29 @@ async function runAsyncGenerationPath({
         .filter(Boolean)
     : [];
 
+  if (statusDir) {
+    for (const agent of agentsRequestedList) {
+      const failure = agentFailures.find((item) => item.agent === agent);
+      recordRunDecision(statusDir, telemetryReporter, {
+        runId,
+        decisionType: 'generation_agent_result',
+        phase: 'generation_async_progress',
+        status: failure ? 'error' : (agentsCompletedList.includes(agent) ? 'success' : 'warning'),
+        errorCode: failure?.code || null,
+        reason: failure?.message || null,
+        message: failure ? `${agent} async generation failed` : `${agent} async generation completed`,
+        metadata: {
+          agent,
+          jobId,
+          finalStatus: finalResp?.status || 'unknown',
+          generatedCount: files.length,
+          agentsCompleted: agentsCompletedList,
+          totalAgents: agentsRequestedList.length,
+        },
+      });
+    }
+  }
+
   // Hard fail only if the orchestrator says failed AND nothing landed on
   // disk. Matches Phase-1 behavior: any partial survives; only an empty
   // total-failure throws.
@@ -6893,6 +7265,38 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
           protectedSpecFiles,
         });
         recordValidationSalvage(salvage);
+        if (statusDir) {
+          recordRunDecision(statusDir, telemetryReporter, {
+            runId,
+            decisionType: 'validation_salvage_decision',
+            phase: stage,
+            status: salvage.recovered ? 'warning' : 'error',
+            errorCode: validation?.errorCode || validation?.code || null,
+            reason: validation?.reason || null,
+            message: salvage.recovered
+              ? 'Validation salvage kept listable specs and quarantined invalid specs.'
+              : 'Validation salvage could not find any listable generated specs.',
+            metadata: {
+              stage,
+              originalSpecCount: salvage.originalSpecCount,
+              keptSpecCount: Array.isArray(salvage.keptSpecFiles) ? salvage.keptSpecFiles.length : 0,
+              quarantinedSpecCount: Array.isArray(salvage.quarantinedSpecFiles) ? salvage.quarantinedSpecFiles.length : 0,
+              keptSpecFiles: salvage.keptSpecFiles,
+              quarantinedSpecFiles: salvage.quarantinedSpecFiles,
+              finalValidation: salvage.finalValidation ? {
+                valid: salvage.finalValidation.valid,
+                listedCount: salvage.finalValidation.listedCount,
+                reason: salvage.finalValidation.reason,
+                stderr: salvage.finalValidation.stderr,
+              } : null,
+              originalValidation: {
+                valid: validation?.valid,
+                reason: validation?.reason,
+                stderr: validation?.stderr,
+              },
+            },
+          });
+        }
         validation = {
           ...validation,
           validationSalvage: salvage,
@@ -7104,6 +7508,19 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
             restoredFiles: restore.restoredFiles,
             assessment,
           }, telemetryReporter);
+          recordRunDecision(statusDir, telemetryReporter, {
+            runId,
+            decisionType: 'quality_recovery_decision',
+            phase: 'generation_quality_recovery_rolled_back',
+            status: 'warning',
+            reason: rollbackEvent.reason,
+            message: 'Quality recovery was rolled back because it did not improve the retained suite.',
+            metadata: {
+              recoveryType: recovery?.type || recovery?.reason || 'unknown',
+              restoredFiles: restore.restoredFiles,
+              assessment,
+            },
+          });
         }
         if (demoteIfSoft && !qualityAuditHasHardErrors(qualityAuditBeforeRecovery)) {
           const demotedAudit = demoteSoftQualityAuditErrors(qualityAuditBeforeRecovery, 'soft_quality_warnings_after_recovery_rollback');
@@ -7136,6 +7553,22 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
             message: `Removed ${pruning.prunedFiles.reduce((sum, file) => sum + file.removedTests, 0)} brittle generated test(s); validating remaining suite...`,
             prunedFiles: pruning.prunedFiles,
           }, telemetryReporter);
+          recordRunDecision(statusDir, telemetryReporter, {
+            runId,
+            decisionType: 'quality_recovery_decision',
+            phase: 'generation_quality_recovered',
+            status: 'warning',
+            message: 'Brittle generated test blocks were pruned before execution.',
+            metadata: {
+              recoveryType: 'prune_test_blocks',
+              prunedFiles: pruning.prunedFiles,
+              quarantineDir: pruning.quarantineDir,
+              before: {
+                totalTests: beforeRecoveryQuality.totalTests,
+                runnableTests: beforeRecoveryQuality.runnableTests,
+              },
+            },
+          });
         }
 
         validation = await validateSuiteOrSalvage({
@@ -7223,6 +7656,23 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
             quarantinedFiles: quarantine.quarantinedFiles.map((file) => file.filename),
             remainingFiles: quarantine.remainingFiles,
           }, telemetryReporter);
+          recordRunDecision(statusDir, telemetryReporter, {
+            runId,
+            decisionType: 'quality_recovery_decision',
+            phase: 'generation_quality_recovered',
+            status: 'warning',
+            message: 'Hard quality blocker specs were quarantined before execution.',
+            metadata: {
+              recoveryType: 'hard_file_quarantine',
+              hardOnly: true,
+              quarantinedFiles: quarantine.quarantinedFiles,
+              remainingFiles: quarantine.remainingFiles,
+              before: {
+                totalTests: beforeRecoveryQuality.totalTests,
+                runnableTests: beforeRecoveryQuality.runnableTests,
+              },
+            },
+          });
         }
 
         validation = await validateSuiteOrSalvage({
@@ -7309,6 +7759,28 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
             reason: 'retained_suite_after_hard_quarantine',
             existingSuiteManifest: retainedSuiteManifest,
             retainedSuite,
+          });
+        }
+        if (statusDir) {
+          recordRunDecision(statusDir, telemetryReporter, {
+            runId,
+            decisionType: 'quality_recovery_decision',
+            phase: 'generation_quality_recovered',
+            status: retainedSuite.executionAllowedAfterHardQuarantine ? 'warning' : 'error',
+            message: retainedSuite.executionAllowedAfterHardQuarantine
+              ? 'Hard-blocker specs quarantined; retained suite remains executable.'
+              : 'Hard-blocker specs quarantined; retained suite is below the recovery-adjusted floor.',
+            metadata: {
+              recoveryType: 'retained_suite_after_hard_quarantine',
+              retainedSuite,
+              quarantinedFileReasons: retainedSuite.quarantinedFileReasons,
+              coverageRetryAvailable: Boolean(generationMeta.coverageRetry?.available),
+              postQuarantineQuality: {
+                totalTests: afterQuarantineQuality.totalTests,
+                runnableTests: afterQuarantineQuality.runnableTests,
+                categories: afterQuarantineQuality.categories,
+              },
+            },
           });
         }
 
@@ -8623,6 +9095,20 @@ async function runPipeline(config, runId) {
           roles: summarizeAuthRoles(roles),
           authFlowRejected: explorationArtifact?.authFlowRejected || null,
         }, telemetryReporter);
+        recordRunDecision(statusDir, telemetryReporter, {
+          runId,
+          decisionType: 'auth_decision',
+          phase: 'auth_injected',
+          status: 'success',
+          message: 'Pre-auth storage states reused for credential injection.',
+          metadata: {
+            authDecision: 'reuse_preauth',
+            totalCredentials: config.testCredentials.length,
+            verifiedRoles: summarizeAuthRoles(roles),
+            authFlowSource: hasTrustedAuthFlow ? 'trusted_exploration' : 'none',
+            authFlowRejected: explorationArtifact?.authFlowRejected || null,
+          },
+        });
       } else {
         // Either pre-auth failed for some roles OR exploration found a richer
         // authFlow — run a fresh injection so storageStates use the best available selectors.
@@ -8653,10 +9139,43 @@ async function runPipeline(config, runId) {
             failedFreshRoles: mergedAuth.failedFreshRoles,
             authFlowRejected: explorationArtifact?.authFlowRejected || null,
           }, telemetryReporter);
+          recordRunDecision(statusDir, telemetryReporter, {
+            runId,
+            decisionType: 'auth_decision',
+            phase: 'auth_injected',
+            status: verifiedCount > 0 ? (mergedAuth.failedFreshRoles.length > 0 ? 'warning' : 'success') : 'error',
+            message: `${verifiedCount}/${roles.length} role login(s) verified after credential injection.`,
+            metadata: {
+              authDecision: hasTrustedAuthFlow ? 'fresh_injection_with_discovered_flow' : 'fresh_injection_without_flow',
+              totalCredentials: config.testCredentials.length,
+              verifiedCount,
+              roles: summarizeAuthRoles(roles),
+              reusedPreAuthRoles: mergedAuth.reusedPreAuthRoles,
+              failedFreshRoles: mergedAuth.failedFreshRoles,
+              authFlowSource: hasTrustedAuthFlow ? 'trusted_exploration' : 'heuristic_fallback',
+              authFlowRejected: explorationArtifact?.authFlowRejected || null,
+            },
+          });
         } catch (credErr) {
           Logger.warn('PipelineWorker', 'Credential injection failed (best-effort)', { reason: credErr.message });
           // Fall back to whatever pre-auth gave us rather than leaving roles empty.
           roles = preAuthRoles.length > 0 ? preAuthRoles : [];
+          recordRunDecision(statusDir, telemetryReporter, {
+            runId,
+            decisionType: 'auth_decision',
+            phase: 'auth_injected',
+            status: roles.some(hasVerifiedStorageState) ? 'warning' : 'error',
+            errorCode: credErr?.code || 'AUTH_INJECTION_FAILED',
+            reason: credErr.message,
+            message: 'Credential injection failed; Healix will use any verified pre-auth storage states.',
+            metadata: {
+              authDecision: 'fresh_injection_failed',
+              roles: summarizeAuthRoles(roles),
+              preAuthRoleCount: preAuthRoles.length,
+              authFlowSource: hasTrustedAuthFlow ? 'trusted_exploration' : 'heuristic_fallback',
+              authFlowRejected: explorationArtifact?.authFlowRejected || null,
+            },
+          });
         }
       }
     }
@@ -8676,6 +9195,20 @@ async function runPipeline(config, runId) {
         reason: 'all_observed_routes_protected_no_verified_credentials',
         routeAccessSummary,
       };
+      recordRunDecision(statusDir, telemetryReporter, {
+        runId,
+        decisionType: 'auth_decision',
+        phase: 'auth',
+        status: 'error',
+        errorCode: authErr.code,
+        reason: authErr.diagnostics.reason,
+        message: authErr.message,
+        metadata: {
+          verifiedRoleCount,
+          routeAccessSummary,
+          roles: summarizeAuthRoles(roles),
+        },
+      });
       throw authErr;
     }
 
@@ -8772,6 +9305,22 @@ async function runPipeline(config, runId) {
             requirementsCoverage,
           });
           if (!qualityGate.ok) {
+            recordRunDecision(statusDir, telemetryReporter, {
+              runId,
+              decisionType: 'final_gating_decision',
+              phase: 'generation_quality_gate',
+              status: 'error',
+              errorCode: qualityGate.error?.code || 'GENERATION_QUALITY_FAILED',
+              reason: qualityGate.error?.message || null,
+              message: 'Generation quality gate blocked execution.',
+              metadata: {
+                target: config.minGeneratedTests || 50,
+                quality: qualityGate.error?.generationQuality || qualityScan,
+                retainedSuite: qualityScan.retainedSuite || null,
+                routeAccessSummary,
+                requirementsCoverage,
+              },
+            });
             const qaContractOnlyRescue =
               generationMeta?.partialGenerationWarning?.reason === 'ai_generation_empty_qa_contract_rescue' &&
               qualityScan.runnableTests > 0 &&
@@ -8800,12 +9349,45 @@ async function runPipeline(config, runId) {
                 runnableTests: qualityScan.runnableTests,
                 qaContractTests: generationMeta.qaContractPack.generatedTests,
               });
+              recordRunDecision(statusDir, telemetryReporter, {
+                runId,
+                decisionType: 'final_gating_decision',
+                phase: 'generation_quality_gate',
+                status: 'warning',
+                message: 'Deterministic QA contract rescue is allowed below the normal useful floor.',
+                metadata: {
+                  quality: rescuedQuality,
+                  qaContractTests: generationMeta.qaContractPack.generatedTests,
+                },
+              });
               break;
             }
             qualityGate.error.generationMeta = generationMeta;
             throw qualityGate.error;
           }
           generationQuality = qualityGate.result;
+          recordRunDecision(statusDir, telemetryReporter, {
+            runId,
+            decisionType: 'final_gating_decision',
+            phase: 'generation_quality_gate',
+            status: generationQuality.qualityGateStatus === 'warning' ? 'warning' : 'success',
+            message: generationQuality.qualityGateStatus === 'warning'
+              ? 'Generation quality gate allowed execution with warnings.'
+              : 'Generation quality gate allowed execution.',
+            metadata: {
+              target: generationQuality.minGeneratedTestsTarget || config.minGeneratedTests || 50,
+              originalMinimumUsefulRunnableFloor: generationQuality.originalMinimumUsefulRunnableFloor,
+              effectiveRunnableFloor: generationQuality.effectiveRunnableFloor || generationQuality.minimumUsefulRunnableFloor,
+              totalTests: generationQuality.totalTests,
+              runnableTests: generationQuality.runnableTests,
+              skippedTests: generationQuality.skippedTests,
+              qualityGateStatus: generationQuality.qualityGateStatus,
+              qualityWarnings: generationQuality.qualityWarnings || [],
+              retainedSuite: generationQuality.retainedSuite || null,
+              missingCategories: generationQuality.missingCategories || [],
+              requirementsCoverage,
+            },
+          });
           codebaseContext = activeGenerationContext;
           if (generationMeta && generationRepairHistory.length > 0) {
             generationMeta.repairAttempts = generationRepairHistory;
@@ -9172,6 +9754,31 @@ async function runPipeline(config, runId) {
       process.env.PLAYWRIGHT_MCP_PARALLEL === 'true' ||
       process.env.PLAYWRIGHT_MCP_ENABLED === 'true';
 
+    recordRunDecision(statusDir, telemetryReporter, {
+      runId,
+      decisionType: 'execution_handoff',
+      phase: 'running',
+      status: 'info',
+      message: 'Handing retained generated suite to Playwright execution.',
+      metadata: {
+        configPath: config.playwrightConfigResult?.configPath || config.playwrightConfig || null,
+        tierBAuthConfigPath: config.tierBAuthConfigPath || null,
+        tierBRoles: config.tierBRoles || [],
+        testDir: path.join(config.projectPath, 'tests', 'generated'),
+        generatedSpecCount: listGeneratedTestFiles(config.projectPath).length,
+        generationQuality: generationQuality ? {
+          totalTests: generationQuality.totalTests,
+          runnableTests: generationQuality.runnableTests,
+          skippedTests: generationQuality.skippedTests,
+          qualityGateStatus: generationQuality.qualityGateStatus,
+          effectiveRunnableFloor: generationQuality.effectiveRunnableFloor || generationQuality.minimumUsefulRunnableFloor,
+          retainedSuite: generationQuality.retainedSuite || null,
+        } : null,
+        mcpParallelEnabled,
+        executionTimeout,
+      },
+    });
+
     // Re-inject credentials just before execution so storageState tokens are
     // always fresh. Generation can take >13 min and Supabase access tokens
     // expire in 1h — stale tokens cause middleware to reject the session and
@@ -9217,9 +9824,38 @@ async function runPipeline(config, runId) {
             failedFreshRoles: mergedAuth.failedFreshRoles,
           }, telemetryReporter);
         }
+        recordRunDecision(statusDir, telemetryReporter, {
+          runId,
+          decisionType: 'auth_decision',
+          phase: 'auth_refreshing',
+          status: verifiedMerged.length > 0 ? (mergedAuth.reusedPreAuthRoles.length > 0 ? 'warning' : 'success') : 'error',
+          message: `${verifiedMerged.length}/${mergedAuth.roles.length} role(s) have verified auth state before execution.`,
+          metadata: {
+            authDecision: 'pre_execution_refresh',
+            verifiedFreshCount: verifiedFresh.length,
+            verifiedMergedCount: verifiedMerged.length,
+            reusedPreAuthRoles: mergedAuth.reusedPreAuthRoles,
+            failedFreshRoles: mergedAuth.failedFreshRoles,
+            roles: summarizeAuthRoles(roles),
+            authFlowSource: hasTrustedAuthFlow ? 'trusted_exploration' : 'none',
+          },
+        });
       } catch (refreshErr) {
         Logger.warn('PipelineWorker', 'Pre-execution auth refresh failed — using existing storageState', {
           reason: refreshErr.message,
+        });
+        recordRunDecision(statusDir, telemetryReporter, {
+          runId,
+          decisionType: 'auth_decision',
+          phase: 'auth_refreshing',
+          status: roles.some(hasVerifiedStorageState) ? 'warning' : 'error',
+          errorCode: refreshErr?.code || 'AUTH_REFRESH_FAILED',
+          reason: refreshErr.message,
+          message: 'Pre-execution auth refresh failed; existing storage states will be used if present.',
+          metadata: {
+            authDecision: 'pre_execution_refresh_failed',
+            roles: summarizeAuthRoles(roles),
+          },
         });
       }
     }
@@ -9416,6 +10052,7 @@ async function runPipeline(config, runId) {
       const reportGen = new ReportGenerator();
       const healixApiKey = process.env.HEALIX_API_KEY;
       const healixDashboardUrl = process.env.HEALIX_DASHBOARD_URL || 'http://localhost:3000';
+      generationMeta = attachPipelineDecisionSummary(generationMeta || {}, statusDir);
 
       return reportGen.generate({
         projectPath: config.projectPath,
@@ -9440,6 +10077,22 @@ async function runPipeline(config, runId) {
         dashboard_url: healixDashboardUrl,
       });
     });
+    recordRunDecision(statusDir, telemetryReporter, {
+      runId,
+      decisionType: 'dashboard_sync_decision',
+      phase: 'reporting',
+      status: report.actualRunId || report.url ? 'success' : 'warning',
+      message: report.actualRunId
+        ? 'Report synced to dashboard.'
+        : 'Report generated locally; dashboard ingest id was not returned.',
+      metadata: {
+        reportPath: report.path,
+        dashboardUrl: report.url,
+        actualRunId: report.actualRunId || null,
+      },
+    });
+    generationMeta = attachPipelineDecisionSummary(generationMeta || {}, statusDir);
+    patchReportWithPipelineDecisionSummary(report.path, statusDir);
 
     // Use the actual run ID returned from the server (if available)
     const actualRunId = report.actualRunId || runId;
@@ -9633,6 +10286,23 @@ async function runPipeline(config, runId) {
       reason: config.generateTests === false ? 'generation_skipped_use_existing_tests' : 'generation_not_started',
     };
     const errorGenerationQuality = error.generationQuality || generationQuality;
+    recordRunDecision(statusDir, telemetryReporter, {
+      runId,
+      decisionType: 'pipeline_error_decision',
+      phase: 'error',
+      status: 'error',
+      errorCode,
+      reason: technicalError,
+      message: userFacingError,
+      metadata: {
+        errorCode,
+        stage: error.diagnostics?.stage || null,
+        reason: error.diagnostics?.reason || technicalError,
+        generationQuality: errorGenerationQuality,
+        validationSalvage: error.validationSalvage || error.diagnostics?.validationSalvage || errorGenerationMeta?.validationSalvage || null,
+      },
+    });
+    attachPipelineDecisionSummary(errorGenerationMeta, statusDir);
 
     updateStatus(statusDir, 'error', {
       runId,
@@ -9725,6 +10395,7 @@ async function runPipeline(config, runId) {
         : (Number.isFinite(Number(validationSalvage?.originalSpecCount))
             ? Number(validationSalvage.originalSpecCount)
             : listGeneratedTestFiles(config.projectPath).length);
+      const pipelineDecisionSummary = buildPipelineDecisionSummary(statusDir);
       const pipelineError = {
         errorCode,
         stage: error.diagnostics?.stage && error.diagnostics.stage !== 'unknown'
@@ -9746,6 +10417,8 @@ async function runPipeline(config, runId) {
         validationSalvage,
         qualityAuditErrors: error.diagnostics?.qualityAuditErrors || null,
         generationQuality: error.generationQuality || error.diagnostics?.generationQuality || null,
+        pipelineDecisionSummary,
+        pipelineDecisionHighlights: pipelineDecisionSummary.notable,
       };
       // Mark the synthetic row so the dashboard can hide it when the banner
       // carries full diagnostics — otherwise stats strip double-counts it as
@@ -9776,6 +10449,22 @@ async function runPipeline(config, runId) {
         api_key: healixApiKey,
         dashboard_url: healixDashboardUrl,
       });
+      recordRunDecision(statusDir, telemetryReporter, {
+        runId,
+        decisionType: 'dashboard_sync_decision',
+        phase: 'error_reported',
+        status: errorReport.actualRunId || errorReport.url ? 'success' : 'warning',
+        message: errorReport.actualRunId
+          ? 'Error report synced to dashboard.'
+          : 'Error report generated locally; dashboard ingest id was not returned.',
+        metadata: {
+          reportPath: errorReport.path,
+          dashboardUrl: errorReport.url,
+          actualRunId: errorReport.actualRunId || null,
+        },
+      });
+      attachPipelineDecisionSummary(errorGenerationMeta, statusDir);
+      patchReportWithPipelineDecisionSummary(errorReport.path, statusDir);
 
       updateStatus(statusDir, 'error_reported', {
         runId,
@@ -9914,6 +10603,10 @@ module.exports = {
   maybeRunFailureTriage,
   maybeGenerateViaSaaS,
   maybeRunCoverageTopUp,
+  recordRunDecision,
+  readRunDecisionEvents,
+  buildPipelineDecisionSummary,
+  boundDecisionMetadata,
   pickAgentsForRun,
   rescuePartialGeneration,
 };

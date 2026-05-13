@@ -28,6 +28,10 @@ const {
   countTestsInContent,
   evaluateGenerationQualityGates,
   maybeRunCoverageTopUp,
+  recordRunDecision,
+  readRunDecisionEvents,
+  buildPipelineDecisionSummary,
+  boundDecisionMetadata,
   hasApiSurfaceForGeneration,
   effectiveApiEndpoints,
   auditGeneratedTestQuality,
@@ -94,6 +98,143 @@ function withTempProject(fn) {
     throw error;
   }
 }
+
+test('pipeline decision logger appends sanitized JSONL and emits telemetry', () => {
+  withTempProject((projectPath) => {
+    const statusDir = path.join(projectPath, 'healix-reports', '.runs', 'decision-run');
+    const emitted = [];
+    const telemetryReporter = {
+      isEnabled: () => true,
+      emitBackground: (event) => emitted.push(event),
+    };
+
+    const longSpec = `import { test } from '@playwright/test';\n${'x'.repeat(2200)}`;
+    recordRunDecision(statusDir, telemetryReporter, {
+      runId: 'decision-run',
+      decisionType: 'auth_decision',
+      phase: 'auth_injecting',
+      status: 'warning',
+      message: 'Auth flow reused verified storage state.',
+      metadata: {
+        username: 'admin@example.com',
+        password: 'SuperSecret123',
+        authorization: 'Bearer token-secret',
+        cookie: 'sid=session-secret',
+        nested: {
+          supabaseAnonKey: 'anon-secret',
+          keep: 'safe-value',
+        },
+        firstSpecPreview: longSpec,
+      },
+    });
+
+    const events = readRunDecisionEvents(statusDir);
+    assert.equal(events.length, 1);
+    assert.equal(events[0].eventType, 'pipeline_decision');
+    assert.equal(events[0].decisionType, 'auth_decision');
+    assert.equal(events[0].status, 'warning');
+    assert.equal(events[0].metadata.password, '[REDACTED]');
+    assert.equal(events[0].metadata.authorization, '[REDACTED]');
+    assert.equal(events[0].metadata.cookie, '[REDACTED]');
+    assert.equal(events[0].metadata.nested.supabaseAnonKey, '[REDACTED]');
+    assert.equal(events[0].metadata.nested.keep, 'safe-value');
+    assert.equal(typeof events[0].metadata.firstSpecPreview.sha256, 'string');
+    assert.equal(events[0].metadata.firstSpecPreview.length, longSpec.length);
+    assert.match(events[0].metadata.firstSpecPreview.preview, /truncated/);
+
+    assert.equal(emitted.length, 1);
+    assert.equal(emitted[0].eventType, 'pipeline_decision');
+    assert.equal(emitted[0].metadata.password, '[REDACTED]');
+  });
+});
+
+test('pipeline decision metadata is bounded without losing serializability', () => {
+  const metadata = boundDecisionMetadata({
+    files: Array.from({ length: 120 }, (_, index) => ({
+      filename: `file-${index}.spec.ts`,
+      stderr: `error ${index}`,
+    })),
+    credentials: {
+      apiKey: 'secret',
+    },
+  });
+
+  const serialized = JSON.stringify(metadata);
+  assert.ok(serialized.length <= 26000);
+  assert.equal(serialized.includes('secret'), false);
+  assert.ok(Array.isArray(metadata.files));
+  assert.equal(metadata.files.length, 61);
+  assert.match(metadata.files[60], /truncated/);
+  assert.equal(metadata.files[0].stderr, 'error 0');
+});
+
+test('pipeline decision summary captures retained-suite gate inputs and retryable top-up no-delta', () => {
+  withTempProject((projectPath) => {
+    const statusDir = path.join(projectPath, 'healix-reports', '.runs', 'retained-run');
+    recordRunDecision(statusDir, null, {
+      runId: 'retained-run',
+      decisionType: 'top_up_decision',
+      phase: 'generation_top_up',
+      status: 'warning',
+      message: 'Coverage top-up produced no new valid delta.',
+      metadata: {
+        topUpStatus: 'no_new_valid_delta',
+        target: 50,
+        minimumUsefulRunnableFloor: 12,
+        runnableTests: 19,
+        retryAvailable: true,
+      },
+    });
+    recordRunDecision(statusDir, null, {
+      runId: 'retained-run',
+      decisionType: 'quality_recovery_decision',
+      phase: 'generation_quality_recovery',
+      status: 'warning',
+      message: 'Hard blockers quarantined; retained suite remains executable.',
+      metadata: {
+        preRecoveryRunnableTests: 19,
+        postRecoveryRunnableTests: 9,
+        retainedSuite: {
+          preRecoveryRunnableTests: 19,
+          postRecoveryRunnableTests: 9,
+          originalRunnableFloor: 12,
+          effectiveRunnableFloor: 8,
+          executionAllowedAfterHardQuarantine: true,
+        },
+        quarantinedFileReasons: [{ filename: 'api-site.spec.ts', reason: 'hard_quality_blocker' }],
+      },
+    });
+    recordRunDecision(statusDir, null, {
+      runId: 'retained-run',
+      decisionType: 'final_gating_decision',
+      phase: 'generation_quality',
+      status: 'warning',
+      message: 'Retained suite cleared recovery-adjusted useful floor.',
+      metadata: {
+        target: 50,
+        originalMinimumUsefulRunnableFloor: 12,
+        effectiveRunnableFloor: 8,
+        runnableTestsActual: 9,
+        retainedSuite: {
+          preRecoveryRunnableTests: 19,
+          postRecoveryRunnableTests: 9,
+          effectiveRunnableFloor: 8,
+        },
+      },
+    });
+
+    const summary = buildPipelineDecisionSummary(statusDir);
+    assert.equal(summary.total, 3);
+    assert.equal(summary.byType.top_up_decision, 1);
+    assert.equal(summary.byType.quality_recovery_decision, 1);
+    assert.equal(summary.byType.final_gating_decision, 1);
+    assert.equal(summary.byStatus.warning, 3);
+    assert.equal(summary.finalGating.metadata.effectiveRunnableFloor, 8);
+    assert.equal(summary.finalGating.metadata.retainedSuite.postRecoveryRunnableTests, 9);
+    assert.equal(summary.notable.length, 3);
+    assert.match(summary.logPath, /pipeline-events\.jsonl$/);
+  });
+});
 
 test('QA contracts detect source-derived filter, delete, and form obligations', () => {
   withTempProject((projectPath) => {

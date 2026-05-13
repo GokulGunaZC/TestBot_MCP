@@ -294,6 +294,8 @@ interface LiveTestResult {
   d: number;
 }
 
+type LiveTimelineFilter = 'all' | 'decisions' | 'warnings' | 'errors';
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 /** Safely convert any error value to a display string */
@@ -1607,12 +1609,94 @@ function PhaseIcon({ phase, isLast }: { phase: string | null; isLast: boolean })
   );
 }
 
+function isDecisionEvent(ev: LiveEvent) {
+  return ev.eventType === 'pipeline_decision';
+}
+
+function decisionTypeLabel(type: unknown) {
+  return String(type || 'pipeline decision')
+    .replace(/_/g, ' ')
+    .replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+function decisionChips(ev: LiveEvent) {
+  const meta = ev.metadata || {};
+  const chips: string[] = [];
+  const decisionType = meta.decisionType || meta.type;
+  if (decisionType) chips.push(String(decisionType));
+  const keys = [
+    ['agent', 'agent'],
+    ['topUpStatus', 'top-up'],
+    ['target', 'target'],
+    ['minimumUsefulRunnableFloor', 'floor'],
+    ['effectiveRunnableFloor', 'floor'],
+    ['runnableTests', 'runnable'],
+    ['totalTests', 'tests'],
+    ['keptSpecCount', 'kept'],
+    ['quarantinedSpecCount', 'quarantined'],
+    ['generatedSpecCount', 'specs'],
+  ] as const;
+  for (const [key, label] of keys) {
+    const value = meta[key];
+    if (value !== undefined && value !== null && value !== '') {
+      chips.push(`${label}: ${String(value)}`);
+    }
+  }
+  const retained = meta.retainedSuite as Record<string, unknown> | undefined;
+  if (retained?.postRecoveryRunnableTests !== undefined) {
+    chips.push(`retained: ${retained.postRecoveryRunnableTests}`);
+  }
+  if (retained?.effectiveRunnableFloor !== undefined) {
+    chips.push(`retained floor: ${retained.effectiveRunnableFloor}`);
+  }
+  return chips.slice(0, 8);
+}
+
+function DecisionEventDetails({ ev }: { ev: LiveEvent }) {
+  const meta = ev.metadata || {};
+  const copyJson = async () => {
+    try {
+      await navigator.clipboard.writeText(JSON.stringify({
+        phase: ev.phase,
+        status: ev.status,
+        message: ev.message,
+        reason: ev.reason,
+        errorCode: ev.errorCode,
+        metadata: meta,
+      }, null, 2));
+    } catch {
+      // clipboard is best-effort
+    }
+  };
+
+  return (
+    <details className="mt-2 rounded-lg border border-white/10 bg-black/20">
+      <summary className="cursor-pointer select-none px-3 py-2 text-[11px] text-[#8BA4C8] hover:text-[#D8E8FF]">
+        Decision details
+      </summary>
+      <div className="border-t border-white/10 p-3">
+        <button
+          type="button"
+          onClick={copyJson}
+          className="mb-2 px-2 py-1 rounded-md bg-white/5 hover:bg-white/10 border border-white/10 text-[10px] text-[#D8E8FF]/80"
+        >
+          Copy JSON
+        </button>
+        <pre className="max-h-72 overflow-auto text-[10px] leading-relaxed text-[#AFC4E8] whitespace-pre-wrap">
+          {JSON.stringify(meta, null, 2)}
+        </pre>
+      </div>
+    </details>
+  );
+}
+
 function LiveTimeline({ events, liveFiles, pipelineEnded }: {
   events: LiveEvent[];
   liveFiles: string[];
   pipelineEnded: boolean;
 }) {
   const [now, setNow] = useState(() => Date.now());
+  const [filter, setFilter] = useState<LiveTimelineFilter>('all');
 
   // Tick every second while the pipeline is still running so the elapsed timer updates
   useEffect(() => {
@@ -1626,21 +1710,54 @@ function LiveTimeline({ events, liveFiles, pipelineEnded }: {
     e.eventType !== 'test_file_generated' &&
     e.eventType !== 'test_result'
   );
-  // Deduplicate: keep only the last event per phase (multiple events per phase are repetitive)
+  const visibleEvents = filteredEvents.filter((e) => {
+    if (filter === 'decisions') return isDecisionEvent(e);
+    if (filter === 'warnings') return String(e.status || '').toLowerCase() === 'warning';
+    if (filter === 'errors') return String(e.status || '').toLowerCase() === 'error';
+    return true;
+  });
+  const decisionEvents = visibleEvents.filter(isDecisionEvent);
+  const phaseEvents = visibleEvents.filter((e) => !isDecisionEvent(e));
+  // Deduplicate non-decision phases only; decision events carry unique gate data.
   const phaseMap = new Map<string, LiveEvent>();
-  for (const e of filteredEvents) {
+  for (const e of phaseEvents) {
     phaseMap.set(e.phase ?? '__unknown__', e);
   }
-  const displayEvents = Array.from(phaseMap.values());
-  if (displayEvents.length === 0) return null;
+  const displayEvents = [...Array.from(phaseMap.values()), ...decisionEvents].sort((a, b) => {
+    const at = a.occurredAt ? new Date(a.occurredAt).getTime() : 0;
+    const bt = b.occurredAt ? new Date(b.occurredAt).getTime() : 0;
+    return at - bt;
+  });
+  if (filteredEvents.length === 0) return null;
   // Decide which single event owns files to avoid duplicates
   const hasTestsGenEvent = displayEvents.some(e => e.eventType === 'tests_generated');
   return (
     <div className="flex flex-col gap-0">
-      {displayEvents.map((ev, i) => {
+      <div className="mb-4 flex flex-wrap gap-1.5">
+        {(['all', 'decisions', 'warnings', 'errors'] as LiveTimelineFilter[]).map((item) => (
+          <button
+            key={item}
+            type="button"
+            onClick={() => setFilter(item)}
+            className={`px-2.5 py-1 rounded-full border text-[10px] font-semibold transition-colors ${
+              filter === item
+                ? 'bg-blue-500/15 border-blue-400/30 text-blue-200'
+                : 'bg-white/[0.03] border-white/10 text-[#8BA4C8] hover:text-[#D8E8FF]'
+            }`}
+          >
+            {item === 'all' ? 'All' : item[0].toUpperCase() + item.slice(1)}
+          </button>
+        ))}
+      </div>
+      {displayEvents.length === 0 ? (
+        <div className="rounded-lg border border-white/10 bg-white/[0.02] px-3 py-2 text-xs text-[#8BA4C8]">
+          No matching activity events.
+        </div>
+      ) : displayEvents.map((ev, i) => {
         const isLast = i === displayEvents.length - 1;
         const isTerminal = TERMINAL_PHASES.has((ev.phase || '').toLowerCase());
         const isTestsGen = ev.eventType === 'tests_generated';
+        const isDecision = isDecisionEvent(ev);
         const isGeneratingPhase = (ev.phase || '').toLowerCase() === 'generating';
         // Show files: prefer tests_generated event if present, else generating phase
         const showFiles = liveFiles.length > 0 && (hasTestsGenEvent ? isTestsGen : isGeneratingPhase);
@@ -1678,10 +1795,23 @@ function LiveTimeline({ events, liveFiles, pipelineEnded }: {
             </div>
             <div className="pb-3 flex-1 min-w-0">
               <div className="flex items-center gap-2 flex-wrap">
-                <span className="text-[#F0F6FF] text-xs font-semibold">{phaseLabel(ev.phase)}</span>
+                <span className={`text-xs font-semibold ${isDecision ? 'text-[#FDE68A]' : 'text-[#F0F6FF]'}`}>
+                  {isDecision ? decisionTypeLabel(ev.metadata?.decisionType || ev.phase) : phaseLabel(ev.phase)}
+                </span>
                 {time && <span className="text-[#4A6280] text-[10px] font-mono">{time}</span>}
                 {ev.durationMs != null && ev.durationMs > 0 && (
                   <span className="text-[#4A6280] text-[10px] font-mono">{(ev.durationMs / 1000).toFixed(1)}s</span>
+                )}
+                {isDecision && (
+                  <span className={`px-1.5 py-0.5 rounded border text-[10px] font-mono ${
+                    String(ev.status || '').toLowerCase() === 'error'
+                      ? 'bg-red-500/10 border-red-500/25 text-[#FCA5A5]'
+                      : String(ev.status || '').toLowerCase() === 'warning'
+                        ? 'bg-amber-500/10 border-amber-500/25 text-[#FDE68A]'
+                        : 'bg-emerald-500/10 border-emerald-500/25 text-[#86EFAC]'
+                  }`}>
+                    {ev.status || 'info'}
+                  </span>
                 )}
                 {effectiveIsLast && (
                   <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" className="text-blue-400/70 flex-shrink-0 animate-spin" style={{animationDuration: '2s'}}>
@@ -1698,6 +1828,21 @@ function LiveTimeline({ events, liveFiles, pipelineEnded }: {
               )}
               {ev.reason && (
                 <div className="text-red-300/80 text-xs mt-0.5 font-mono">{ev.reason}</div>
+              )}
+              {isDecision && (
+                <>
+                  <div className="mt-2 flex flex-wrap gap-1">
+                    {decisionChips(ev).map((chip) => (
+                      <span
+                        key={chip}
+                        className="px-1.5 py-0.5 rounded bg-amber-500/10 border border-amber-500/20 text-[#FDE68A]/85 text-[10px] font-mono"
+                      >
+                        {chip}
+                      </span>
+                    ))}
+                  </div>
+                  <DecisionEventDetails ev={ev} />
+                </>
               )}
 
               {/* Live file badges — drip in under generating phase AND tests_generated */}
