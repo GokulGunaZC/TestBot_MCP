@@ -1032,6 +1032,121 @@ function buildExistingSuiteManifest({
   };
 }
 
+function sanitizeRetryRoles(roles = []) {
+  return (Array.isArray(roles) ? roles : [])
+    .filter(Boolean)
+    .map((role) => ({
+      name: role.name || role.role || 'user',
+      role: role.role || role.name || 'user',
+      loginVerified: Boolean(role.loginVerified),
+      storageStatePath: role.storageStatePath || null,
+      credentialSource: role.credentialSource || null,
+      originalCredentialRole: role.originalCredentialRole || null,
+    }));
+}
+
+function sanitizeRetryPayloadValue(value, depth = 0) {
+  if (value == null || depth > 8) return value;
+  if (Array.isArray(value)) {
+    return value.map((item) => sanitizeRetryPayloadValue(item, depth + 1));
+  }
+  if (typeof value !== 'object') return value;
+
+  const out = {};
+  for (const [key, inner] of Object.entries(value)) {
+    if (/password|passwd|secret|token|api[-_]?key|authorization|cookie|session|username|email/i.test(key)) {
+      out[key] = '[redacted]';
+    } else {
+      out[key] = sanitizeRetryPayloadValue(inner, depth + 1);
+    }
+  }
+  return out;
+}
+
+function buildFailedAgentRetryMetadata({
+  agentFailures = [],
+  agentsRequested = [],
+  agentsCompleted = [],
+  sharedPayload = {},
+  config = {},
+  runId = null,
+  existingSuiteManifest = null,
+  agentTransportTimeoutMs = null,
+  reason = 'agent_failures',
+} = {}) {
+  const failedAgents = [...new Set((agentFailures || [])
+    .map((failure) => String(failure?.agent || '').trim())
+    .filter(Boolean)
+    .filter((agent) => agent !== 'unknown'))];
+  if (failedAgents.length === 0) return null;
+
+  const currentTimeoutMs = Number.isFinite(Number(agentTransportTimeoutMs))
+    ? Number(agentTransportTimeoutMs)
+    : Number(process.env.HEALIX_OPENAI_TIMEOUT_MS || 540000);
+  const recommendedTimeoutMs = Math.max(
+    300000,
+    Math.min(1800000, Math.ceil(currentTimeoutMs * 1.75)),
+  );
+  const context = sharedPayload.context || {};
+  const safeContext = sanitizeRetryPayloadValue(context) || {};
+  const safeExplorationArtifact = sanitizeRetryPayloadValue(sharedPayload.explorationArtifact || null);
+  const safeProjectInfo = sanitizeRetryPayloadValue(sharedPayload.projectInfo || {});
+  const manifest = existingSuiteManifest || (config.projectPath
+    ? buildExistingSuiteManifest({
+        projectPath: config.projectPath,
+        context,
+        roles: sharedPayload.roles || [],
+        testType: sharedPayload.testType || config.testType || 'both',
+        routeAccessSummary: buildRouteAccessSummary(sharedPayload.explorationArtifact || null),
+      })
+    : null);
+
+  return {
+    available: true,
+    status: 'available',
+    reason,
+    runId,
+    agents: failedAgents,
+    agentsRequested: (agentsRequested || []).filter(Boolean),
+    agentsCompleted: (agentsCompleted || []).filter(Boolean),
+    recommendedTimeoutMs,
+    recommendedBudgetMultiplier: 2,
+    mode: 'failed_agent_retry_delta',
+    canRunFromDashboard: true,
+    existingSuiteManifest: manifest,
+    request: {
+      agents: failedAgents,
+      context: {
+        ...safeContext,
+        generationFeedback: {
+          ...(safeContext.generationFeedback || {}),
+          mode: 'failed_agent_retry_delta',
+          previousFailureCode: 'AGENT_FAILED',
+          existingSuiteManifest: manifest,
+          instructions: [
+            'Generate append-only top-up specs only for failed generation agents.',
+            'Do not replace, rewrite, or duplicate existing tests in the suite manifest.',
+            'Target only missing routes, QA contracts, requirements, workflows, or API endpoints listed as missing.',
+            'Prefer fewer source-grounded tests over broad route-only padding.',
+          ],
+        },
+      },
+      prd: sharedPayload.prd || '',
+      parsedPRD: sharedPayload.parsedPRD || null,
+      explorationArtifact: safeExplorationArtifact,
+      roles: sanitizeRetryRoles(sharedPayload.roles || []),
+      testType: sharedPayload.testType || config.testType || 'both',
+      projectInfo: safeProjectInfo,
+      options: {
+        ...(sharedPayload.options || {}),
+        maxExpansionAttempts: 0,
+        coverageProfile: sharedPayload.options?.coverageProfile || config.coverageProfile || 'qa-max',
+        minGeneratedTests: Math.max(5, Math.min(20, Math.ceil(Number(sharedPayload.options?.minGeneratedTests || config.minGeneratedTests || 50) / 4))),
+      },
+    },
+  };
+}
+
 function extractQualityFailureFileNames(qualityAudit = {}) {
   const names = new Set();
   const add = (value) => {
@@ -6142,6 +6257,8 @@ async function runPhase1FanOut({
     );
     err.code = firstFailure?.code || 'GENERATION_FAILED';
     err.agentFailures = agentFailures;
+    err.agentsRequested = agents;
+    err.agentsCompleted = agentsCompleted;
     throw err;
   }
 
@@ -6162,7 +6279,13 @@ async function runPhase1FanOut({
         (emptyAgents.length > 0 ? ` (empty: ${emptyAgents.join(', ')})` : ''),
     );
     err.code = 'AGENTS_RETURNED_ZERO_TESTS';
-    err.agentFailures = agentFailures;
+    err.agentFailures = (emptyAgents.length > 0 ? emptyAgents : agents).map((agent) => ({
+      agent,
+      code: 'AGENTS_RETURNED_ZERO_TESTS',
+      message: 'Agent completed without returning runnable tests',
+    }));
+    err.agentsRequested = agents;
+    err.agentsCompleted = [];
     throw err;
   }
 
@@ -6182,6 +6305,16 @@ async function runPhase1FanOut({
   if (topUpEvent) {
     coverageTopUps.push(topUpEvent);
   }
+  const failedAgentRetry = buildFailedAgentRetryMetadata({
+    agentFailures,
+    agentsRequested: agents,
+    agentsCompleted,
+    sharedPayload,
+    config,
+    runId,
+    existingSuiteManifest: topUpEvent?.existingSuiteManifest || null,
+    agentTransportTimeoutMs,
+  });
 
   // Deps must be installed once, after all writes are done (dedupes axios/etc.
   // across agents — installing during the Promise.allSettled loop would race).
@@ -6204,6 +6337,7 @@ async function runPhase1FanOut({
       agentTransportTimeoutMs,
       agentMeta,
       coverageTopUps,
+      failedAgentRetry,
     },
   };
 }
@@ -6472,9 +6606,12 @@ async function runAsyncGenerationPath({
       }))
     : [];
 
+  const failedAgentNames = new Set(agentFailures.map((failure) => failure.agent).filter(Boolean));
   const agentsCompletedList = Array.isArray(finalResp?.agentsCompleted)
     ? finalResp.agentsCompleted
+        .filter((a) => !(typeof a === 'object' && a?.ok === false))
         .map((a) => (typeof a === 'string' ? a : a?.agent))
+        .filter((agent) => agent && !failedAgentNames.has(agent))
         .filter(Boolean)
     : [];
 
@@ -6491,6 +6628,8 @@ async function runAsyncGenerationPath({
     err.agentFailures = agentFailures.length > 0
       ? agentFailures
       : [{ agent: 'unknown', code: 'ALL_AGENTS_FAILED', message: err.message }];
+    err.agentsRequested = agentsRequestedList;
+    err.agentsCompleted = agentsCompletedList;
     err.jobId = jobId;
     throw err;
   }
@@ -6512,6 +6651,16 @@ async function runAsyncGenerationPath({
   if (topUpEvent) {
     coverageTopUps.push(topUpEvent);
   }
+  const failedAgentRetry = buildFailedAgentRetryMetadata({
+    agentFailures,
+    agentsRequested: agentsRequestedList,
+    agentsCompleted: agentsCompletedList,
+    sharedPayload,
+    config,
+    runId,
+    existingSuiteManifest: topUpEvent?.existingSuiteManifest || null,
+    reason: 'async_agent_failures',
+  });
 
   // Deps install once after all writes (dedupes axios/etc. across agents).
   installMissingDependencies(config.projectPath, testsDir);
@@ -6533,6 +6682,7 @@ async function runAsyncGenerationPath({
       backendGenerationSkippedReason,
       ...(finalResp?.generationMeta || {}),
       coverageTopUps,
+      failedAgentRetry,
     },
   };
 }
@@ -7178,11 +7328,72 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
     }
   };
 
+  const buildRetrySharedPayload = () => ({
+    context,
+    prd: prdContent || '',
+    parsedPRD: parsedPRD || null,
+    explorationArtifact: explorationArtifact || null,
+    roles: roles || [],
+    testType: config.testType,
+    projectInfo,
+    options: {
+      includeSmoke: true,
+      includeWorkflows: true,
+      includeErrorStates: true,
+      allowSyntheticErrorScenarios: false,
+      strictAIGeneration: strictAIEnabled(config),
+      coverageProfile: config.coverageProfile || 'qa-max',
+      minGeneratedTests: toFiniteNumber(config.minGeneratedTests, 50),
+      maxExpansionAttempts: 0,
+    },
+  });
+
+  const attachFailedAgentRetryFromFailures = ({
+    agentFailures = [],
+    agentsRequested = null,
+    agentsCompleted = [],
+    reason = 'agent_failures',
+    existingSuiteManifest = null,
+    agentTransportTimeoutMs = null,
+  } = {}) => {
+    if (!Array.isArray(agentFailures) || agentFailures.length === 0) return null;
+    const requestedAgents = Array.isArray(agentsRequested) && agentsRequested.length > 0
+      ? agentsRequested
+      : pickAgentsForRun(config.testType, projectInfo, context);
+    const retry = buildFailedAgentRetryMetadata({
+      agentFailures,
+      agentsRequested: requestedAgents,
+      agentsCompleted: Array.isArray(agentsCompleted) ? agentsCompleted : [],
+      sharedPayload: buildRetrySharedPayload(),
+      config,
+      runId,
+      existingSuiteManifest,
+      agentTransportTimeoutMs,
+      reason,
+    });
+    generationMeta.agentsRequested = generationMeta.agentsRequested || requestedAgents;
+    generationMeta.agentsCompleted = generationMeta.agentsCompleted || (Array.isArray(agentsCompleted) ? agentsCompleted : []);
+    generationMeta.agentFailures = agentFailures;
+    if (retry && !generationMeta.failedAgentRetry) {
+      generationMeta.failedAgentRetry = retry;
+    }
+    return retry;
+  };
+
+  const mergeGenerationMetaFromResult = (resultMeta) => {
+    if (!resultMeta || typeof resultMeta !== 'object') return;
+    if (Array.isArray(resultMeta.agentsRequested)) generationMeta.agentsRequested = resultMeta.agentsRequested;
+    if (Array.isArray(resultMeta.agentsCompleted)) generationMeta.agentsCompleted = resultMeta.agentsCompleted;
+    if (Array.isArray(resultMeta.agentFailures)) generationMeta.agentFailures = resultMeta.agentFailures;
+    if (resultMeta.failedAgentRetry) generationMeta.failedAgentRetry = resultMeta.failedAgentRetry;
+  };
+
   const tryGenerator = async (generatorName, runFn) => {
     const startedAt = Date.now();
 
     try {
       const result = await withStageBudget(runBudget, 'generation', runFn);
+      mergeGenerationMetaFromResult(result?.generationMeta);
       const fixtureWiring = applyFixtureWiring(generatorName);
       let cursorOverlay = null;
       if (config.generateTests) {
@@ -7226,6 +7437,13 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
     } catch (error) {
       const summarizedReason = summarizeGenerationAttemptError(error);
       const errorCode = error?.code ? String(error.code) : classifyErrorCode(error);
+      mergeGenerationMetaFromResult(error?.generationMeta);
+      attachFailedAgentRetryFromFailures({
+        agentFailures: error?.agentFailures || error?.generationMeta?.agentFailures || [],
+        agentsRequested: error?.agentsRequested || error?.generationMeta?.agentsRequested || null,
+        agentsCompleted: error?.agentsCompleted || error?.generationMeta?.agentsCompleted || [],
+        reason: `generation_error_${errorCode}`,
+      });
 
       // Partial-survival path: when withStageBudget trips TIME_BUDGET_EXCEEDED
       // mid-run, the per-agent Promise.allSettled inside maybeGenerateViaSaaS
@@ -7323,6 +7541,39 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
             partialsWrittenCount: validation.qualityAudit?.totalFiles || recoveredPack.generatedTests || 0,
             message: 'AI generation returned no usable files; proceeding with deterministic source-derived QA contract tests.',
           };
+          if (Array.isArray(error?.agentFailures) && error.agentFailures.length > 0) {
+            const requestedAgents = pickAgentsForRun(config.testType, projectInfo, context);
+            generationMeta.agentsRequested = requestedAgents;
+            generationMeta.agentsCompleted = [];
+            generationMeta.agentFailures = error.agentFailures;
+            generationMeta.failedAgentRetry = buildFailedAgentRetryMetadata({
+              agentFailures: error.agentFailures,
+              agentsRequested: requestedAgents,
+              agentsCompleted: [],
+              sharedPayload: {
+                context,
+                prd: prdContent || '',
+                parsedPRD: parsedPRD || null,
+                explorationArtifact: explorationArtifact || null,
+                roles: roles || [],
+                testType: config.testType,
+                projectInfo,
+                options: {
+                  includeSmoke: true,
+                  includeWorkflows: true,
+                  includeErrorStates: true,
+                  allowSyntheticErrorScenarios: false,
+                  strictAIGeneration: strictAIEnabled(config),
+                  coverageProfile: config.coverageProfile || 'qa-max',
+                  minGeneratedTests: toFiniteNumber(config.minGeneratedTests, 50),
+                  maxExpansionAttempts: 0,
+                },
+              },
+              config,
+              runId,
+              reason: 'qa_contract_rescue_after_agent_failures',
+            });
+          }
           generationMeta.attempts.push({
             generator: generatorName,
             status: 'partial',
@@ -9378,6 +9629,7 @@ module.exports = {
   isRepairableGenerationFailure,
   collectGenerationQuality,
   buildExistingSuiteManifest,
+  buildFailedAgentRetryMetadata,
   extractSpecSignals,
   filterDeltaTopUpTests,
   normalizeGeneratedRouteFamily,

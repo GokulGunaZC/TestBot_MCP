@@ -21,6 +21,7 @@ const {
   shouldAttemptCoverageTopUp,
   collectGenerationQuality,
   buildExistingSuiteManifest,
+  buildFailedAgentRetryMetadata,
   countSkippedTestsInContent,
   countTestsInContent,
   evaluateGenerationQualityGates,
@@ -1092,6 +1093,57 @@ test('coverage top-up WEBAPP_UNREACHABLE preserves useful pre-topup suite', asyn
     });
     assert.equal(gate.ok, true);
     assert.equal(gate.result.qualityGateStatus, 'warning');
+  });
+});
+
+test('failed-agent retry metadata stores append-only retry payload without credential secrets', () => {
+  withTempProject((projectPath) => {
+    const generatedDir = path.join(projectPath, 'tests', 'generated');
+    fs.mkdirSync(generatedDir, { recursive: true });
+    fs.writeFileSync(path.join(generatedDir, 'smoke.spec.ts'), `
+      import { test, expect } from '@playwright/test';
+      test('[REQ:home] [CAT:ui_flow] home renders', async ({ page }) => {
+        await page.goto('/');
+        await expect(page.getByRole('heading', { name: 'Home' })).toBeVisible();
+      });
+    `);
+
+    const retry = buildFailedAgentRetryMetadata({
+      agentFailures: [{ agent: 'frontend', code: 'WEBAPP_TIMEOUT', message: 'timed out' }],
+      agentsRequested: ['smoke', 'frontend', 'workflow'],
+      agentsCompleted: ['smoke'],
+      config: { projectPath, testType: 'frontend', minGeneratedTests: 50 },
+      runId: 'retry-run',
+      agentTransportTimeoutMs: 120000,
+      sharedPayload: {
+        context: {
+          pages: [{ path: '/', sourceFile: 'src/App.tsx' }],
+          authProbe: { token: 'session-token-secret', cookie: 'auth-cookie-secret' },
+        },
+        prd: 'Home must render',
+        roles: [{ role: 'admin', username: 'admin@example.com', password: 'secret', loginVerified: true, storageStatePath: '.healix/auth.json' }],
+        testType: 'frontend',
+        projectInfo: {
+          name: 'Retry Fixture',
+          testCredentials: [{ role: 'admin', username: 'admin@example.com', password: 'secret' }],
+        },
+        options: { minGeneratedTests: 50, coverageProfile: 'qa-max' },
+      },
+    });
+
+    assert.ok(retry);
+    assert.deepEqual(retry.agents, ['frontend']);
+    assert.equal(retry.request.roles[0].password, undefined);
+    assert.equal(retry.request.roles[0].username, undefined);
+    assert.equal(retry.request.roles[0].storageStatePath, '.healix/auth.json');
+    assert.equal(retry.request.context.generationFeedback.mode, 'failed_agent_retry_delta');
+    assert.ok(retry.existingSuiteManifest.covered.reqMarkers.includes('home'));
+    assert.ok(retry.recommendedTimeoutMs > 120000);
+    const serializedRequest = JSON.stringify(retry.request);
+    assert.equal(serializedRequest.includes('admin@example.com'), false);
+    assert.equal(serializedRequest.includes('secret'), false);
+    assert.equal(serializedRequest.includes('session-token-secret'), false);
+    assert.equal(serializedRequest.includes('auth-cookie-secret'), false);
   });
 });
 

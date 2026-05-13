@@ -56,6 +56,33 @@ interface AgentFailure {
   message?: string;
 }
 
+interface FailedAgentRetryAttempt {
+  status?: string;
+  startedAt?: string;
+  finishedAt?: string;
+  agents?: string[];
+  timeoutMs?: number;
+  generatedFiles?: string[];
+  generatedCount?: number;
+  rejectedFiles?: Array<{ filename?: string; reason?: string }>;
+  rejectedCount?: number;
+  errorCode?: string;
+  message?: string;
+}
+
+interface FailedAgentRetryMeta {
+  available?: boolean;
+  status?: string;
+  reason?: string;
+  agents?: string[];
+  request?: unknown;
+  recommendedTimeoutMs?: number;
+  recommendedBudgetMultiplier?: number;
+  canRunFromDashboard?: boolean;
+  lastAttempt?: FailedAgentRetryAttempt | null;
+  history?: FailedAgentRetryAttempt[];
+}
+
 interface PartialGenerationWarning {
   reason: string;
   generator?: string;
@@ -165,6 +192,7 @@ interface GenerationMetaShape {
   } | null;
   qaContractSummary?: Record<string, number> | null;
   coverageTopUps?: CoverageTopUpEvent[];
+  failedAgentRetry?: FailedAgentRetryMeta | null;
   [key: string]: unknown;
 }
 
@@ -2293,6 +2321,140 @@ function PartialGenerationBanner({
   );
 }
 
+function FailedAgentRetryPanel({
+  runId,
+  generationMeta,
+  agentFailures,
+  agentsRequested,
+  agentsCompleted,
+  onRefresh,
+}: {
+  runId: string;
+  generationMeta: GenerationMetaShape | null;
+  agentFailures: AgentFailure[];
+  agentsRequested: string[];
+  agentsCompleted: string[];
+  onRefresh: () => Promise<void>;
+}) {
+  const retryMeta = generationMeta?.failedAgentRetry ?? null;
+  const failedAgents = [...new Set([
+    ...(Array.isArray(retryMeta?.agents) ? retryMeta!.agents! : []),
+    ...agentFailures.map((failure) => failure.agent),
+  ].filter(Boolean))];
+  const [submitting, setSubmitting] = useState(false);
+  const [message, setMessage] = useState<string | null>(retryMeta?.lastAttempt?.message ?? null);
+  const [error, setError] = useState<string | null>(null);
+
+  if (failedAgents.length === 0) return null;
+
+  const requestedCount = agentsRequested.length || failedAgents.length + agentsCompleted.length;
+  const completedCount = agentsCompleted.length;
+  const timeoutMinutes = retryMeta?.recommendedTimeoutMs
+    ? Math.ceil(retryMeta.recommendedTimeoutMs / 60000)
+    : null;
+  const canRetry = retryMeta?.available !== false && Boolean(retryMeta?.request);
+  const lastAttempt = retryMeta?.lastAttempt ?? null;
+
+  const runRetry = async () => {
+    setSubmitting(true);
+    setError(null);
+    setMessage(null);
+    try {
+      const res = await fetch(`/api/test-runs/${runId}/retry-failed-agents`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          agents: failedAgents,
+          timeoutMultiplier: retryMeta?.recommendedBudgetMultiplier ?? 2,
+        }),
+      });
+      const payload = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(payload?.message || payload?.reason || payload?.error || 'Failed-agent retry failed');
+      }
+      setMessage(payload?.attempt?.message || 'Failed-agent retry completed.');
+      await onRefresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: -6 }}
+      animate={{ opacity: 1, y: 0 }}
+      className="glass-card rounded-2xl overflow-hidden border border-amber-500/25 bg-amber-500/[0.035]"
+    >
+      <div className="px-5 py-4 border-b border-amber-500/15 flex items-start justify-between gap-3">
+        <div className="flex items-start gap-3 min-w-0">
+          <div className="w-9 h-9 rounded-lg bg-amber-500/15 border border-amber-500/30 flex items-center justify-center flex-shrink-0 mt-0.5">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#FBBF24" strokeWidth="2.2">
+              <path d="M13 2 3 14h8l-1 8 10-12h-8l1-8z" />
+            </svg>
+          </div>
+          <div className="min-w-0">
+            <div className="text-[#FDE68A] font-semibold text-[15px]">Generation agents need retry</div>
+            <div className="text-[#F0F6FF]/85 text-sm mt-0.5">
+              {failedAgents.length} agent{failedAgents.length === 1 ? '' : 's'} failed while other pipeline work continued. Retry adds append-only top-up specs with a larger generation budget.
+            </div>
+            <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+              <span className="px-2 py-0.5 rounded-md bg-amber-500/10 border border-amber-500/25 text-[#FCD34D] text-[11px] font-mono">
+                agents: {completedCount}/{requestedCount} complete
+              </span>
+              {failedAgents.map((agent) => (
+                <span key={agent} className="px-2 py-0.5 rounded-md bg-red-500/10 border border-red-500/25 text-[#FCA5A5] text-[11px] font-mono">
+                  {agent}
+                </span>
+              ))}
+              {timeoutMinutes && (
+                <span className="px-2 py-0.5 rounded-md bg-white/5 border border-white/10 text-[#D8E8FF]/70 text-[11px] font-mono">
+                  retry budget: ~{timeoutMinutes}m
+                </span>
+              )}
+              {lastAttempt?.status && (
+                <span className="px-2 py-0.5 rounded-md bg-white/5 border border-white/10 text-[#D8E8FF]/70 text-[11px] font-mono">
+                  last: {lastAttempt.status}
+                </span>
+              )}
+              {typeof lastAttempt?.rejectedCount === 'number' && lastAttempt.rejectedCount > 0 && (
+                <span className="px-2 py-0.5 rounded-md bg-white/5 border border-white/10 text-[#D8E8FF]/70 text-[11px] font-mono">
+                  rejected duplicates: {lastAttempt.rejectedCount}
+                </span>
+              )}
+            </div>
+          </div>
+        </div>
+        <button
+          onClick={runRetry}
+          disabled={submitting || !canRetry}
+          className="px-3 py-1.5 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 disabled:opacity-50 disabled:cursor-not-allowed border border-amber-500/30 text-[#FDE68A] text-xs font-semibold transition-colors flex-shrink-0"
+        >
+          {submitting ? 'Retrying…' : 'Retry failed agents'}
+        </button>
+      </div>
+      {(message || error || !canRetry) && (
+        <div className="px-5 py-3 text-[12.5px] border-t border-amber-500/10">
+          {message && <div className="text-emerald-300/90">{message}</div>}
+          {error && <div className="text-[#FCA5A5]">{error}</div>}
+          {!canRetry && (
+            <div className="text-[#D8E8FF]/75">
+              This historical run does not include the saved generation context required for one-click retry. Re-run Healix from the MCP to create retryable agent metadata.
+            </div>
+          )}
+          {Array.isArray(lastAttempt?.generatedFiles) && lastAttempt.generatedFiles.length > 0 && (
+            <div className="mt-2 text-[#D8E8FF]/70 font-mono text-[11px]">
+              {lastAttempt.generatedFiles.slice(0, 4).join(', ')}
+              {lastAttempt.generatedFiles.length > 4 ? ` +${lastAttempt.generatedFiles.length - 4} more` : ''}
+            </div>
+          )}
+        </div>
+      )}
+    </motion.div>
+  );
+}
+
 interface SuggestedFixStep {
   action: string;
   detail?: string;
@@ -2803,6 +2965,30 @@ export default function TestRunDetailPage() {
     ].includes(phase);
   }, []);
 
+  const refreshRun = useCallback(async () => {
+    if (!id) return;
+    const res = await fetch(`/api/test-runs/${id}`, { cache: 'no-store' });
+    if (!res.ok) return;
+    const json = await res.json();
+    if (!json?.data) return;
+    const nextRun = json.data as TestRun;
+    lastRunSignatureRef.current = JSON.stringify({
+      id: nextRun?.id,
+      status: nextRun?.status,
+      updated_at: nextRun?.updated_at,
+      current_phase: nextRun?.current_phase,
+      error_code: nextRun?.error_code,
+      total_tests: nextRun?.total_tests,
+      passed_tests: nextRun?.passed_tests,
+      failed_tests: nextRun?.failed_tests,
+      skipped_tests: nextRun?.skipped_tests,
+    });
+    setTestRun(nextRun);
+    setGenerationJob(
+      (json.data as { generationJob?: GenerationJobSnapshot | null }).generationJob ?? null
+    );
+  }, [id]);
+
   useEffect(() => {
     if (!id || !isLiveDetailId) return;
     const evtSource = new EventSource(`/api/test-runs/${id}/stream`);
@@ -3117,6 +3303,12 @@ export default function TestRunDetailPage() {
   const agentFailuresFromMeta: AgentFailure[] = Array.isArray(generationMeta?.agentFailures)
     ? (generationMeta!.agentFailures as AgentFailure[])
     : [];
+  const agentFailuresFromJob: AgentFailure[] = generationJob?.agentsCompleted
+    ?.filter((agent) => agent && agent.ok === false)
+    .map((agent) => ({ agent: agent.agent, code: agent.errorCode || 'AGENT_FAILED', message: '' })) ?? [];
+  const visibleAgentFailures: AgentFailure[] = agentFailuresFromMeta.length > 0
+    ? agentFailuresFromMeta
+    : agentFailuresFromJob;
   const agentsCompletedFromMeta: string[] = Array.isArray(generationMeta?.agentsCompleted)
     ? (generationMeta!.agentsCompleted as string[])
     : [];
@@ -3130,7 +3322,7 @@ export default function TestRunDetailPage() {
     !pipelineError &&
     !!generationMeta &&
     (!!partialWarning ||
-      (agentFailuresFromMeta.length > 0 && agentsCompletedFromMeta.length > 0));
+      (visibleAgentFailures.length > 0 && agentsCompletedFromMeta.length > 0));
   const effectiveWarning: PartialGenerationWarning | null = partialWarning
     ? partialWarning
     : shouldShowPartialBanner
@@ -3312,10 +3504,21 @@ export default function TestRunDetailPage() {
         <PipelineErrorBanner error={pipelineError as PipelineErrorShape} runId={testRun.id} />
       )}
 
+      {visibleAgentFailures.length > 0 && (
+        <FailedAgentRetryPanel
+          runId={testRun.id}
+          generationMeta={generationMeta}
+          agentFailures={visibleAgentFailures}
+          agentsCompleted={agentsCompletedFromMeta}
+          agentsRequested={agentsRequestedFromMeta}
+          onRefresh={refreshRun}
+        />
+      )}
+
       {shouldShowPartialBanner && effectiveWarning && (
         <PartialGenerationBanner
           warning={effectiveWarning}
-          agentFailures={agentFailuresFromMeta}
+          agentFailures={visibleAgentFailures}
           agentsCompleted={agentsCompletedFromMeta}
           agentsRequested={agentsRequestedFromMeta}
         />
