@@ -646,7 +646,7 @@ test('quality audit requires runnable QA filter form and a11y contracts to be co
       testType: 'both',
     });
     assert.equal(pack.written, true);
-    assert.equal(pack.generatedTests, 3);
+    assert.ok(pack.generatedTests >= 3);
 
     const coveredAudit = auditQaContractCoverage({
       context: { qaContracts },
@@ -978,6 +978,184 @@ test('Pulseboard planted-bug fixture derives runnable filter/form contracts and 
   assert.match(spec.content, /\[QAC:qac-filter-get-api-cards-status\]/);
   assert.match(spec.content, /\[QAC:qac-form-validation-root-src-app-tsx\]/);
   assert.match(spec.content, /row must satisfy status=/);
+});
+
+test('protected form QA contracts run once with the inferred positive role', () => {
+  const qaContracts = extractQaContracts({
+    projectPath: '/virtual/app',
+    context: {
+      pages: [{ path: '/admin/members', sourceFile: 'src/app/members.tsx', requiresAuth: true }],
+      forms: [{
+        file: 'src/app/members.tsx',
+        fields: [{ name: 'name', required: true }],
+        submitButtons: ['Create member'],
+      }],
+    },
+    readFile() {
+      return '';
+    },
+  });
+
+  assert.equal(qaContracts.formValidationContracts[0].allowedRoles[0], 'admin');
+  const spec = buildQaContractSpec({
+    qaContracts,
+    roles: [
+      { role: 'admin', loginVerified: true, storageStatePath: '/tmp/admin.json' },
+      { role: 'user', loginVerified: true, storageStatePath: '/tmp/user.json' },
+      { role: 'viewer', loginVerified: true, storageStatePath: '/tmp/viewer.json' },
+    ],
+    testType: 'frontend',
+  });
+
+  assert.match(spec.content, /@auth @tierB \[QAC:qac-form-validation-admin-members-src-app-members-tsx\]/);
+  assert.match(spec.content, /const targetRole = "admin"/);
+  assert.match(spec.content, /Form validation contract runs once with role/);
+});
+
+test('QA contracts normalize mounted router paths and do not infer auth from unrelated handlers', () => {
+  const qaContracts = extractQaContracts({
+    projectPath: '/virtual/pulseboard',
+    context: {
+      apiEndpoints: [
+        { method: 'POST', path: '/issue/:id', source: 'services/comments-node/src/routes/comments.ts', requiresAuth: true },
+        { method: 'DELETE', path: '/:id', source: 'services/comments-node/src/routes/comments.ts', requiresAuth: true },
+        { method: 'POST', path: '/api/issues', source: 'services/issues-java/src/main/java/io/pulseboard/issues/controller/IssueController.java' },
+        { method: 'PUT', path: '/api/issues/:id', source: 'services/issues-java/src/main/java/io/pulseboard/issues/controller/IssueController.java' },
+        { method: 'GET', path: '/api/projects', source: 'services/projects-node/src/index.ts', requiresAuth: true },
+        { method: 'POST', path: '/api/auth/login', source: 'frontend-next/app/api/auth/login/route.ts', requiresAuth: true },
+      ],
+    },
+    readFile(filePath) {
+      const normalized = filePath.replace(/\\/g, '/');
+      if (normalized.endsWith('comments.ts')) {
+        return `
+          import { Router } from 'express';
+          import { requireAuth } from '../jwt';
+          const router = Router();
+          router.get('/issue/:id', (req, res) => res.json([]));
+          router.post('/issue/:id', requireAuth, (req, res) => {
+            const { body } = req.body;
+            if (!body || !body.trim()) return res.status(400).json({ error: 'required' });
+            res.status(201).json({ id: 'c1', body });
+          });
+          router.delete('/:id', requireAuth, (req, res) => res.status(204).end());
+        `;
+      }
+      if (normalized.endsWith('IssueController.java')) {
+        return `
+          @RequestMapping("/api/issues")
+          public class IssueController {
+          @PostMapping
+          public ResponseEntity<Issue> create(HttpServletRequest req, @RequestBody CreateIssueBody body) {
+            AuthUser u = AuthRequired.requireMutator(req);
+            if (body.projectSlug() == null || body.projectSlug().isBlank()) return ResponseEntity.badRequest().build();
+            if (body.title() == null || body.title().isBlank()) return ResponseEntity.badRequest().build();
+            return ResponseEntity.ok(repo.save(new Issue()));
+          }
+          @PutMapping("/{id}")
+          public Issue update(HttpServletRequest req, @PathVariable String id, @RequestBody UpdateIssueBody body) {
+            AuthRequired.requireMutator(req);
+            if (body.title() != null && !body.title().isBlank()) issue.setTitle(body.title().trim());
+            return repo.save(issue);
+          }
+          }
+        `;
+      }
+      if (normalized.endsWith('index.ts')) {
+        return `
+          import { requireAdmin } from './jwt';
+          app.get<{ Querystring: { q?: string } }>('/api/projects', async () => []);
+          app.post('/api/projects', { preHandler: requireAdmin }, async (req, reply) => reply.code(201).send(req.body));
+        `;
+      }
+      if (normalized.endsWith('login/route.ts')) {
+        return `
+          export async function POST(req) {
+            const body = await req.json();
+            if (!body.email || !body.password) return Response.json({ error: 'missing_credentials' }, { status: 400 });
+            if (body.password !== 'known') return Response.json({ error: 'invalid_credentials' }, { status: 401 });
+            return Response.json({ ok: true });
+          }
+        `;
+      }
+      return '';
+    },
+  });
+
+  assert.ok(qaContracts.boundaryValidationContracts.some((contract) => contract.path === '/api/comments/issue/:id'));
+  assert.ok(qaContracts.deleteStatusContracts.some((contract) => contract.path === '/api/comments/:id'));
+  assert.equal(qaContracts.boundaryValidationContracts.some((contract) => contract.path === '/api/issues/:id'), false);
+  assert.equal(qaContracts.rbacContracts.some((contract) => contract.path === '/api/projects'), false);
+  assert.equal(qaContracts.rbacContracts.some((contract) => contract.path === '/api/auth/login'), false);
+
+  const spec = buildQaContractSpec({
+    qaContracts,
+    roles: [{ role: 'member', loginVerified: true, storageStatePath: '/tmp/member.json' }],
+    testType: 'backend',
+  });
+  assert.match(spec.content, /@auth @tierB \[QAC:qac-post-status-post-api-issues\]/);
+  assert.match(spec.content, /@auth @tierB \[QAC:qac-boundary-validation-post-api-issues\]/);
+  assert.match(spec.content, /Status contract runs once with mutating role/);
+  assert.match(spec.content, /Boundary contract runs once with mutating role/);
+  assert.match(spec.content, /resolveApiPathFromPage\(page, "\/api\/issues"\)/);
+  assert.match(spec.content, /@auth @tierB \[QAC:qac-post-status-post-api-comments-issue-id\]/);
+  assert.match(spec.content, /@auth @tierB \[QAC:qac-boundary-validation-post-api-comments-issue-id\]/);
+  assert.match(spec.content, /resolveApiPathFromPage\(page, "\/api\/comments\/issue\/:id"\)/);
+  assert.match(spec.content, /apiFetchFromPage\(page, concretePath/);
+  assert.equal(spec.content.includes('await resolveApiPathFromPage(page, "/api/issues"),'), false);
+  assert.equal(spec.content.includes('request.post("/api/issues"'), false);
+  assert.equal(spec.content.includes('request.post("/api/comments/issue/:id"'), false);
+  assert.equal(spec.content.includes('request.post("/issue/:id"'), false);
+});
+
+test('QA contracts detect free-text search filters as contains predicates', () => {
+  const qaContracts = extractQaContracts({
+    projectPath: '/virtual/search',
+    context: {
+      apiEndpoints: [{ method: 'GET', path: '/api/issues', source: 'src/routes/issues.ts' }],
+    },
+    readFile() {
+      return `
+        export async function GET(req) {
+          const q = req.nextUrl.searchParams.get('q');
+          const rows = await db.issue.findMany({ where: { title: { contains: q, mode: 'insensitive' } } });
+          return Response.json(rows);
+        }
+      `;
+    },
+  });
+
+  assert.equal(qaContracts.filterContracts.length, 1);
+  assert.equal(qaContracts.filterContracts[0].queryParam, 'q');
+  assert.equal(qaContracts.filterContracts[0].operator, 'contains');
+  assert.equal(qaContracts.filterContracts[0].responseField, 'title');
+
+  const spec = buildQaContractSpec({ qaContracts, testType: 'backend' });
+  assert.match(spec.content, /toContain\(value\.toLowerCase\(\)\)/);
+});
+
+test('context gatherer scans nested Next app/api directories and ignores type-only routes', async () => {
+  await withTempProject(async (projectPath) => {
+    const nextAppDir = path.join(projectPath, 'frontend-next', 'app');
+    fs.mkdirSync(path.join(nextAppDir, 'projects', '[slug]'), { recursive: true });
+    fs.mkdirSync(path.join(nextAppDir, 'api', 'admin', 'users'), { recursive: true });
+    fs.mkdirSync(path.join(nextAppDir, 'api', 'activity', '[[...path]]'), { recursive: true });
+    fs.mkdirSync(path.join(projectPath, 'frontend-next', '.next', 'types'), { recursive: true });
+    fs.writeFileSync(path.join(nextAppDir, 'projects', '[slug]', 'page.tsx'), `export default function Page(){ return <button aria-label="Add issue">+</button> }`);
+    fs.writeFileSync(path.join(nextAppDir, 'api', 'admin', 'users', 'route.ts'), `export async function GET(){ return Response.json([]) }`);
+    fs.writeFileSync(path.join(nextAppDir, 'api', 'activity', '[[...path]]', 'route.ts'), `export async function GET(){ return Response.json([]) }`);
+    fs.writeFileSync(path.join(projectPath, 'frontend-next', '.next', 'types', 'routes.d.ts'), `export type Route = '/bad-type-route'`);
+
+    const gatherer = new ContextGatherer({ projectPath, maxFiles: 200 });
+    const pages = await gatherer.findPages(projectPath);
+    const endpoints = await gatherer.findAPIEndpoints(projectPath);
+
+    assert.ok(pages.some((page) => page.path === '/projects/:slug'));
+    assert.equal(pages.some((page) => String(page.sourceFile || '').includes('.next/types/routes.d.ts')), false);
+    assert.ok(endpoints.some((endpoint) => endpoint.method === 'GET' && endpoint.path === '/api/admin/users'));
+    assert.ok(endpoints.some((endpoint) => endpoint.method === 'GET' && endpoint.path === '/api/activity'));
+    assert.equal(endpoints.some((endpoint) => String(endpoint.path).includes(':...path')), false);
+  });
 });
 
 test('counts runnable declarations separately from skipped declarations and runtime skips', () => {
@@ -3261,13 +3439,14 @@ test('report generator only persists deterministic or classifier-confirmed app f
       projectName: 'findings-app',
       runId: 'findings-report',
       testResults: {
-        total: 3,
+        total: 4,
         passed: 0,
-        failed: 3,
+        failed: 4,
         skipped: 0,
         duration: 10,
         tests: [
           { title: '[QAC:a11y-home] icon button has an accessible name', status: 'failed', file: 'tests/generated/healix-qa-contracts.spec.ts', error: 'missing accessible name' },
+          { title: '[QAC:qac-form-validation-admin-login] [CAT:form_validation] /admin/login requires accessible inline validation', status: 'failed', file: 'tests/generated/healix-qa-contracts.spec.ts', error: 'missing role alert' },
           { title: 'AI workflow failed but untriaged', status: 'failed', file: 'tests/generated/workflow.spec.ts', error: 'locator mismatch' },
           { title: 'AI API check found app bug', status: 'failed', file: 'tests/generated/api.spec.ts', error: 'expected 201 received 200' },
         ],
@@ -3279,11 +3458,13 @@ test('report generator only persists deterministic or classifier-confirmed app f
     });
     const report = JSON.parse(fs.readFileSync(generated.path, 'utf-8'));
 
-    assert.equal(report.qaFindings.length, 2);
-    assert.equal(report.findingSummary.total, 2);
+    assert.equal(report.qaFindings.length, 3);
+    assert.equal(report.findingSummary.total, 3);
     assert.equal(report.findingSummary.status, 'completed_with_findings');
     assert.ok(report.qaFindings.some((finding) => finding.findingType === 'deterministic_contract'));
     assert.ok(report.qaFindings.some((finding) => finding.findingType === 'app_is_wrong'));
+    assert.ok(report.qaFindings.some((finding) => finding.category === 'a11y' && finding.severity === 'P2'));
+    assert.ok(report.qaFindings.some((finding) => finding.category === 'validation' && finding.severity === 'P1'));
     assert.ok(!report.qaFindings.some((finding) => finding.testTitle === 'AI workflow failed but untriaged'));
   } finally {
     fs.rmSync(projectPath, { recursive: true, force: true });

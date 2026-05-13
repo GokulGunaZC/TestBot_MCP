@@ -426,11 +426,11 @@ class ReportGenerator {
 
   inferQaCategory(test = {}) {
     const text = `${test.title || ''} ${test.file || ''} ${test.suite || ''}`.toLowerCase();
-    if (/rbac|authz|api_auth|admin|forbidden|unauthorized/.test(text)) return 'authz';
-    if (/boundary|validation|required|string|whitespace|api_negative/.test(text)) return 'validation';
+    if (/form_validation|form-validation|boundary|validation|required|string|whitespace|api_negative/.test(text)) return 'validation';
+    if (/a11y|accessib|aria|interactive/.test(text)) return 'a11y';
+    if (/rbac|authz|api_auth|forbidden|unauthorized/.test(text)) return 'authz';
     if (/filter|query|search/.test(text)) return 'filter_logic';
     if (/status|201|202|204|api_contract|contract/.test(text)) return 'http_contract';
-    if (/a11y|accessib|aria|interactive/.test(text)) return 'a11y';
     return 'functional';
   }
 

@@ -61,8 +61,19 @@ function findQuotedPathIndex(content, endpointPath) {
   return -1;
 }
 
+function findMethodQuotedPathIndex(content, endpoint = {}) {
+  const method = normalizeMethod(endpoint.method).toLowerCase();
+  if (!method) return -1;
+  for (const variant of endpointPathVariants(endpoint.path)) {
+    const pattern = new RegExp(`\\b(?:app|router)\\s*\\.\\s*${escapeRegExp(method)}(?:\\s*<[^)]*>)?\\s*\\(\\s*(['"\`])${escapeRegExp(variant)}\\1`, 'i');
+    const match = content.match(pattern);
+    if (match && typeof match.index === 'number') return match.index;
+  }
+  return -1;
+}
+
 function sliceEndpointSourceFrom(content, startIndex) {
-  const routeStartPattern = /(?:\b(?:app|router)\s*\.\s*(?:get|post|put|patch|delete)\s*\(|@(?:Get|Post|Put|Patch|Delete|Request)Mapping\b|\b(?:GET|POST|PUT|PATCH|DELETE)\s*\()/g;
+  const routeStartPattern = /(?:\b(?:app|router)\s*\.\s*(?:get|post|put|patch|delete)(?:\s*<[^)]*>)?\s*\(|@(?:Get|Post|Put|Patch|Delete|Request)Mapping\b|\b(?:GET|POST|PUT|PATCH|DELETE)\s*\()/g;
   let next = -1;
   routeStartPattern.lastIndex = Math.max(0, startIndex + 1);
   const match = routeStartPattern.exec(content);
@@ -75,20 +86,30 @@ function findSpringEndpointIndex(content, endpoint = {}) {
   const method = normalizeMethod(endpoint.method);
   const annotation = `${method[0]}${method.slice(1).toLowerCase()}Mapping`;
   if (!/Mapping$/.test(annotation)) return -1;
-  const localPath = endpoint.sourceRoutePath;
+  let localPath = endpoint.sourceRoutePath;
+  const quotedValues = (value) => [...String(value || '').matchAll(/(['"`])([^'"`]+)\1/g)].map((match) => match[2]);
+  if ((localPath === undefined || localPath === null) && endpoint.path) {
+    const baseMatch = String(content || '').match(/@RequestMapping\s*\([^)]*?(['"`])(\/[^'"`]+)\1/);
+    const basePath = baseMatch ? normalizeRoute(baseMatch[2]) : null;
+    const endpointPath = normalizeRoute(endpoint.path);
+    if (basePath && endpointPath.startsWith(basePath)) {
+      localPath = endpointPath.slice(basePath.length) || '';
+    }
+  }
   if (localPath !== undefined && localPath !== null) {
-    const suffix = String(localPath || '');
-    if (!suffix) {
-      const barePattern = new RegExp(`@${annotation}(?!\\s*\\()`, 'i');
-      const bare = content.match(barePattern);
-      if (bare && typeof bare.index === 'number') return bare.index;
-      const emptyPattern = new RegExp(`@${annotation}\\s*\\(\\s*\\)`, 'i');
-      const empty = content.match(emptyPattern);
-      if (empty && typeof empty.index === 'number') return empty.index;
-    } else {
-      const quotedPattern = new RegExp(`@${annotation}\\s*\\([^)]*(['"\`])${escapeRegExp(suffix)}\\1`, 'i');
-      const quoted = content.match(quotedPattern);
-      if (quoted && typeof quoted.index === 'number') return quoted.index;
+    const suffix = normalizeDynamicRoute(String(localPath || '') || '/');
+    const expectedSuffixes = new Set(endpointPathVariants(suffix).map(normalizeDynamicRoute));
+    const annotationPattern = new RegExp(`@${annotation}(?:\\s*\\(([^)]*)\\))?`, 'gi');
+    for (const match of String(content || '').matchAll(annotationPattern)) {
+      const args = match[1] || '';
+      const paths = quotedValues(args).map(normalizeDynamicRoute);
+      if (suffix === '/') {
+        if (paths.length === 0 || paths.some((route) => route === '/' || route === '')) return match.index;
+        continue;
+      }
+      if (paths.some((route) => expectedSuffixes.has(route))) {
+        return match.index;
+      }
     }
   }
   return -1;
@@ -99,10 +120,11 @@ function extractEndpointSource(content, endpoint = {}) {
   const springIndex = findSpringEndpointIndex(content, endpoint);
   if (springIndex >= 0) return sliceEndpointSourceFrom(content, springIndex);
 
-  const pathIndex = findQuotedPathIndex(content, endpoint.path);
+  let pathIndex = findMethodQuotedPathIndex(content, endpoint);
+  if (pathIndex < 0) pathIndex = findQuotedPathIndex(content, endpoint.path);
   if (pathIndex < 0) return content;
 
-  const routeStartPattern = /(?:\b(?:app|router)\s*\.\s*(?:get|post|put|patch|delete)\s*\(|@(?:Get|Post|Put|Patch|Delete|Request)Mapping\b|\b(?:GET|POST|PUT|PATCH|DELETE)\s*\()/g;
+  const routeStartPattern = /(?:\b(?:app|router)\s*\.\s*(?:get|post|put|patch|delete)(?:\s*<[^)]*>)?\s*\(|@(?:Get|Post|Put|Patch|Delete|Request)Mapping\b|\b(?:GET|POST|PUT|PATCH|DELETE)\s*\()/g;
   let start = 0;
   let next = -1;
   for (const match of content.matchAll(routeStartPattern)) {
@@ -135,7 +157,7 @@ function extractQueryParams(content) {
       if (value) params.push(value);
     }
   }
-  return uniq(params).filter((param) => !/^(page|limit|offset|sort|order|q|query|search)$/i.test(param));
+  return uniq(params).filter((param) => !/^(page|limit|offset|sort|order)$/i.test(param));
 }
 
 function sourceProvesEqualityFilter(content, param) {
@@ -148,6 +170,17 @@ function sourceProvesEqualityFilter(content, param) {
     new RegExp(`\\bfilter\\s*\\([\\s\\S]{0,700}\\.${escaped}\\s*={2,3}\\s*${escaped}\\b`, 'i'),
     new RegExp(`\\b${escaped}\\s*:\\s*${escaped}\\b`, 'i'),
     new RegExp(`\\b${escaped}\\s*:\\s*\\{\\s*(?:equals|eq)\\s*:\\s*${escaped}\\b`, 'i'),
+  ];
+  return patterns.some((pattern) => pattern.test(content));
+}
+
+function sourceProvesContainsFilter(content, param) {
+  const escaped = escapeRegExp(param);
+  const patterns = [
+    new RegExp(`\\b${escaped}\\b[\\s\\S]{0,500}(?:LIKE|ILIKE|contains|includes|startsWith|endsWith)`, 'i'),
+    new RegExp(`(?:LIKE|ILIKE|contains|includes|startsWith|endsWith)[\\s\\S]{0,500}\\b${escaped}\\b`, 'i'),
+    new RegExp(`%\\s*['"\`]?\\s*\\+\\s*${escaped}\\b|\\b${escaped}\\s*\\+\\s*['"\`]?\\s*%`, 'i'),
+    new RegExp(`\\b${escaped}\\s*:\\s*\\{\\s*(?:contains|search|mode)\\b`, 'i'),
   ];
   return patterns.some((pattern) => pattern.test(content));
 }
@@ -166,6 +199,7 @@ function sourceReferencesFilterParam(content, param) {
 function inferResponseFieldFromSource(content, param) {
   const escaped = escapeRegExp(param);
   const patterns = [
+    new RegExp(`\\b([A-Za-z_][\\w]*)\\s*:\\s*\\{\\s*(?:contains|search|startsWith|endsWith)\\s*:\\s*${escaped}\\b`, 'i'),
     new RegExp(`\\b\\w+\\.([A-Za-z_][\\w]*)\\s*=\\s*:${escaped}\\b`, 'i'),
     new RegExp(`\\b([A-Za-z_][\\w]*)\\s*=\\s*:${escaped}\\b`, 'i'),
     new RegExp(`\\bwhere\\s+[\\w"'\`.]*([A-Za-z_][\\w]*)\\s*=\\s*\\?`, 'i'),
@@ -174,6 +208,11 @@ function inferResponseFieldFromSource(content, param) {
   for (const pattern of patterns) {
     const match = content.match(pattern);
     if (match?.[1]) return match[1];
+  }
+  if (/^(q|query|search|term)$/i.test(param)) {
+    for (const field of ['title', 'name', 'summary', 'description', 'body']) {
+      if (new RegExp(`\\b${field}\\b`, 'i').test(content)) return field;
+    }
   }
   return String(param);
 }
@@ -279,6 +318,75 @@ function normalizeRoute(route) {
   return withSlash.replace(/\/+$/, '') || '/';
 }
 
+function normalizeDynamicRoute(route) {
+  return normalizeRoute(route)
+    .replace(/\{\s*([A-Za-z_][\w-]*)\s*\}/g, ':$1')
+    .replace(/:\.\.\.([A-Za-z_][\w-]*)/g, ':$1')
+    .replace(/\[\[\.\.\.([^\]]+)\]\]/g, ':$1')
+    .replace(/\[\.\.\.([^\]]+)\]/g, ':$1')
+    .replace(/\[([^\]]+)\]/g, ':$1');
+}
+
+function sourceFileLooksTypeOnly(sourceFile) {
+  const normalized = String(sourceFile || '').replace(/\\/g, '/');
+  return (
+    /\.d\.ts$/i.test(normalized) ||
+    /(?:^|\/)(?:node_modules|\.next|dist|build|coverage|out|vendor|target)(?:\/|$)/i.test(normalized)
+  );
+}
+
+function apiPrefixFromSourceFile(sourceFile) {
+  const normalized = String(sourceFile || '').replace(/\\/g, '/');
+  const appApiMatch = normalized.match(/(?:^|\/)(?:src\/)?app\/api\/(.+?)\/route\.(?:tsx?|jsx?)$/);
+  if (appApiMatch) {
+    const parts = appApiMatch[1]
+      .split('/')
+      .filter((part) => part && !/^\(.+\)$/.test(part) && !/^\[\[?\.\.\.[^\]]+\]?\]$/.test(part))
+      .map((part) => part.replace(/^\[([^\]]+)\]$/, ':$1'));
+    return normalizeRoute(`/api/${parts.join('/')}`);
+  }
+
+  const routeFileMatch = normalized.match(/(?:^|\/)routes\/([A-Za-z0-9_-]+)\.(?:tsx?|jsx?|mjs|cjs)$/);
+  if (routeFileMatch) {
+    const resource = routeFileMatch[1].replace(/[-_]routes?$/i, '');
+    if (resource && !/^(index|router|routes?)$/i.test(resource)) return normalizeRoute(`/api/${resource}`);
+  }
+
+  const serviceMatch = normalized.match(/(?:^|\/)services\/([A-Za-z0-9_-]+?)(?:-(?:node|api|service|java|go|py|python|ruby|rails|dotnet|spring))?\/src\//i);
+  if (serviceMatch) {
+    const resource = serviceMatch[1];
+    if (resource && !/^(frontend|backend|server|api)$/i.test(resource)) return normalizeRoute(`/api/${resource}`);
+  }
+
+  return null;
+}
+
+function sourceProxyPathFromContent(content) {
+  const match = String(content || '').match(/return\s+["'`]((?:\/api\/)[^"'`]+)["'`]\s*\+/);
+  return match?.[1] ? normalizeRoute(match[1]) : null;
+}
+
+function canonicalEndpointPath(endpoint = {}, content = '') {
+  const sourceFile = endpoint.source || endpoint.sourceFile || '';
+  const rawPath = normalizeDynamicRoute(endpoint.path || '/');
+  const proxyPath = sourceProxyPathFromContent(content);
+  const sourcePrefix = apiPrefixFromSourceFile(sourceFile);
+
+  if (proxyPath && (rawPath === sourcePrefix || rawPath.includes(':path') || rawPath.includes(':...path'))) {
+    return proxyPath;
+  }
+
+  if (sourcePrefix) {
+    if (rawPath === '/' || rawPath === sourcePrefix) return sourcePrefix;
+    if (rawPath.startsWith(`${sourcePrefix}/`)) return rawPath;
+    if (!rawPath.startsWith('/api/')) {
+      return normalizeDynamicRoute(`${sourcePrefix}${rawPath}`);
+    }
+  }
+
+  return rawPath;
+}
+
 function normalizeRoleName(value) {
   return String(value || 'user')
     .trim()
@@ -298,9 +406,11 @@ function routeRequiresAuth(route, pages = []) {
 
 function pageRouteFromEntry(entry) {
   if (!entry) return null;
+  if (sourceFileLooksTypeOnly(entry.sourceFile || entry.source || entry.file)) return null;
   const candidate = entry.path || entry.route || entry.url;
   if (!candidate || !String(candidate).startsWith('/')) return null;
   const normalized = normalizeRoute(candidate);
+  if (/\.(?:d\.ts|map|json)$/i.test(normalized)) return null;
   if (routeHasDynamicSegment(normalized)) return null;
   return normalized;
 }
@@ -391,9 +501,9 @@ function formRequiresAuth(form, pages = []) {
 
 function extractRequiredStringFieldsFromSource(content) {
   const fields = new Map();
-  const add = (name, reason = 'required') => {
+  const add = (name, reason = 'required', options = {}) => {
     const key = String(name || '').trim();
-    if (!key || /^(req|res|request|response|ctx|context|body|data|input|payload)$/i.test(key)) return;
+    if (!key || (!options.allowGenericName && /^(req|res|request|response|ctx|context|body|data|input|payload)$/i.test(key))) return;
     fields.set(key, { name: key, type: 'string', reason });
   };
 
@@ -410,14 +520,23 @@ function extractRequiredStringFieldsFromSource(content) {
     for (const part of String(match[1] || '').split(',')) {
       const name = part.split(':')[0].trim();
       if (new RegExp(`!\\s*${escapeRegExp(name)}\\b|${escapeRegExp(name)}\\s*==={0,1}\\s*['"\`]\\s*['"\`]|${escapeRegExp(name)}\\.trim\\s*\\(\\s*\\)`, 'i').test(content)) {
-        add(name, 'required_guard');
+        add(name, 'required_guard', { allowGenericName: true });
       }
     }
   }
   for (const match of String(content || '').matchAll(/\b(?:body|data|input|payload)\.([A-Za-z_][\w]*)\b/g)) {
     const name = match[1];
-    if (new RegExp(`!\\s*(?:body|data|input|payload)\\.${escapeRegExp(name)}\\b|(?:body|data|input|payload)\\.${escapeRegExp(name)}\\.trim\\s*\\(\\s*\\)`, 'i').test(content)) {
+    if (new RegExp(`!\\s*(?:body|data|input|payload)\\.${escapeRegExp(name)}\\b(?!\\s*\\()|(?:body|data|input|payload)\\.${escapeRegExp(name)}\\.trim\\s*\\(\\s*\\)`, 'i').test(content)) {
       add(name, 'required_guard');
+    }
+  }
+  for (const match of String(content || '').matchAll(/\bisBlank\s*\(\s*(?:body|data|input|payload)\.([A-Za-z_][\w]*)\s*\(\s*\)\s*\)/g)) {
+    add(match[1], 'java_record_required_blank_guard');
+  }
+  for (const match of String(content || '').matchAll(/\b(?:body|data|input|payload)\.([A-Za-z_][\w]*)\s*\(\s*\)\s*\.isBlank\s*\(\s*\)/g)) {
+    const name = match[1];
+    if (new RegExp(`(?:body|data|input|payload)\\.${escapeRegExp(name)}\\s*\\(\\s*\\)\\s*==\\s*null`, 'i').test(content)) {
+      add(name, 'java_record_required_blank_guard');
     }
   }
 
@@ -443,10 +562,28 @@ function sourceSuggestsAdminOnly(content, endpointPath) {
     || /(^|\/)admin(\/|$)/i.test(endpointPath);
 }
 
+function allowedPositiveRolesForEndpoint(content, endpointPath) {
+  if (sourceSuggestsAdminOnly(content, endpointPath)) return ['admin'];
+  return ['member', 'user', 'admin'];
+}
+
+function allowedPositiveRolesForRoute(route) {
+  return /(^|\/)admin(\/|$)/i.test(normalizeRoute(route)) ? ['admin'] : ['member', 'user', 'admin'];
+}
+
+function endpointIsPublicAuthAction(endpoint = {}) {
+  const method = normalizeMethod(endpoint.method);
+  const endpointPath = normalizeRoute(endpoint.path || '/');
+  return method === 'POST' && /^\/api\/auth\/(?:login|register|signup|logout|signout)$/i.test(endpointPath);
+}
+
 function endpointRequiresAuth(endpoint = {}, content = '') {
-  if (endpoint.requiresAuth === true || endpoint.authRequired === true || endpoint.protected === true) return true;
+  if (endpointIsPublicAuthAction(endpoint)) return false;
   if (sourceSuggestsAdminOnly(content, endpoint.path || '/')) return true;
-  return /requireAuth|getServerSession|auth\s*\(|currentUser|401|unauthorized|forbidden|403|requireRole|hasRole/i.test(content);
+  if (/requireAuth|requireMutator|requireMember|requireViewer|requireUser|AuthRequired\.(?:requireAuth|requireMutator|requireMember|requireViewer)|getServerSession|auth\s*\(|currentUser|401|unauthorized|forbidden|403|requireRole|hasRole|preHandler\s*:\s*require/i.test(content)) return true;
+  if (endpoint.requiresAuth === true && normalizeMethod(endpoint.method) !== 'GET') return true;
+  if (!content && (endpoint.requiresAuth === true || endpoint.authRequired === true || endpoint.protected === true)) return true;
+  return false;
 }
 
 function buildPayloadFieldList(requiredFields) {
@@ -473,6 +610,7 @@ function extractQaContracts({ projectPath, context = {}, readFile } = {}) {
     ...((context.routes || []).map(pageRouteFromEntry)),
   ].filter(Boolean);
   for (const route of uniq(knownPageRoutes).slice(0, 40)) {
+    if (/\.(?:d\.ts|map|json)$/i.test(route)) continue;
     const requiresAuth = routeRequiresAuth(route, pages);
     const id = contractId(['qac', 'a11y', route]);
     a11yContracts.push({
@@ -493,13 +631,21 @@ function extractQaContracts({ projectPath, context = {}, readFile } = {}) {
     const sourceContent = readSource(projectPath, sourceFile, readFile);
     const content = extractEndpointSource(sourceContent, endpoint);
     if (!content) continue;
-    const endpointPath = normalizeRoute(endpoint.path || '/');
+    const endpointPath = canonicalEndpointPath(endpoint, content);
+    const requiresAuth = endpointRequiresAuth({ ...endpoint, path: endpointPath }, content);
 
     if (method === 'GET') {
       if (endpointPath === '/') continue;
       for (const queryParam of extractQueryParams(content)) {
         let filterEvidence = null;
-        if (sourceProvesEqualityFilter(content, queryParam)) {
+        let operator = 'equals';
+        if (sourceProvesContainsFilter(content, queryParam)) {
+          filterEvidence = {
+            sourceFile,
+            responseField: inferResponseFieldFromSource(content, queryParam),
+          };
+          operator = 'contains';
+        } else if (sourceProvesEqualityFilter(content, queryParam)) {
           filterEvidence = {
             sourceFile,
             responseField: inferResponseFieldFromSource(content, queryParam),
@@ -524,10 +670,10 @@ function extractQaContracts({ projectPath, context = {}, readFile } = {}) {
           path: endpointPath,
           queryParam,
           responseField,
-          operator: 'equals',
+          operator,
           sourceFile: filterEvidence.sourceFile || sourceFile,
-          requiresAuth: Boolean(endpoint.requiresAuth || endpoint.authRequired),
-          runnable: !Boolean(endpoint.requiresAuth || endpoint.authRequired),
+          requiresAuth,
+          runnable: !requiresAuth,
           marker: `[QAC:${id}]`,
         });
       }
@@ -542,10 +688,10 @@ function extractQaContracts({ projectPath, context = {}, readFile } = {}) {
         explicitStatuses.length === 0
       );
       deleteStatusContracts.push({
-        id: contractId(['qac', 'delete-status', method, endpoint.path]),
+        id: contractId(['qac', 'delete-status', method, endpointPath]),
         type: 'delete_status',
         method,
-        path: endpoint.path || '/',
+        path: endpointPath,
         sourceFile,
         explicitStatuses,
         noBody,
@@ -553,14 +699,14 @@ function extractQaContracts({ projectPath, context = {}, readFile } = {}) {
         advisory,
         requiresConfirmation: advisory,
         runnable: false,
-        marker: `[QAC:${contractId(['qac', 'delete-status', method, endpoint.path])}]`,
+        marker: `[QAC:${contractId(['qac', 'delete-status', method, endpointPath])}]`,
         question: advisory
-          ? `DELETE ${endpoint.path || '/'} appears to return no body. Should Healix expect HTTP 204, or is ${explicitStatuses.join('/') || 'the implicit default status'} intentional?`
+          ? `DELETE ${endpointPath} appears to return no body. Should Healix expect HTTP 204, or is ${explicitStatuses.join('/') || 'the implicit default status'} intentional?`
           : null,
       });
     }
 
-    const requiredFields = extractRequiredStringFieldsFromSource(`${content}\n${sourceContent}`);
+    const requiredFields = extractRequiredStringFieldsFromSource(content);
     if (endpointLooksLikeCreate(method, endpointPath, content) && requiredFields.length > 0) {
       const statusPolicy = expectedCreateStatusFromSource(content);
       const id = contractId(['qac', 'post-status', method, endpointPath]);
@@ -574,13 +720,14 @@ function extractQaContracts({ projectPath, context = {}, readFile } = {}) {
         expectedStatuses: statusPolicy.expectedStatuses,
         explicitStatuses: statusPolicy.explicitStatuses,
         reason: statusPolicy.reason || 'explicit_or_inferred_create_status',
-        requiresAuth: endpointRequiresAuth(endpoint, content),
-        runnable: !endpointRequiresAuth(endpoint, content),
+        requiresAuth,
+        allowedRoles: requiresAuth ? allowedPositiveRolesForEndpoint(content, endpointPath) : [],
+        runnable: !requiresAuth,
         marker: `[QAC:${id}]`,
       });
     }
 
-    if (['POST', 'PUT', 'PATCH'].includes(method) && requiredFields.length > 0) {
+    if (method === 'POST' && requiredFields.length > 0) {
       const id = contractId(['qac', 'boundary-validation', method, endpointPath]);
       boundaryValidationContracts.push({
         id,
@@ -591,13 +738,14 @@ function extractQaContracts({ projectPath, context = {}, readFile } = {}) {
         requiredFields: buildPayloadFieldList(requiredFields),
         invalidCases: ['missing', 'empty_string', 'whitespace', 'null'],
         expectedStatuses: [400, 422],
-        requiresAuth: endpointRequiresAuth(endpoint, content),
-        runnable: !endpointRequiresAuth(endpoint, content),
+        requiresAuth,
+        allowedRoles: requiresAuth ? allowedPositiveRolesForEndpoint(content, endpointPath) : [],
+        runnable: !requiresAuth,
         marker: `[QAC:${id}]`,
       });
     }
 
-    if (endpointRequiresAuth(endpoint, content)) {
+    if (requiresAuth) {
       const adminOnly = sourceSuggestsAdminOnly(content, endpointPath);
       const id = contractId(['qac', 'rbac', method, endpointPath]);
       rbacContracts.push({
@@ -644,6 +792,7 @@ function extractQaContracts({ projectPath, context = {}, readFile } = {}) {
       submitButtons: form.submitButtons || [],
       selectorHints: form.selectorHints || [],
       requiresAuth,
+      allowedRoles: requiresAuth ? allowedPositiveRolesForRoute(route) : [],
       requiresConcreteRoute,
       runnable: !requiresAuth && !requiresConcreteRoute,
       marker: `[QAC:${id}]`,
@@ -792,6 +941,56 @@ function buildPayload(fields: string[], overrides: Record<string, unknown> = {})
   return payload;
 }
 
+function pathNeedsSample(pathname: string): boolean {
+  return /(?:\\{[^}]+\\}|:[A-Za-z_][\\w-]*)/.test(pathname);
+}
+
+function fillDynamicPath(pathname: string, value: string | number): string {
+  return pathname
+    .replace(/\\{[^}]+\\}/, encodeURIComponent(String(value)))
+    .replace(/:[A-Za-z_][\\w-]*/, encodeURIComponent(String(value)));
+}
+
+function collectionPathForDynamic(pathname: string): string {
+  return pathname
+    .replace(/(?:\\/\\{[^}]+\\}|\\/:[A-Za-z_][\\w-]*)(?:\\/.*)?$/, '') || '/';
+}
+
+function sampleIdFromRows(rows: any[]): string | number | null {
+  for (const row of rows) {
+    if (!row || typeof row !== 'object') continue;
+    for (const key of ['id', '_id', 'uuid', 'slug', 'issueId', 'projectSlug']) {
+      const value = row[key];
+      if (value !== undefined && value !== null && String(value).length > 0) return value as string | number;
+    }
+  }
+  return null;
+}
+
+async function resolveApiPathFromRequest(request: any, pathname: string): Promise<string | null> {
+  if (!pathNeedsSample(pathname)) return pathname;
+  const collectionPath = collectionPathForDynamic(pathname);
+  const response = await request.get(collectionPath);
+  if (!response.ok()) return null;
+  const rows = extractRows(await response.json());
+  const sample = sampleIdFromRows(rows);
+  return sample === null ? null : fillDynamicPath(pathname, sample);
+}
+
+async function resolveApiPathFromPage(page: any, pathname: string): Promise<string | null> {
+  if (!pathNeedsSample(pathname)) return pathname;
+  const collectionPath = collectionPathForDynamic(pathname);
+  const result = await page.evaluate(async ({ path }) => {
+    const response = await fetch(path, { credentials: 'include' });
+    let body: unknown = null;
+    try { body = await response.json(); } catch {}
+    return { ok: response.ok, body };
+  }, { path: collectionPath });
+  if (!result.ok) return null;
+  const sample = sampleIdFromRows(extractRows(result.body));
+  return sample === null ? null : fillDynamicPath(pathname, sample);
+}
+
 async function apiFetchFromPage(page: any, path: string, options: { method?: string; body?: unknown } = {}) {
   return page.evaluate(async ({ path: innerPath, options: innerOptions }) => {
     const response = await fetch(innerPath, {
@@ -811,7 +1010,11 @@ function buildFilterContractTests(contracts) {
   if (contracts.length === 0) return '';
   return `
 test.describe('Healix QA filter contracts', () => {
-${contracts.map((contract) => `  test('${contract.marker} [CAT:api_contract] ${contract.method} ${contract.path} enforces ${contract.queryParam} filter', async ({ request }) => {
+${contracts.map((contract) => {
+  const assertion = contract.operator === 'contains'
+    ? `expect(String(row[${JSON.stringify(contract.responseField)}]).toLowerCase(), \`row must contain ${contract.responseField}~=\${value}\`).toContain(value.toLowerCase());`
+    : `expect(String(row[${JSON.stringify(contract.responseField)}]), \`row must satisfy ${contract.responseField}=\${value}\`).toBe(value);`;
+  return `  test('${contract.marker} [CAT:api_contract] ${contract.method} ${contract.path} enforces ${contract.queryParam} filter', async ({ request }) => {
     // [SRC:${contract.sourceFile || 'unknown'}] Source maps query param "${contract.queryParam}" to response field "${contract.responseField}".
     const listResponse = await request.get(${JSON.stringify(contract.path)});
     expect(listResponse.ok(), 'unfiltered list endpoint should be reachable').toBeTruthy();
@@ -825,9 +1028,10 @@ ${contracts.map((contract) => `  test('${contract.marker} [CAT:api_contract] ${c
     const filteredRows = extractRows(await filteredResponse.json());
     expect(filteredRows.length, 'filtering by an existing value should return at least one row').toBeGreaterThan(0);
     for (const row of filteredRows) {
-      expect(String(row[${JSON.stringify(contract.responseField)}]), \`row must satisfy ${contract.responseField}=\${value}\`).toBe(value);
+      ${assertion}
     }
-  });`).join('\n\n')}
+  });`;
+}).join('\n\n')}
 });
 `;
 }
@@ -862,34 +1066,88 @@ ${contracts.map((contract) => {
 `;
 }
 
-function buildStatusContractTests(contracts) {
+function preferredPositiveRoleForContract(contract, roles = []) {
+  if (!contract?.requiresAuth) return null;
+  const verified = (roles || [])
+    .filter((role) => role && role.loginVerified && role.storageStatePath)
+    .map((role) => normalizeRoleName(role.role || role.name || 'user'));
+  const allowed = (Array.isArray(contract.allowedRoles) && contract.allowedRoles.length > 0
+    ? contract.allowedRoles
+    : ['member', 'user', 'admin'])
+    .map(normalizeRoleName);
+  const candidates = allowed.filter((role) => verified.includes(role));
+  const preference = ['member', 'user', 'admin'];
+  return candidates.sort((a, b) => {
+    const ai = preference.includes(a) ? preference.indexOf(a) : preference.length;
+    const bi = preference.includes(b) ? preference.indexOf(b) : preference.length;
+    return ai - bi;
+  })[0] || null;
+}
+
+function buildStatusContractTests(contracts, roles = []) {
   if (contracts.length === 0) return '';
   return `
 test.describe('Healix QA HTTP status contracts', () => {
 ${contracts.map((contract) => {
   const fields = (contract.requiredFields || []).map((field) => field.name).filter(Boolean);
-  return `  test('${contract.marker} [CAT:api_contract] ${contract.method} ${contract.path} returns create status ${contract.expectedStatuses.join('/')}', async ({ request }) => {
+  const authPrefix = contract.requiresAuth ? '@auth @tierB ' : '';
+  const fixtureName = contract.requiresAuth ? 'page' : 'request';
+  const targetRole = preferredPositiveRoleForContract(contract, roles);
+  const resolverCall = contract.requiresAuth
+    ? `resolveApiPathFromPage(page, ${JSON.stringify(contract.path)})`
+    : `resolveApiPathFromRequest(request, ${JSON.stringify(contract.path)})`;
+  const executor = contract.requiresAuth
+    ? `apiFetchFromPage(page, concretePath, { method: ${JSON.stringify(contract.method)}, body: payload })`
+    : `request.${String(contract.method).toLowerCase()}(concretePath, { data: payload })`;
+  const statusExpr = contract.requiresAuth ? 'response.status' : 'response.status()';
+  return `  test('${authPrefix}${contract.marker} [CAT:api_contract] ${contract.method} ${contract.path} returns create status ${contract.expectedStatuses.join('/')}', async ({ ${fixtureName} }${contract.requiresAuth ? ', testInfo' : ''}) => {
     // [SRC:${contract.sourceFile || 'unknown'}] ${contract.reason || 'Create endpoint status consistency'}.
     const payload = buildPayload(${JSON.stringify(fields)});
     test.skip(Object.keys(payload).length === 0, 'No source-derived valid payload available for status contract.');
-    const response = await request.${String(contract.method).toLowerCase()}(${JSON.stringify(contract.path)}, { data: payload });
-    expect(${JSON.stringify(contract.expectedStatuses)}, 'create endpoint should return a create/accepted status, not a generic success status').toContain(response.status());
+    ${contract.requiresAuth ? `const roleMatch = testInfo.project.name.match(/^tierB-auth-(.+)$/);
+    const role = roleMatch ? roleMatch[1].toLowerCase() : ${JSON.stringify(targetRole || '')};
+    const targetRole = ${JSON.stringify(targetRole || '')};
+    test.skip(!targetRole, 'No verified mutating role is available for this authenticated status contract.');
+    test.skip(role !== targetRole, \`Status contract runs once with mutating role ${'${'}targetRole}; role ${'${'}role} is covered by RBAC.\`);` : ''}
+    ${contract.requiresAuth ? "await page.goto('/');" : ''}
+    const concretePath = await ${resolverCall};
+    test.skip(!concretePath, 'No live fixture row available for dynamic status endpoint.');
+    const response = await ${executor};
+    expect(${JSON.stringify(contract.expectedStatuses)}, 'create endpoint should return a create/accepted status, not a generic success status').toContain(${statusExpr});
   });`;
 }).join('\n\n')}
 });
 `;
 }
 
-function buildBoundaryContractTests(contracts) {
+function buildBoundaryContractTests(contracts, roles = []) {
   if (contracts.length === 0) return '';
   return `
 test.describe('Healix QA boundary validation contracts', () => {
 ${contracts.map((contract) => {
   const fields = (contract.requiredFields || []).map((field) => field.name).filter(Boolean);
-  return `  test('${contract.marker} [CAT:api_negative] ${contract.method} ${contract.path} rejects required-string boundary values', async ({ request }) => {
+  const authPrefix = contract.requiresAuth ? '@auth @tierB ' : '';
+  const fixtureName = contract.requiresAuth ? 'page' : 'request';
+  const targetRole = preferredPositiveRoleForContract(contract, roles);
+  const resolverCall = contract.requiresAuth
+    ? `resolveApiPathFromPage(page, ${JSON.stringify(contract.path)})`
+    : `resolveApiPathFromRequest(request, ${JSON.stringify(contract.path)})`;
+  const executor = contract.requiresAuth
+    ? `apiFetchFromPage(page, concretePath, { method: ${JSON.stringify(contract.method)}, body: payload })`
+    : `request.${String(contract.method).toLowerCase()}(concretePath, { data: payload })`;
+  const statusExpr = contract.requiresAuth ? 'response.status' : 'response.status()';
+  return `  test('${authPrefix}${contract.marker} [CAT:api_negative] ${contract.method} ${contract.path} rejects required-string boundary values', async ({ ${fixtureName} }${contract.requiresAuth ? ', testInfo' : ''}) => {
     // [SRC:${contract.sourceFile || 'unknown'}] Required fields: ${fields.join(', ')}.
     const requiredFields = ${JSON.stringify(fields)};
     test.skip(requiredFields.length === 0, 'No source-derived required string fields available for boundary validation.');
+    ${contract.requiresAuth ? `const roleMatch = testInfo.project.name.match(/^tierB-auth-(.+)$/);
+    const role = roleMatch ? roleMatch[1].toLowerCase() : ${JSON.stringify(targetRole || '')};
+    const targetRole = ${JSON.stringify(targetRole || '')};
+    test.skip(!targetRole, 'No verified mutating role is available for this authenticated boundary contract.');
+    test.skip(role !== targetRole, \`Boundary contract runs once with mutating role ${'${'}targetRole}; role ${'${'}role} is covered by RBAC.\`);` : ''}
+    ${contract.requiresAuth ? "await page.goto('/');" : ''}
+    const concretePath = await ${resolverCall};
+    test.skip(!concretePath, 'No live fixture row available for dynamic boundary-validation endpoint.');
     for (const field of requiredFields) {
       const cases: Record<string, unknown> = {
         missing: undefined,
@@ -901,8 +1159,8 @@ ${contracts.map((contract) => {
         const overrides = value === undefined ? {} : { [field]: value };
         const payload = buildPayload(requiredFields, overrides);
         if (value === undefined) delete payload[field];
-        const response = await request.${String(contract.method).toLowerCase()}(${JSON.stringify(contract.path)}, { data: payload });
-        expect(${JSON.stringify(contract.expectedStatuses || [400, 422])}, \`required field ${'${'}field} must reject ${'${'}caseName}\`).toContain(response.status());
+        const response = await ${executor};
+        expect(${JSON.stringify(contract.expectedStatuses || [400, 422])}, \`required field ${'${'}field} must reject ${'${'}caseName}\`).toContain(${statusExpr});
       }
     }
   });`;
@@ -921,10 +1179,14 @@ test.describe('Healix QA RBAC contracts', () => {
 ${contracts.map((contract) => {
   const fields = (contract.requiredFields || []).map((field) => field.name).filter(Boolean);
   const expectedByRole = contract.expectedRoleStatuses || {};
+  const method = String(contract.method).toUpperCase();
+  const unsafePositiveRoleCheck = method !== 'GET';
   return `  test('${contract.marker} [CAT:api_auth] anonymous ${contract.method} ${contract.path} is denied by RBAC', async ({ request }) => {
     // [SRC:${contract.sourceFile || 'unknown'}] Anonymous access must not reach protected endpoint.
     const payload = buildPayload(${JSON.stringify(fields)});
-    const response = await request.${String(contract.method).toLowerCase()}(${JSON.stringify(contract.path)}, ${['POST', 'PUT', 'PATCH'].includes(contract.method) ? '{ data: payload }' : '{}'});
+    const concretePath = await resolveApiPathFromRequest(request, ${JSON.stringify(contract.path)});
+    test.skip(!concretePath, 'No live fixture row available for dynamic anonymous RBAC endpoint.');
+    const response = await request.${String(contract.method).toLowerCase()}(concretePath, ${['POST', 'PUT', 'PATCH'].includes(contract.method) ? '{ data: payload }' : '{}'});
     expect(${JSON.stringify(contract.expectedAnonymousStatuses || [401, 403])}, 'anonymous protected-endpoint request must be rejected').toContain(response.status());
   });
 
@@ -934,9 +1196,12 @@ ${contracts.map((contract) => {
     const role = roleMatch ? roleMatch[1] : ${JSON.stringify(verifiedRoles[0] || 'user')};
     const expectedByRole: Record<string, Array<number | string>> = ${JSON.stringify(expectedByRole)};
     const expected = (expectedByRole[role] || expectedByRole[role.toLowerCase()] || expectedByRole.user || [403]).map(Number);
+    test.skip(${unsafePositiveRoleCheck} && expected.some((status) => status >= 200 && status < 300), 'Healix avoids mutating RBAC success probes without a safe create/delete fixture.');
     await page.goto('/');
+    const concretePath = await resolveApiPathFromPage(page, ${JSON.stringify(contract.path)});
+    test.skip(!concretePath, 'No live fixture row available for dynamic RBAC endpoint.');
     const payload = buildPayload(${JSON.stringify(fields)});
-    const result = await apiFetchFromPage(page, ${JSON.stringify(contract.path)}, { method: ${JSON.stringify(contract.method)}, body: ${['POST', 'PUT', 'PATCH'].includes(contract.method) ? 'payload' : 'undefined'} });
+    const result = await apiFetchFromPage(page, concretePath, { method: ${JSON.stringify(contract.method)}, body: ${['POST', 'PUT', 'PATCH'].includes(contract.method) ? 'payload' : 'undefined'} });
     expect(expected, \`role ${'${'}role} must match RBAC matrix for ${contract.method} ${contract.path}\`).toContain(result.status);
   });`;
 }).join('\n\n')}
@@ -944,14 +1209,20 @@ ${contracts.map((contract) => {
 `;
 }
 
-function buildFormContractTests(contracts, verifiedRoleCount) {
+function buildFormContractTests(contracts, roles = []) {
   if (contracts.length === 0) return '';
   return `
 test.describe('Healix QA form validation contracts', () => {
 ${contracts.map((contract) => {
-  const authPrefix = contract.requiresAuth && verifiedRoleCount > 0 ? '@auth @tierB ' : '';
-  return `  test('${authPrefix}${contract.marker} [CAT:form_validation] ${contract.route} requires accessible inline validation', async ({ page }) => {
+  const targetRole = preferredPositiveRoleForContract(contract, roles);
+  const authPrefix = contract.requiresAuth ? '@auth @tierB ' : '';
+  return `  test('${authPrefix}${contract.marker} [CAT:form_validation] ${contract.route} requires accessible inline validation', async ({ page }${contract.requiresAuth ? ', testInfo' : ''}) => {
     // [SRC:${contract.sourceFile || 'unknown'}] Required fields: ${contract.requiredFields.map((field) => field.name).join(', ')}.
+    ${contract.requiresAuth ? `const roleMatch = testInfo.project.name.match(/^tierB-auth-(.+)$/);
+    const role = roleMatch ? roleMatch[1].toLowerCase() : ${JSON.stringify(targetRole || '')};
+    const targetRole = ${JSON.stringify(targetRole || '')};
+    test.skip(!targetRole, 'No verified role is available for this authenticated form-validation contract.');
+    test.skip(role !== targetRole, \`Form validation contract runs once with role ${'${'}targetRole}; role ${'${'}role} is covered by RBAC/access checks.\`);` : ''}
     await page.goto(${JSON.stringify(contract.route || '/')});
     const form = page.locator('form').first();
     await expect(form, 'source-declared form should render').toBeVisible();
@@ -994,10 +1265,10 @@ import { test, expect } from '@playwright/test';
 
 ${buildContractRuntimeHelpers()}
 ${buildFilterContractTests(filterContracts)}
-${buildFormContractTests(formContracts, verifiedRoleCount)}
+${buildFormContractTests(formContracts, roles)}
 ${buildA11yContractTests(a11yContracts, verifiedRoleCount)}
-${buildStatusContractTests(statusContracts)}
-${buildBoundaryContractTests(boundaryContracts)}
+${buildStatusContractTests(statusContracts, roles)}
+${buildBoundaryContractTests(boundaryContracts, roles)}
 ${buildRbacContractTests(rbacContracts, roles)}
 `;
   return {
