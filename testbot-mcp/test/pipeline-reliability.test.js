@@ -458,6 +458,54 @@ test('deterministic QA contract spec uses live property checks and accessible fo
   assert.match(spec.content, /\[role="alert"\], \[aria-invalid="true"\]/);
   assert.match(spec.content, /requestSubmit\(\)/);
   assert.doesNotMatch(spec.content, /checkValidity\(/);
+  assert.doesNotMatch(spec.content, /\$\{separator\}|\$\{encodeURIComponent|healix\.local/);
+});
+
+test('Tier-0 QA contracts generate a11y status boundary and RBAC invariants', () => {
+  withTempProject((projectPath) => {
+    fs.mkdirSync(path.join(projectPath, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(projectPath, 'src', 'routes.ts'), `
+      app.post('/api/issues', (req, res) => {
+        const { title, body } = req.body;
+        if (!title || !title.trim()) return res.status(400).json({ error: 'missing_title' });
+        res.status(200).json({ id: 'issue-1', title });
+      });
+
+      app.get('/api/admin/users', requireAdmin, (req, res) => {
+        res.json([{ email: 'admin@example.test' }]);
+      });
+    `);
+
+    const qaContracts = extractQaContracts({
+      projectPath,
+      context: {
+        apiEndpoints: [
+          { method: 'POST', path: '/api/issues', source: 'src/routes.ts' },
+          { method: 'GET', path: '/api/admin/users', source: 'src/routes.ts', requiresAuth: true },
+        ],
+        pages: [{ path: '/projects/polished-mobile', sourceFile: 'src/App.tsx', requiresAuth: false }],
+        forms: [],
+      },
+    });
+
+    assert.equal(qaContracts.a11yContracts.length, 1);
+    assert.equal(qaContracts.statusCodeContracts.length, 1);
+    assert.equal(qaContracts.boundaryValidationContracts.length, 1);
+    assert.equal(qaContracts.rbacContracts.length, 1);
+    assert.deepEqual(qaContracts.statusCodeContracts[0].expectedStatuses, [201, 202]);
+
+    const spec = buildQaContractSpec({
+      qaContracts,
+      roles: [{ role: 'viewer', loginVerified: true, storageStatePath: path.join(projectPath, '.healix', 'viewer.json') }],
+      testType: 'both',
+    });
+    assert.match(spec.content, /\[CAT:a11y\]/);
+    assert.match(spec.content, /\[CAT:api_contract\].*returns create status 201\/202/);
+    assert.match(spec.content, /\[CAT:api_negative\].*rejects required-string boundary values/);
+    assert.match(spec.content, /\[CAT:api_auth\].*role matrix/);
+    assert.match(spec.content, /buildUrl\(pathname/);
+    assert.doesNotMatch(spec.content, /\$\{separator\}|projectSlug=\$\{encodeURIComponent|healix\.local/);
+  });
 });
 
 test('QA form contracts require concrete URLs for dynamic Next routes', () => {
@@ -547,7 +595,7 @@ test('QA form contracts map shared React Router files by route component', async
   });
 });
 
-test('quality audit requires runnable QA filter and form contracts to be covered', () => {
+test('quality audit requires runnable QA filter form and a11y contracts to be covered', () => {
   withGeneratedSuite(`
     import { test, expect } from '@playwright/test';
     test('[SRC:src/App.tsx] source-grounded smoke', async ({ page }) => {
@@ -598,7 +646,7 @@ test('quality audit requires runnable QA filter and form contracts to be covered
       testType: 'both',
     });
     assert.equal(pack.written, true);
-    assert.equal(pack.generatedTests, 2);
+    assert.equal(pack.generatedTests, 3);
 
     const coveredAudit = auditQaContractCoverage({
       context: { qaContracts },
@@ -953,6 +1001,28 @@ test('counts runnable declarations separately from skipped declarations and runt
 
   assert.equal(countTestsInContent(content), 3);
   assert.equal(countSkippedTestsInContent(content), 2);
+});
+
+test('deterministic QA contract runtime skip guards do not fail runnable-ratio quality gate', () => {
+  withTempProject((projectPath) => {
+    const generatedDir = path.join(projectPath, 'tests', 'generated');
+    fs.mkdirSync(generatedDir, { recursive: true });
+    fs.writeFileSync(path.join(generatedDir, 'healix-qa-contracts.spec.ts'), `
+      import { test, expect } from '@playwright/test';
+      ${Array.from({ length: 4 }, (_, index) => `
+      test('[QAC:contract-${index}] [CAT:api_contract] runtime guarded contract ${index}', async ({ request }) => {
+        const response = await request.get('/api/items');
+        test.skip(response.status() === 404, 'route unavailable in this environment');
+        expect([200, 404]).toContain(response.status());
+      });`).join('\n')}
+    `);
+
+    const quality = collectGenerationQuality(projectPath, { baseURL: 'http://127.0.0.1:3000' });
+    assert.equal(quality.totalTests, 4);
+    assert.equal(quality.skippedTests, 0);
+    assert.equal(quality.runnableTests, 4);
+    assert.equal(quality.runnableRatio, 1);
+  });
 });
 
 test('exploration fallback synthesizes source-grounded route context when browser exploration is empty', () => {
@@ -3176,6 +3246,45 @@ test('report generator records triage metadata without empty AI summary', async 
     assert.equal(report.aiSummary, null);
     assert.equal(report.metadata.aiTriage.aiTriageStatus, 'skipped_deterministic');
     assert.equal(report.aiTriage.deterministicVerdicts, 1);
+    assert.deepEqual(report.qaFindings, []);
+  } finally {
+    fs.rmSync(projectPath, { recursive: true, force: true });
+  }
+});
+
+test('report generator only persists deterministic or classifier-confirmed app findings', async () => {
+  const projectPath = fs.mkdtempSync(path.join(os.tmpdir(), 'healix-report-findings-'));
+  try {
+    const reportGen = new ReportGenerator();
+    const generated = await reportGen.generate({
+      projectPath,
+      projectName: 'findings-app',
+      runId: 'findings-report',
+      testResults: {
+        total: 3,
+        passed: 0,
+        failed: 3,
+        skipped: 0,
+        duration: 10,
+        tests: [
+          { title: '[QAC:a11y-home] icon button has an accessible name', status: 'failed', file: 'tests/generated/healix-qa-contracts.spec.ts', error: 'missing accessible name' },
+          { title: 'AI workflow failed but untriaged', status: 'failed', file: 'tests/generated/workflow.spec.ts', error: 'locator mismatch' },
+          { title: 'AI API check found app bug', status: 'failed', file: 'tests/generated/api.spec.ts', error: 'expected 201 received 200' },
+        ],
+        failures: [],
+      },
+      classifierVerdicts: [
+        { testName: 'AI API check found app bug', verdict: 'app_is_wrong', reason: 'Source requires 201' },
+      ],
+    });
+    const report = JSON.parse(fs.readFileSync(generated.path, 'utf-8'));
+
+    assert.equal(report.qaFindings.length, 2);
+    assert.equal(report.findingSummary.total, 2);
+    assert.equal(report.findingSummary.status, 'completed_with_findings');
+    assert.ok(report.qaFindings.some((finding) => finding.findingType === 'deterministic_contract'));
+    assert.ok(report.qaFindings.some((finding) => finding.findingType === 'app_is_wrong'));
+    assert.ok(!report.qaFindings.some((finding) => finding.testTitle === 'AI workflow failed but untriaged'));
   } finally {
     fs.rmSync(projectPath, { recursive: true, force: true });
   }

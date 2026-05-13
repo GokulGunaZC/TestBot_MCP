@@ -279,6 +279,32 @@ function normalizeRoute(route) {
   return withSlash.replace(/\/+$/, '') || '/';
 }
 
+function normalizeRoleName(value) {
+  return String(value || 'user')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, '-')
+    .replace(/^-+|-+$/g, '') || 'user';
+}
+
+function routeRequiresAuth(route, pages = []) {
+  const normalized = normalizeRoute(route);
+  const matchingPage = (pages || []).find((page) => page?.path && normalizeRoute(page.path) === normalized);
+  if (matchingPage?.requiresAuth === true || matchingPage?.authRequired === true || matchingPage?.protected === true) return true;
+  if (matchingPage?.requiresAuth === false || matchingPage?.authRequired === false || matchingPage?.protected === false) return false;
+  if (/(^|\/)(login|log-in|signin|sign-in|register|signup|sign-up)(\/|$)/i.test(normalized)) return false;
+  return /(^|\/)(admin|account|dashboard|settings|profile|checkout)(\/|$)/i.test(normalized);
+}
+
+function pageRouteFromEntry(entry) {
+  if (!entry) return null;
+  const candidate = entry.path || entry.route || entry.url;
+  if (!candidate || !String(candidate).startsWith('/')) return null;
+  const normalized = normalizeRoute(candidate);
+  if (routeHasDynamicSegment(normalized)) return null;
+  return normalized;
+}
+
 function applySourceRouteBase(route, file) {
   const normalizedRoute = normalizeRoute(route);
   const base = sourceSuggestsRouteBase(file);
@@ -363,6 +389,73 @@ function formRequiresAuth(form, pages = []) {
   return /(^|\/)(admin|account|dashboard|settings|profile|checkout)(\/|$)/i.test(route);
 }
 
+function extractRequiredStringFieldsFromSource(content) {
+  const fields = new Map();
+  const add = (name, reason = 'required') => {
+    const key = String(name || '').trim();
+    if (!key || /^(req|res|request|response|ctx|context|body|data|input|payload)$/i.test(key)) return;
+    fields.set(key, { name: key, type: 'string', reason });
+  };
+
+  for (const match of String(content || '').matchAll(/\b([A-Za-z_][\w]*)\s*:\s*z\.string\s*\(\s*\)(?:\.[\w]+\([^)]*\))*\.(?:min\s*\(\s*1|nonempty\s*\()/g)) {
+    add(match[1], 'zod_required_string');
+  }
+  for (const match of String(content || '').matchAll(/\b([A-Za-z_][\w]*)\s*:\s*yup\.string\s*\(\s*\)(?:\.[\w]+\([^)]*\))*\.required\s*\(/g)) {
+    add(match[1], 'yup_required_string');
+  }
+  for (const match of String(content || '').matchAll(/@(?:NotBlank|NotEmpty)[\s\S]{0,120}?(?:private|public|protected)?\s+String\s+([A-Za-z_][\w]*)/g)) {
+    add(match[1], 'class_validator_required_string');
+  }
+  for (const match of String(content || '').matchAll(/\b(?:const|let|var)\s*\{\s*([^}]{2,300})\s*\}\s*=\s*(?:await\s+)?(?:req|request)?\.?(?:body|json\s*\(\s*\)|parse\s*\()/g)) {
+    for (const part of String(match[1] || '').split(',')) {
+      const name = part.split(':')[0].trim();
+      if (new RegExp(`!\\s*${escapeRegExp(name)}\\b|${escapeRegExp(name)}\\s*==={0,1}\\s*['"\`]\\s*['"\`]|${escapeRegExp(name)}\\.trim\\s*\\(\\s*\\)`, 'i').test(content)) {
+        add(name, 'required_guard');
+      }
+    }
+  }
+  for (const match of String(content || '').matchAll(/\b(?:body|data|input|payload)\.([A-Za-z_][\w]*)\b/g)) {
+    const name = match[1];
+    if (new RegExp(`!\\s*(?:body|data|input|payload)\\.${escapeRegExp(name)}\\b|(?:body|data|input|payload)\\.${escapeRegExp(name)}\\.trim\\s*\\(\\s*\\)`, 'i').test(content)) {
+      add(name, 'required_guard');
+    }
+  }
+
+  return [...fields.values()].slice(0, 12);
+}
+
+function endpointLooksLikeCreate(method, endpointPath, content) {
+  if (normalizeMethod(method) !== 'POST') return false;
+  if (/\/(?:auth\/)?(?:login|signin|sign-in|logout|signout|session|token|refresh)(?:\/|$)/i.test(endpointPath)) return false;
+  return /\b(?:create|insert|save|add|new\s+[A-Z]|\.(?:create|insert|save)\s*\(|201|CREATED|ResponseEntity\.created)\b/i.test(content)
+    || !/\/(?:search|filter|query|export|import)(?:\/|$)/i.test(endpointPath);
+}
+
+function expectedCreateStatusFromSource(content) {
+  const explicitStatuses = extractStatusCodes(content);
+  if (explicitStatuses.some((status) => [201, 202].includes(status))) return { expectedStatuses: [201, 202], explicitStatuses, advisory: false };
+  if (explicitStatuses.some((status) => [200].includes(status))) return { expectedStatuses: [201, 202], explicitStatuses, advisory: false, reason: 'create_endpoint_returns_ok' };
+  return { expectedStatuses: [201, 202], explicitStatuses, advisory: false, reason: 'rest_create_convention' };
+}
+
+function sourceSuggestsAdminOnly(content, endpointPath) {
+  return /requireAdmin|isAdmin|hasRole\s*\(\s*['"`]admin['"`]|role\s*={2,3}\s*['"`]admin['"`]|roles?\.(?:includes|has)\s*\(\s*['"`]admin['"`]/i.test(content)
+    || /(^|\/)admin(\/|$)/i.test(endpointPath);
+}
+
+function endpointRequiresAuth(endpoint = {}, content = '') {
+  if (endpoint.requiresAuth === true || endpoint.authRequired === true || endpoint.protected === true) return true;
+  if (sourceSuggestsAdminOnly(content, endpoint.path || '/')) return true;
+  return /requireAuth|getServerSession|auth\s*\(|currentUser|401|unauthorized|forbidden|403|requireRole|hasRole/i.test(content);
+}
+
+function buildPayloadFieldList(requiredFields) {
+  return (requiredFields || []).map((field) => ({
+    name: field.name,
+    type: field.type || 'string',
+  }));
+}
+
 function extractQaContracts({ projectPath, context = {}, readFile } = {}) {
   const endpoints = Array.isArray(context.apiEndpoints) ? context.apiEndpoints : [];
   const forms = Array.isArray(context.forms) ? context.forms : [];
@@ -370,6 +463,28 @@ function extractQaContracts({ projectPath, context = {}, readFile } = {}) {
   const filterContracts = [];
   const deleteStatusContracts = [];
   const formValidationContracts = [];
+  const a11yContracts = [];
+  const statusCodeContracts = [];
+  const boundaryValidationContracts = [];
+  const rbacContracts = [];
+
+  const knownPageRoutes = [
+    ...pages.map(pageRouteFromEntry),
+    ...((context.routes || []).map(pageRouteFromEntry)),
+  ].filter(Boolean);
+  for (const route of uniq(knownPageRoutes).slice(0, 40)) {
+    const requiresAuth = routeRequiresAuth(route, pages);
+    const id = contractId(['qac', 'a11y', route]);
+    a11yContracts.push({
+      id,
+      type: 'a11y_interactive_name',
+      route,
+      sourceFile: (pages.find((page) => pageRouteFromEntry(page) === route) || {}).sourceFile || null,
+      requiresAuth,
+      runnable: !requiresAuth,
+      marker: `[QAC:${id}]`,
+    });
+  }
 
   for (const endpoint of endpoints) {
     if (!endpoint || endpoint.synthetic === true || endpoint.source === 'healix_fallback') continue;
@@ -378,9 +493,9 @@ function extractQaContracts({ projectPath, context = {}, readFile } = {}) {
     const sourceContent = readSource(projectPath, sourceFile, readFile);
     const content = extractEndpointSource(sourceContent, endpoint);
     if (!content) continue;
+    const endpointPath = normalizeRoute(endpoint.path || '/');
 
     if (method === 'GET') {
-      const endpointPath = normalizeRoute(endpoint.path || '/');
       if (endpointPath === '/') continue;
       for (const queryParam of extractQueryParams(content)) {
         let filterEvidence = null;
@@ -444,6 +559,64 @@ function extractQaContracts({ projectPath, context = {}, readFile } = {}) {
           : null,
       });
     }
+
+    const requiredFields = extractRequiredStringFieldsFromSource(`${content}\n${sourceContent}`);
+    if (endpointLooksLikeCreate(method, endpointPath, content) && requiredFields.length > 0) {
+      const statusPolicy = expectedCreateStatusFromSource(content);
+      const id = contractId(['qac', 'post-status', method, endpointPath]);
+      statusCodeContracts.push({
+        id,
+        type: 'http_status_consistency',
+        method,
+        path: endpointPath,
+        sourceFile,
+        requiredFields: buildPayloadFieldList(requiredFields),
+        expectedStatuses: statusPolicy.expectedStatuses,
+        explicitStatuses: statusPolicy.explicitStatuses,
+        reason: statusPolicy.reason || 'explicit_or_inferred_create_status',
+        requiresAuth: endpointRequiresAuth(endpoint, content),
+        runnable: !endpointRequiresAuth(endpoint, content),
+        marker: `[QAC:${id}]`,
+      });
+    }
+
+    if (['POST', 'PUT', 'PATCH'].includes(method) && requiredFields.length > 0) {
+      const id = contractId(['qac', 'boundary-validation', method, endpointPath]);
+      boundaryValidationContracts.push({
+        id,
+        type: 'boundary_validation',
+        method,
+        path: endpointPath,
+        sourceFile,
+        requiredFields: buildPayloadFieldList(requiredFields),
+        invalidCases: ['missing', 'empty_string', 'whitespace', 'null'],
+        expectedStatuses: [400, 422],
+        requiresAuth: endpointRequiresAuth(endpoint, content),
+        runnable: !endpointRequiresAuth(endpoint, content),
+        marker: `[QAC:${id}]`,
+      });
+    }
+
+    if (endpointRequiresAuth(endpoint, content)) {
+      const adminOnly = sourceSuggestsAdminOnly(content, endpointPath);
+      const id = contractId(['qac', 'rbac', method, endpointPath]);
+      rbacContracts.push({
+        id,
+        type: 'rbac_matrix',
+        method,
+        path: endpointPath,
+        sourceFile,
+        requiredFields: buildPayloadFieldList(requiredFields),
+        expectedAnonymousStatuses: [401, 403],
+        adminOnly,
+        expectedRoleStatuses: adminOnly
+          ? { admin: [200, 201, 202, 204], member: [403], user: [403], viewer: [403] }
+          : { admin: [200, 201, 202, 204], member: [200, 201, 202, 204], user: [200, 201, 202, 204], viewer: ['GET'].includes(method) ? [200] : [403] },
+        runnable: true,
+        requiresAuth: true,
+        marker: `[QAC:${id}]`,
+      });
+    }
   }
 
   for (const form of forms) {
@@ -484,6 +657,10 @@ function extractQaContracts({ projectPath, context = {}, readFile } = {}) {
     filterContracts: filterContracts.slice(0, 50),
     deleteStatusContracts: deleteStatusContracts.slice(0, 50),
     formValidationContracts: formValidationContracts.slice(0, 50),
+    a11yContracts: a11yContracts.slice(0, 40),
+    statusCodeContracts: statusCodeContracts.slice(0, 40),
+    boundaryValidationContracts: boundaryValidationContracts.slice(0, 40),
+    rbacContracts: rbacContracts.slice(0, 40),
   };
   qaContracts.summary = summarizeQaContracts(qaContracts);
   qaContracts.questions = buildQaContractQuestions(qaContracts);
@@ -495,6 +672,10 @@ function summarizeQaContracts(qaContracts = {}) {
     filterContracts: (qaContracts.filterContracts || []).length,
     deleteStatusContracts: (qaContracts.deleteStatusContracts || []).length,
     formValidationContracts: (qaContracts.formValidationContracts || []).length,
+    a11yContracts: (qaContracts.a11yContracts || []).length,
+    statusCodeContracts: (qaContracts.statusCodeContracts || []).length,
+    boundaryValidationContracts: (qaContracts.boundaryValidationContracts || []).length,
+    rbacContracts: (qaContracts.rbacContracts || []).length,
     advisoryQuestions: buildQaContractQuestions(qaContracts).length,
   };
 }
@@ -537,11 +718,22 @@ function runnableQaObligations(qaContracts = {}, roles = []) {
     .filter((contract) => contract.runnable !== false && (!contract.requiresAuth || verifiedRoleCount > 0));
   const forms = (qaContracts.formValidationContracts || [])
     .filter((contract) => !contract.requiresConcreteRoute && (contract.runnable !== false || (contract.requiresAuth && verifiedRoleCount > 0)));
+  const a11y = (qaContracts.a11yContracts || [])
+    .filter((contract) => contract.runnable !== false || (contract.requiresAuth && verifiedRoleCount > 0));
+  const statuses = (qaContracts.statusCodeContracts || [])
+    .filter((contract) => contract.runnable !== false || (contract.requiresAuth && verifiedRoleCount > 0));
+  const boundaries = (qaContracts.boundaryValidationContracts || [])
+    .filter((contract) => contract.runnable !== false || (contract.requiresAuth && verifiedRoleCount > 0));
+  const rbac = (qaContracts.rbacContracts || [])
+    .filter((contract) => contract.runnable !== false);
   const blocked = [
     ...(qaContracts.filterContracts || []).filter((contract) => contract.requiresAuth && verifiedRoleCount === 0),
     ...(qaContracts.formValidationContracts || []).filter((contract) => contract.requiresAuth && verifiedRoleCount === 0),
+    ...(qaContracts.a11yContracts || []).filter((contract) => contract.requiresAuth && verifiedRoleCount === 0),
+    ...(qaContracts.statusCodeContracts || []).filter((contract) => contract.requiresAuth && verifiedRoleCount === 0),
+    ...(qaContracts.boundaryValidationContracts || []).filter((contract) => contract.requiresAuth && verifiedRoleCount === 0),
   ];
-  return { filters, forms, blocked };
+  return { filters, forms, a11y, statuses, boundaries, rbac, blocked };
 }
 
 function extractCoveredQaMarkersFromText(text) {
@@ -565,6 +757,56 @@ function buildResponseRowsHelper() {
 }`;
 }
 
+function buildContractRuntimeHelpers() {
+  return `${buildResponseRowsHelper()}
+
+function buildUrl(pathname: string, params: Record<string, string | number | boolean | null | undefined> = {}): string {
+  const [pathOnly, existingQuery = ''] = String(pathname).split('?');
+  const search = new URLSearchParams(existingQuery);
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== null && value !== undefined) search.set(key, String(value));
+  }
+  const query = search.toString();
+  return query ? pathOnly + '?' + query : pathOnly;
+}
+
+function sampleValueForField(name: string, index = 0): unknown {
+  const lower = name.toLowerCase();
+  if (lower.includes('email')) return 'healix-' + Date.now() + '-' + index + '@example.test';
+  if (lower.includes('password')) return 'HealixPass123!';
+  if (lower.includes('price') || lower.includes('amount') || lower.includes('count') || lower.endsWith('id')) return index + 1;
+  if (lower.includes('date')) return new Date().toISOString();
+  if (lower.includes('status')) return 'open';
+  if (lower.includes('priority')) return 'high';
+  if (lower.includes('role')) return 'member';
+  return 'healix-' + name + '-' + Date.now() + '-' + index;
+}
+
+function buildPayload(fields: string[], overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  const payload: Record<string, unknown> = {};
+  fields.forEach((field, index) => {
+    payload[field] = Object.prototype.hasOwnProperty.call(overrides, field)
+      ? overrides[field]
+      : sampleValueForField(field, index);
+  });
+  return payload;
+}
+
+async function apiFetchFromPage(page: any, path: string, options: { method?: string; body?: unknown } = {}) {
+  return page.evaluate(async ({ path: innerPath, options: innerOptions }) => {
+    const response = await fetch(innerPath, {
+      method: innerOptions.method || 'GET',
+      headers: innerOptions.body === undefined ? undefined : { 'Content-Type': 'application/json' },
+      body: innerOptions.body === undefined ? undefined : JSON.stringify(innerOptions.body),
+      credentials: 'include',
+    });
+    let text = '';
+    try { text = await response.text(); } catch {}
+    return { status: response.status, ok: response.ok, text: text.slice(0, 500) };
+  }, { path, options });
+}`;
+}
+
 function buildFilterContractTests(contracts) {
   if (contracts.length === 0) return '';
   return `
@@ -577,8 +819,8 @@ ${contracts.map((contract) => `  test('${contract.marker} [CAT:api_contract] ${c
     const sample = listRows.find((row) => row && row[${JSON.stringify(contract.responseField)}] !== undefined && row[${JSON.stringify(contract.responseField)}] !== null && String(row[${JSON.stringify(contract.responseField)}]).length > 0);
     test.skip(!sample, 'No live sample row exposes ${contract.responseField}; cannot exercise filter contract deterministically.');
     const value = String(sample[${JSON.stringify(contract.responseField)}]);
-    const separator = ${JSON.stringify(contract.path)}.includes('?') ? '&' : '?';
-    const filteredResponse = await request.get(\`${contract.path}\${separator}${contract.queryParam}=\${encodeURIComponent(value)}\`);
+    const filteredPath = buildUrl(${JSON.stringify(contract.path)}, { ${JSON.stringify(contract.queryParam)}: value });
+    const filteredResponse = await request.get(filteredPath);
     expect(filteredResponse.ok(), 'filtered endpoint should be reachable').toBeTruthy();
     const filteredRows = extractRows(await filteredResponse.json());
     expect(filteredRows.length, 'filtering by an existing value should return at least one row').toBeGreaterThan(0);
@@ -586,6 +828,118 @@ ${contracts.map((contract) => `  test('${contract.marker} [CAT:api_contract] ${c
       expect(String(row[${JSON.stringify(contract.responseField)}]), \`row must satisfy ${contract.responseField}=\${value}\`).toBe(value);
     }
   });`).join('\n\n')}
+});
+`;
+}
+
+function buildA11yContractTests(contracts, verifiedRoleCount) {
+  if (contracts.length === 0) return '';
+  return `
+test.describe('Healix QA a11y contracts', () => {
+${contracts.map((contract) => {
+  const authPrefix = contract.requiresAuth && verifiedRoleCount > 0 ? '@auth @tierB ' : '';
+  return `  test('${authPrefix}${contract.marker} [CAT:a11y] ${contract.route} interactive elements have accessible names', async ({ page }) => {
+    // [SRC:${contract.sourceFile || 'exploration'}] Deterministic accessibility invariant for interactive controls.
+    await page.goto(${JSON.stringify(contract.route || '/')});
+    await page.waitForLoadState('domcontentloaded');
+    const issues = await page.locator('button, a[href], input:not([type="hidden"]), select, textarea, [role="button"], [role="link"], [tabindex]:not([tabindex="-1"])').evaluateAll((elements) => {
+      return elements.slice(0, 150).map((element: Element, index: number) => {
+        const html = element as HTMLElement;
+        const ariaLabel = html.getAttribute('aria-label') || '';
+        const labelledBy = html.getAttribute('aria-labelledby') || '';
+        const title = html.getAttribute('title') || '';
+        const alt = html.getAttribute('alt') || '';
+        const value = html.getAttribute('value') || '';
+        const text = (html.innerText || html.textContent || '').replace(/\\s+/g, ' ').trim();
+        const hasName = Boolean((ariaLabel || labelledBy || title || alt || value || text).trim());
+        return hasName ? null : { index, tag: html.tagName.toLowerCase(), role: html.getAttribute('role'), testId: html.getAttribute('data-testid') };
+      }).filter(Boolean);
+    });
+    expect(issues, 'every interactive element must expose an accessible name').toEqual([]);
+  });`;
+}).join('\n\n')}
+});
+`;
+}
+
+function buildStatusContractTests(contracts) {
+  if (contracts.length === 0) return '';
+  return `
+test.describe('Healix QA HTTP status contracts', () => {
+${contracts.map((contract) => {
+  const fields = (contract.requiredFields || []).map((field) => field.name).filter(Boolean);
+  return `  test('${contract.marker} [CAT:api_contract] ${contract.method} ${contract.path} returns create status ${contract.expectedStatuses.join('/')}', async ({ request }) => {
+    // [SRC:${contract.sourceFile || 'unknown'}] ${contract.reason || 'Create endpoint status consistency'}.
+    const payload = buildPayload(${JSON.stringify(fields)});
+    test.skip(Object.keys(payload).length === 0, 'No source-derived valid payload available for status contract.');
+    const response = await request.${String(contract.method).toLowerCase()}(${JSON.stringify(contract.path)}, { data: payload });
+    expect(${JSON.stringify(contract.expectedStatuses)}, 'create endpoint should return a create/accepted status, not a generic success status').toContain(response.status());
+  });`;
+}).join('\n\n')}
+});
+`;
+}
+
+function buildBoundaryContractTests(contracts) {
+  if (contracts.length === 0) return '';
+  return `
+test.describe('Healix QA boundary validation contracts', () => {
+${contracts.map((contract) => {
+  const fields = (contract.requiredFields || []).map((field) => field.name).filter(Boolean);
+  return `  test('${contract.marker} [CAT:api_negative] ${contract.method} ${contract.path} rejects required-string boundary values', async ({ request }) => {
+    // [SRC:${contract.sourceFile || 'unknown'}] Required fields: ${fields.join(', ')}.
+    const requiredFields = ${JSON.stringify(fields)};
+    test.skip(requiredFields.length === 0, 'No source-derived required string fields available for boundary validation.');
+    for (const field of requiredFields) {
+      const cases: Record<string, unknown> = {
+        missing: undefined,
+        empty_string: '',
+        whitespace: '   ',
+        null_value: null,
+      };
+      for (const [caseName, value] of Object.entries(cases)) {
+        const overrides = value === undefined ? {} : { [field]: value };
+        const payload = buildPayload(requiredFields, overrides);
+        if (value === undefined) delete payload[field];
+        const response = await request.${String(contract.method).toLowerCase()}(${JSON.stringify(contract.path)}, { data: payload });
+        expect(${JSON.stringify(contract.expectedStatuses || [400, 422])}, \`required field ${'${'}field} must reject ${'${'}caseName}\`).toContain(response.status());
+      }
+    }
+  });`;
+}).join('\n\n')}
+});
+`;
+}
+
+function buildRbacContractTests(contracts, roles = []) {
+  if (contracts.length === 0) return '';
+  const verifiedRoles = (roles || [])
+    .filter((role) => role && role.loginVerified && role.storageStatePath)
+    .map((role) => normalizeRoleName(role.role || role.name || 'user'));
+  return `
+test.describe('Healix QA RBAC contracts', () => {
+${contracts.map((contract) => {
+  const fields = (contract.requiredFields || []).map((field) => field.name).filter(Boolean);
+  const expectedByRole = contract.expectedRoleStatuses || {};
+  return `  test('${contract.marker} [CAT:api_auth] anonymous ${contract.method} ${contract.path} is denied by RBAC', async ({ request }) => {
+    // [SRC:${contract.sourceFile || 'unknown'}] Anonymous access must not reach protected endpoint.
+    const payload = buildPayload(${JSON.stringify(fields)});
+    const response = await request.${String(contract.method).toLowerCase()}(${JSON.stringify(contract.path)}, ${['POST', 'PUT', 'PATCH'].includes(contract.method) ? '{ data: payload }' : '{}'});
+    expect(${JSON.stringify(contract.expectedAnonymousStatuses || [401, 403])}, 'anonymous protected-endpoint request must be rejected').toContain(response.status());
+  });
+
+  test('@auth @tierB ${contract.marker} [CAT:api_auth] role matrix for ${contract.method} ${contract.path}', async ({ page }, testInfo) => {
+    test.skip(${JSON.stringify(verifiedRoles)}.length === 0, 'No verified role storage states available for RBAC matrix.');
+    const roleMatch = testInfo.project.name.match(/^tierB-auth-(.+)$/);
+    const role = roleMatch ? roleMatch[1] : ${JSON.stringify(verifiedRoles[0] || 'user')};
+    const expectedByRole: Record<string, Array<number | string>> = ${JSON.stringify(expectedByRole)};
+    const expected = (expectedByRole[role] || expectedByRole[role.toLowerCase()] || expectedByRole.user || [403]).map(Number);
+    await page.goto('/');
+    const payload = buildPayload(${JSON.stringify(fields)});
+    const result = await apiFetchFromPage(page, ${JSON.stringify(contract.path)}, { method: ${JSON.stringify(contract.method)}, body: ${['POST', 'PUT', 'PATCH'].includes(contract.method) ? 'payload' : 'undefined'} });
+    expect(expected, \`role ${'${'}role} must match RBAC matrix for ${contract.method} ${contract.path}\`).toContain(result.status);
+  });`;
+}).join('\n\n')}
 });
 `;
 }
@@ -622,20 +976,39 @@ function buildQaContractSpec({ qaContracts = {}, roles = [], testType = 'both' }
   const obligations = runnableQaObligations(qaContracts, roles);
   const filterContracts = includeApi ? obligations.filters : [];
   const formContracts = includeUi ? obligations.forms : [];
-  if (filterContracts.length === 0 && formContracts.length === 0) return null;
+  const a11yContracts = includeUi ? obligations.a11y : [];
+  const statusContracts = includeApi ? obligations.statuses : [];
+  const boundaryContracts = includeApi ? obligations.boundaries : [];
+  const rbacContracts = includeApi ? obligations.rbac : [];
+  if (
+    filterContracts.length === 0 &&
+    formContracts.length === 0 &&
+    a11yContracts.length === 0 &&
+    statusContracts.length === 0 &&
+    boundaryContracts.length === 0 &&
+    rbacContracts.length === 0
+  ) return null;
 
   const content = `// ${GENERATED_BY}. Do not edit by hand.
 import { test, expect } from '@playwright/test';
 
-${buildResponseRowsHelper()}
+${buildContractRuntimeHelpers()}
 ${buildFilterContractTests(filterContracts)}
 ${buildFormContractTests(formContracts, verifiedRoleCount)}
+${buildA11yContractTests(a11yContracts, verifiedRoleCount)}
+${buildStatusContractTests(statusContracts)}
+${buildBoundaryContractTests(boundaryContracts)}
+${buildRbacContractTests(rbacContracts, roles)}
 `;
   return {
     filename: 'healix-qa-contracts.spec.ts',
     content,
     filterContracts: filterContracts.map((contract) => contract.id),
     formValidationContracts: formContracts.map((contract) => contract.id),
+    a11yContracts: a11yContracts.map((contract) => contract.id),
+    statusCodeContracts: statusContracts.map((contract) => contract.id),
+    boundaryValidationContracts: boundaryContracts.map((contract) => contract.id),
+    rbacContracts: rbacContracts.map((contract) => contract.id),
   };
 }
 
@@ -652,6 +1025,10 @@ function ensureQaContractSpec({ projectPath, context = {}, roles = [], testType 
     generatedContracts: {
       filterContracts: spec?.filterContracts || [],
       formValidationContracts: spec?.formValidationContracts || [],
+      a11yContracts: spec?.a11yContracts || [],
+      statusCodeContracts: spec?.statusCodeContracts || [],
+      boundaryValidationContracts: spec?.boundaryValidationContracts || [],
+      rbacContracts: spec?.rbacContracts || [],
     },
     qaContractSummary: summary,
     qaContractQuestions: questions,
@@ -685,6 +1062,10 @@ function auditQaContractCoverage({ context = {}, roles = [], contents = [], test
   const required = [
     ...(includeApi ? obligations.filters : []),
     ...(includeUi ? obligations.forms : []),
+    ...(includeUi ? obligations.a11y : []),
+    ...(includeApi ? obligations.statuses : []),
+    ...(includeApi ? obligations.boundaries : []),
+    ...(includeApi ? obligations.rbac : []),
   ];
   const missing = required.filter((contract) => !covered.has(contract.id));
   const questions = buildQaContractQuestions(qaContracts);
