@@ -728,6 +728,17 @@ function extractBracketMarkers(text, prefix) {
 function normalizeGeneratedRoute(value) {
   const raw = String(value || '').trim();
   if (!raw) return null;
+  const withoutTemplateBase = raw
+    .replace(/^\$\{\s*(?:BASE|baseURL|baseUrl|BASE_URL|rootURL|rootUrl|origin|appUrl|APP_URL)\s*\}/, '')
+    .replace(/^\$\{\s*[^}]*base[^}]*\}/i, '');
+  if (withoutTemplateBase !== raw) {
+    if (withoutTemplateBase.startsWith('/')) {
+      return normalizeGeneratedRoute(withoutTemplateBase);
+    }
+    if (/^\$\{[^}]+\}/.test(withoutTemplateBase)) {
+      return null;
+    }
+  }
   try {
     const parsed = new URL(raw, 'http://healix.local');
     return `${parsed.pathname}${parsed.search || ''}${parsed.hash || ''}` || '/';
@@ -747,6 +758,72 @@ function normalizeApiPathForAudit(value) {
   } catch {
     return withoutQuery.replace(/\/+$/, '') || '/';
   }
+}
+
+function normalizeGeneratedRouteFamily(value) {
+  const normalized = normalizeGeneratedRoute(value);
+  if (!normalized) return null;
+  const withoutQuery = String(normalized).split('?')[0] || '/';
+  const withoutTrailingSlash = withoutQuery.length > 1
+    ? withoutQuery.replace(/\/+$/, '')
+    : withoutQuery;
+  const uuidPattern = /\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b/gi;
+  const objectIdPattern = /\b[0-9a-f]{24}\b/gi;
+  return withoutTrailingSlash
+    .split('/')
+    .map((segment) => {
+      const replaced = segment
+        .replace(uuidPattern, ':id')
+        .replace(objectIdPattern, ':id');
+      if (/^\d+$/.test(replaced)) return ':id';
+      if (/^[A-Za-z0-9_-]{18,}$/.test(replaced) && /\d/.test(replaced)) return ':id';
+      return replaced;
+    })
+    .join('/') || '/';
+}
+
+function routePriorityScore(route) {
+  const text = String(route || '').toLowerCase();
+  if (text === '/' || text === '') return 0;
+  if (/checkout|cart/.test(text)) return 1;
+  if (/login|signin|signup|register|auth/.test(text)) return 2;
+  if (/admin/.test(text)) return 3;
+  if (/contact|about|lookbook/.test(text)) return 4;
+  if (/:id|\[[^\]]+\]/.test(text)) return 8;
+  return 6;
+}
+
+function summarizeMissingRoutesByFamily(routeCandidates = [], coveredRoutes = [], limit = 30) {
+  const coveredFamilies = new Set(
+    (coveredRoutes || [])
+      .map(normalizeGeneratedRouteFamily)
+      .filter(Boolean)
+  );
+  const byFamily = new Map();
+  for (const rawRoute of routeCandidates || []) {
+    const route = normalizeGeneratedRoute(rawRoute);
+    if (!route) continue;
+    const family = normalizeGeneratedRouteFamily(route);
+    if (!family || coveredFamilies.has(family)) continue;
+    if (!byFamily.has(family)) {
+      byFamily.set(family, { family, examples: [], priority: routePriorityScore(family) });
+    }
+    const entry = byFamily.get(family);
+    if (entry.examples.length < 5 && !entry.examples.includes(route)) {
+      entry.examples.push(route);
+    }
+  }
+  const groups = [...byFamily.values()]
+    .sort((a, b) => a.priority - b.priority || a.family.localeCompare(b.family))
+    .slice(0, limit);
+  return {
+    routes: groups.map((entry) => entry.examples[0]).filter(Boolean),
+    routeFamilies: groups.map((entry) => entry.family),
+    routeExamples: groups.map((entry) => ({
+      family: entry.family,
+      examples: entry.examples,
+    })),
+  };
 }
 
 function apiPathPatternToRegex(pathValue) {
@@ -903,8 +980,15 @@ function buildExistingSuiteManifest({
     .map((endpoint) => `${String(endpoint.method || 'GET').toUpperCase()} ${normalizeGeneratedRoute(endpoint.path || '/') || '/'}`);
 
   const requiredCategories = requiredCategoriesForRun({ testType, context });
+  const routeSummary = summarizeMissingRoutesByFamily(
+    [...new Set(routeCandidates)],
+    [...covered.routes],
+    30,
+  );
   const missing = {
-    routes: [...new Set(routeCandidates)].filter((route) => !covered.routes.has(route)).slice(0, 30),
+    routes: routeSummary.routes,
+    routeFamilies: routeSummary.routeFamilies,
+    routeExamples: routeSummary.routeExamples,
     apiEndpoints: [...new Set(apiCandidates)].filter((endpoint) => !covered.apiEndpoints.has(endpoint)).slice(0, 30),
     categories: requiredCategories.filter((category) => !covered.catMarkers.has(category)).slice(0, 20),
     qaContracts: (qaCoverage.missing || []).slice(0, 50),
@@ -939,6 +1023,7 @@ function buildExistingSuiteManifest({
       qacMarkers: [...covered.qacMarkers].slice(0, 120),
       catMarkers: [...covered.catMarkers].slice(0, 60),
       routes: [...covered.routes].slice(0, 120),
+      routeFamilies: [...new Set([...covered.routes].map(normalizeGeneratedRouteFamily).filter(Boolean))].slice(0, 120),
       apiEndpoints: [...covered.apiEndpoints].slice(0, 120),
       sourceRefs: [...covered.sourceRefs].slice(0, 120),
     },
@@ -964,6 +1049,9 @@ function extractQualityFailureFileNames(qualityAudit = {}) {
   for (const value of qualityAudit.riskyFiles || []) add(value);
   for (const value of qualityAudit.sourceMismatchFiles || []) add(value);
   for (const value of qualityAudit.authGatingFiles || []) add(value);
+  for (const item of qualityAudit.ungroundedApiEndpointFiles || []) {
+    add(typeof item === 'string' ? item : item?.file);
+  }
 
   for (const item of qualityAudit.ungroundedSelectorFiles || []) {
     add(typeof item === 'string' ? item : item?.file);
@@ -976,6 +1064,147 @@ function extractQualityFailureFileNames(qualityAudit = {}) {
   }
 
   return [...names];
+}
+
+function isHardQualityAuditError(error) {
+  const text = String(error || '');
+  return /^(?:generated_tests_missing|no_generated_tests|zero_runnable_tests|runnable_coverage_too_low|fallback_or_template_spec|hardcoded_unverified_credentials|ungrounded_api_endpoint|hash_route_without_hash_fragment|unblocked_protected_route_without_credentials|protected_route_missing_auth_tag|auth_gated_review_form_without_auth_tag|missing_qa_contract_coverage|missing_api_test_files)(?::|$)/i.test(text);
+}
+
+function qualityAuditHasHardErrors(qualityAudit = {}) {
+  return (qualityAudit.errors || []).some(isHardQualityAuditError);
+}
+
+function fileContainsOnlyBrittleTests(projectPath, filename) {
+  const filePath = path.join(projectPath, 'tests', 'generated', path.basename(filename || ''));
+  if (!fs.existsSync(filePath)) return false;
+  let content = '';
+  try {
+    content = fs.readFileSync(filePath, 'utf-8');
+  } catch {
+    return false;
+  }
+  const blocks = findGeneratedTestBlocks(content);
+  return blocks.length > 0 && blocks.every((block) => isBrittleGeneratedTestBlock(block.content));
+}
+
+function extractHardQualityFailureFileNames(qualityAudit = {}, { projectPath = null } = {}) {
+  const names = new Set();
+  const add = (value) => {
+    if (!value) return;
+    const matches = String(value).match(GENERATED_SPEC_FILENAME_PATTERN) || [];
+    for (const match of matches) names.add(path.basename(match));
+  };
+
+  for (const error of qualityAudit.errors || []) {
+    if (isHardQualityAuditError(error)) add(error);
+  }
+  for (const item of qualityAudit.ungroundedApiEndpointFiles || []) {
+    add(typeof item === 'string' ? item : item?.file);
+  }
+  for (const value of qualityAudit.authGatingFiles || []) add(value);
+  if (projectPath) {
+    for (const value of qualityAudit.brittlePatternFiles || []) {
+      if (fileContainsOnlyBrittleTests(projectPath, value)) add(value);
+    }
+  }
+
+  return [...names];
+}
+
+function demoteSoftQualityAuditErrors(qualityAudit = {}, reason = 'soft_quality_warnings_only') {
+  const softErrors = (qualityAudit.errors || []).filter((error) => !isHardQualityAuditError(error));
+  return {
+    ...qualityAudit,
+    valid: true,
+    errors: (qualityAudit.errors || []).filter(isHardQualityAuditError),
+    warnings: [
+      ...(qualityAudit.warnings || []),
+      ...softErrors.map((error) => `soft_quality_warning:${error}`),
+      reason,
+    ],
+    softQualityWarnings: softErrors,
+  };
+}
+
+function snapshotGeneratedSpecFiles(projectPath) {
+  const generatedDir = path.join(projectPath, 'tests', 'generated');
+  const snapshot = {
+    generatedDir,
+    files: [],
+  };
+  if (!fs.existsSync(generatedDir)) return snapshot;
+  for (const filePath of listGeneratedTestFiles(projectPath)) {
+    try {
+      snapshot.files.push({
+        filename: path.basename(filePath),
+        content: fs.readFileSync(filePath, 'utf-8'),
+      });
+    } catch {
+      // best effort snapshot; unreadable files will be handled by validation
+    }
+  }
+  return snapshot;
+}
+
+function restoreGeneratedSpecSnapshot(projectPath, snapshot = {}) {
+  const generatedDir = snapshot.generatedDir || path.join(projectPath, 'tests', 'generated');
+  ensureDir(generatedDir);
+  for (const filePath of listGeneratedTestFiles(projectPath)) {
+    try {
+      fs.rmSync(filePath, { force: true });
+    } catch {
+      // best effort cleanup before restore
+    }
+  }
+  for (const file of snapshot.files || []) {
+    fs.writeFileSync(path.join(generatedDir, file.filename), file.content, 'utf-8');
+  }
+  return {
+    restoredFiles: (snapshot.files || []).map((file) => file.filename),
+  };
+}
+
+function missingCategoriesForQuality({ config = {}, context = {}, quality = {} } = {}) {
+  const requiredCategories = requiredCategoriesForRun({
+    testType: config.testType,
+    context,
+  });
+  const profile = toCoverageProfile(config.coverageProfile);
+  const minHits = minimumCategoryHitsByProfile(profile);
+  return requiredCategories.filter((category) => (quality.categories?.[category] || 0) < minHits);
+}
+
+function assessQualityRecoveryNetBenefit({
+  config = {},
+  context = {},
+  beforeQuality = {},
+  afterQuality = {},
+  hardRecovery = false,
+} = {}) {
+  if (hardRecovery) return { keep: true, reason: 'hard_quality_recovery' };
+  const target = toFiniteNumber(config.minGeneratedTests, 50);
+  const floor = minimumUsefulRunnableFloor(target);
+  if ((beforeQuality.runnableTests || 0) >= floor && (afterQuality.runnableTests || 0) < floor) {
+    return {
+      keep: false,
+      reason: 'would_drop_below_minimum_useful_floor',
+      floor,
+      beforeRunnableTests: beforeQuality.runnableTests || 0,
+      afterRunnableTests: afterQuality.runnableTests || 0,
+    };
+  }
+  const beforeMissing = missingCategoriesForQuality({ config, context, quality: beforeQuality });
+  const afterMissing = missingCategoriesForQuality({ config, context, quality: afterQuality });
+  if (beforeMissing.length === 0 && afterMissing.length > 0) {
+    return {
+      keep: false,
+      reason: 'would_remove_required_category_coverage',
+      beforeMissingCategories: beforeMissing,
+      afterMissingCategories: afterMissing,
+    };
+  }
+  return { keep: true, reason: 'net_benefit_preserved' };
 }
 
 function findGeneratedTestBlocks(content) {
@@ -1124,7 +1353,10 @@ function pruneGeneratedTestsByQuality({ projectPath, qualityAudit = {}, reason =
     const content = fs.readFileSync(filePath, 'utf-8');
     const blocks = findGeneratedTestBlocks(content);
     if (blocks.length <= 1) continue;
-    const badBlocks = blocks.filter((block) => isBrittleGeneratedTestBlock(block.content));
+    const badBlocks = blocks.filter((block) =>
+      isBrittleGeneratedTestBlock(block.content) ||
+      findContextualSelectorIssues({ projectPath, blockContent: block.content }).length > 0
+    );
     if (badBlocks.length === 0 || badBlocks.length >= blocks.length) continue;
 
     ensureDir(quarantineDir);
@@ -1154,7 +1386,7 @@ function pruneGeneratedTestsByQuality({ projectPath, qualityAudit = {}, reason =
   };
 }
 
-function quarantineGeneratedSpecFiles({ projectPath, qualityAudit = {}, reason = 'quality_audit' } = {}) {
+function quarantineGeneratedSpecFiles({ projectPath, qualityAudit = {}, reason = 'quality_audit', hardOnly = false } = {}) {
   const generatedDir = path.join(projectPath, 'tests', 'generated');
   if (!fs.existsSync(generatedDir)) {
     return { applied: false, reason: 'generated_dir_missing', quarantinedFiles: [] };
@@ -1162,11 +1394,17 @@ function quarantineGeneratedSpecFiles({ projectPath, qualityAudit = {}, reason =
 
   const allFiles = fs.readdirSync(generatedDir)
     .filter((name) => GENERATED_SPEC_FILE_PATTERN.test(name));
-  const candidates = extractQualityFailureFileNames(qualityAudit)
+  const candidates = (hardOnly
+    ? extractHardQualityFailureFileNames(qualityAudit, { projectPath })
+    : extractQualityFailureFileNames(qualityAudit))
     .filter((name) => allFiles.includes(name));
 
   if (candidates.length === 0) {
-    return { applied: false, reason: 'no_file_specific_failures', quarantinedFiles: [] };
+    return {
+      applied: false,
+      reason: hardOnly ? 'no_hard_file_specific_failures' : 'no_file_specific_failures',
+      quarantinedFiles: [],
+    };
   }
   if (candidates.length >= allFiles.length) {
     return {
@@ -1200,6 +1438,7 @@ function quarantineGeneratedSpecFiles({ projectPath, qualityAudit = {}, reason =
     applied: quarantinedFiles.length > 0,
     reason,
     quarantineDir,
+    hardOnly,
     quarantinedFiles,
     remainingFiles: Math.max(0, allFiles.length - quarantinedFiles.length),
   };
@@ -3000,12 +3239,18 @@ function buildTopUpTargetHits(signals, manifest = {}) {
   const hits = [];
 
   const missingRoutes = new Set(missing.routes || []);
+  const missingRouteFamilies = new Set(
+    (missing.routeFamilies || (missing.routes || []).map(normalizeGeneratedRouteFamily)).filter(Boolean)
+  );
   const missingApis = new Set(missing.apiEndpoints || []);
   const missingCategories = new Set(missing.categories || []);
   const coveredReqs = new Set(covered.reqMarkers || []);
 
   for (const route of signals.routes || []) {
-    if (missingRoutes.has(route)) hits.push(`route:${route}`);
+    const family = normalizeGeneratedRouteFamily(route);
+    if (missingRoutes.has(route) || (family && missingRouteFamilies.has(family))) {
+      hits.push(`route:${family || route}`);
+    }
   }
   for (const endpoint of signals.apiEndpoints || []) {
     if (missingApis.has(endpoint)) hits.push(`api:${endpoint}`);
@@ -3033,6 +3278,9 @@ function filterDeltaTopUpTests({ incoming = [], existingSuiteManifest = {}, used
   const existingReqs = new Set(covered.reqMarkers || []);
   const existingQacs = new Set(covered.qacMarkers || []);
   const existingRoutes = new Set(covered.routes || []);
+  const existingRouteFamilies = new Set(
+    (covered.routeFamilies || (covered.routes || []).map(normalizeGeneratedRouteFamily)).filter(Boolean)
+  );
   const existingApis = new Set(covered.apiEndpoints || []);
   const accepted = [];
   const rejected = [];
@@ -3096,7 +3344,10 @@ function filterDeltaTopUpTests({ incoming = [], existingSuiteManifest = {}, used
     }
 
     const targetHits = buildTopUpTargetHits(signals, existingSuiteManifest);
-    const addsNewRoute = (signals.routes || []).some((route) => !existingRoutes.has(route));
+    const addsNewRoute = (signals.routes || []).some((route) => {
+      const family = normalizeGeneratedRouteFamily(route);
+      return !existingRoutes.has(route) && (!family || !existingRouteFamilies.has(family));
+    });
     const addsNewApi = (signals.apiEndpoints || []).some((endpoint) => !existingApis.has(endpoint));
     if (targetHits.length === 0 && !addsNewRoute && !addsNewApi) {
       reject('no_missing_surface_targeted');
@@ -4288,6 +4539,114 @@ function sourceFileContainsLiteral(projectPath, sourceRef, literal) {
   }
 }
 
+function readSourceReferenceContents(projectPath, sourceRefs = []) {
+  const contents = [];
+  const root = path.resolve(projectPath || '.');
+  for (const sourceRef of sourceRefs || []) {
+    try {
+      const cleanRef = String(sourceRef || '').replace(/^\/+/, '');
+      if (!cleanRef) continue;
+      const sourcePath = path.resolve(root, cleanRef);
+      if (!sourcePath.startsWith(root)) continue;
+      if (!fs.existsSync(sourcePath) || !fs.statSync(sourcePath).isFile()) continue;
+      contents.push(fs.readFileSync(sourcePath, 'utf-8'));
+    } catch {
+      // best-effort source grounding
+    }
+  }
+  return contents;
+}
+
+function sourceHasRoleName(projectPath, sourceRefs = [], role, literal) {
+  const normalizedRole = String(role || '').toLowerCase();
+  const text = String(literal || '').replace(/\s+/g, ' ').trim();
+  if (!normalizedRole || !text) return true;
+  const contents = readSourceReferenceContents(projectPath, sourceRefs);
+  if (contents.length === 0) return true;
+  const escaped = escapeRegExp(text);
+  const roleTags = {
+    link: ['a', 'Link'],
+    button: ['button', 'Button'],
+    heading: ['h1', 'h2', 'h3', 'h4', 'h5', 'h6'],
+  }[normalizedRole];
+  if (!roleTags) return true;
+
+  for (const content of contents) {
+    for (const tag of roleTags) {
+      const elementWithLiteral = new RegExp(`<${tag}\\b[\\s\\S]{0,600}(?:aria-label\\s*=\\s*["'\`]${escaped}["'\`]|>[\\s\\S]{0,500}${escaped}[\\s\\S]{0,120}<\\/${tag}>)`, 'i');
+      if (elementWithLiteral.test(content)) return true;
+      const dynamicElement = new RegExp(`<${tag}\\b[\\s\\S]{0,500}>[\\s\\S]{0,500}\\{[^}]+\\}[\\s\\S]{0,160}<\\/${tag}>`, 'i');
+      if (dynamicElement.test(content) && normalizeTextForAudit(content).includes(normalizeTextForAudit(text))) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function extractCssSelectorStrings(content) {
+  const selectors = [];
+  for (const match of String(content || '').matchAll(/(?:\bpage|\bform|[A-Za-z_$][\w$]*)\.locator\(\s*(['"`])([^'"`]{1,220})\1/g)) {
+    const selector = String(match[2] || '').trim();
+    if (selector) selectors.push(selector);
+  }
+  return selectors;
+}
+
+function sourceHasCssSelectorToken(projectPath, sourceRefs = [], tokenType, token) {
+  const text = String(token || '').trim();
+  if (!text) return true;
+  const contents = readSourceReferenceContents(projectPath, sourceRefs);
+  if (contents.length === 0) return true;
+  const escaped = escapeRegExp(text);
+  for (const content of contents) {
+    if (tokenType === 'id') {
+      if (new RegExp(`\\bid\\s*=\\s*["'\`]${escaped}["'\`]`, 'i').test(content)) return true;
+      if (new RegExp(`\\bhtmlFor\\s*=\\s*["'\`]${escaped}["'\`]`, 'i').test(content)) return true;
+    }
+    if (tokenType === 'class') {
+      if (new RegExp(`\\b(?:className|class)\\s*=\\s*["'\`][^"'\`]*\\b${escaped}\\b`, 'i').test(content)) return true;
+      if (new RegExp(`\\b(?:className|class)\\s*=\\s*\\{[^}]*["'\`][^"'\`]*\\b${escaped}\\b`, 'i').test(content)) return true;
+    }
+  }
+  return false;
+}
+
+function findContextualSelectorIssues({ projectPath, blockContent } = {}) {
+  const block = String(blockContent || '');
+  const sourceRefs = extractSourceRefsFromContent(block);
+  if (sourceRefs.length === 0) return [];
+  const issues = [];
+
+  for (const match of block.matchAll(/getByRole\(\s*['"`]([^'"`]+)['"`]\s*,\s*\{[\s\S]{0,320}?\bname\s*:\s*(['"`])([^'"`\n]{2,160})\2/gi)) {
+    const role = match[1];
+    const name = match[3];
+    if (!sourceHasRoleName(projectPath, sourceRefs, role, name)) {
+      issues.push(`role:${role}:${name}`);
+    }
+  }
+
+  for (const selector of extractCssSelectorStrings(block)) {
+    if (/^\s*(?:form|main|nav|body|html|section|article|header|footer|button|input|select|textarea)(?:\b|$)/i.test(selector) && !/[.#]/.test(selector)) {
+      continue;
+    }
+    for (const idMatch of selector.matchAll(/#([A-Za-z_][\w-]*)/g)) {
+      const id = idMatch[1];
+      if (!sourceHasCssSelectorToken(projectPath, sourceRefs, 'id', id)) {
+        issues.push(`css-id:#${id}`);
+      }
+    }
+    for (const classMatch of selector.matchAll(/\.([A-Za-z_][\w-]*)/g)) {
+      const className = classMatch[1];
+      if (!sourceHasCssSelectorToken(projectPath, sourceRefs, 'class', className)) {
+        issues.push(`css-class:.${className}`);
+      }
+    }
+  }
+
+  return [...new Set(issues)];
+}
+
 function auditGeneratedTestQuality({ projectPath, testType, context, explorationArtifact = null, roles = [] }) {
   const generatedDir = path.join(projectPath, 'tests', 'generated');
   const apiEndpointCount = effectiveApiEndpoints(context).length;
@@ -4498,7 +4857,24 @@ function auditGeneratedTestQuality({ projectPath, testType, context, exploration
       summary.riskyFiles.push(name);
     }
 
+    const isDeterministicQaContractFile = name === 'healix-qa-contracts.spec.ts' || /\[QAC:[^\]]+\]/.test(content);
     const generatedBlocks = findGeneratedTestBlocks(content);
+    const contextualSelectorIssueBlocks = generatedBlocks
+      .map((block) => ({
+        block,
+        issues: findContextualSelectorIssues({ projectPath, blockContent: block.content }),
+      }))
+      .filter((entry) => entry.issues.length > 0);
+    if (contextualSelectorIssueBlocks.length > 0) {
+      recordBrittlePattern('brittle_source_selector_mismatch', name);
+      summary.errors.push(
+        `brittle_source_selector_mismatch:${name}:${contextualSelectorIssueBlocks
+          .flatMap((entry) => entry.issues)
+          .slice(0, 4)
+          .join('|')}`
+      );
+    }
+
     if (generatedBlocks.some((block) => looksLikeCartAssertionWithoutSetup(block.content))) {
       recordBrittlePattern('brittle_cart_state_without_add_item_setup', name);
     }
@@ -4561,7 +4937,7 @@ function auditGeneratedTestQuality({ projectPath, testType, context, exploration
             if (sourceHits >= 2) break;
           }
         }
-        if (sourceHits === 0 && fileTests > 0) {
+        if (sourceHits === 0 && fileTests > 0 && !isDeterministicQaContractFile) {
           summary.ungroundedUiFiles.push(name);
         }
       }
@@ -5242,6 +5618,7 @@ async function maybeRunCoverageTopUp({
     return {
       attempted: false,
       status: 'skipped_budget',
+      topUpStatus: 'skipped_budget',
       reason: 'generation_budget_too_low',
       before,
       target: decision.target,
@@ -5344,11 +5721,16 @@ async function maybeRunCoverageTopUp({
         Number.isFinite(remainingMs) ? Math.max(60_000, remainingMs - 30_000) : 600_000,
       ),
     );
+    const retryBudgetMs = Number.isFinite(remainingMs)
+      ? Math.max(15_000, Math.min(90_000, remainingMs - timeoutMs - 15_000))
+      : 90_000;
     const payload = await client.generateTestsForAgent({
       agent: 'expansion',
       ...sharedPayload,
       context: feedbackContext,
       transportTimeoutMs: timeoutMs,
+      transportRetryDelaysMs: [0, 1000, 3000, 8000, 15000, 30000],
+      transportRetryMaxElapsedMs: retryBudgetMs,
       options: {
         ...(sharedPayload?.options || {}),
         minGeneratedTests: requestedAdditional,
@@ -5390,6 +5772,9 @@ async function maybeRunCoverageTopUp({
     event.status = after.runnableTests > before.runnableTests
       ? 'added'
       : (files.length > beforeFileCount ? 'added_files_pending_quality' : 'no_new_valid_delta');
+    event.topUpStatus = event.status;
+    event.topUpErrorCode = null;
+    event.continuedWithPreTopUpSuite = event.status !== 'added';
 
     if (statusDir) {
       updateStatus(statusDir, 'generation_top_up_complete', {
@@ -5438,6 +5823,10 @@ async function maybeRunCoverageTopUp({
       code: err?.code || classifyErrorCode(err),
       message: err?.message || String(err),
     };
+    event.topUpStatus = event.status;
+    event.topUpErrorCode = event.error.code;
+    event.continuedWithPreTopUpSuite = before.runnableTests >= decision.minimumUsefulRunnableFloor;
+    event.nonFatal = event.continuedWithPreTopUpSuite;
     Logger.warn('PipelineWorker', 'Coverage top-up failed; continuing with generated suite', event.error);
     if (statusDir) {
       updateStatus(statusDir, 'generation_top_up_failed', {
@@ -5445,6 +5834,13 @@ async function maybeRunCoverageTopUp({
         message: 'Coverage top-up failed; continuing with the best valid generated suite.',
         errorCode: event.error.code,
         reason: event.error.message,
+        continuedWithPreTopUpSuite: event.continuedWithPreTopUpSuite,
+        before: {
+          totalTests: before.totalTests,
+          runnableTests: before.runnableTests,
+        },
+        target: decision.target,
+        minimumUsefulRunnableFloor: decision.minimumUsefulRunnableFloor,
       }, telemetryReporter);
     }
     return event;
@@ -6363,6 +6759,49 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
     generationMeta.qaContractQuestions = qualityAudit.qaContractQuestions || generationMeta.qaContractQuestions || [];
 
     if (!qualityAudit.valid) {
+      const qualityAuditBeforeRecovery = qualityAudit;
+      const validationBeforeQualityRecovery = validation;
+      const beforeRecoveryQuality = collectGenerationQuality(config.projectPath, {
+        baseURL: config.baseURL || projectInfo?.baseURL,
+      });
+      const beforeRecoverySnapshot = snapshotGeneratedSpecFiles(config.projectPath);
+      const rollbackQualityRecovery = ({ recovery, assessment, demoteIfSoft = true } = {}) => {
+        const restore = restoreGeneratedSpecSnapshot(config.projectPath, beforeRecoverySnapshot);
+        const rollbackEvent = {
+          type: 'quality_recovery_rollback',
+          reason: assessment?.reason || 'no_net_benefit',
+          recovery,
+          assessment,
+          restoredFiles: restore.restoredFiles,
+        };
+        qualityRecoveryEvents.push(rollbackEvent);
+        Logger.warn('PipelineWorker', 'Rolled back quality recovery because it reduced useful runnable coverage', {
+          generator,
+          reason: rollbackEvent.reason,
+          restoredFiles: restore.restoredFiles,
+        });
+        if (statusDir) {
+          updateStatus(statusDir, 'generation_quality_recovery_rolled_back', {
+            runId,
+            message: 'Quality recovery would have removed too much runnable coverage; restored the best valid generated suite.',
+            reason: rollbackEvent.reason,
+            restoredFiles: restore.restoredFiles,
+            assessment,
+          }, telemetryReporter);
+        }
+        if (demoteIfSoft && !qualityAuditHasHardErrors(qualityAuditBeforeRecovery)) {
+          const demotedAudit = demoteSoftQualityAuditErrors(qualityAuditBeforeRecovery, 'soft_quality_warnings_after_recovery_rollback');
+          demotedAudit.qualityRecovery = rollbackEvent;
+          return {
+            ...validationBeforeQualityRecovery,
+            qualityAudit: demotedAudit,
+            qualityRecovery: rollbackEvent,
+          };
+        }
+        validation = validationBeforeQualityRecovery;
+        return null;
+      };
+
       const pruning = pruneGeneratedTestsByQuality({
         projectPath: config.projectPath,
         qualityAudit,
@@ -6414,6 +6853,30 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
           totalTests: qualityAudit.totalTests,
           runnableTests: qualityAudit.runnableTests,
         });
+        const afterPruningQuality = collectGenerationQuality(config.projectPath, {
+          baseURL: config.baseURL || projectInfo?.baseURL,
+        });
+        const pruningAssessment = assessQualityRecoveryNetBenefit({
+          config,
+          context,
+          beforeQuality: beforeRecoveryQuality,
+          afterQuality: afterPruningQuality,
+          hardRecovery: false,
+        });
+        if (!pruningAssessment.keep) {
+          const rollbackResult = rollbackQualityRecovery({
+            recovery: pruning,
+            assessment: pruningAssessment,
+          });
+          if (rollbackResult) return rollbackResult;
+          qualityAudit = auditGeneratedTestQuality({
+            projectPath: config.projectPath,
+            testType: config.testType,
+            context,
+            explorationArtifact,
+            roles,
+          });
+        }
         if (qualityAudit.valid) {
           return {
             ...validation,
@@ -6427,6 +6890,7 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
         projectPath: config.projectPath,
         qualityAudit,
         reason: `${generator}_quality_audit`,
+        hardOnly: true,
       });
       if (quarantine.applied) {
         qualityRecoveryEvents.push(quarantine);
@@ -6629,6 +7093,32 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
         }
       }
 
+      if (!qualityAuditHasHardErrors(qualityAudit)) {
+        const demotedAudit = demoteSoftQualityAuditErrors(qualityAudit, 'soft_quality_warnings_only');
+        const softRecovery = {
+          type: 'soft_quality_warnings_only',
+          warnings: demotedAudit.softQualityWarnings || [],
+        };
+        demotedAudit.qualityRecovery = softRecovery;
+        qualityRecoveryEvents.push(softRecovery);
+        Logger.warn('PipelineWorker', 'Quality audit found only soft issues; continuing with generated suite and warnings', {
+          generator,
+          warnings: demotedAudit.softQualityWarnings,
+        });
+        if (statusDir) {
+          updateStatus(statusDir, 'generation_quality_warning', {
+            runId,
+            message: 'Generated suite has non-blocking quality warnings; continuing to execution.',
+            warnings: demotedAudit.softQualityWarnings,
+          }, telemetryReporter);
+        }
+        return {
+          ...validation,
+          qualityAudit: demotedAudit,
+          qualityRecovery: softRecovery,
+        };
+      }
+
       Logger.error('PipelineWorker', `[QUALITY GATE] ❌ Quality audit FAILED for generator="${generator}" — errors: ${qualityAudit.errors.join(', ')}`, null, {
         generator,
         errors: qualityAudit.errors,
@@ -6807,8 +7297,22 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
       const hasQaContracts =
         (context?.qaContracts?.filterContracts || []).length > 0 ||
         (context?.qaContracts?.formValidationContracts || []).length > 0;
-      if (hasQaContracts && ['ALL_AGENTS_FAILED', 'GENERATION_FAILED'].includes(errorCode)) {
+      if (hasQaContracts && ['ALL_AGENTS_FAILED', 'GENERATION_FAILED', 'WEBAPP_TIMEOUT', 'WEBAPP_UNREACHABLE'].includes(errorCode)) {
         try {
+          const recoveredPack = ensureQaContractSpec({
+            projectPath: config.projectPath,
+            context,
+            roles,
+            testType: config.testType,
+          });
+          generationMeta.qaContractPack = recoveredPack;
+          generationMeta.qaContractSummary = recoveredPack.qaContractSummary;
+          generationMeta.qaContractQuestions = recoveredPack.qaContractQuestions;
+          generationMeta.qaContractWarnings = recoveredPack.qaContractWarnings;
+          if (!recoveredPack.written || recoveredPack.generatedTests <= 0) {
+            throw new Error('No runnable deterministic QA contract tests were available for rescue.');
+          }
+          generationMeta.fixtureWiring = applyFixtureWiring(`${generatorName}-qa-contracts`);
           const validation = await runValidation(`${generatorName}-qa-contracts`);
           generationMeta.provider = generatorName;
           generationMeta.selectedGenerator = `${generatorName}-qa-contracts`;
@@ -6816,7 +7320,7 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
           generationMeta.partialGenerationWarning = {
             reason: 'ai_generation_empty_qa_contract_rescue',
             generator: generatorName,
-            partialsWrittenCount: validation.qualityAudit?.totalFiles || 0,
+            partialsWrittenCount: validation.qualityAudit?.totalFiles || recoveredPack.generatedTests || 0,
             message: 'AI generation returned no usable files; proceeding with deterministic source-derived QA contract tests.',
           };
           generationMeta.attempts.push({
@@ -7783,6 +8287,36 @@ async function runPipeline(config, runId) {
             requirementsCoverage,
           });
           if (!qualityGate.ok) {
+            const qaContractOnlyRescue =
+              generationMeta?.partialGenerationWarning?.reason === 'ai_generation_empty_qa_contract_rescue' &&
+              qualityScan.runnableTests > 0 &&
+              (generationMeta?.qaContractPack?.generatedTests || 0) > 0 &&
+              qualityGate.error?.code === 'INSUFFICIENT_RUNNABLE_COVERAGE';
+            if (qaContractOnlyRescue) {
+              const rescuedQuality = {
+                ...(qualityGate.error.generationQuality || qualityScan),
+                qualityGateStatus: 'warning',
+                executionAllowedDespiteWarnings: true,
+                qualityWarnings: [
+                  ...((qualityGate.error.generationQuality || {}).qualityWarnings || []),
+                  {
+                    code: 'AI_GENERATION_UNAVAILABLE_QA_CONTRACT_RESCUE',
+                    message: 'AI generation was unavailable, but deterministic source-derived QA contract tests were valid and will run.',
+                    actual: qualityScan.runnableTests,
+                    expected: qualityGate.error.generationQuality?.minimumUsefulRunnableFloor || null,
+                    severity: 'warning',
+                  },
+                ],
+              };
+              generationQuality = rescuedQuality;
+              codebaseContext = activeGenerationContext;
+              Logger.warn('PipelineWorker', 'Executing deterministic QA contract rescue below normal useful floor', {
+                runId,
+                runnableTests: qualityScan.runnableTests,
+                qaContractTests: generationMeta.qaContractPack.generatedTests,
+              });
+              break;
+            }
             qualityGate.error.generationMeta = generationMeta;
             throw qualityGate.error;
           }
@@ -8846,6 +9380,8 @@ module.exports = {
   buildExistingSuiteManifest,
   extractSpecSignals,
   filterDeltaTopUpTests,
+  normalizeGeneratedRouteFamily,
+  summarizeMissingRoutesByFamily,
   salvageGeneratedTestValidation,
   validateGeneratedTestsWithList,
   ensureHealixValidationConfig,
@@ -8858,6 +9394,11 @@ module.exports = {
   isBrittleGeneratedTestBlock,
   pruneGeneratedTestsByQuality,
   quarantineGeneratedSpecFiles,
+  snapshotGeneratedSpecFiles,
+  restoreGeneratedSpecSnapshot,
+  assessQualityRecoveryNetBenefit,
+  qualityAuditHasHardErrors,
+  demoteSoftQualityAuditErrors,
   strictAIEnabled,
   classifyErrorCode,
   buildUserFacingPipelineError,
@@ -8880,6 +9421,7 @@ module.exports = {
   DEFAULT_TOTAL_BUDGET_MS,
   maybeRunFailureTriage,
   maybeGenerateViaSaaS,
+  maybeRunCoverageTopUp,
   pickAgentsForRun,
   rescuePartialGeneration,
 };

@@ -85,6 +85,31 @@ interface QualityWarning {
   missingCategories?: string[];
 }
 
+interface CoverageTopUpQualitySnapshot {
+  totalTests?: number;
+  runnableTests?: number;
+  generatedTestsActual?: number;
+  runnableTestsActual?: number;
+}
+
+interface CoverageTopUpEvent {
+  attempted?: boolean;
+  status?: string;
+  reason?: string;
+  requestedAdditional?: number;
+  target?: number;
+  minimumUsefulRunnableFloor?: number;
+  before?: CoverageTopUpQualitySnapshot | null;
+  after?: CoverageTopUpQualitySnapshot | null;
+  addedFiles?: string[];
+  rejectedFiles?: Array<string | { filename?: string; reason?: string; title?: string }>;
+  topUpMode?: string;
+  error?: {
+    code?: string;
+    message?: string;
+  } | null;
+}
+
 interface AgentGenerationQuality {
   valid?: boolean;
   errorCode?: string;
@@ -139,6 +164,7 @@ interface GenerationMetaShape {
     blocked?: string[];
   } | null;
   qaContractSummary?: Record<string, number> | null;
+  coverageTopUps?: CoverageTopUpEvent[];
   [key: string]: unknown;
 }
 
@@ -1950,6 +1976,87 @@ function QaContractAdvisoryBanner({ generationMeta }: { generationMeta: Generati
   );
 }
 
+function CoverageTopUpAdvisoryBanner({ topUps }: { topUps: CoverageTopUpEvent[] }) {
+  const relevant = topUps.filter((event) => {
+    const status = String(event.status || '').toLowerCase();
+    return status === 'failed' || status === 'no_new_valid_delta' || status.startsWith('skipped');
+  });
+  if (relevant.length === 0) return null;
+
+  const latest = relevant[relevant.length - 1];
+  const status = String(latest.status || 'unknown');
+  const addedCount = Array.isArray(latest.addedFiles) ? latest.addedFiles.length : 0;
+  const rejectedCount = Array.isArray(latest.rejectedFiles) ? latest.rejectedFiles.length : 0;
+  const beforeRunnable = latest.before?.runnableTestsActual ?? latest.before?.runnableTests ?? null;
+  const afterRunnable = latest.after?.runnableTestsActual ?? latest.after?.runnableTests ?? null;
+  const message = status === 'failed'
+    ? 'Coverage top-up failed, so Healix continued with the best valid generated suite.'
+    : status === 'no_new_valid_delta'
+      ? 'Coverage top-up completed but did not add a new valid runnable delta; Healix continued with the best valid suite.'
+      : 'Coverage top-up was skipped, so Healix continued with the existing generated suite.';
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: -6 }}
+      animate={{ opacity: 1, y: 0 }}
+      className="glass-card rounded-2xl overflow-hidden border border-amber-500/25 bg-amber-500/[0.04]"
+    >
+      <div className="px-5 py-4 flex items-start gap-3">
+        <div className="w-9 h-9 rounded-lg flex items-center justify-center flex-shrink-0 mt-0.5 bg-amber-500/15 border border-amber-500/30">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#FBBF24" strokeWidth="2.2">
+            <circle cx="12" cy="12" r="10" />
+            <path d="M12 7v6" />
+            <path d="M12 17h.01" />
+          </svg>
+        </div>
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <div className="font-semibold text-[15px] text-[#FDE68A]">
+              Coverage top-up did not add runnable coverage
+            </div>
+            <span className="px-2 py-0.5 rounded-md bg-amber-500/10 border border-amber-500/25 text-[#FCD34D] text-[11px] font-mono">
+              status: {status}
+            </span>
+            {latest.reason && (
+              <span className="px-2 py-0.5 rounded-md bg-white/5 border border-white/10 text-[#D8E8FF]/70 text-[11px] font-mono">
+                reason: {latest.reason}
+              </span>
+            )}
+            {typeof latest.target === 'number' && (
+              <span className="px-2 py-0.5 rounded-md bg-white/5 border border-white/10 text-[#D8E8FF]/70 text-[11px] font-mono">
+                target: {latest.target}
+              </span>
+            )}
+            {beforeRunnable !== null && afterRunnable !== null && (
+              <span className="px-2 py-0.5 rounded-md bg-white/5 border border-white/10 text-[#D8E8FF]/70 text-[11px] font-mono">
+                runnable: {beforeRunnable} → {afterRunnable}
+              </span>
+            )}
+            {addedCount > 0 && (
+              <span className="px-2 py-0.5 rounded-md bg-white/5 border border-white/10 text-[#D8E8FF]/70 text-[11px] font-mono">
+                added files: {addedCount}
+              </span>
+            )}
+            {rejectedCount > 0 && (
+              <span className="px-2 py-0.5 rounded-md bg-white/5 border border-white/10 text-[#D8E8FF]/70 text-[11px] font-mono">
+                rejected: {rejectedCount}
+              </span>
+            )}
+          </div>
+          <p className="text-[#F0F6FF]/85 text-sm mt-1">
+            {message}
+          </p>
+          {latest.error?.message && (
+            <p className="text-[#D8E8FF]/65 text-[12.5px] mt-1 font-mono">
+              {latest.error.code ? `${latest.error.code}: ` : ''}{latest.error.message}
+            </p>
+          )}
+        </div>
+      </div>
+    </motion.div>
+  );
+}
+
 const AGENT_CATEGORY_SCOPE: Record<string, string[]> = {
   api: ['api_contract', 'api_auth', 'api_negative', 'api_stress'],
   frontend: ['ui_flow', 'form_validation'],
@@ -2442,15 +2549,31 @@ function PipelineErrorBanner({ error, runId }: { error: PipelineErrorShape; runI
   const runnableFromQuality = error.generationQuality?.runnableTestsActual
     ?? error.generationQuality?.runnableTests
     ?? null;
-  const displayedGeneratedSpecCount = typeof error.generatedSpecCount === 'number' && error.generatedSpecCount > 0
-    ? error.generatedSpecCount
-    : (typeof generatedFromQuality === 'number' ? generatedFromQuality : error.generatedSpecCount);
-  const keptSpecCount = typeof error.keptSpecCount === 'number'
-    ? error.keptSpecCount
-    : (Array.isArray(error.validationSalvage?.keptSpecFiles) ? error.validationSalvage.keptSpecFiles.length : null);
-  const quarantinedSpecCount = typeof error.quarantinedSpecCount === 'number'
-    ? error.quarantinedSpecCount
-    : (Array.isArray(error.validationSalvage?.quarantinedSpecFiles) ? error.validationSalvage.quarantinedSpecFiles.length : null);
+  const salvagedOriginalSpecCount = typeof error.validationSalvage?.originalSpecCount === 'number'
+    ? error.validationSalvage.originalSpecCount
+    : null;
+  const salvagedKeptSpecCount = Array.isArray(error.validationSalvage?.keptSpecFiles)
+    ? error.validationSalvage.keptSpecFiles.length
+    : null;
+  const salvagedQuarantinedSpecCount = Array.isArray(error.validationSalvage?.quarantinedSpecFiles)
+    ? error.validationSalvage.quarantinedSpecFiles.length
+    : null;
+  const salvageTotalSpecCount = typeof salvagedKeptSpecCount === 'number' || typeof salvagedQuarantinedSpecCount === 'number'
+    ? (salvagedKeptSpecCount || 0) + (salvagedQuarantinedSpecCount || 0)
+    : null;
+  const positiveCount = (...counts: Array<number | null | undefined>) =>
+    counts.find((count) => typeof count === 'number' && Number.isFinite(count) && count > 0) ?? null;
+  const displayedGeneratedSpecCount = positiveCount(
+    error.generatedSpecCount,
+    salvagedOriginalSpecCount,
+    salvageTotalSpecCount,
+    generatedFromQuality,
+    runnableFromQuality,
+  ) ?? (typeof error.generatedSpecCount === 'number' ? error.generatedSpecCount : null);
+  const keptSpecCount = positiveCount(error.keptSpecCount, salvagedKeptSpecCount)
+    ?? (typeof error.keptSpecCount === 'number' ? error.keptSpecCount : salvagedKeptSpecCount);
+  const quarantinedSpecCount = positiveCount(error.quarantinedSpecCount, salvagedQuarantinedSpecCount)
+    ?? (typeof error.quarantinedSpecCount === 'number' ? error.quarantinedSpecCount : salvagedQuarantinedSpecCount);
   const usefulFloor = error.generationQuality?.minimumUsefulRunnableFloor
     ?? error.generationQuality?.adaptiveRunnableFloor
     ?? null;
@@ -2984,6 +3107,13 @@ export default function TestRunDetailPage() {
   const generationMeta = (report?.metadata?.generationMeta ?? null) as GenerationMetaShape | null;
   const partialWarning = generationMeta?.partialGenerationWarning ?? null;
   const qualityWarning = generationMeta?.qualityWarning ?? null;
+  const coverageTopUps = Array.isArray(generationMeta?.coverageTopUps)
+    ? generationMeta!.coverageTopUps
+    : [];
+  const shouldShowCoverageTopUpBanner = !pipelineError && coverageTopUps.some((event) => {
+    const status = String(event.status || '').toLowerCase();
+    return status === 'failed' || status === 'no_new_valid_delta' || status.startsWith('skipped');
+  });
   const agentFailuresFromMeta: AgentFailure[] = Array.isArray(generationMeta?.agentFailures)
     ? (generationMeta!.agentFailures as AgentFailure[])
     : [];
@@ -3199,6 +3329,10 @@ export default function TestRunDetailPage() {
 
       {!pipelineError && generationMeta && Array.isArray(generationMeta.qaContractQuestions) && generationMeta.qaContractQuestions.length > 0 && (
         <QaContractAdvisoryBanner generationMeta={generationMeta} />
+      )}
+
+      {shouldShowCoverageTopUpBanner && (
+        <CoverageTopUpAdvisoryBanner topUps={coverageTopUps} />
       )}
 
       {Array.isArray(generationMeta?.agentMeta) && generationMeta!.agentMeta!.length > 0 && (

@@ -24,6 +24,7 @@ const {
   countSkippedTestsInContent,
   countTestsInContent,
   evaluateGenerationQualityGates,
+  maybeRunCoverageTopUp,
   hasApiSurfaceForGeneration,
   effectiveApiEndpoints,
   auditGeneratedTestQuality,
@@ -42,6 +43,8 @@ const {
   pruneGeneratedTestsByQuality,
   quarantineGeneratedSpecFiles,
   filterDeltaTopUpTests,
+  normalizeGeneratedRouteFamily,
+  assessQualityRecoveryNetBenefit,
   salvageGeneratedTestValidation,
   ensureHealixValidationConfig,
   safeWriteGeneratedTest,
@@ -351,6 +354,55 @@ test('QA form contracts require concrete URLs for dynamic Next routes', () => {
   });
 });
 
+test('QA form contracts map shared React Router files by route component', async () => {
+  await withTempProject(async (projectPath) => {
+    const srcDir = path.join(projectPath, 'src');
+    fs.mkdirSync(srcDir, { recursive: true });
+    const appPath = path.join(srcDir, 'App.tsx');
+    fs.writeFileSync(appPath, `
+      import { Routes, Route } from 'react-router-dom';
+      function Overview() {
+        return <main><h1>Home</h1></main>;
+      }
+      function Plan() {
+        return (
+          <main>
+            <h1>Renewal Plan</h1>
+            <form>
+              <input name="accountName" required />
+              <button type="submit">Save plan</button>
+            </form>
+          </main>
+        );
+      }
+      export default function App() {
+        return (
+          <Routes>
+            <Route path="/" element={<Overview />} />
+            <Route path="/plan" element={<Plan />} />
+          </Routes>
+        );
+      }
+    `);
+
+    const gatherer = new ContextGatherer({ projectPath, language: 'typescript' });
+    const pages = await gatherer.findReactRouterRoutes(projectPath);
+    const forms = gatherer.extractFormsFromFile(fs.readFileSync(appPath, 'utf8'), appPath);
+
+    assert.equal(pages.find((page) => page.path === '/')?.routeComponent, 'Overview');
+    assert.equal(pages.find((page) => page.path === '/plan')?.routeComponent, 'Plan');
+    assert.equal(forms[0].componentName, 'Plan');
+
+    const qaContracts = extractQaContracts({
+      projectPath,
+      context: { pages, forms },
+    });
+
+    assert.equal(qaContracts.formValidationContracts.length, 1);
+    assert.equal(qaContracts.formValidationContracts[0].route, '/plan');
+  });
+});
+
 test('quality audit requires runnable QA filter and form contracts to be covered', () => {
   withGeneratedSuite(`
     import { test, expect } from '@playwright/test';
@@ -463,6 +515,95 @@ test('delta top-up manifest rejects duplicate/generated-noise and keeps missing-
     assert.equal(result.rejected.length, 2);
     assert.ok(result.rejected.some((item) => item.reason === 'duplicate_filename'));
     assert.ok(result.rejected.some((item) => item.reason === 'qa_contracts_owned_by_deterministic_pack'));
+  });
+});
+
+test('delta top-up manifest collapses uuid detail routes by route family', () => {
+  const firstProduct = '/shop/11111111-1111-1111-1111-111111111111';
+  const secondProduct = '/shop/22222222-2222-4222-9222-222222222222';
+  withGeneratedSuite(`
+    import { test, expect } from '@playwright/test';
+    test('[CAT:ui_flow] existing product detail', async ({ page }) => {
+      await page.goto('${firstProduct}');
+      await expect(page.getByRole('heading')).toBeVisible();
+    });
+  `, (projectPath) => {
+    assert.equal(normalizeGeneratedRouteFamily(firstProduct), '/shop/:id');
+    assert.equal(normalizeGeneratedRouteFamily(secondProduct), '/shop/:id');
+
+    const manifest = buildExistingSuiteManifest({
+      projectPath,
+      context: {
+        pages: [{ path: firstProduct }, { path: secondProduct }],
+        apiEndpoints: [],
+        forms: [],
+        workflows: [],
+      },
+      testType: 'frontend',
+      routeAccessSummary: { publicRoutes: [firstProduct, secondProduct], protectedRoutes: [] },
+    });
+
+    assert.deepEqual(manifest.missing.routes, []);
+    assert.ok(manifest.covered.routeFamilies.includes('/shop/:id'));
+
+    const result = filterDeltaTopUpTests({
+      existingSuiteManifest: manifest,
+      usedFilenames: new Set(['generated.spec.ts']),
+      incoming: [{
+        filename: 'second-product.spec.ts',
+        content: `import { test } from '@playwright/test'; test('second product repeats covered family', async ({ page }) => { await page.goto('${secondProduct}'); });`,
+      }],
+    });
+
+    assert.equal(result.accepted.length, 0);
+    assert.equal(result.rejected[0].reason, 'no_missing_surface_targeted');
+  });
+});
+
+test('delta top-up rejects duplicate titles requirements and incoming filenames', () => {
+  withGeneratedSuite(`
+    import { test } from '@playwright/test';
+    test('[REQ:F1] existing route title', async ({ page }) => {
+      await page.goto('/dashboard');
+    });
+  `, (projectPath) => {
+    const manifest = buildExistingSuiteManifest({
+      projectPath,
+      context: {
+        pages: [{ path: '/dashboard' }, { path: '/settings' }, { path: '/billing' }],
+        apiEndpoints: [],
+      },
+      testType: 'frontend',
+      routeAccessSummary: { publicRoutes: ['/dashboard', '/settings', '/billing'], protectedRoutes: [] },
+    });
+    const result = filterDeltaTopUpTests({
+      existingSuiteManifest: manifest,
+      usedFilenames: new Set(['generated.spec.ts']),
+      incoming: [
+        {
+          filename: 'settings.spec.ts',
+          content: `import { test } from '@playwright/test'; test('[REQ:F1] existing route title', async ({ page }) => { await page.goto('/settings'); });`,
+        },
+        {
+          filename: 'billing.spec.ts',
+          content: `import { test } from '@playwright/test'; test('[REQ:F1] repeats requirement only', async ({ page }) => { await page.goto('/billing'); });`,
+        },
+        {
+          filename: 'shared.spec.ts',
+          content: `import { test } from '@playwright/test'; test('[REQ:F2] settings delta', async ({ page }) => { await page.goto('/settings'); });`,
+        },
+        {
+          filename: 'shared.spec.ts',
+          content: `import { test } from '@playwright/test'; test('[REQ:F3] billing delta', async ({ page }) => { await page.goto('/billing'); });`,
+        },
+      ],
+    });
+
+    assert.equal(result.accepted.length, 1);
+    assert.equal(result.accepted[0].filename, 'healix-topup-shared.spec.ts');
+    assert.ok(result.rejected.some((item) => item.reason === 'duplicate_test_title'));
+    assert.ok(result.rejected.some((item) => item.reason === 'duplicate_requirement_markers'));
+    assert.ok(result.rejected.some((item) => item.reason === 'duplicate_filename'));
   });
 });
 
@@ -900,6 +1041,60 @@ test('coverage top-up decision runs once for nonzero suites below target', () =>
   assert.equal(targetMet.reason, 'target_met');
 });
 
+test('coverage top-up WEBAPP_UNREACHABLE preserves useful pre-topup suite', async () => {
+  await withTempProject(async (projectPath) => {
+    const generatedDir = path.join(projectPath, 'tests', 'generated');
+    fs.mkdirSync(generatedDir, { recursive: true });
+    fs.writeFileSync(path.join(generatedDir, 'pretopup.spec.ts'), `
+      import { test, expect } from '@playwright/test';
+      ${generatedRunnableTests(12)}
+    `);
+
+    const err = new Error('fetch failed');
+    err.code = 'WEBAPP_UNREACHABLE';
+    const event = await maybeRunCoverageTopUp({
+      client: {
+        async generateTestsForAgent() {
+          throw err;
+        },
+      },
+      sharedPayload: {
+        context: { pages: Array.from({ length: 12 }, (_, index) => ({ path: `/route-${index}` })) },
+        projectInfo: { baseURL: 'http://127.0.0.1:5173' },
+        testType: 'frontend',
+        options: {},
+      },
+      testsDir: generatedDir,
+      usedFilenames: new Set(['pretopup.spec.ts']),
+      files: [{ filename: 'pretopup.spec.ts' }],
+      config: {
+        projectPath,
+        baseURL: 'http://127.0.0.1:5173',
+        testType: 'frontend',
+        coverageProfile: 'qa-max',
+        minGeneratedTests: 50,
+      },
+    });
+
+    assert.equal(event.status, 'failed');
+    assert.equal(event.topUpErrorCode, 'WEBAPP_UNREACHABLE');
+    assert.equal(event.continuedWithPreTopUpSuite, true);
+    assert.equal(fs.existsSync(path.join(generatedDir, 'pretopup.spec.ts')), true);
+
+    const quality = collectGenerationQuality(projectPath);
+    const gate = evaluateGenerationQualityGates({
+      config: { projectPath, testType: 'frontend', coverageProfile: 'qa-max', minGeneratedTests: 50 },
+      context: { pages: Array.from({ length: 12 }, (_, index) => ({ path: `/route-${index}` })) },
+      quality,
+      prdContent: '',
+      parsedPRD: {},
+      requirementsCoverage: {},
+    });
+    assert.equal(gate.ok, true);
+    assert.equal(gate.result.qualityGateStatus, 'warning');
+  });
+});
+
 test('quality gates allow small targets at the minimum useful floor', () => {
   withGeneratedSuite(`
     import { test, expect } from '@playwright/test';
@@ -1084,6 +1279,62 @@ test('quality audit accepts UI specs grounded to source files and observed route
     });
 
     assert.equal(audit.valid, true);
+  });
+});
+
+test('quality audit treats deterministic QA contract specs as source-grounded obligations', () => {
+  withTempProject((projectPath) => {
+    const srcDir = path.join(projectPath, 'src');
+    const generatedDir = path.join(projectPath, 'tests', 'generated');
+    fs.mkdirSync(srcDir, { recursive: true });
+    fs.mkdirSync(generatedDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(srcDir, 'App.tsx'),
+      `export function Plan(){ return <form><input name="accountName" required /><button>Save Plan</button></form> }`,
+    );
+    fs.writeFileSync(
+      path.join(generatedDir, 'healix-qa-contracts.spec.ts'),
+      `
+        import { test, expect } from '@playwright/test';
+        test('[QAC:qac-form-validation-plan-src-app-tsx] [CAT:form_validation] /plan requires accessible inline validation', async ({ page }) => {
+          // [SRC:src/App.tsx] Required fields: accountName.
+          await page.goto('/plan');
+          const form = page.locator('form').first();
+          await expect(form).toBeVisible();
+          await form.locator('button').click();
+          await expect(page.locator('[role="alert"], [aria-invalid="true"]').first()).toBeVisible();
+        });
+      `,
+    );
+
+    const audit = auditGeneratedTestQuality({
+      projectPath,
+      testType: 'frontend',
+      context: {
+        pages: [{ path: '/plan', sourceFile: 'src/App.tsx', description: 'Success plan form' }],
+        sourceContext: {
+          files: [{ file: 'src/App.tsx', routePaths: ['/plan'], assertableText: ['Save Plan'] }],
+          routePaths: ['/plan'],
+          assertableText: ['Save Plan'],
+        },
+        qaContracts: {
+          formValidationContracts: [{
+            id: 'qac-form-validation-plan-src-app-tsx',
+            marker: '[QAC:qac-form-validation-plan-src-app-tsx]',
+            route: '/plan',
+            sourceFile: 'src/App.tsx',
+            requiredFields: [{ name: 'accountName' }],
+            runnable: true,
+          }],
+        },
+      },
+      explorationArtifact: {
+        routes: [{ path: '/plan', requiresAuth: false, forms: [{ fields: [{ name: 'accountName', required: true }] }] }],
+      },
+    });
+
+    assert.equal(audit.valid, true);
+    assert.equal(audit.ungroundedUiFiles.length, 0);
   });
 });
 
@@ -1445,6 +1696,30 @@ test('quality audit allows exact supplied credential fixtures for API auth setup
     });
 
     assert.ok(!audit.errors.some((error) => error.startsWith('hardcoded_unverified_credentials:')));
+  });
+});
+
+test('quality audit normalizes template-literal base URL API requests', () => {
+  withGeneratedSuite(`
+    import { test, expect } from '@playwright/test';
+
+    const BASE = process.env.HEALIX_BASE_URL || 'http://127.0.0.1:3000';
+
+    test('[CAT:api_contract] GET /shop through shared base URL', async ({ request }) => {
+      const res = await request.get(\`\${BASE}/shop\`);
+      expect(res.status()).toBe(200);
+    });
+  `, (projectPath) => {
+    const audit = auditGeneratedTestQuality({
+      projectPath,
+      testType: 'both',
+      context: {
+        apiEndpoints: [{ method: 'GET', path: '/shop' }],
+      },
+    });
+
+    assert.equal(audit.valid, true);
+    assert.equal(audit.errors.some((error) => String(error).startsWith('ungrounded_api_endpoint:')), false);
   });
 });
 
@@ -1900,6 +2175,140 @@ test('quality quarantine removes only file-specific bad generated specs', () => 
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
+});
+
+test('hard-only quality quarantine keeps soft file issues for execution warnings', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'healix-quality-quarantine-soft-'));
+  try {
+    const generatedDir = path.join(root, 'tests', 'generated');
+    fs.mkdirSync(generatedDir, { recursive: true });
+    fs.writeFileSync(path.join(generatedDir, 'soft.spec.ts'), `import { test } from '@playwright/test'; test('soft', async () => {});`);
+    fs.writeFileSync(path.join(generatedDir, 'hard.spec.ts'), `import { test } from '@playwright/test'; test('hard', async () => {});`);
+
+    const softRecovery = quarantineGeneratedSpecFiles({
+      projectPath: root,
+      qualityAudit: { errors: ['missing_source_reference:soft.spec.ts'] },
+      reason: 'soft',
+      hardOnly: true,
+    });
+    assert.equal(softRecovery.applied, false);
+    assert.equal(softRecovery.reason, 'no_hard_file_specific_failures');
+    assert.equal(fs.existsSync(path.join(generatedDir, 'soft.spec.ts')), true);
+
+    const hardRecovery = quarantineGeneratedSpecFiles({
+      projectPath: root,
+      qualityAudit: { errors: ['hardcoded_unverified_credentials:hard.spec.ts:user@example.test'] },
+      reason: 'hard',
+      hardOnly: true,
+    });
+    assert.equal(hardRecovery.applied, true);
+    assert.deepEqual(hardRecovery.quarantinedFiles.map((file) => file.filename), ['hard.spec.ts']);
+    assert.equal(fs.existsSync(path.join(generatedDir, 'hard.spec.ts')), false);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('quality audit prunes source-role and CSS selector mismatches inside mixed specs', () => {
+  withTempProject((projectPath) => {
+    const srcDir = path.join(projectPath, 'src');
+    const generatedDir = path.join(projectPath, 'tests', 'generated');
+    fs.mkdirSync(srcDir, { recursive: true });
+    fs.mkdirSync(generatedDir, { recursive: true });
+    fs.writeFileSync(path.join(srcDir, 'App.tsx'), `
+      export function App() {
+        return <main>
+          <h1>Customer Success Console</h1>
+          <ul><li><strong>Northwind Robotics</strong></li></ul>
+          <select id="risk-filter"><option>High Risk</option></select>
+        </main>
+      }
+    `);
+    fs.writeFileSync(path.join(generatedDir, 'mixed.spec.ts'), `
+      import { test, expect } from '@playwright/test';
+      test('bad source-role selector [SRC:src/App.tsx] [CAT:ui_flow]', async ({ page }) => {
+        await page.goto('/');
+        await expect(page.locator('main').getByRole('link', { name: 'Northwind Robotics', exact: true })).toBeVisible();
+      });
+      test('bad CSS selector [SRC:src/App.tsx] [CAT:ui_flow]', async ({ page }) => {
+        await page.goto('/');
+        await expect(page.locator('main .account-list a').first()).toBeVisible();
+      });
+      test('good grounded selector [SRC:src/App.tsx] [CAT:ui_flow]', async ({ page }) => {
+        await page.goto('/');
+        await expect(page.getByRole('heading', { name: 'Customer Success Console' })).toBeVisible();
+        await expect(page.locator('select#risk-filter')).toBeVisible();
+      });
+    `);
+
+    const audit = auditGeneratedTestQuality({
+      projectPath,
+      testType: 'frontend',
+      context: {
+        pages: [{ path: '/', sourceFile: 'src/App.tsx', selectorHints: ['Customer Success Console', 'High Risk'] }],
+      },
+    });
+
+    assert.equal(audit.valid, false);
+    assert.ok(audit.errors.some((error) => error.startsWith('brittle_source_selector_mismatch:mixed.spec.ts:')));
+
+    const pruning = pruneGeneratedTestsByQuality({ projectPath, qualityAudit: audit, reason: 'selector_mismatch' });
+    assert.equal(pruning.applied, true);
+    assert.equal(pruning.prunedFiles[0].removedTests, 2);
+
+    const remaining = fs.readFileSync(path.join(generatedDir, 'mixed.spec.ts'), 'utf-8');
+    assert.doesNotMatch(remaining, /account-list|Northwind Robotics/);
+    assert.match(remaining, /good grounded selector/);
+  });
+});
+
+test('quality recovery net-benefit rejects collapsing a useful suite below floor or categories', () => {
+  const beforeQuality = {
+    runnableTests: 19,
+    totalTests: 19,
+    categories: {
+      ui_flow: 4,
+      workflow_journey: 2,
+      api_contract: 1,
+      api_negative: 1,
+      api_stress: 1,
+    },
+  };
+  const afterQuality = {
+    runnableTests: 2,
+    totalTests: 2,
+    categories: {
+      ui_flow: 2,
+      workflow_journey: 1,
+      api_contract: 0,
+      api_negative: 0,
+      api_stress: 0,
+    },
+  };
+  const assessment = assessQualityRecoveryNetBenefit({
+    config: { testType: 'both', coverageProfile: 'qa-max', minGeneratedTests: 50 },
+    context: {
+      pages: [{ path: '/' }],
+      apiEndpoints: [{ method: 'GET', path: '/api/products' }],
+    },
+    beforeQuality,
+    afterQuality,
+  });
+
+  assert.equal(assessment.keep, false);
+  assert.equal(assessment.reason, 'would_drop_below_minimum_useful_floor');
+
+  const hardAssessment = assessQualityRecoveryNetBenefit({
+    config: { testType: 'both', coverageProfile: 'qa-max', minGeneratedTests: 50 },
+    context: {
+      pages: [{ path: '/' }],
+      apiEndpoints: [{ method: 'GET', path: '/api/products' }],
+    },
+    beforeQuality,
+    afterQuality,
+    hardRecovery: true,
+  });
+  assert.equal(hardAssessment.keep, true);
 });
 
 test('quality pruning removes only brittle generated test blocks inside a mixed file', () => {
