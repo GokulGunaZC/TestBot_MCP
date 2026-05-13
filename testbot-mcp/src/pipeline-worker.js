@@ -1147,6 +1147,118 @@ function buildFailedAgentRetryMetadata({
   };
 }
 
+function effectiveRetainedRunnableFloor({ originalFloor, preRecoveryRunnableTests } = {}) {
+  const original = Math.max(1, Number.isFinite(Number(originalFloor)) ? Number(originalFloor) : 1);
+  const preRecovery = Number(preRecoveryRunnableTests);
+  if (!Number.isFinite(preRecovery) || preRecovery <= 0) return original;
+  return Math.min(original, Math.max(5, Math.ceil(preRecovery * 0.4)));
+}
+
+function buildRetainedSuiteRecoveryMeta({
+  config = {},
+  beforeQuality = {},
+  afterQuality = {},
+  recovery = {},
+} = {}) {
+  const target = toFiniteNumber(config.minGeneratedTests, 50);
+  const originalFloor = minimumUsefulRunnableFloor(target);
+  const preRecoveryRunnableTests = Number(beforeQuality.runnableTests || 0);
+  const postRecoveryRunnableTests = Number(afterQuality.runnableTests || 0);
+  const effectiveFloor = effectiveRetainedRunnableFloor({
+    originalFloor,
+    preRecoveryRunnableTests,
+  });
+  const coverageLoss = Math.max(0, preRecoveryRunnableTests - postRecoveryRunnableTests);
+  const quarantinedFileReasons = (recovery.quarantinedFiles || []).map((file) => ({
+    filename: file.filename || path.basename(file.path || ''),
+    path: file.path || null,
+    reason: 'hard_quality_blocker',
+  }));
+
+  return {
+    type: 'retained_suite_after_hard_quarantine',
+    preRecoveryRunnableTests,
+    postRecoveryRunnableTests,
+    originalRunnableFloor: originalFloor,
+    effectiveRunnableFloor: effectiveFloor,
+    qualityRecoveryCoverageLoss: coverageLoss,
+    quarantinedFileReasons,
+    executionAllowedAfterHardQuarantine: postRecoveryRunnableTests >= effectiveFloor && postRecoveryRunnableTests > 0,
+  };
+}
+
+function buildCoverageRetryMetadata({
+  sharedPayload = {},
+  config = {},
+  runId = null,
+  reason = 'coverage_top_up',
+  existingSuiteManifest = null,
+  topUpEvent = null,
+  retainedSuite = null,
+} = {}) {
+  const context = sharedPayload.context || {};
+  const safeContext = sanitizeRetryPayloadValue(context) || {};
+  const safeExplorationArtifact = sanitizeRetryPayloadValue(sharedPayload.explorationArtifact || null);
+  const safeProjectInfo = sanitizeRetryPayloadValue(sharedPayload.projectInfo || {});
+  const manifest = existingSuiteManifest || topUpEvent?.existingSuiteManifest || (config.projectPath
+    ? buildExistingSuiteManifest({
+        projectPath: config.projectPath,
+        context,
+        roles: sharedPayload.roles || [],
+        testType: sharedPayload.testType || config.testType || 'both',
+        routeAccessSummary: buildRouteAccessSummary(sharedPayload.explorationArtifact || null),
+      })
+    : null);
+  const currentTimeoutMs = Number(process.env.HEALIX_OPENAI_TIMEOUT_MS || 540000);
+  const recommendedTimeoutMs = Math.max(300000, Math.min(1800000, Math.ceil(currentTimeoutMs * 1.5)));
+
+  return {
+    available: true,
+    status: 'available',
+    reason,
+    runId,
+    mode: 'coverage_top_up_retry_delta',
+    canRunFromDashboard: true,
+    recommendedTimeoutMs,
+    recommendedBudgetMultiplier: 2,
+    topUpStatus: topUpEvent?.topUpStatus || topUpEvent?.status || null,
+    topUpErrorCode: topUpEvent?.topUpErrorCode || topUpEvent?.error?.code || null,
+    retainedSuite: retainedSuite || null,
+    existingSuiteManifest: manifest,
+    request: {
+      agents: ['expansion'],
+      context: {
+        ...safeContext,
+        generationFeedback: {
+          ...(safeContext.generationFeedback || {}),
+          mode: 'coverage_top_up_retry_delta',
+          previousFailureCode: topUpEvent?.topUpErrorCode || topUpEvent?.status || reason,
+          existingSuiteManifest: manifest,
+          retainedSuite: retainedSuite || null,
+          instructions: [
+            'Generate append-only coverage top-up specs only.',
+            'Do not replace, rewrite, or duplicate existing tests in the suite manifest.',
+            'Target only listed missing routes, route families, forms, QA contracts, requirements, workflows, or API endpoints.',
+            'Prefer source-backed routes with headings, labels, buttons, test IDs, or observed text. Skip ambiguous or protected routes.',
+          ],
+        },
+      },
+      prd: sharedPayload.prd || '',
+      parsedPRD: sharedPayload.parsedPRD || null,
+      explorationArtifact: safeExplorationArtifact,
+      roles: sanitizeRetryRoles(sharedPayload.roles || []),
+      testType: sharedPayload.testType || config.testType || 'both',
+      projectInfo: safeProjectInfo,
+      options: {
+        ...(sharedPayload.options || {}),
+        maxExpansionAttempts: 1,
+        coverageProfile: sharedPayload.options?.coverageProfile || config.coverageProfile || 'qa-max',
+        minGeneratedTests: Math.max(5, Math.min(20, Math.ceil(Number(sharedPayload.options?.minGeneratedTests || config.minGeneratedTests || 50) / 3))),
+      },
+    },
+  };
+}
+
 function extractQualityFailureFileNames(qualityAudit = {}) {
   const names = new Set();
   const add = (value) => {
@@ -2244,7 +2356,14 @@ function evaluateGenerationQualityGates({ config, context, quality, prdContent, 
   const missingCategories = requiredCategories.filter((category) => (quality.categories[category] || 0) < minHits);
 
   const minGeneratedTests = toFiniteNumber(config.minGeneratedTests, 50);
-  const usefulFloor = minimumUsefulRunnableFloor(minGeneratedTests);
+  const originalUsefulFloor = minimumUsefulRunnableFloor(minGeneratedTests);
+  const retainedSuite = quality.retainedSuite && typeof quality.retainedSuite === 'object'
+    ? quality.retainedSuite
+    : null;
+  const retainedEffectiveFloor = Number(retainedSuite?.effectiveRunnableFloor);
+  const usefulFloor = Number.isFinite(retainedEffectiveFloor) && retainedEffectiveFloor > 0
+    ? Math.min(originalUsefulFloor, retainedEffectiveFloor)
+    : originalUsefulFloor;
   const minSelectorQuality = profile === 'balanced' ? 0.35 : (profile === 'exhaustive' ? 0.6 : 0.5);
   const minRunnableRatio = profile === 'balanced' ? 0.25 : 0.5;
   const buildQualityEnvelope = (status, extra = {}) => ({
@@ -2253,6 +2372,9 @@ function evaluateGenerationQualityGates({ config, context, quality, prdContent, 
     minGeneratedTestsTarget: minGeneratedTests,
     minimumUsefulRunnableFloor: usefulFloor,
     adaptiveRunnableFloor: usefulFloor,
+    originalMinimumUsefulRunnableFloor: originalUsefulFloor,
+    effectiveRunnableFloor: usefulFloor,
+    retainedSuite: retainedSuite || quality.retainedSuite || null,
     generatedTestsActual: quality.totalTests,
     runnableTestsActual: quality.runnableTests,
     qualityGateStatus: status,
@@ -2315,33 +2437,48 @@ function evaluateGenerationQualityGates({ config, context, quality, prdContent, 
 
   const qualityWarnings = [];
   if (quality.totalTests < minGeneratedTests) {
+    const meetsUsefulFloor = quality.runnableTests >= usefulFloor;
     const minCountWarning = {
       code: 'MIN_TEST_COUNT_NOT_MET',
-      message: `Generated ${quality.totalTests} tests below target ${minGeneratedTests}; executing because the runnable suite meets the minimum useful floor.`,
+      message: meetsUsefulFloor
+        ? `Generated ${quality.totalTests} tests below target ${minGeneratedTests}; executing because the runnable suite meets the ${retainedSuite ? 'retained-suite ' : ''}minimum useful floor.`
+        : `Generated ${quality.totalTests} tests below target ${minGeneratedTests}; runnable tests ${quality.runnableTests} are below the minimum useful floor ${usefulFloor}.`,
       actual: quality.totalTests,
       expected: minGeneratedTests,
       severity: 'warning',
     };
 
-    if (quality.runnableTests < usefulFloor) {
+    if (!meetsUsefulFloor) {
+      const insufficientCode = retainedSuite ? 'INSUFFICIENT_RETAINED_RUNNABLE_COVERAGE' : 'INSUFFICIENT_RUNNABLE_COVERAGE';
       const error = new Error(
-        `Generated runnable tests ${quality.runnableTests} below minimum useful floor ${usefulFloor} for target ${minGeneratedTests}.`
+        retainedSuite
+          ? `Retained runnable tests ${quality.runnableTests} below recovery-adjusted useful floor ${usefulFloor} after hard quality quarantine (pre-recovery ${retainedSuite.preRecoveryRunnableTests || 0}).`
+          : `Generated runnable tests ${quality.runnableTests} below minimum useful floor ${usefulFloor} for target ${minGeneratedTests}.`
       );
-      error.code = 'INSUFFICIENT_RUNNABLE_COVERAGE';
+      error.code = insufficientCode;
       error.generationQuality = buildQualityEnvelope('failed', {
         qualityWarnings: [minCountWarning],
       });
       error.diagnostics = buildPipelineDiagnostics({
         projectPath: config.projectPath,
         stage: 'generation',
-        reason: 'insufficient_runnable_coverage',
+        reason: retainedSuite ? 'insufficient_retained_runnable_coverage' : 'insufficient_runnable_coverage',
         stderr: error.message,
-        qualityAudit: { errors: ['insufficient_runnable_coverage'], ...quality },
+        qualityAudit: { errors: [retainedSuite ? 'insufficient_retained_runnable_coverage' : 'insufficient_runnable_coverage'], ...quality },
       });
       return { ok: false, error };
     }
 
     qualityWarnings.push(minCountWarning);
+    if (retainedSuite) {
+      qualityWarnings.push({
+        code: 'RETAINED_SUITE_AFTER_HARD_QUARANTINE',
+        message: `Invalid generated specs were quarantined; retained ${quality.runnableTests} runnable test(s) meet recovery-adjusted floor ${usefulFloor} (original floor ${originalUsefulFloor}).`,
+        actual: quality.runnableTests,
+        expected: usefulFloor,
+        severity: 'warning',
+      });
+    }
     Logger.warn('PipelineWorker', `Generated tests ${quality.totalTests} below target ${minGeneratedTests}, but continuing because runnable tests ${quality.runnableTests} meet minimum useful floor ${usefulFloor}`);
   }
 
@@ -2462,7 +2599,7 @@ function buildGenerationRepairContext({
   if (missingCategories.length > 0) {
     instructions.push(`Close missing coverage categories: ${missingCategories.join(', ')}.`);
   }
-  if (code === 'INSUFFICIENT_RUNNABLE_COVERAGE' || code === 'MIN_TEST_COUNT_NOT_MET') {
+  if (code === 'INSUFFICIENT_RUNNABLE_COVERAGE' || code === 'INSUFFICIENT_RETAINED_RUNNABLE_COVERAGE' || code === 'MIN_TEST_COUNT_NOT_MET') {
     const floor = quality?.minimumUsefulRunnableFloor ?? quality?.adaptiveRunnableFloor;
     const actual = quality?.runnableTests ?? quality?.totalTests;
     const target = quality?.minGeneratedTestsTarget ?? quality?.minGeneratedTests;
@@ -2862,6 +2999,10 @@ function buildUserFacingPipelineError(errorCode, error) {
 
   if (errorCode === 'RUNNABLE_COVERAGE_TOO_LOW') {
     return `Healix generated too many skipped tests for the available app surface. ${normalizedMessage}`;
+  }
+
+  if (errorCode === 'INSUFFICIENT_RETAINED_RUNNABLE_COVERAGE') {
+    return `Healix quarantined invalid generated specs, but too few retained runnable tests remained after the recovery-adjusted floor was applied. ${normalizedMessage}`;
   }
 
   if (errorCode === 'INSUFFICIENT_RUNNABLE_COVERAGE') {
@@ -5890,6 +6031,16 @@ async function maybeRunCoverageTopUp({
     event.topUpStatus = event.status;
     event.topUpErrorCode = null;
     event.continuedWithPreTopUpSuite = event.status !== 'added';
+    if (event.continuedWithPreTopUpSuite) {
+      event.coverageRetry = buildCoverageRetryMetadata({
+        sharedPayload,
+        config,
+        runId,
+        reason: event.status,
+        existingSuiteManifest,
+        topUpEvent: event,
+      });
+    }
 
     if (statusDir) {
       updateStatus(statusDir, 'generation_top_up_complete', {
@@ -5942,6 +6093,16 @@ async function maybeRunCoverageTopUp({
     event.topUpErrorCode = event.error.code;
     event.continuedWithPreTopUpSuite = before.runnableTests >= decision.minimumUsefulRunnableFloor;
     event.nonFatal = event.continuedWithPreTopUpSuite;
+    if (event.continuedWithPreTopUpSuite) {
+      event.coverageRetry = buildCoverageRetryMetadata({
+        sharedPayload,
+        config,
+        runId,
+        reason: event.error.code || 'top_up_failed',
+        existingSuiteManifest,
+        topUpEvent: event,
+      });
+    }
     Logger.warn('PipelineWorker', 'Coverage top-up failed; continuing with generated suite', event.error);
     if (statusDir) {
       updateStatus(statusDir, 'generation_top_up_failed', {
@@ -6315,6 +6476,7 @@ async function runPhase1FanOut({
     existingSuiteManifest: topUpEvent?.existingSuiteManifest || null,
     agentTransportTimeoutMs,
   });
+  const coverageRetry = topUpEvent?.coverageRetry || null;
 
   // Deps must be installed once, after all writes are done (dedupes axios/etc.
   // across agents — installing during the Promise.allSettled loop would race).
@@ -6337,6 +6499,7 @@ async function runPhase1FanOut({
       agentTransportTimeoutMs,
       agentMeta,
       coverageTopUps,
+      coverageRetry,
       failedAgentRetry,
     },
   };
@@ -6463,6 +6626,7 @@ async function runAsyncGenerationPath({
           backendGenerationSkippedReason,
           ...(syncPayload.generationMeta || {}),
           coverageTopUps,
+          coverageRetry: topUpEvent?.coverageRetry || null,
         },
       };
     }
@@ -6661,6 +6825,7 @@ async function runAsyncGenerationPath({
     existingSuiteManifest: topUpEvent?.existingSuiteManifest || null,
     reason: 'async_agent_failures',
   });
+  const coverageRetry = topUpEvent?.coverageRetry || null;
 
   // Deps install once after all writes (dedupes axios/etc. across agents).
   installMissingDependencies(config.projectPath, testsDir);
@@ -6682,6 +6847,7 @@ async function runAsyncGenerationPath({
       backendGenerationSkippedReason,
       ...(finalResp?.generationMeta || {}),
       coverageTopUps,
+      coverageRetry,
       failedAgentRetry,
     },
   };
@@ -7074,14 +7240,77 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
           });
         }
 
-          qualityAudit = auditGeneratedTestQuality({
-            projectPath: config.projectPath,
-            testType: config.testType,
-            context,
-            explorationArtifact,
-            roles,
-          });
+        qualityAudit = auditGeneratedTestQuality({
+          projectPath: config.projectPath,
+          testType: config.testType,
+          context,
+          explorationArtifact,
+          roles,
+        });
         qualityAudit.qualityRecovery = quarantine;
+        const afterQuarantineQuality = collectGenerationQuality(config.projectPath, {
+          baseURL: config.baseURL || projectInfo?.baseURL,
+        });
+        const retainedSuite = buildRetainedSuiteRecoveryMeta({
+          config,
+          beforeQuality: beforeRecoveryQuality,
+          afterQuality: afterQuarantineQuality,
+          recovery: quarantine,
+        });
+        quarantine.retainedSuite = retainedSuite;
+        quarantine.preRecoveryRunnableTests = retainedSuite.preRecoveryRunnableTests;
+        quarantine.postRecoveryRunnableTests = retainedSuite.postRecoveryRunnableTests;
+        quarantine.effectiveRunnableFloor = retainedSuite.effectiveRunnableFloor;
+        quarantine.originalRunnableFloor = retainedSuite.originalRunnableFloor;
+        quarantine.qualityRecoveryCoverageLoss = retainedSuite.qualityRecoveryCoverageLoss;
+        quarantine.executionAllowedAfterHardQuarantine = retainedSuite.executionAllowedAfterHardQuarantine;
+        quarantine.quarantinedFileReasons = retainedSuite.quarantinedFileReasons;
+        qualityAudit.retainedSuite = retainedSuite;
+        generationMeta.retainedSuite = retainedSuite;
+        const retainedSuiteManifest = buildExistingSuiteManifest({
+          projectPath: config.projectPath,
+          context,
+          roles,
+          testType: config.testType,
+          quality: afterQuarantineQuality,
+          routeAccessSummary: buildRouteAccessSummary(explorationArtifact || null),
+        });
+        if (generationMeta.coverageRetry) {
+          const previousRequest = generationMeta.coverageRetry.request || {};
+          const previousContext = previousRequest.context && typeof previousRequest.context === 'object'
+            ? previousRequest.context
+            : {};
+          const previousFeedback = previousContext.generationFeedback && typeof previousContext.generationFeedback === 'object'
+            ? previousContext.generationFeedback
+            : {};
+          generationMeta.coverageRetry = {
+            ...generationMeta.coverageRetry,
+            retainedSuite,
+            existingSuiteManifest: retainedSuiteManifest,
+            reason: generationMeta.coverageRetry.reason || 'retained_suite_after_hard_quarantine',
+            request: {
+              ...previousRequest,
+              context: {
+                ...previousContext,
+                generationFeedback: {
+                  ...previousFeedback,
+                  mode: 'coverage_top_up_retry_delta',
+                  existingSuiteManifest: retainedSuiteManifest,
+                  retainedSuite,
+                },
+              },
+            },
+          };
+        } else {
+          generationMeta.coverageRetry = buildCoverageRetryMetadata({
+            sharedPayload: buildRetrySharedPayload(),
+            config,
+            runId,
+            reason: 'retained_suite_after_hard_quarantine',
+            existingSuiteManifest: retainedSuiteManifest,
+            retainedSuite,
+          });
+        }
 
         Logger.info('PipelineWorker', '[QUALITY GATE] post-quarantine auditGeneratedTestQuality result', {
           valid: qualityAudit.valid,
@@ -7090,6 +7319,7 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
           totalFiles: qualityAudit.totalFiles,
           totalTests: qualityAudit.totalTests,
           runnableTests: qualityAudit.runnableTests,
+          retainedSuite,
         });
 
         if (qualityAudit.valid) {
@@ -7386,6 +7616,7 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
     if (Array.isArray(resultMeta.agentsCompleted)) generationMeta.agentsCompleted = resultMeta.agentsCompleted;
     if (Array.isArray(resultMeta.agentFailures)) generationMeta.agentFailures = resultMeta.agentFailures;
     if (resultMeta.failedAgentRetry) generationMeta.failedAgentRetry = resultMeta.failedAgentRetry;
+    if (resultMeta.coverageRetry) generationMeta.coverageRetry = resultMeta.coverageRetry;
   };
 
   const tryGenerator = async (generatorName, runFn) => {
@@ -8522,6 +8753,9 @@ async function runPipeline(config, runId) {
           const qualityScan = collectGenerationQuality(config.projectPath, {
             baseURL: config.baseURL || projectInfo.baseURL,
           });
+          if (generationMeta?.retainedSuite) {
+            qualityScan.retainedSuite = generationMeta.retainedSuite;
+          }
           // Build requirements coverage FIRST so the gate can feed the BRD-trace
           // signal into the quality score + suggestions block.
           requirementsCoverage = buildRequirementsCoverage({
@@ -8659,6 +8893,9 @@ async function runPipeline(config, runId) {
           minGeneratedTestsTarget: generationQuality.minGeneratedTestsTarget,
           minimumUsefulRunnableFloor: generationQuality.minimumUsefulRunnableFloor,
           adaptiveRunnableFloor: generationQuality.adaptiveRunnableFloor,
+          originalMinimumUsefulRunnableFloor: generationQuality.originalMinimumUsefulRunnableFloor,
+          effectiveRunnableFloor: generationQuality.effectiveRunnableFloor,
+          retainedSuite: generationQuality.retainedSuite || null,
           runnableTestsActual: generationQuality.runnableTestsActual,
           qualityWarnings: generationQuality.qualityWarnings || [],
           executionAllowedDespiteWarnings: generationQuality.executionAllowedDespiteWarnings,
@@ -9625,11 +9862,14 @@ module.exports = {
   buildGenerationRepairContext,
   minimumUsefulRunnableFloor,
   adaptiveRunnableFloor,
+  effectiveRetainedRunnableFloor,
   shouldAttemptCoverageTopUp,
   isRepairableGenerationFailure,
   collectGenerationQuality,
   buildExistingSuiteManifest,
   buildFailedAgentRetryMetadata,
+  buildCoverageRetryMetadata,
+  buildRetainedSuiteRecoveryMeta,
   extractSpecSignals,
   filterDeltaTopUpTests,
   normalizeGeneratedRouteFamily,

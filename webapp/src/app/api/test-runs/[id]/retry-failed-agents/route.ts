@@ -21,6 +21,8 @@ type RetryMeta = {
   request?: Record<string, unknown>
   recommendedTimeoutMs?: number
   existingSuiteManifest?: Record<string, unknown>
+  mode?: string
+  reason?: string
   history?: unknown[]
   lastAttempt?: Record<string, unknown>
 }
@@ -143,10 +145,12 @@ function writeRetrySpecs({
   projectPath,
   files,
   agents,
+  prefix = 'healix-agent-retry',
 }: {
   projectPath: string
   files: RetryGeneratedFile[]
   agents: AgentName[]
+  prefix?: string
 }) {
   const testsDir = path.join(projectPath, 'tests', 'generated')
   fs.mkdirSync(testsDir, { recursive: true })
@@ -157,11 +161,11 @@ function writeRetrySpecs({
   files.forEach((file, index) => {
     const original = sanitizeFilename(file.filename || '', `retry-${index + 1}.spec.ts`)
     const suffix = original.endsWith('.spec.ts') || original.endsWith('.test.ts') ? original : `${original}.spec.ts`
-    let filename = `healix-agent-retry-${agentSlug}-${stamp}-${index + 1}-${suffix}`
+    let filename = `${prefix}-${agentSlug}-${stamp}-${index + 1}-${suffix}`
     let target = path.join(testsDir, filename)
     let counter = 2
     while (fs.existsSync(target)) {
-      filename = `healix-agent-retry-${agentSlug}-${stamp}-${index + 1}-${counter}-${suffix}`
+      filename = `${prefix}-${agentSlug}-${stamp}-${index + 1}-${counter}-${suffix}`
       target = path.join(testsDir, filename)
       counter += 1
     }
@@ -201,6 +205,7 @@ export async function POST(
     agents?: unknown
     timeoutMultiplier?: unknown
     timeoutMs?: unknown
+    coverageRetry?: unknown
   }
 
   const [row] = await db
@@ -213,14 +218,18 @@ export async function POST(
 
   const report = row.reportJson as Record<string, unknown> | null
   const generationMeta = getGenerationMeta(report)
-  const retryMeta = generationMeta?.failedAgentRetry as RetryMeta | undefined
+  const coverageRetryRequested = Boolean(body.coverageRetry)
+  const retryMeta = (coverageRetryRequested
+    ? generationMeta?.coverageRetry
+    : generationMeta?.failedAgentRetry) as RetryMeta | undefined
+  const retryKind = coverageRetryRequested ? 'coverage' : 'failed_agent'
   if (!retryMeta?.request || typeof retryMeta.request !== 'object') {
-    return buildUnavailableResponse('missing_retry_payload')
+    return buildUnavailableResponse(coverageRetryRequested ? 'missing_coverage_retry_payload' : 'missing_retry_payload')
   }
 
-  const agents = normalizeAgents(body.agents, retryMeta.agents || [])
+  const agents = normalizeAgents(body.agents, coverageRetryRequested ? ['expansion'] : (retryMeta.agents || []))
   if (agents.length === 0) {
-    return buildUnavailableResponse('no_failed_agents')
+    return buildUnavailableResponse(coverageRetryRequested ? 'no_coverage_retry_agent' : 'no_failed_agents')
   }
 
   const projectPath = row.projectPath || (report?.metadata as { projectPath?: string } | undefined)?.projectPath
@@ -230,7 +239,7 @@ export async function POST(
 
   const tokenCheck = await checkTokenBalance({
     userId: user.id,
-    endpoint: '/api/test-runs/[id]/retry-failed-agents',
+    endpoint: coverageRetryRequested ? '/api/test-runs/[id]/retry-coverage-top-up' : '/api/test-runs/[id]/retry-failed-agents',
     minRequired: Math.floor(MIN_TOKENS_GENERATE / 2),
     recommended: REC_TOKENS_GENERATE,
   })
@@ -247,17 +256,23 @@ export async function POST(
   const retryRequest = retryMeta.request as Record<string, unknown>
   const existingSuiteManifest = retryMeta.existingSuiteManifest
     || ((retryRequest.context as { generationFeedback?: { existingSuiteManifest?: unknown } } | undefined)?.generationFeedback?.existingSuiteManifest)
+  const feedbackMode = coverageRetryRequested ? 'coverage_top_up_retry_delta' : 'failed_agent_retry_delta'
   const context = {
     ...((retryRequest.context && typeof retryRequest.context === 'object') ? retryRequest.context as Record<string, unknown> : {}),
     generationFeedback: {
       ...((((retryRequest.context as { generationFeedback?: unknown } | undefined)?.generationFeedback || {}) as Record<string, unknown>)),
-      mode: 'failed_agent_retry_delta',
+      mode: feedbackMode,
       existingSuiteManifest,
-      failedAgents: agents,
+      ...(coverageRetryRequested ? { coverageRetry: true } : { failedAgents: agents }),
       instructions: [
-        'Dashboard retry: generate only append-only top-up tests for failed agents.',
+        coverageRetryRequested
+          ? 'Dashboard coverage retry: generate only append-only coverage top-up specs.'
+          : 'Dashboard retry: generate only append-only top-up tests for failed agents.',
         'Do not duplicate existing [REQ], [QAC], titles, routes, or API endpoints from the suite manifest.',
         'Use the saved source/route context and prefer stable source-backed selectors.',
+        ...(coverageRetryRequested
+          ? ['Target missing surfaces from existingSuiteManifest.missing and avoid route-only padding.']
+          : []),
       ],
     },
   }
@@ -296,14 +311,14 @@ export async function POST(
       if (!record.success || (record.tokensTotal ?? 0) <= 0) continue
       await recordTokenUsage({
         userId: user.id,
-        endpoint: '/api/test-runs/[id]/retry-failed-agents',
+        endpoint: coverageRetryRequested ? '/api/test-runs/[id]/retry-coverage-top-up' : '/api/test-runs/[id]/retry-failed-agents',
         agent: record.agent,
         model: resolveModel(record.modelUsed),
         tokensInput: record.tokensPrompt ?? 0,
         tokensOutput: record.tokensCompletion ?? 0,
         referenceType: 'test_run',
         referenceId: row.id,
-        metadata: { retry: true, agents },
+        metadata: { retry: true, retryKind, agents },
       })
     }
 
@@ -312,6 +327,7 @@ export async function POST(
       projectPath,
       files: filtered.accepted,
       agents,
+      prefix: coverageRetryRequested ? 'healix-coverage-retry' : 'healix-agent-retry',
     })
 
     attempt = {
@@ -319,14 +335,15 @@ export async function POST(
       startedAt,
       finishedAt: new Date().toISOString(),
       agents,
+      retryKind,
       timeoutMs,
       generatedFiles: writtenFiles,
       generatedCount: writtenFiles.length,
       rejectedFiles: filtered.rejected,
       rejectedCount: filtered.rejected.length,
       message: writtenFiles.length > 0
-        ? `Generated ${writtenFiles.length} append-only failed-agent top-up spec${writtenFiles.length === 1 ? '' : 's'}.`
-        : 'Failed-agent retry completed but did not return new non-duplicate specs.',
+        ? `Generated ${writtenFiles.length} append-only ${coverageRetryRequested ? 'coverage retry' : 'failed-agent top-up'} spec${writtenFiles.length === 1 ? '' : 's'}.`
+        : `${coverageRetryRequested ? 'Coverage retry' : 'Failed-agent retry'} completed but did not return new non-duplicate specs.`,
     }
   } catch (error) {
     attempt = {
@@ -334,10 +351,18 @@ export async function POST(
       startedAt,
       finishedAt: new Date().toISOString(),
       agents,
+      retryKind,
       timeoutMs,
-      errorCode: (error as { code?: string })?.code || 'FAILED_AGENT_RETRY_FAILED',
+      errorCode: (error as { code?: string })?.code || (coverageRetryRequested ? 'COVERAGE_RETRY_FAILED' : 'FAILED_AGENT_RETRY_FAILED'),
       message: error instanceof Error ? error.message : String(error),
     }
+  }
+
+  const nextRetryMeta = {
+    ...(retryMeta || {}),
+    status: attempt.status,
+    lastAttempt: attempt,
+    history: [...(Array.isArray(retryMeta?.history) ? retryMeta.history : []), attempt].slice(-5),
   }
 
   const nextReport = {
@@ -346,12 +371,9 @@ export async function POST(
       ...((report?.metadata && typeof report.metadata === 'object') ? report.metadata as Record<string, unknown> : {}),
       generationMeta: {
         ...(generationMeta || {}),
-        failedAgentRetry: {
-          ...(retryMeta || {}),
-          status: attempt.status,
-          lastAttempt: attempt,
-          history: [...(Array.isArray(retryMeta?.history) ? retryMeta.history : []), attempt].slice(-5),
-        },
+        ...(coverageRetryRequested
+          ? { coverageRetry: nextRetryMeta }
+          : { failedAgentRetry: nextRetryMeta }),
       },
     },
   }

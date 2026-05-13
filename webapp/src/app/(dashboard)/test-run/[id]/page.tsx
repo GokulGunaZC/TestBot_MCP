@@ -83,6 +83,28 @@ interface FailedAgentRetryMeta {
   history?: FailedAgentRetryAttempt[];
 }
 
+interface CoverageRetryMeta {
+  available?: boolean;
+  status?: string;
+  reason?: string;
+  mode?: string;
+  request?: unknown;
+  recommendedTimeoutMs?: number;
+  recommendedBudgetMultiplier?: number;
+  topUpStatus?: string | null;
+  topUpErrorCode?: string | null;
+  retainedSuite?: {
+    preRecoveryRunnableTests?: number;
+    postRecoveryRunnableTests?: number;
+    effectiveRunnableFloor?: number;
+    originalRunnableFloor?: number;
+    qualityRecoveryCoverageLoss?: number;
+    executionAllowedAfterHardQuarantine?: boolean;
+  } | null;
+  lastAttempt?: FailedAgentRetryAttempt | null;
+  history?: FailedAgentRetryAttempt[];
+}
+
 interface PartialGenerationWarning {
   reason: string;
   generator?: string;
@@ -104,6 +126,9 @@ interface QualityWarning {
   minGeneratedTestsTarget?: number;
   minimumUsefulRunnableFloor?: number;
   adaptiveRunnableFloor?: number;
+  originalMinimumUsefulRunnableFloor?: number;
+  effectiveRunnableFloor?: number;
+  retainedSuite?: CoverageRetryMeta['retainedSuite'];
   runnableTestsActual?: number;
   qualityWarnings?: Array<{ code?: string; message?: string; actual?: number; expected?: number; severity?: string }>;
   executionAllowedDespiteWarnings?: boolean;
@@ -193,6 +218,7 @@ interface GenerationMetaShape {
   qaContractSummary?: Record<string, number> | null;
   coverageTopUps?: CoverageTopUpEvent[];
   failedAgentRetry?: FailedAgentRetryMeta | null;
+  coverageRetry?: CoverageRetryMeta | null;
   [key: string]: unknown;
 }
 
@@ -1800,6 +1826,7 @@ function QualityWarningBanner({ warning }: { warning: QualityWarning }) {
   const suggestions = warning.suggestions || [];
   const topSuggestion = suggestions[0];
   const minCountWarning = (warning.qualityWarnings || []).find((item) => item.code === 'MIN_TEST_COUNT_NOT_MET');
+  const retainedWarning = (warning.qualityWarnings || []).find((item) => item.code === 'RETAINED_SUITE_AFTER_HARD_QUARANTINE');
   const usefulFloor = warning.minimumUsefulRunnableFloor ?? warning.adaptiveRunnableFloor;
 
   // amber for 60-79, orange/red for below 60
@@ -1826,10 +1853,14 @@ function QualityWarningBanner({ warning }: { warning: QualityWarning }) {
           </div>
           <div className="min-w-0">
             <div className={`font-semibold text-[15px] ${accentText}`}>
-              {minCountWarning ? 'Generated fewer tests than target' : `Test suite quality: ${score}%`}
+              {retainedWarning ? 'Invalid specs quarantined; retained tests ran' : (minCountWarning ? 'Generated fewer tests than target' : `Test suite quality: ${score}%`)}
             </div>
             <div className="text-[#F0F6FF]/85 text-sm mt-0.5">
-              {minCountWarning ? (
+              {retainedWarning ? (
+                <>
+                  Healix quarantined hard-problem specs and executed the retained valid suite because it met the recovery-adjusted floor.
+                </>
+              ) : minCountWarning ? (
                 <>
                   Generated tests were below target, but valid runnable tests ran because the suite met Healix&apos;s minimum useful runnable floor.
                 </>
@@ -1875,6 +1906,16 @@ function QualityWarningBanner({ warning }: { warning: QualityWarning }) {
               {typeof usefulFloor === 'number' && (
                 <span className="px-2 py-0.5 rounded-md bg-white/5 border border-white/10 text-[#D8E8FF]/70 text-[11px] font-mono">
                   floor: {usefulFloor}
+                </span>
+              )}
+              {typeof warning.originalMinimumUsefulRunnableFloor === 'number' && warning.originalMinimumUsefulRunnableFloor !== usefulFloor && (
+                <span className="px-2 py-0.5 rounded-md bg-white/5 border border-white/10 text-[#D8E8FF]/70 text-[11px] font-mono">
+                  original floor: {warning.originalMinimumUsefulRunnableFloor}
+                </span>
+              )}
+              {typeof warning.retainedSuite?.qualityRecoveryCoverageLoss === 'number' && warning.retainedSuite.qualityRecoveryCoverageLoss > 0 && (
+                <span className="px-2 py-0.5 rounded-md bg-white/5 border border-white/10 text-[#D8E8FF]/70 text-[11px] font-mono">
+                  quarantined: {warning.retainedSuite.qualityRecoveryCoverageLoss} tests
                 </span>
               )}
               {typeof warning.selectorQuality === 'number' && (
@@ -2455,6 +2496,135 @@ function FailedAgentRetryPanel({
   );
 }
 
+function CoverageRetryPanel({
+  runId,
+  generationMeta,
+  onRefresh,
+}: {
+  runId: string;
+  generationMeta: GenerationMetaShape | null;
+  onRefresh: () => Promise<void>;
+}) {
+  const retryMeta = generationMeta?.coverageRetry ?? null;
+  const retained = retryMeta?.retainedSuite ?? null;
+  const lastAttempt = retryMeta?.lastAttempt ?? null;
+  const [submitting, setSubmitting] = useState(false);
+  const [message, setMessage] = useState<string | null>(lastAttempt?.message ?? null);
+  const [error, setError] = useState<string | null>(null);
+
+  if (!retryMeta) return null;
+
+  const canRetry = retryMeta.available !== false && Boolean(retryMeta.request);
+  const timeoutMinutes = retryMeta.recommendedTimeoutMs
+    ? Math.ceil(retryMeta.recommendedTimeoutMs / 60000)
+    : null;
+
+  const runRetry = async () => {
+    setSubmitting(true);
+    setError(null);
+    setMessage(null);
+    try {
+      const res = await fetch(`/api/test-runs/${runId}/retry-failed-agents`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          coverageRetry: true,
+          agents: ['expansion'],
+          timeoutMultiplier: retryMeta.recommendedBudgetMultiplier ?? 2,
+        }),
+      });
+      const payload = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(payload?.message || payload?.reason || payload?.error || 'Coverage retry failed');
+      }
+      setMessage(payload?.attempt?.message || 'Coverage retry completed.');
+      await onRefresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: -6 }}
+      animate={{ opacity: 1, y: 0 }}
+      className="glass-card rounded-2xl overflow-hidden border border-amber-500/25 bg-amber-500/[0.035]"
+    >
+      <div className="px-5 py-4 border-b border-amber-500/15 flex items-start justify-between gap-3">
+        <div className="flex items-start gap-3 min-w-0">
+          <div className="w-9 h-9 rounded-lg bg-amber-500/15 border border-amber-500/30 flex items-center justify-center flex-shrink-0 mt-0.5">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#FBBF24" strokeWidth="2.2">
+              <path d="M21 12a9 9 0 0 1-9 9 9 9 0 0 1-7.5-4" />
+              <path d="M3 12a9 9 0 0 1 9-9 9 9 0 0 1 7.5 4" />
+              <path d="M3 16h5v5" />
+              <path d="M21 8h-5V3" />
+            </svg>
+          </div>
+          <div className="min-w-0">
+            <div className="text-[#FDE68A] font-semibold text-[15px]">Coverage top-up can be retried</div>
+            <div className="text-[#F0F6FF]/85 text-sm mt-0.5">
+              Healix kept the valid suite and quarantined unsafe specs. Retry adds append-only tests for uncovered routes or workflows with a larger budget.
+            </div>
+            <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+              {retryMeta.topUpStatus && (
+                <span className="px-2 py-0.5 rounded-md bg-amber-500/10 border border-amber-500/25 text-[#FCD34D] text-[11px] font-mono">
+                  top-up: {retryMeta.topUpStatus}
+                </span>
+              )}
+              {retained && (
+                <span className="px-2 py-0.5 rounded-md bg-white/5 border border-white/10 text-[#D8E8FF]/70 text-[11px] font-mono">
+                  retained: {retained.postRecoveryRunnableTests ?? '?'} / floor {retained.effectiveRunnableFloor ?? '?'}
+                </span>
+              )}
+              {typeof retained?.qualityRecoveryCoverageLoss === 'number' && retained.qualityRecoveryCoverageLoss > 0 && (
+                <span className="px-2 py-0.5 rounded-md bg-white/5 border border-white/10 text-[#D8E8FF]/70 text-[11px] font-mono">
+                  quarantined loss: {retained.qualityRecoveryCoverageLoss}
+                </span>
+              )}
+              {timeoutMinutes && (
+                <span className="px-2 py-0.5 rounded-md bg-white/5 border border-white/10 text-[#D8E8FF]/70 text-[11px] font-mono">
+                  retry budget: ~{timeoutMinutes}m
+                </span>
+              )}
+              {lastAttempt?.status && (
+                <span className="px-2 py-0.5 rounded-md bg-white/5 border border-white/10 text-[#D8E8FF]/70 text-[11px] font-mono">
+                  last: {lastAttempt.status}
+                </span>
+              )}
+            </div>
+          </div>
+        </div>
+        <button
+          onClick={runRetry}
+          disabled={submitting || !canRetry}
+          className="px-3 py-1.5 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 disabled:opacity-50 disabled:cursor-not-allowed border border-amber-500/30 text-[#FDE68A] text-xs font-semibold transition-colors flex-shrink-0"
+        >
+          {submitting ? 'Retrying…' : 'Retry coverage top-up'}
+        </button>
+      </div>
+      {(message || error || !canRetry) && (
+        <div className="px-5 py-3 text-[12.5px] border-t border-amber-500/10">
+          {message && <div className="text-emerald-300/90">{message}</div>}
+          {error && <div className="text-[#FCA5A5]">{error}</div>}
+          {!canRetry && (
+            <div className="text-[#D8E8FF]/75">
+              This historical run does not include the saved suite manifest required for one-click coverage retry.
+            </div>
+          )}
+          {Array.isArray(lastAttempt?.generatedFiles) && lastAttempt.generatedFiles.length > 0 && (
+            <div className="mt-2 text-[#D8E8FF]/70 font-mono text-[11px]">
+              {lastAttempt.generatedFiles.slice(0, 4).join(', ')}
+              {lastAttempt.generatedFiles.length > 4 ? ` +${lastAttempt.generatedFiles.length - 4} more` : ''}
+            </div>
+          )}
+        </div>
+      )}
+    </motion.div>
+  );
+}
+
 interface SuggestedFixStep {
   action: string;
   detail?: string;
@@ -2547,7 +2717,7 @@ function buildSuggestedFix(error: PipelineErrorShape): SuggestedFix | null {
     };
   }
 
-  if (code === 'INSUFFICIENT_RUNNABLE_COVERAGE' || code === 'MIN_TEST_COUNT_NOT_MET') {
+  if (code === 'INSUFFICIENT_RUNNABLE_COVERAGE' || code === 'INSUFFICIENT_RETAINED_RUNNABLE_COVERAGE' || code === 'MIN_TEST_COUNT_NOT_MET') {
     return {
       title: 'Suggested fix — add focused runnable coverage',
       steps: [
@@ -2701,10 +2871,12 @@ function PipelineErrorBanner({ error, runId }: { error: PipelineErrorShape; runI
     );
   const isMinCountIssue = code === 'MIN_TEST_COUNT_NOT_MET'
     || code === 'INSUFFICIENT_RUNNABLE_COVERAGE'
+    || code === 'INSUFFICIENT_RETAINED_RUNNABLE_COVERAGE'
     || /MIN_TEST_COUNT_NOT_MET|Generated tests \d+ below minimum|below (?:adaptive|minimum useful) floor/i.test(
       `${error.userFacingMessage ?? ''} ${error.stderr ?? ''} ${error.reason ?? ''}`
     );
   const isInsufficientRunnableCoverage = code === 'INSUFFICIENT_RUNNABLE_COVERAGE';
+  const isInsufficientRetainedCoverage = code === 'INSUFFICIENT_RETAINED_RUNNABLE_COVERAGE';
   const generatedFromQuality = error.generationQuality?.generatedTestsActual
     ?? error.generationQuality?.totalTests
     ?? null;
@@ -2742,7 +2914,7 @@ function PipelineErrorBanner({ error, runId }: { error: PipelineErrorShape; runI
   const stage = isHardcodedBaseUrlMismatch || isMinCountIssue ? 'generation' : (error.stage || 'unknown');
   const reason = isHardcodedBaseUrlMismatch
     ? 'hardcoded_base_url_mismatch'
-    : (isMinCountIssue ? (isInsufficientRunnableCoverage ? 'insufficient_runnable_coverage' : 'min_test_count_not_met') : (error.reason || 'unknown_reason'));
+    : (isMinCountIssue ? (isInsufficientRetainedCoverage ? 'insufficient_retained_runnable_coverage' : (isInsufficientRunnableCoverage ? 'insufficient_runnable_coverage' : 'min_test_count_not_met')) : (error.reason || 'unknown_reason'));
   const displayMessage = isHardcodedBaseUrlMismatch && !error.userFacingMessage
     ? 'Generated tests used an absolute URL outside the configured baseURL. Healix blocked execution so results do not come from the wrong target app.'
     : (isMinCountIssue && !error.userFacingMessage
@@ -2758,6 +2930,7 @@ function PipelineErrorBanner({ error, runId }: { error: PipelineErrorShape; runI
   const stageLabel =
     code === 'HARDCODED_BASE_URL_MISMATCH' ? 'Generated tests targeted the wrong app origin' :
     code === 'TARGET_PORT_IN_USE_NOT_READY' ? 'Target port is occupied but not reachable' :
+    isInsufficientRetainedCoverage ? 'Too few retained tests after quarantine' :
     isInsufficientRunnableCoverage ? 'Generated fewer runnable tests than the useful minimum' :
     isMinCountIssue ? 'Generated fewer tests than target' :
     stage === 'validation' ? 'Generated tests failed Playwright validation' :
@@ -3511,6 +3684,14 @@ export default function TestRunDetailPage() {
           agentFailures={visibleAgentFailures}
           agentsCompleted={agentsCompletedFromMeta}
           agentsRequested={agentsRequestedFromMeta}
+          onRefresh={refreshRun}
+        />
+      )}
+
+      {generationMeta?.coverageRetry && (
+        <CoverageRetryPanel
+          runId={testRun.id}
+          generationMeta={generationMeta}
           onRefresh={refreshRun}
         />
       )}

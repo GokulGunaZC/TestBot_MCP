@@ -18,10 +18,12 @@ const {
   buildGenerationRepairContext,
   minimumUsefulRunnableFloor,
   adaptiveRunnableFloor,
+  effectiveRetainedRunnableFloor,
   shouldAttemptCoverageTopUp,
   collectGenerationQuality,
   buildExistingSuiteManifest,
   buildFailedAgentRetryMetadata,
+  buildCoverageRetryMetadata,
   countSkippedTestsInContent,
   countTestsInContent,
   evaluateGenerationQualityGates,
@@ -1018,6 +1020,81 @@ test('quality gates fail below minimum useful runnable floor after top-up', () =
   });
 });
 
+test('quality gates execute retained suite after hard quarantine using recovery-adjusted floor', () => {
+  withGeneratedSuite(`
+    import { test, expect } from '@playwright/test';
+    ${generatedRunnableTests(9)}
+  `, (projectPath) => {
+    const quality = collectGenerationQuality(projectPath);
+    quality.retainedSuite = {
+      type: 'retained_suite_after_hard_quarantine',
+      preRecoveryRunnableTests: 19,
+      postRecoveryRunnableTests: 9,
+      originalRunnableFloor: 12,
+      effectiveRunnableFloor: effectiveRetainedRunnableFloor({
+        originalFloor: 12,
+        preRecoveryRunnableTests: 19,
+      }),
+      qualityRecoveryCoverageLoss: 10,
+      executionAllowedAfterHardQuarantine: true,
+      quarantinedFileReasons: [{ filename: 'api-site.spec.ts', reason: 'hard_quality_blocker' }],
+    };
+
+    const gate = evaluateGenerationQualityGates({
+      config: { projectPath, testType: 'both', coverageProfile: 'qa-max', minGeneratedTests: 50 },
+      context: { pages: Array.from({ length: 9 }, (_, index) => ({ path: `/route-${index}` })) },
+      quality,
+      prdContent: '',
+      parsedPRD: {},
+      requirementsCoverage: {},
+    });
+
+    assert.equal(effectiveRetainedRunnableFloor({ originalFloor: 12, preRecoveryRunnableTests: 19 }), 8);
+    assert.equal(gate.ok, true);
+    assert.equal(gate.result.qualityGateStatus, 'warning');
+    assert.equal(gate.result.minimumUsefulRunnableFloor, 8);
+    assert.equal(gate.result.originalMinimumUsefulRunnableFloor, 12);
+    assert.equal(gate.result.retainedSuite.preRecoveryRunnableTests, 19);
+    assert.equal(gate.result.retainedSuite.postRecoveryRunnableTests, 9);
+    assert.equal(gate.result.executionAllowedDespiteWarnings, true);
+    assert.ok(gate.result.qualityWarnings.some((warning) => warning.code === 'RETAINED_SUITE_AFTER_HARD_QUARANTINE'));
+  });
+});
+
+test('quality gates fail retained suite below recovery-adjusted floor', () => {
+  withGeneratedSuite(`
+    import { test, expect } from '@playwright/test';
+    ${generatedRunnableTests(4)}
+  `, (projectPath) => {
+    const quality = collectGenerationQuality(projectPath);
+    quality.retainedSuite = {
+      type: 'retained_suite_after_hard_quarantine',
+      preRecoveryRunnableTests: 19,
+      postRecoveryRunnableTests: 4,
+      originalRunnableFloor: 12,
+      effectiveRunnableFloor: 8,
+      qualityRecoveryCoverageLoss: 15,
+      executionAllowedAfterHardQuarantine: false,
+    };
+
+    const gate = evaluateGenerationQualityGates({
+      config: { projectPath, testType: 'both', coverageProfile: 'qa-max', minGeneratedTests: 50 },
+      context: { pages: Array.from({ length: 4 }, (_, index) => ({ path: `/route-${index}` })) },
+      quality,
+      prdContent: '',
+      parsedPRD: {},
+      requirementsCoverage: {},
+    });
+
+    assert.equal(gate.ok, false);
+    assert.equal(gate.error.code, 'INSUFFICIENT_RETAINED_RUNNABLE_COVERAGE');
+    assert.equal(gate.error.generationQuality.minimumUsefulRunnableFloor, 8);
+    assert.equal(gate.error.generationQuality.originalMinimumUsefulRunnableFloor, 12);
+    assert.match(gate.error.message, /Retained runnable tests 4 below recovery-adjusted useful floor 8/);
+    assert.equal(gate.error.generationQuality.qualityWarnings[0].message.includes('executing because'), false);
+  });
+});
+
 test('coverage top-up decision runs once for nonzero suites below target', () => {
   const decision = shouldAttemptCoverageTopUp({
     config: { minGeneratedTests: 50 },
@@ -1080,6 +1157,9 @@ test('coverage top-up WEBAPP_UNREACHABLE preserves useful pre-topup suite', asyn
     assert.equal(event.status, 'failed');
     assert.equal(event.topUpErrorCode, 'WEBAPP_UNREACHABLE');
     assert.equal(event.continuedWithPreTopUpSuite, true);
+    assert.ok(event.coverageRetry);
+    assert.equal(event.coverageRetry.request.context.generationFeedback.mode, 'coverage_top_up_retry_delta');
+    assert.equal(event.coverageRetry.request.agents[0], 'expansion');
     assert.equal(fs.existsSync(path.join(generatedDir, 'pretopup.spec.ts')), true);
 
     const quality = collectGenerationQuality(projectPath);
@@ -1093,6 +1173,55 @@ test('coverage top-up WEBAPP_UNREACHABLE preserves useful pre-topup suite', asyn
     });
     assert.equal(gate.ok, true);
     assert.equal(gate.result.qualityGateStatus, 'warning');
+  });
+});
+
+test('coverage retry metadata stores append-only expansion payload from suite manifest', () => {
+  withTempProject((projectPath) => {
+    const generatedDir = path.join(projectPath, 'tests', 'generated');
+    fs.mkdirSync(generatedDir, { recursive: true });
+    fs.writeFileSync(path.join(generatedDir, 'smoke.spec.ts'), `
+      import { test, expect } from '@playwright/test';
+      test('[REQ:home] [CAT:ui_flow] home renders', async ({ page }) => {
+        await page.goto('/');
+        await expect(page.getByRole('heading', { name: 'Home' })).toBeVisible();
+      });
+    `);
+
+    const retry = buildCoverageRetryMetadata({
+      config: { projectPath, testType: 'frontend', minGeneratedTests: 50, coverageProfile: 'qa-max' },
+      runId: 'coverage-retry-run',
+      reason: 'no_new_valid_delta',
+      sharedPayload: {
+        context: {
+          pages: [
+            { path: '/', sourceFile: 'src/App.tsx', headings: ['Home'] },
+            { path: '/about', sourceFile: 'src/About.tsx', headings: ['About'] },
+          ],
+          authProbe: { token: 'session-token-secret' },
+        },
+        prd: 'Home and about pages must render',
+        roles: [{ role: 'admin', username: 'admin@example.com', password: 'secret' }],
+        testType: 'frontend',
+        projectInfo: { name: 'Coverage Fixture' },
+        options: { minGeneratedTests: 50 },
+      },
+      retainedSuite: {
+        preRecoveryRunnableTests: 19,
+        postRecoveryRunnableTests: 9,
+        effectiveRunnableFloor: 8,
+        originalRunnableFloor: 12,
+      },
+    });
+
+    assert.ok(retry.available);
+    assert.equal(retry.request.agents[0], 'expansion');
+    assert.equal(retry.request.context.generationFeedback.mode, 'coverage_top_up_retry_delta');
+    assert.equal(retry.request.context.generationFeedback.retainedSuite.postRecoveryRunnableTests, 9);
+    assert.ok(retry.existingSuiteManifest.covered.reqMarkers.includes('home'));
+    assert.equal(JSON.stringify(retry.request).includes('admin@example.com'), false);
+    assert.equal(JSON.stringify(retry.request).includes('secret'), false);
+    assert.equal(JSON.stringify(retry.request).includes('session-token-secret'), false);
   });
 });
 
@@ -1224,6 +1353,13 @@ test('pipeline error classifier treats min-count and useful-floor failures as ge
   assert.equal(insufficient.stage, 'generation');
   assert.equal(insufficient.reason, 'insufficient_runnable_coverage');
   assert.equal(insufficient.errorCode, 'INSUFFICIENT_RUNNABLE_COVERAGE');
+
+  const retained = classifyPipelineErrorFromStderr({
+    stderr: 'Retained runnable tests 4 below recovery-adjusted useful floor 8 after hard quality quarantine.',
+  });
+  assert.equal(retained.stage, 'generation');
+  assert.equal(retained.reason, 'insufficient_retained_runnable_coverage');
+  assert.equal(retained.errorCode, 'INSUFFICIENT_RETAINED_RUNNABLE_COVERAGE');
 });
 
 test('pipeline error classifier treats occupied unreachable target port as setup failure', () => {
