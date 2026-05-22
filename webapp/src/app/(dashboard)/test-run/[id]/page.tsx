@@ -2275,7 +2275,7 @@ function QaContractAdvisoryBanner({ generationMeta }: { generationMeta: Generati
           <div className="mt-3 space-y-2">
             {questions.slice(0, 4).map((question, index) => (
               <div
-                key={question.id || `${question.method || 'DELETE'}-${question.path || index}`}
+                key={question.id || `${question.method|| 'DELETE'}-${question.path || index}`}
                 className="rounded-xl border border-amber-500/15 bg-black/15 px-3 py-2"
               >
                 <div className="flex flex-wrap items-center gap-2 text-[11px] font-mono text-[#FCD34D]">
