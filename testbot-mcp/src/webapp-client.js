@@ -17,7 +17,7 @@
 const Logger = require('./logger');
 
 // Heavy AI endpoints (generate-tests, parse-prd, exploration/plan, analyze-failures)
-// can legitimately take 10-20 minutes for non-trivial projects — gpt-5.4-mini runs on
+// can legitimately take 10-20 minutes for non-trivial projects — gpt-5.5-mini runs on
 // the Responses API with `reasoning: { effort: "high" }`, which trades latency
 // for quality. Default is intentionally long; lightweight endpoints pass their
 // own short timeoutMs explicitly.
@@ -34,12 +34,12 @@ const ENDPOINT_TIMEOUTS_MS = {
   validate: 6_000,
   phase: 4_000,
   ingest: 60_000,
-  analyze: 600_000,          // 10 min — gpt-5.4-mini high-reasoning triage
+  analyze: 600_000,          // 10 min — gpt-5.5-mini high-reasoning triage
   planExploration: 600_000,  // 10 min
   parsePRD: 600_000,         // 10 min
   generateTests: 1_200_000,  // 20 min — legacy monolithic code-gen
   // Per-agent chunked generation. Localhost-first: each agent slice routinely
-  // needs minutes under gpt-5.4-mini high-reasoning (frontend and error agents
+  // needs minutes under gpt-5.5-mini high-reasoning (frontend and error agents
   // especially). Override via HEALIX_WEBAPP_TIMEOUT_MS if you need a tighter
   // global ceiling. The old 55s value was a Vercel-hobby accommodation.
   generateTestsForAgent: 600_000,
@@ -103,7 +103,7 @@ class WebappClient {
     this.dashboardUrl = normalizeLocalhost(dashboardUrl || process.env.HEALIX_DASHBOARD_URL || 'http://localhost:3000');
     this.timeoutMs = Number.isFinite(timeoutMs) ? timeoutMs : DEFAULT_TIMEOUT_MS;
     // When the webapp runs locally there is no Vercel 60 s hard cap.
-    // Use generous per-agent timeouts so gpt-5.4-mini high-reasoning can finish.
+    // Use generous per-agent timeouts so gpt-5.5-mini high-reasoning can finish.
     try {
       this._isLocal = LOCAL_HOSTS.has(new URL(this.dashboardUrl).hostname);
     } catch {
@@ -283,7 +283,20 @@ class WebappClient {
    * Same return shape as `generateTests` (tests[], generationMeta, agentRuns);
    * just narrower — typically a single agent's tests.
    */
-  async generateTestsForAgent({ agent, context, prd, parsedPRD, explorationArtifact, roles, testType, projectInfo, options, transportTimeoutMs }) {
+  async generateTestsForAgent({
+    agent,
+    context,
+    prd,
+    parsedPRD,
+    explorationArtifact,
+    roles,
+    testType,
+    projectInfo,
+    options,
+    transportTimeoutMs,
+    transportRetryDelaysMs,
+    transportRetryMaxElapsedMs,
+  }) {
     this._assertKey('/api/generate-tests');
     if (!KNOWN_AGENTS.includes(agent)) {
       const err = new Error(
@@ -315,8 +328,12 @@ class WebappClient {
         // layer. If the socket drops after minutes, retrying duplicates the
         // whole agent and burns the pipeline budget. Retry only immediate
         // connection flakes.
-        retryDelaysMs: [0, 1000],
-        retryMaxElapsedMs: 15_000,
+        retryDelaysMs: Array.isArray(transportRetryDelaysMs) && transportRetryDelaysMs.length > 0
+          ? transportRetryDelaysMs
+          : [0, 1000],
+        retryMaxElapsedMs: Number.isFinite(Number(transportRetryMaxElapsedMs))
+          ? Number(transportRetryMaxElapsedMs)
+          : 15_000,
       }
     );
   }

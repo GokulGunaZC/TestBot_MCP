@@ -21,6 +21,7 @@ import type { GenerationPlan } from '@/lib/test-generation/plan-schema'
 export type GenerationJobPayload = Record<string, unknown>
 export type GenerationJobResult = Record<string, unknown>
 export type GenerationJobError = Record<string, unknown>
+export type FindingSummary = Record<string, unknown>
 
 export const profiles = pgTable('profiles', {
   id: uuid('id').primaryKey(),
@@ -89,6 +90,7 @@ export const testRuns = pgTable(
     currentPhaseAt: timestamp('current_phase_at', { withTimezone: true }),
     tierResults: jsonb('tier_results'),
     pipelineError: jsonb('pipeline_error'),
+    findingSummary: jsonb('finding_summary').$type<FindingSummary>(),
     createdAt: timestamp('created_at', { withTimezone: true }).defaultNow(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow(),
   },
@@ -127,6 +129,125 @@ export const testFailures = pgTable(
     index('test_failures_run_idx').on(table.testRunId),
     index('test_failures_user_verdict_idx').on(table.userId, table.verdict),
     index('test_failures_cluster_idx').on(table.testRunId, table.clusterId),
+  ]
+)
+
+export const qaTestCases = pgTable(
+  'qa_test_cases',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => profiles.id, { onDelete: 'cascade' }),
+    projectFingerprint: text('project_fingerprint').notNull(),
+    caseKey: text('case_key').notNull(),
+    title: text('title').notNull(),
+    suite: text('suite'),
+    filePath: text('file_path'),
+    testType: text('test_type'),
+    category: text('category'),
+    tags: text('tags').array().notNull().default(sql`'{}'`),
+    source: text('source').notNull().default('mcp'),
+    metadata: jsonb('metadata'),
+    firstSeenAt: timestamp('first_seen_at', { withTimezone: true }).defaultNow().notNull(),
+    lastSeenAt: timestamp('last_seen_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex('qa_test_cases_user_project_key_idx').on(table.userId, table.projectFingerprint, table.caseKey),
+    index('qa_test_cases_user_project_idx').on(table.userId, table.projectFingerprint),
+    index('qa_test_cases_last_seen_idx').on(table.lastSeenAt.desc()),
+  ]
+)
+
+export const qaTestCaseRuns = pgTable(
+  'qa_test_case_runs',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    testRunId: uuid('test_run_id')
+      .notNull()
+      .references(() => testRuns.id, { onDelete: 'cascade' }),
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => profiles.id, { onDelete: 'cascade' }),
+    testCaseId: uuid('test_case_id').references(() => qaTestCases.id, { onDelete: 'set null' }),
+    projectFingerprint: text('project_fingerprint').notNull(),
+    caseKey: text('case_key').notNull(),
+    testName: text('test_name').notNull(),
+    status: text('status').notNull(),
+    suite: text('suite'),
+    filePath: text('file_path'),
+    durationMs: integer('duration_ms'),
+    attempt: integer('attempt').notNull().default(0),
+    errorMessage: text('error_message'),
+    rawResult: jsonb('raw_result'),
+    startedAt: timestamp('started_at', { withTimezone: true }),
+    completedAt: timestamp('completed_at', { withTimezone: true }),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex('qa_test_case_runs_run_case_attempt_idx').on(table.testRunId, table.caseKey, table.attempt),
+    index('qa_test_case_runs_run_idx').on(table.testRunId),
+    index('qa_test_case_runs_case_idx').on(table.testCaseId),
+    index('qa_test_case_runs_user_project_idx').on(table.userId, table.projectFingerprint),
+  ]
+)
+
+export const qaContractSnapshots = pgTable(
+  'qa_contract_snapshots',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => profiles.id, { onDelete: 'cascade' }),
+    testRunId: uuid('test_run_id').references(() => testRuns.id, { onDelete: 'set null' }),
+    projectFingerprint: text('project_fingerprint').notNull(),
+    snapshotHash: text('snapshot_hash').notNull(),
+    source: text('source').notNull().default('mcp'),
+    contracts: jsonb('contracts').notNull(),
+    summary: jsonb('summary'),
+    capturedAt: timestamp('captured_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex('qa_contract_snapshots_user_project_hash_idx').on(table.userId, table.projectFingerprint, table.snapshotHash),
+    index('qa_contract_snapshots_user_project_idx').on(table.userId, table.projectFingerprint, table.capturedAt.desc()),
+    index('qa_contract_snapshots_run_idx').on(table.testRunId),
+  ]
+)
+
+export const qaFindings = pgTable(
+  'qa_findings',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => profiles.id, { onDelete: 'cascade' }),
+    testRunId: uuid('test_run_id')
+      .notNull()
+      .references(() => testRuns.id, { onDelete: 'cascade' }),
+    testCaseId: uuid('test_case_id').references(() => qaTestCases.id, { onDelete: 'set null' }),
+    testCaseRunId: uuid('test_case_run_id').references(() => qaTestCaseRuns.id, { onDelete: 'set null' }),
+    projectFingerprint: text('project_fingerprint').notNull(),
+    fingerprint: text('fingerprint').notNull(),
+    title: text('title').notNull(),
+    severity: text('severity').notNull().default('medium'),
+    status: text('status').notNull().default('open'),
+    category: text('category'),
+    findingType: text('finding_type'),
+    testName: text('test_name'),
+    testFile: text('test_file'),
+    recommendation: text('recommendation'),
+    evidence: jsonb('evidence'),
+    rawFinding: jsonb('raw_finding'),
+    firstSeenAt: timestamp('first_seen_at', { withTimezone: true }).defaultNow().notNull(),
+    lastSeenAt: timestamp('last_seen_at', { withTimezone: true }).defaultNow().notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex('qa_findings_run_fingerprint_idx').on(table.userId, table.testRunId, table.fingerprint),
+    index('qa_findings_run_idx').on(table.testRunId),
+    index('qa_findings_user_project_idx').on(table.userId, table.projectFingerprint, table.lastSeenAt.desc()),
+    index('qa_findings_user_severity_idx').on(table.userId, table.severity),
+    index('qa_findings_status_idx').on(table.status),
   ]
 )
 
@@ -312,7 +433,7 @@ export const projectUsage = pgTable(
 /**
  * P1.5 planner-pass cache. Each user's (prd + parsedPRD + contextDigest +
  * projectInfoDigest + roles) hash maps to a single cached GenerationPlan
- * for 24h. Skipping the planner on a cache hit eliminates two gpt-5.4-mini calls
+ * for 24h. Skipping the planner on a cache hit eliminates two gpt-5.5-mini calls
  * per pipeline run for repeat generations against the same repo snapshot.
  */
 export const generationPlans = pgTable(
@@ -408,7 +529,7 @@ export const tokenLedger = pgTable(
     entryType: text('entry_type').notNull(), // 'debit' | 'credit'
     endpoint: text('endpoint'),              // '/api/generate-tests' etc.; null on credits
     agent: text('agent'),                    // 'smoke'|'frontend'|'api'|...; null on credits
-    model: text('model'),                    // 'gpt-5.4' etc.; null on credits
+    model: text('model'),                    // runtime model id; null on credits
     tokensInput: bigint('tokens_input', { mode: 'number' }).default(0).notNull(),
     tokensOutput: bigint('tokens_output', { mode: 'number' }).default(0).notNull(),
     tokensTotal: bigint('tokens_total', { mode: 'number' }).default(0).notNull(),

@@ -4,7 +4,7 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import { useParams } from 'next/navigation';
 import Link from 'next/link';
 import { motion, AnimatePresence } from 'framer-motion';
-import type { TestRun, TestFailure, FailureVerdict } from '@/lib/types/database';
+import type { TestRun, TestFailure, FailureVerdict, QaFinding, FindingSummary } from '@/lib/types/database';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -56,6 +56,55 @@ interface AgentFailure {
   message?: string;
 }
 
+interface FailedAgentRetryAttempt {
+  status?: string;
+  startedAt?: string;
+  finishedAt?: string;
+  agents?: string[];
+  timeoutMs?: number;
+  generatedFiles?: string[];
+  generatedCount?: number;
+  rejectedFiles?: Array<{ filename?: string; reason?: string }>;
+  rejectedCount?: number;
+  errorCode?: string;
+  message?: string;
+}
+
+interface FailedAgentRetryMeta {
+  available?: boolean;
+  status?: string;
+  reason?: string;
+  agents?: string[];
+  request?: unknown;
+  recommendedTimeoutMs?: number;
+  recommendedBudgetMultiplier?: number;
+  canRunFromDashboard?: boolean;
+  lastAttempt?: FailedAgentRetryAttempt | null;
+  history?: FailedAgentRetryAttempt[];
+}
+
+interface CoverageRetryMeta {
+  available?: boolean;
+  status?: string;
+  reason?: string;
+  mode?: string;
+  request?: unknown;
+  recommendedTimeoutMs?: number;
+  recommendedBudgetMultiplier?: number;
+  topUpStatus?: string | null;
+  topUpErrorCode?: string | null;
+  retainedSuite?: {
+    preRecoveryRunnableTests?: number;
+    postRecoveryRunnableTests?: number;
+    effectiveRunnableFloor?: number;
+    originalRunnableFloor?: number;
+    qualityRecoveryCoverageLoss?: number;
+    executionAllowedAfterHardQuarantine?: boolean;
+  } | null;
+  lastAttempt?: FailedAgentRetryAttempt | null;
+  history?: FailedAgentRetryAttempt[];
+}
+
 interface PartialGenerationWarning {
   reason: string;
   generator?: string;
@@ -74,17 +123,56 @@ interface QualityWarning {
   potentialImprovement: number;
   suggestions: QualityImprovementSuggestion[];
   totalTests?: number;
+  minGeneratedTestsTarget?: number;
+  minimumUsefulRunnableFloor?: number;
+  adaptiveRunnableFloor?: number;
+  originalMinimumUsefulRunnableFloor?: number;
+  effectiveRunnableFloor?: number;
+  retainedSuite?: CoverageRetryMeta['retainedSuite'];
+  runnableTestsActual?: number;
+  qualityWarnings?: Array<{ code?: string; message?: string; actual?: number; expected?: number; severity?: string }>;
+  executionAllowedDespiteWarnings?: boolean;
   selectorQuality?: number;
   coverageProfile?: string;
   missingCategories?: string[];
+}
+
+interface CoverageTopUpQualitySnapshot {
+  totalTests?: number;
+  runnableTests?: number;
+  generatedTestsActual?: number;
+  runnableTestsActual?: number;
+}
+
+interface CoverageTopUpEvent {
+  attempted?: boolean;
+  status?: string;
+  reason?: string;
+  requestedAdditional?: number;
+  target?: number;
+  minimumUsefulRunnableFloor?: number;
+  before?: CoverageTopUpQualitySnapshot | null;
+  after?: CoverageTopUpQualitySnapshot | null;
+  addedFiles?: string[];
+  rejectedFiles?: Array<string | { filename?: string; reason?: string; title?: string }>;
+  topUpMode?: string;
+  error?: {
+    code?: string;
+    message?: string;
+  } | null;
 }
 
 interface AgentGenerationQuality {
   valid?: boolean;
   errorCode?: string;
   errors?: string[];
+  qualityWarnings?: Array<{ code?: string; message?: string }>;
+  qualityGateStatus?: string;
   totalTests?: number;
+  runnableTests?: number;
   minGeneratedTests?: number;
+  minimumUsefulRunnableFloor?: number;
+  adaptiveRunnableFloor?: number;
   coverageProfile?: string;
   requiredCategories?: string[];
   missingCategories?: string[];
@@ -110,6 +198,27 @@ interface GenerationMetaShape {
   partialsWrittenCount?: number;
   partialGenerationWarning?: PartialGenerationWarning;
   qualityWarning?: QualityWarning;
+  qaContractQuestions?: Array<{
+    id?: string;
+    type?: string;
+    severity?: string;
+    method?: string;
+    path?: string;
+    sourceFile?: string | null;
+    expectedStatus?: number;
+    explicitStatuses?: number[];
+    question?: string;
+  }>;
+  qaContractCoverage?: {
+    required?: string[];
+    covered?: string[];
+    missing?: string[];
+    blocked?: string[];
+  } | null;
+  qaContractSummary?: Record<string, number> | null;
+  coverageTopUps?: CoverageTopUpEvent[];
+  failedAgentRetry?: FailedAgentRetryMeta | null;
+  coverageRetry?: CoverageRetryMeta | null;
   [key: string]: unknown;
 }
 
@@ -143,9 +252,9 @@ interface AiAnalysisItem {
   analysis?: string;
   root_cause?: string;
   rootCause?: string;
-  suggested_fix?: string;
-  suggestedFix?: string;
-  fix?: string;
+  suggested_fix?: unknown;
+  suggestedFix?: unknown;
+  fix?: unknown;
   testingRecommendations?: string;
   testing_recommendations?: string;
   confidence?: number | string;
@@ -185,6 +294,8 @@ interface LiveTestResult {
   d: number;
 }
 
+type LiveTimelineFilter = 'all' | 'decisions' | 'warnings' | 'errors';
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 /** Safely convert any error value to a display string */
@@ -210,6 +321,27 @@ function safeString(val: unknown): string | null {
     return JSON.stringify(val);
   }
   return String(val);
+}
+
+function hasMeaningfulAiAnalysis(item: AiAnalysisItem | null | undefined): boolean {
+  if (!item) return false;
+  if (safeString(item.analysis)?.trim()) return true;
+  if (safeString(item.root_cause ?? item.rootCause)?.trim()) return true;
+  if (safeString(item.testingRecommendations ?? item.testing_recommendations)?.trim()) return true;
+
+  const fix = item.suggested_fix ?? item.suggestedFix ?? item.fix;
+  if (typeof fix === 'string') return fix.trim().length > 0;
+  if (fix && typeof fix === 'object') {
+    const obj = fix as Record<string, unknown>;
+    return !!(
+      safeString(obj.description)?.trim()
+      || safeString(obj.summary)?.trim()
+      || safeString(obj.patch)?.trim()
+      || (Array.isArray(obj.changes) && obj.changes.length > 0)
+    );
+  }
+
+  return false;
 }
 
 function getConfidencePercent(confidence: number | string | null | undefined): number | null {
@@ -330,6 +462,116 @@ function StatusBadge({ status }: { status: string }) {
   if (s === 'skipped' || s === 'skip' || s === 'pending')
     return <span className="px-2 py-0.5 rounded-full text-xs font-semibold bg-amber-500/10 text-amber-400">skipped</span>;
   return <span className="px-2 py-0.5 rounded-full text-xs font-semibold bg-blue-500/10 text-blue-400">{s}</span>;
+}
+
+function runStatusLabel(status: string | null | undefined): string {
+  if (status === 'completed_with_findings') return 'completed with findings';
+  return status || 'unknown';
+}
+
+function runStatusClass(status: string | null | undefined): string {
+  if (status === 'passed') return 'bg-emerald-500/10 border border-emerald-500/20 text-emerald-400';
+  if (status === 'failed') return 'bg-red-500/10 border border-red-500/20 text-red-400';
+  if (status === 'running') return 'bg-blue-500/10 border border-blue-500/20 text-blue-400';
+  if (status === 'completed_with_findings') return 'bg-amber-500/10 border border-amber-500/25 text-amber-300';
+  return 'bg-amber-500/10 border border-amber-500/20 text-amber-400';
+}
+
+function severityClass(severity: string | null | undefined): string {
+  const s = String(severity || '').toLowerCase();
+  if (s === 'critical') return 'bg-red-500/15 border-red-500/35 text-red-200';
+  if (s === 'high') return 'bg-orange-500/15 border-orange-500/35 text-orange-200';
+  if (s === 'medium') return 'bg-amber-500/15 border-amber-500/35 text-amber-200';
+  if (s === 'low') return 'bg-blue-500/15 border-blue-500/30 text-blue-200';
+  return 'bg-white/5 border-white/10 text-[#8BA4C8]';
+}
+
+function normalizeFindingSummary(value: unknown, findings: QaFinding[]): FindingSummary | null {
+  if (value && typeof value === 'object') {
+    const summary = value as Partial<FindingSummary>;
+    return {
+      total: Number(summary.total ?? findings.length ?? 0),
+      realTotal: Number(summary.realTotal ?? findings.length ?? 0),
+      bySeverity: summary.bySeverity ?? {},
+      byStatus: summary.byStatus ?? {},
+      byCategory: summary.byCategory ?? {},
+      highestSeverity: summary.highestSeverity ?? null,
+    };
+  }
+  if (findings.length === 0) return null;
+  const bySeverity: Record<string, number> = {};
+  const byStatus: Record<string, number> = {};
+  const byCategory: Record<string, number> = {};
+  for (const finding of findings) {
+    bySeverity[finding.severity] = (bySeverity[finding.severity] || 0) + 1;
+    byStatus[finding.status] = (byStatus[finding.status] || 0) + 1;
+    const category = finding.category || 'uncategorized';
+    byCategory[category] = (byCategory[category] || 0) + 1;
+  }
+  return { total: findings.length, realTotal: findings.length, bySeverity, byStatus, byCategory, highestSeverity: null };
+}
+
+function QaFindingsSection({ summary, findings }: { summary: FindingSummary | null; findings: QaFinding[] }) {
+  if (!summary || (summary.total === 0 && findings.length === 0)) return null;
+  const severityEntries = Object.entries(summary.bySeverity || {})
+    .filter(([, count]) => Number(count) > 0)
+    .sort(([a], [b]) => {
+      const order = ['critical', 'high', 'medium', 'low', 'info'];
+      return (order.indexOf(a) === -1 ? 99 : order.indexOf(a)) - (order.indexOf(b) === -1 ? 99 : order.indexOf(b));
+    });
+  const visibleFindings = findings.slice(0, 8);
+
+  return (
+    <motion.div initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.28 }} className="glass-card rounded-2xl p-5">
+      <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-3 mb-4">
+        <div>
+          <h2 className="text-[#F0F6FF] font-semibold text-sm">Findings</h2>
+          <p className="text-[#4A6280] text-xs mt-0.5">
+            {summary.realTotal} actionable finding{summary.realTotal === 1 ? '' : 's'} from this completed run
+          </p>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          {severityEntries.length > 0 ? severityEntries.map(([severity, count]) => (
+            <span key={severity} className={`px-2.5 py-1 rounded-full border text-xs font-semibold ${severityClass(severity)}`}>
+              {severity}: {count}
+            </span>
+          )) : (
+            <span className="px-2.5 py-1 rounded-full border border-white/10 bg-white/5 text-[#8BA4C8] text-xs font-semibold">
+              no severity data
+            </span>
+          )}
+        </div>
+      </div>
+
+      {visibleFindings.length > 0 && (
+        <div className="divide-y divide-white/8 border border-white/8 rounded-xl overflow-hidden">
+          {visibleFindings.map((finding) => (
+            <div key={finding.id} className="p-3 bg-white/[0.02]">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                <div className="min-w-0">
+                  <div className="text-[#F0F6FF] text-sm font-medium break-words">{finding.title}</div>
+                  <div className="text-[#4A6280] text-[11px] mt-0.5 font-mono break-words">
+                    {[finding.category, finding.test_name, finding.test_file].filter(Boolean).join(' · ')}
+                  </div>
+                </div>
+                <div className="flex items-center gap-2 flex-shrink-0">
+                  <span className={`px-2 py-0.5 rounded-full border text-[11px] font-semibold ${severityClass(finding.severity)}`}>
+                    {finding.severity}
+                  </span>
+                  <span className="px-2 py-0.5 rounded-full bg-white/5 text-[#8BA4C8] text-[11px] font-semibold">
+                    {finding.status}
+                  </span>
+                </div>
+              </div>
+              {finding.recommendation && (
+                <div className="text-[#BFD4F2] text-xs mt-2 leading-relaxed break-words">{finding.recommendation}</div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </motion.div>
+  );
 }
 
 
@@ -482,6 +724,12 @@ const CATEGORY_META: Record<string, { label: string; color: string; border: stri
   api_auth:          { label: 'API Auth',            color: 'text-[#8BA4C8]', border: 'border-[#8BA4C8]/30', dot: 'bg-[#8BA4C8]' },
   api_negative:      { label: 'API Negative',        color: 'text-[#8BA4C8]', border: 'border-[#8BA4C8]/30', dot: 'bg-[#8BA4C8]' },
   api_stress:        { label: 'API Stress',          color: 'text-[#8BA4C8]', border: 'border-[#8BA4C8]/30', dot: 'bg-[#8BA4C8]' },
+  smoke_coverage:    { label: 'Smoke Coverage',      color: 'text-[#8BA4C8]', border: 'border-[#8BA4C8]/30', dot: 'bg-[#8BA4C8]' },
+  frontend_coverage: { label: 'Frontend Coverage',   color: 'text-[#8BA4C8]', border: 'border-[#8BA4C8]/30', dot: 'bg-[#8BA4C8]' },
+  api_coverage:      { label: 'API Coverage',        color: 'text-[#8BA4C8]', border: 'border-[#8BA4C8]/30', dot: 'bg-[#8BA4C8]' },
+  workflow_coverage: { label: 'Workflow Coverage',   color: 'text-[#8BA4C8]', border: 'border-[#8BA4C8]/30', dot: 'bg-[#8BA4C8]' },
+  e2e_coverage:      { label: 'E2E Coverage',        color: 'text-[#8BA4C8]', border: 'border-[#8BA4C8]/30', dot: 'bg-[#8BA4C8]' },
+  test_coverage:     { label: 'Test Coverage',       color: 'text-[#8BA4C8]', border: 'border-[#8BA4C8]/30', dot: 'bg-[#8BA4C8]' },
   uncategorized:     { label: 'Uncategorized',       color: 'text-[#8BA4C8]', border: 'border-[#8BA4C8]/30', dot: 'bg-[#8BA4C8]' },
 };
 
@@ -569,6 +817,15 @@ function getMainTypeMeta(type: string) {
   return { label, color: 'text-[#C8DEFF]', bg: 'bg-white/[0.04]', dot: 'bg-[#C8DEFF]', order: 99 };
 }
 
+function fallbackSubcategoryForSection(type: string): string {
+  if (type === 'smoke') return 'smoke_coverage';
+  if (type === 'frontend') return 'frontend_coverage';
+  if (type === 'api') return 'api_coverage';
+  if (type === 'workflow') return 'workflow_coverage';
+  if (type === 'e2e') return 'e2e_coverage';
+  return 'test_coverage';
+}
+
 const SECTION_BORDER: Record<string, string> = {
   smoke:     'border-[#C8DEFF]/40',
   frontend:  'border-[#C8DEFF]/40',
@@ -607,6 +864,11 @@ function SectionOverview({ sections }: { sections: SectionDatum[] }) {
           totals.skipped > 0 ? `${totals.skipped} skipped` : null,
           totals.passed > 0 ? `${totals.passed} passed` : null,
         ].filter(Boolean).join(' · ');
+        const displaySubs = subs.length > 0
+          ? subs
+          : total > 0
+            ? [{ key: fallbackSubcategoryForSection(key), counts: totals }]
+            : [];
         return (
           <div key={key} className={`border-l-2 ${border} pl-3 flex flex-col gap-2`}>
             {/* Section header: name + overall inline */}
@@ -616,9 +878,9 @@ function SectionOverview({ sections }: { sections: SectionDatum[] }) {
               <span className="text-[#4A6280] text-[11px]">{subParts}</span>
             </div>
             {/* Subcategory arc-progress circles */}
-            {subs.length > 0 && (
+            {displaySubs.length > 0 && (
               <div className="flex flex-wrap gap-3">
-                {subs.map(({ key: subKey, counts }) => {
+                {displaySubs.map(({ key: subKey, counts }) => {
                   const subMeta = getCategoryMeta(subKey);
                   const subTotal = counts.passed + counts.failed + counts.skipped;
                   const subRate = subTotal > 0 ? Math.round((counts.passed / subTotal) * 100) : 0;
@@ -772,24 +1034,40 @@ interface EvidenceShape {
   role?: string | null;
 }
 
+type EvidenceTabKey = 'test' | 'app' | 'ac' | 'patch';
+
+function EvidenceTabButton({
+  tabKey,
+  label,
+  activeTab,
+  onSelect,
+}: {
+  tabKey: EvidenceTabKey;
+  label: string;
+  activeTab: EvidenceTabKey;
+  onSelect: (tab: EvidenceTabKey) => void;
+}) {
+  return (
+    <button
+      onClick={(e) => { e.stopPropagation(); onSelect(tabKey); }}
+      className={`px-3 py-1.5 text-[11px] font-semibold uppercase tracking-wider rounded-t-md transition-colors ${
+        activeTab === tabKey
+          ? 'bg-white/10 text-[#F0F6FF] border-b-2 border-[#60A5FA]'
+          : 'text-[#4A6280] hover:text-[#8BA4C8]'
+      }`}
+    >
+      {label}
+    </button>
+  );
+}
+
 function EvidencePanel({ failure }: { failure: TestFailure }) {
-  const [tab, setTab] = useState<'test' | 'app' | 'ac' | 'patch'>('test');
+  const [tab, setTab] = useState<EvidenceTabKey>('test');
   const evidence: EvidenceShape = (failure.evidence ?? {}) as EvidenceShape;
   const patch = failure.suggested_patch as null | {
     file?: string; lineStart?: number; lineEnd?: number;
     oldCode?: string; newCode?: string; preservesRequirementTag?: boolean;
   };
-
-  const Tab = ({ k, label }: { k: typeof tab; label: string }) => (
-    <button
-      onClick={(e) => { e.stopPropagation(); setTab(k); }}
-      className={`px-3 py-1.5 text-[11px] font-semibold uppercase tracking-wider rounded-t-md transition-colors ${
-        tab === k
-          ? 'bg-white/10 text-[#F0F6FF] border-b-2 border-[#60A5FA]'
-          : 'text-[#4A6280] hover:text-[#8BA4C8]'
-      }`}
-    >{label}</button>
-  );
 
   const failedAction = evidence.trace?.failedAction;
   const dom = evidence.trace?.domAtFailure;
@@ -799,10 +1077,10 @@ function EvidencePanel({ failure }: { failure: TestFailure }) {
   return (
     <div className="rounded-xl bg-white/[0.02] border border-white/10 overflow-hidden">
       <div className="flex items-center gap-1 px-3 pt-2 border-b border-white/5">
-        <Tab k="test"  label="Test asked for" />
-        <Tab k="app"   label="App rendered" />
-        <Tab k="ac"    label="AC says" />
-        <Tab k="patch" label={patch ? 'Suggested patch' : 'No patch'} />
+        <EvidenceTabButton tabKey="test" label="Test asked for" activeTab={tab} onSelect={setTab} />
+        <EvidenceTabButton tabKey="app" label="App rendered" activeTab={tab} onSelect={setTab} />
+        <EvidenceTabButton tabKey="ac" label="AC says" activeTab={tab} onSelect={setTab} />
+        <EvidenceTabButton tabKey="patch" label={patch ? 'Suggested patch' : 'No patch'} activeTab={tab} onSelect={setTab} />
       </div>
       <div className="p-3">
         {tab === 'test' && (
@@ -970,6 +1248,7 @@ function FailureClusterBanner({ clusters }: { clusters: Array<{ clusterId: strin
 function TestRow({ t, idx, indented = false, aiAnalysis = [], failure, runId, onOverride }: { t: NormalisedTest; idx: number; indented?: boolean; aiAnalysis?: AiAnalysisItem[]; failure?: TestFailure; runId?: string; onOverride?: (failureId: string, verdict: FailureVerdict) => void }) {
   const [expanded, setExpanded] = useState(false);
   const matchedAi = aiAnalysis.find(item => {
+    if (!hasMeaningfulAiAnalysis(item)) return false;
     const aiName = safeString(item.testName ?? item.test ?? item.test_name);
     if (!aiName) return false;
     return aiName.toLowerCase().trim() === t.name.toLowerCase().trim();
@@ -1171,7 +1450,7 @@ function TestRow({ t, idx, indented = false, aiAnalysis = [], failure, runId, on
                 )}
 
                 {/* Inline AI Analysis */}
-                {matchedAi && isFailed && (() => {
+                {matchedAi && isFailed && hasMeaningfulAiAnalysis(matchedAi) && (() => {
                   const analysis = safeString(matchedAi.analysis);
                   const rootCause = safeString(matchedAi.root_cause ?? matchedAi.rootCause);
                   const fix = safeString(matchedAi.suggested_fix ?? matchedAi.suggestedFix ?? matchedAi.fix);
@@ -1365,6 +1644,8 @@ const PHASE_LABELS: Record<string, string> = {
   starting_pipeline: 'Starting Healix',
   started: 'Healix Started',
   port_conflict: 'Port Conflict',
+  dev_server_reused: 'Using Existing App',
+  server_start_blocked: 'Server Start Blocked',
   jira: 'Fetching Jira Stories',
   context: 'Gathering Context',
   context_enrichment: 'Enriching Context',
@@ -1438,12 +1719,94 @@ function PhaseIcon({ phase, isLast }: { phase: string | null; isLast: boolean })
   );
 }
 
+function isDecisionEvent(ev: LiveEvent) {
+  return ev.eventType === 'pipeline_decision';
+}
+
+function decisionTypeLabel(type: unknown) {
+  return String(type || 'pipeline decision')
+    .replace(/_/g, ' ')
+    .replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+function decisionChips(ev: LiveEvent) {
+  const meta = ev.metadata || {};
+  const chips: string[] = [];
+  const decisionType = meta.decisionType || meta.type;
+  if (decisionType) chips.push(String(decisionType));
+  const keys = [
+    ['agent', 'agent'],
+    ['topUpStatus', 'top-up'],
+    ['target', 'target'],
+    ['minimumUsefulRunnableFloor', 'floor'],
+    ['effectiveRunnableFloor', 'floor'],
+    ['runnableTests', 'runnable'],
+    ['totalTests', 'tests'],
+    ['keptSpecCount', 'kept'],
+    ['quarantinedSpecCount', 'quarantined'],
+    ['generatedSpecCount', 'specs'],
+  ] as const;
+  for (const [key, label] of keys) {
+    const value = meta[key];
+    if (value !== undefined && value !== null && value !== '') {
+      chips.push(`${label}: ${String(value)}`);
+    }
+  }
+  const retained = meta.retainedSuite as Record<string, unknown> | undefined;
+  if (retained?.postRecoveryRunnableTests !== undefined) {
+    chips.push(`retained: ${retained.postRecoveryRunnableTests}`);
+  }
+  if (retained?.effectiveRunnableFloor !== undefined) {
+    chips.push(`retained floor: ${retained.effectiveRunnableFloor}`);
+  }
+  return chips.slice(0, 8);
+}
+
+function DecisionEventDetails({ ev }: { ev: LiveEvent }) {
+  const meta = ev.metadata || {};
+  const copyJson = async () => {
+    try {
+      await navigator.clipboard.writeText(JSON.stringify({
+        phase: ev.phase,
+        status: ev.status,
+        message: ev.message,
+        reason: ev.reason,
+        errorCode: ev.errorCode,
+        metadata: meta,
+      }, null, 2));
+    } catch {
+      // clipboard is best-effort
+    }
+  };
+
+  return (
+    <details className="mt-2 rounded-lg border border-white/10 bg-black/20">
+      <summary className="cursor-pointer select-none px-3 py-2 text-[11px] text-[#8BA4C8] hover:text-[#D8E8FF]">
+        Decision details
+      </summary>
+      <div className="border-t border-white/10 p-3">
+        <button
+          type="button"
+          onClick={copyJson}
+          className="mb-2 px-2 py-1 rounded-md bg-white/5 hover:bg-white/10 border border-white/10 text-[10px] text-[#D8E8FF]/80"
+        >
+          Copy JSON
+        </button>
+        <pre className="max-h-72 overflow-auto text-[10px] leading-relaxed text-[#AFC4E8] whitespace-pre-wrap">
+          {JSON.stringify(meta, null, 2)}
+        </pre>
+      </div>
+    </details>
+  );
+}
+
 function LiveTimeline({ events, liveFiles, pipelineEnded }: {
   events: LiveEvent[];
   liveFiles: string[];
   pipelineEnded: boolean;
 }) {
   const [now, setNow] = useState(() => Date.now());
+  const [filter, setFilter] = useState<LiveTimelineFilter>('all');
 
   // Tick every second while the pipeline is still running so the elapsed timer updates
   useEffect(() => {
@@ -1457,21 +1820,54 @@ function LiveTimeline({ events, liveFiles, pipelineEnded }: {
     e.eventType !== 'test_file_generated' &&
     e.eventType !== 'test_result'
   );
-  // Deduplicate: keep only the last event per phase (multiple events per phase are repetitive)
+  const visibleEvents = filteredEvents.filter((e) => {
+    if (filter === 'decisions') return isDecisionEvent(e);
+    if (filter === 'warnings') return String(e.status || '').toLowerCase() === 'warning';
+    if (filter === 'errors') return String(e.status || '').toLowerCase() === 'error';
+    return true;
+  });
+  const decisionEvents = visibleEvents.filter(isDecisionEvent);
+  const phaseEvents = visibleEvents.filter((e) => !isDecisionEvent(e));
+  // Deduplicate non-decision phases only; decision events carry unique gate data.
   const phaseMap = new Map<string, LiveEvent>();
-  for (const e of filteredEvents) {
+  for (const e of phaseEvents) {
     phaseMap.set(e.phase ?? '__unknown__', e);
   }
-  const displayEvents = Array.from(phaseMap.values());
-  if (displayEvents.length === 0) return null;
+  const displayEvents = [...Array.from(phaseMap.values()), ...decisionEvents].sort((a, b) => {
+    const at = a.occurredAt ? new Date(a.occurredAt).getTime() : 0;
+    const bt = b.occurredAt ? new Date(b.occurredAt).getTime() : 0;
+    return at - bt;
+  });
+  if (filteredEvents.length === 0) return null;
   // Decide which single event owns files to avoid duplicates
   const hasTestsGenEvent = displayEvents.some(e => e.eventType === 'tests_generated');
   return (
     <div className="flex flex-col gap-0">
-      {displayEvents.map((ev, i) => {
+      <div className="mb-4 flex flex-wrap gap-1.5">
+        {(['all', 'decisions', 'warnings', 'errors'] as LiveTimelineFilter[]).map((item) => (
+          <button
+            key={item}
+            type="button"
+            onClick={() => setFilter(item)}
+            className={`px-2.5 py-1 rounded-full border text-[10px] font-semibold transition-colors ${
+              filter === item
+                ? 'bg-blue-500/15 border-blue-400/30 text-blue-200'
+                : 'bg-white/[0.03] border-white/10 text-[#8BA4C8] hover:text-[#D8E8FF]'
+            }`}
+          >
+            {item === 'all' ? 'All' : item[0].toUpperCase() + item.slice(1)}
+          </button>
+        ))}
+      </div>
+      {displayEvents.length === 0 ? (
+        <div className="rounded-lg border border-white/10 bg-white/[0.02] px-3 py-2 text-xs text-[#8BA4C8]">
+          No matching activity events.
+        </div>
+      ) : displayEvents.map((ev, i) => {
         const isLast = i === displayEvents.length - 1;
         const isTerminal = TERMINAL_PHASES.has((ev.phase || '').toLowerCase());
         const isTestsGen = ev.eventType === 'tests_generated';
+        const isDecision = isDecisionEvent(ev);
         const isGeneratingPhase = (ev.phase || '').toLowerCase() === 'generating';
         // Show files: prefer tests_generated event if present, else generating phase
         const showFiles = liveFiles.length > 0 && (hasTestsGenEvent ? isTestsGen : isGeneratingPhase);
@@ -1509,10 +1905,23 @@ function LiveTimeline({ events, liveFiles, pipelineEnded }: {
             </div>
             <div className="pb-3 flex-1 min-w-0">
               <div className="flex items-center gap-2 flex-wrap">
-                <span className="text-[#F0F6FF] text-xs font-semibold">{phaseLabel(ev.phase)}</span>
+                <span className={`text-xs font-semibold ${isDecision ? 'text-[#FDE68A]' : 'text-[#F0F6FF]'}`}>
+                  {isDecision ? decisionTypeLabel(ev.metadata?.decisionType || ev.phase) : phaseLabel(ev.phase)}
+                </span>
                 {time && <span className="text-[#4A6280] text-[10px] font-mono">{time}</span>}
                 {ev.durationMs != null && ev.durationMs > 0 && (
                   <span className="text-[#4A6280] text-[10px] font-mono">{(ev.durationMs / 1000).toFixed(1)}s</span>
+                )}
+                {isDecision && (
+                  <span className={`px-1.5 py-0.5 rounded border text-[10px] font-mono ${
+                    String(ev.status || '').toLowerCase() === 'error'
+                      ? 'bg-red-500/10 border-red-500/25 text-[#FCA5A5]'
+                      : String(ev.status || '').toLowerCase() === 'warning'
+                        ? 'bg-amber-500/10 border-amber-500/25 text-[#FDE68A]'
+                        : 'bg-emerald-500/10 border-emerald-500/25 text-[#86EFAC]'
+                  }`}>
+                    {ev.status || 'info'}
+                  </span>
                 )}
                 {effectiveIsLast && (
                   <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" className="text-blue-400/70 flex-shrink-0 animate-spin" style={{animationDuration: '2s'}}>
@@ -1520,12 +1929,30 @@ function LiveTimeline({ events, liveFiles, pipelineEnded }: {
                     <polyline points="12 6 12 12 16 14"/>
                   </svg>
                 )}
+                {elapsedLabel && (
+                  <span className="text-blue-300/70 text-[10px] font-mono">{elapsedLabel}</span>
+                )}
               </div>
               {ev.message && (
                 <div className="text-[#8BA4C8] text-xs mt-0.5">{ev.message}</div>
               )}
               {ev.reason && (
                 <div className="text-red-300/80 text-xs mt-0.5 font-mono">{ev.reason}</div>
+              )}
+              {isDecision && (
+                <>
+                  <div className="mt-2 flex flex-wrap gap-1">
+                    {decisionChips(ev).map((chip) => (
+                      <span
+                        key={chip}
+                        className="px-1.5 py-0.5 rounded bg-amber-500/10 border border-amber-500/20 text-[#FDE68A]/85 text-[10px] font-mono"
+                      >
+                        {chip}
+                      </span>
+                    ))}
+                  </div>
+                  <DecisionEventDetails ev={ev} />
+                </>
               )}
 
               {/* Live file badges — drip in under generating phase AND tests_generated */}
@@ -1573,7 +2000,26 @@ interface PipelineErrorShape {
   stdout?: string | null;
   firstSpecPreview?: { file?: string; lines?: string } | null;
   generatedSpecCount?: number;
+  keptSpecCount?: number | null;
+  quarantinedSpecCount?: number | null;
+  validationSalvage?: {
+    attempted?: boolean;
+    recovered?: boolean;
+    status?: string;
+    originalSpecCount?: number;
+    keptSpecFiles?: Array<{ filename?: string }>;
+    quarantinedSpecFiles?: Array<{ filename?: string; reason?: string }>;
+  } | null;
   qualityAuditErrors?: string[] | null;
+  generationQuality?: {
+    totalTests?: number;
+    runnableTests?: number;
+    generatedTestsActual?: number;
+    runnableTestsActual?: number;
+    minimumUsefulRunnableFloor?: number;
+    adaptiveRunnableFloor?: number;
+    minGeneratedTestsTarget?: number;
+  } | null;
   errorCode?: string | null;
   userFacingMessage?: string | null;
 }
@@ -1634,6 +2080,9 @@ function QualityWarningBanner({ warning }: { warning: QualityWarning }) {
   const targetScore = Math.min(100, score + potential);
   const suggestions = warning.suggestions || [];
   const topSuggestion = suggestions[0];
+  const minCountWarning = (warning.qualityWarnings || []).find((item) => item.code === 'MIN_TEST_COUNT_NOT_MET');
+  const retainedWarning = (warning.qualityWarnings || []).find((item) => item.code === 'RETAINED_SUITE_AFTER_HARD_QUARANTINE');
+  const usefulFloor = warning.minimumUsefulRunnableFloor ?? warning.adaptiveRunnableFloor;
 
   // amber for 60-79, orange/red for below 60
   const toneClass = score >= 60
@@ -1659,10 +2108,18 @@ function QualityWarningBanner({ warning }: { warning: QualityWarning }) {
           </div>
           <div className="min-w-0">
             <div className={`font-semibold text-[15px] ${accentText}`}>
-              Test suite quality: {score}%
+              {retainedWarning ? 'Invalid specs quarantined; retained tests ran' : (minCountWarning ? 'Generated fewer tests than target' : `Test suite quality: ${score}%`)}
             </div>
             <div className="text-[#F0F6FF]/85 text-sm mt-0.5">
-              {potential > 0 ? (
+              {retainedWarning ? (
+                <>
+                  Healix quarantined hard-problem specs and executed the retained valid suite because it met the recovery-adjusted floor.
+                </>
+              ) : minCountWarning ? (
+                <>
+                  Generated tests were below target, but valid runnable tests ran because the suite met Healix&apos;s minimum useful runnable floor.
+                </>
+              ) : potential > 0 ? (
                 <>
                   Tests were generated and will run, but quality could improve by{' '}
                   <span className="font-semibold text-[#FDE68A]">~{potential}%</span>{' '}
@@ -1689,6 +2146,31 @@ function QualityWarningBanner({ warning }: { warning: QualityWarning }) {
               {typeof warning.totalTests === 'number' && (
                 <span className="px-2 py-0.5 rounded-md bg-white/5 border border-white/10 text-[#D8E8FF]/70 text-[11px] font-mono">
                   {warning.totalTests} tests
+                </span>
+              )}
+              {typeof warning.runnableTestsActual === 'number' && (
+                <span className="px-2 py-0.5 rounded-md bg-white/5 border border-white/10 text-[#D8E8FF]/70 text-[11px] font-mono">
+                  runnable: {warning.runnableTestsActual}
+                </span>
+              )}
+              {typeof warning.minGeneratedTestsTarget === 'number' && (
+                <span className="px-2 py-0.5 rounded-md bg-white/5 border border-white/10 text-[#D8E8FF]/70 text-[11px] font-mono">
+                  target: {warning.minGeneratedTestsTarget}
+                </span>
+              )}
+              {typeof usefulFloor === 'number' && (
+                <span className="px-2 py-0.5 rounded-md bg-white/5 border border-white/10 text-[#D8E8FF]/70 text-[11px] font-mono">
+                  floor: {usefulFloor}
+                </span>
+              )}
+              {typeof warning.originalMinimumUsefulRunnableFloor === 'number' && warning.originalMinimumUsefulRunnableFloor !== usefulFloor && (
+                <span className="px-2 py-0.5 rounded-md bg-white/5 border border-white/10 text-[#D8E8FF]/70 text-[11px] font-mono">
+                  original floor: {warning.originalMinimumUsefulRunnableFloor}
+                </span>
+              )}
+              {typeof warning.retainedSuite?.qualityRecoveryCoverageLoss === 'number' && warning.retainedSuite.qualityRecoveryCoverageLoss > 0 && (
+                <span className="px-2 py-0.5 rounded-md bg-white/5 border border-white/10 text-[#D8E8FF]/70 text-[11px] font-mono">
+                  quarantined: {warning.retainedSuite.qualityRecoveryCoverageLoss} tests
                 </span>
               )}
               {typeof warning.selectorQuality === 'number' && (
@@ -1737,20 +2219,209 @@ function QualityWarningBanner({ warning }: { warning: QualityWarning }) {
   );
 }
 
+function QaContractAdvisoryBanner({ generationMeta }: { generationMeta: GenerationMetaShape }) {
+  const questions = Array.isArray(generationMeta.qaContractQuestions)
+    ? generationMeta.qaContractQuestions
+    : [];
+  const coverage = generationMeta.qaContractCoverage || null;
+  const summary = generationMeta.qaContractSummary || null;
+  if (questions.length === 0) return null;
+
+  const required = Array.isArray(coverage?.required) ? coverage.required.length : 0;
+  const covered = Array.isArray(coverage?.covered) ? coverage.covered.length : 0;
+  const missing = Array.isArray(coverage?.missing) ? coverage.missing.length : 0;
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: -6 }}
+      animate={{ opacity: 1, y: 0 }}
+      className="glass-card rounded-2xl overflow-hidden border border-amber-500/25 bg-amber-500/[0.04]"
+    >
+      <div className="px-5 py-4 flex items-start gap-3">
+        <div className="w-9 h-9 rounded-lg flex items-center justify-center flex-shrink-0 mt-0.5 bg-amber-500/15 border border-amber-500/30">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#FBBF24" strokeWidth="2.2">
+            <circle cx="12" cy="12" r="10" />
+            <path d="M12 7v6" />
+            <path d="M12 17h.01" />
+          </svg>
+        </div>
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <div className="font-semibold text-[15px] text-[#FDE68A]">
+              QA contract needs confirmation
+            </div>
+            <span className="px-2 py-0.5 rounded-md bg-amber-500/10 border border-amber-500/25 text-[#FCD34D] text-[11px] font-mono">
+              {questions.length} question{questions.length === 1 ? '' : 's'}
+            </span>
+            {required > 0 && (
+              <span className="px-2 py-0.5 rounded-md bg-white/5 border border-white/10 text-[#D8E8FF]/70 text-[11px] font-mono">
+                QAC covered: {covered}/{required}
+              </span>
+            )}
+            {missing > 0 && (
+              <span className="px-2 py-0.5 rounded-md bg-red-500/10 border border-red-500/25 text-red-300 text-[11px] font-mono">
+                missing: {missing}
+              </span>
+            )}
+            {summary?.deleteStatusContracts ? (
+              <span className="px-2 py-0.5 rounded-md bg-white/5 border border-white/10 text-[#D8E8FF]/70 text-[11px] font-mono">
+                delete contracts: {summary.deleteStatusContracts}
+              </span>
+            ) : null}
+          </div>
+          <p className="text-[#F0F6FF]/85 text-sm mt-1">
+            Healix found source-derived DELETE no-body status conventions that should be confirmed by the app owner. These are advisory and separate from app/test failures unless the source or PRD explicitly requires a status.
+          </p>
+          <div className="mt-3 space-y-2">
+            {questions.slice(0, 4).map((question, index) => (
+              <div
+                key={question.id || `${question.method || 'DELETE'}-${question.path || index}`}
+                className="rounded-xl border border-amber-500/15 bg-black/15 px-3 py-2"
+              >
+                <div className="flex flex-wrap items-center gap-2 text-[11px] font-mono text-[#FCD34D]">
+                  <span>{question.method || 'DELETE'}</span>
+                  <span>{question.path || '/'}</span>
+                  {question.sourceFile && <span className="text-[#D8E8FF]/55">[{question.sourceFile}]</span>}
+                </div>
+                <div className="text-[13px] text-[#F0F6FF]/85 mt-1">
+                  {question.question || 'Confirm whether this no-body DELETE endpoint should return HTTP 204.'}
+                </div>
+              </div>
+            ))}
+            {questions.length > 4 && (
+              <div className="text-[12px] text-[#D8E8FF]/55">
+                +{questions.length - 4} more confirmation item{questions.length - 4 === 1 ? '' : 's'} in the full report metadata.
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    </motion.div>
+  );
+}
+
+function CoverageTopUpAdvisoryBanner({ topUps }: { topUps: CoverageTopUpEvent[] }) {
+  const relevant = topUps.filter((event) => {
+    const status = String(event.status || '').toLowerCase();
+    return status === 'failed' || status === 'no_new_valid_delta' || status.startsWith('skipped');
+  });
+  if (relevant.length === 0) return null;
+
+  const latest = relevant[relevant.length - 1];
+  const status = String(latest.status || 'unknown');
+  const addedCount = Array.isArray(latest.addedFiles) ? latest.addedFiles.length : 0;
+  const rejectedCount = Array.isArray(latest.rejectedFiles) ? latest.rejectedFiles.length : 0;
+  const beforeRunnable = latest.before?.runnableTestsActual ?? latest.before?.runnableTests ?? null;
+  const afterRunnable = latest.after?.runnableTestsActual ?? latest.after?.runnableTests ?? null;
+  const message = status === 'failed'
+    ? 'Coverage top-up failed, so Healix continued with the best valid generated suite.'
+    : status === 'no_new_valid_delta'
+      ? 'Coverage top-up completed but did not add a new valid runnable delta; Healix continued with the best valid suite.'
+      : 'Coverage top-up was skipped, so Healix continued with the existing generated suite.';
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: -6 }}
+      animate={{ opacity: 1, y: 0 }}
+      className="glass-card rounded-2xl overflow-hidden border border-amber-500/25 bg-amber-500/[0.04]"
+    >
+      <div className="px-5 py-4 flex items-start gap-3">
+        <div className="w-9 h-9 rounded-lg flex items-center justify-center flex-shrink-0 mt-0.5 bg-amber-500/15 border border-amber-500/30">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#FBBF24" strokeWidth="2.2">
+            <circle cx="12" cy="12" r="10" />
+            <path d="M12 7v6" />
+            <path d="M12 17h.01" />
+          </svg>
+        </div>
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <div className="font-semibold text-[15px] text-[#FDE68A]">
+              Coverage top-up did not add runnable coverage
+            </div>
+            <span className="px-2 py-0.5 rounded-md bg-amber-500/10 border border-amber-500/25 text-[#FCD34D] text-[11px] font-mono">
+              status: {status}
+            </span>
+            {latest.reason && (
+              <span className="px-2 py-0.5 rounded-md bg-white/5 border border-white/10 text-[#D8E8FF]/70 text-[11px] font-mono">
+                reason: {latest.reason}
+              </span>
+            )}
+            {typeof latest.target === 'number' && (
+              <span className="px-2 py-0.5 rounded-md bg-white/5 border border-white/10 text-[#D8E8FF]/70 text-[11px] font-mono">
+                target: {latest.target}
+              </span>
+            )}
+            {beforeRunnable !== null && afterRunnable !== null && (
+              <span className="px-2 py-0.5 rounded-md bg-white/5 border border-white/10 text-[#D8E8FF]/70 text-[11px] font-mono">
+                runnable: {beforeRunnable} → {afterRunnable}
+              </span>
+            )}
+            {addedCount > 0 && (
+              <span className="px-2 py-0.5 rounded-md bg-white/5 border border-white/10 text-[#D8E8FF]/70 text-[11px] font-mono">
+                added files: {addedCount}
+              </span>
+            )}
+            {rejectedCount > 0 && (
+              <span className="px-2 py-0.5 rounded-md bg-white/5 border border-white/10 text-[#D8E8FF]/70 text-[11px] font-mono">
+                rejected: {rejectedCount}
+              </span>
+            )}
+          </div>
+          <p className="text-[#F0F6FF]/85 text-sm mt-1">
+            {message}
+          </p>
+          {latest.error?.message && (
+            <p className="text-[#D8E8FF]/65 text-[12.5px] mt-1 font-mono">
+              {latest.error.code ? `${latest.error.code}: ` : ''}{latest.error.message}
+            </p>
+          )}
+        </div>
+      </div>
+    </motion.div>
+  );
+}
+
+const AGENT_CATEGORY_SCOPE: Record<string, string[]> = {
+  api: ['api_contract', 'api_auth', 'api_negative', 'api_stress'],
+  frontend: ['ui_flow', 'form_validation'],
+  smoke: ['ui_flow'],
+  workflow: ['workflow_journey'],
+  error: ['form_validation', 'api_negative'],
+};
+
+function inferAgentRequiredCategories(agent: string, q: Record<string, unknown>) {
+  const categories = (q.categories && typeof q.categories === 'object' ? q.categories : {}) as Record<string, number>;
+  const reportedRequired = Array.isArray(q.requiredCategories) ? q.requiredCategories : [];
+  const agentScope = String(q.agentScope || agent || '').toLowerCase();
+  const scoped = AGENT_CATEGORY_SCOPE[agentScope] || reportedRequired;
+  const filtered = scoped.filter((category) =>
+    reportedRequired.length === 0 || reportedRequired.includes(category) || Number(categories[category] || 0) > 0
+  );
+  return filtered.length > 0 ? filtered : reportedRequired;
+}
+
 function AgentCoveragePanel({ agentMeta }: { agentMeta: AgentMetaEntry[] }) {
   const rows = agentMeta
     .map((entry) => {
-      const q = entry.generationMeta?.generationQuality ?? {};
-      const categories = q.categories ?? {};
+      const q = (entry.generationMeta?.generationQuality ?? {}) as Record<string, unknown>;
+      const categories = (q.categories && typeof q.categories === 'object' ? q.categories : {}) as Record<string, number>;
       const total = Number(q.totalTests ?? 0);
-      const required = Array.isArray(q.requiredCategories) ? q.requiredCategories : [];
-      const missing = Array.isArray(q.missingCategories) ? q.missingCategories : [];
+      const required = inferAgentRequiredCategories(entry.agent, q);
+      const missing = required.filter((category) => Number(categories[category] || 0) <= 0);
       const met = required.filter((c) => !missing.includes(c)).length;
+      const minCountWarning = Array.isArray(q.qualityWarnings)
+        ? q.qualityWarnings.find((warning) =>
+            warning && typeof warning === 'object' && (warning as { code?: string }).code === 'MIN_TEST_COUNT_NOT_MET'
+          )
+        : null;
+      const hardFailure = q.valid === false && missing.length > 0;
       return {
         agent: entry.agent,
         total,
-        valid: q.valid !== false,
-        errorCode: q.errorCode ?? null,
+        valid: !hardFailure,
+        errorCode: typeof q.errorCode === 'string' ? q.errorCode : null,
+        needsMoreCoverage: missing.length > 0,
+        belowTarget: Boolean(minCountWarning) && missing.length === 0,
         missing,
         met,
         totalRequired: required.length,
@@ -1800,7 +2471,15 @@ function AgentCoveragePanel({ agentMeta }: { agentMeta: AgentMetaEntry[] }) {
                   )}
                 </td>
                 <td className="py-2 pr-4">
-                  {row.valid ? (
+                  {row.needsMoreCoverage ? (
+                    <span className="px-2 py-0.5 rounded bg-amber-500/10 border border-amber-500/30 text-[#FCD34D] text-[11px]">
+                      needs more coverage
+                    </span>
+                  ) : row.belowTarget ? (
+                    <span className="px-2 py-0.5 rounded bg-amber-500/10 border border-amber-500/30 text-[#FCD34D] text-[11px]">
+                      below target
+                    </span>
+                  ) : row.valid ? (
                     <span className="px-2 py-0.5 rounded bg-emerald-500/10 border border-emerald-500/30 text-emerald-300/90 text-[11px]">ok</span>
                   ) : (
                     <span className="px-2 py-0.5 rounded bg-amber-500/10 border border-amber-500/30 text-[#FCD34D] text-[11px] font-mono">
@@ -1938,6 +2617,269 @@ function PartialGenerationBanner({
   );
 }
 
+function FailedAgentRetryPanel({
+  runId,
+  generationMeta,
+  agentFailures,
+  agentsRequested,
+  agentsCompleted,
+  onRefresh,
+}: {
+  runId: string;
+  generationMeta: GenerationMetaShape | null;
+  agentFailures: AgentFailure[];
+  agentsRequested: string[];
+  agentsCompleted: string[];
+  onRefresh: () => Promise<void>;
+}) {
+  const retryMeta = generationMeta?.failedAgentRetry ?? null;
+  const failedAgents = [...new Set([
+    ...(Array.isArray(retryMeta?.agents) ? retryMeta!.agents! : []),
+    ...agentFailures.map((failure) => failure.agent),
+  ].filter(Boolean))];
+  const [submitting, setSubmitting] = useState(false);
+  const [message, setMessage] = useState<string | null>(retryMeta?.lastAttempt?.message ?? null);
+  const [error, setError] = useState<string | null>(null);
+
+  if (failedAgents.length === 0) return null;
+
+  const requestedCount = agentsRequested.length || failedAgents.length + agentsCompleted.length;
+  const completedCount = agentsCompleted.length;
+  const timeoutMinutes = retryMeta?.recommendedTimeoutMs
+    ? Math.ceil(retryMeta.recommendedTimeoutMs / 60000)
+    : null;
+  const canRetry = retryMeta?.available !== false && Boolean(retryMeta?.request);
+  const lastAttempt = retryMeta?.lastAttempt ?? null;
+
+  const runRetry = async () => {
+    setSubmitting(true);
+    setError(null);
+    setMessage(null);
+    try {
+      const res = await fetch(`/api/test-runs/${runId}/retry-failed-agents`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          agents: failedAgents,
+          timeoutMultiplier: retryMeta?.recommendedBudgetMultiplier ?? 2,
+        }),
+      });
+      const payload = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(payload?.message || payload?.reason || payload?.error || 'Failed-agent retry failed');
+      }
+      setMessage(payload?.attempt?.message || 'Failed-agent retry completed.');
+      await onRefresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: -6 }}
+      animate={{ opacity: 1, y: 0 }}
+      className="glass-card rounded-2xl overflow-hidden border border-amber-500/25 bg-amber-500/[0.035]"
+    >
+      <div className="px-5 py-4 border-b border-amber-500/15 flex items-start justify-between gap-3">
+        <div className="flex items-start gap-3 min-w-0">
+          <div className="w-9 h-9 rounded-lg bg-amber-500/15 border border-amber-500/30 flex items-center justify-center flex-shrink-0 mt-0.5">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#FBBF24" strokeWidth="2.2">
+              <path d="M13 2 3 14h8l-1 8 10-12h-8l1-8z" />
+            </svg>
+          </div>
+          <div className="min-w-0">
+            <div className="text-[#FDE68A] font-semibold text-[15px]">Generation agents need retry</div>
+            <div className="text-[#F0F6FF]/85 text-sm mt-0.5">
+              {failedAgents.length} agent{failedAgents.length === 1 ? '' : 's'} failed while other pipeline work continued. Retry adds append-only top-up specs with a larger generation budget.
+            </div>
+            <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+              <span className="px-2 py-0.5 rounded-md bg-amber-500/10 border border-amber-500/25 text-[#FCD34D] text-[11px] font-mono">
+                agents: {completedCount}/{requestedCount} complete
+              </span>
+              {failedAgents.map((agent) => (
+                <span key={agent} className="px-2 py-0.5 rounded-md bg-red-500/10 border border-red-500/25 text-[#FCA5A5] text-[11px] font-mono">
+                  {agent}
+                </span>
+              ))}
+              {timeoutMinutes && (
+                <span className="px-2 py-0.5 rounded-md bg-white/5 border border-white/10 text-[#D8E8FF]/70 text-[11px] font-mono">
+                  retry budget: ~{timeoutMinutes}m
+                </span>
+              )}
+              {lastAttempt?.status && (
+                <span className="px-2 py-0.5 rounded-md bg-white/5 border border-white/10 text-[#D8E8FF]/70 text-[11px] font-mono">
+                  last: {lastAttempt.status}
+                </span>
+              )}
+              {typeof lastAttempt?.rejectedCount === 'number' && lastAttempt.rejectedCount > 0 && (
+                <span className="px-2 py-0.5 rounded-md bg-white/5 border border-white/10 text-[#D8E8FF]/70 text-[11px] font-mono">
+                  rejected duplicates: {lastAttempt.rejectedCount}
+                </span>
+              )}
+            </div>
+          </div>
+        </div>
+        <button
+          onClick={runRetry}
+          disabled={submitting || !canRetry}
+          className="px-3 py-1.5 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 disabled:opacity-50 disabled:cursor-not-allowed border border-amber-500/30 text-[#FDE68A] text-xs font-semibold transition-colors flex-shrink-0"
+        >
+          {submitting ? 'Retrying…' : 'Retry failed agents'}
+        </button>
+      </div>
+      {(message || error || !canRetry) && (
+        <div className="px-5 py-3 text-[12.5px] border-t border-amber-500/10">
+          {message && <div className="text-emerald-300/90">{message}</div>}
+          {error && <div className="text-[#FCA5A5]">{error}</div>}
+          {!canRetry && (
+            <div className="text-[#D8E8FF]/75">
+              This historical run does not include the saved generation context required for one-click retry. Re-run Healix from the MCP to create retryable agent metadata.
+            </div>
+          )}
+          {Array.isArray(lastAttempt?.generatedFiles) && lastAttempt.generatedFiles.length > 0 && (
+            <div className="mt-2 text-[#D8E8FF]/70 font-mono text-[11px]">
+              {lastAttempt.generatedFiles.slice(0, 4).join(', ')}
+              {lastAttempt.generatedFiles.length > 4 ? ` +${lastAttempt.generatedFiles.length - 4} more` : ''}
+            </div>
+          )}
+        </div>
+      )}
+    </motion.div>
+  );
+}
+
+function CoverageRetryPanel({
+  runId,
+  generationMeta,
+  onRefresh,
+}: {
+  runId: string;
+  generationMeta: GenerationMetaShape | null;
+  onRefresh: () => Promise<void>;
+}) {
+  const retryMeta = generationMeta?.coverageRetry ?? null;
+  const retained = retryMeta?.retainedSuite ?? null;
+  const lastAttempt = retryMeta?.lastAttempt ?? null;
+  const [submitting, setSubmitting] = useState(false);
+  const [message, setMessage] = useState<string | null>(lastAttempt?.message ?? null);
+  const [error, setError] = useState<string | null>(null);
+
+  if (!retryMeta) return null;
+
+  const canRetry = retryMeta.available !== false && Boolean(retryMeta.request);
+  const timeoutMinutes = retryMeta.recommendedTimeoutMs
+    ? Math.ceil(retryMeta.recommendedTimeoutMs / 60000)
+    : null;
+
+  const runRetry = async () => {
+    setSubmitting(true);
+    setError(null);
+    setMessage(null);
+    try {
+      const res = await fetch(`/api/test-runs/${runId}/retry-failed-agents`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          coverageRetry: true,
+          agents: ['expansion'],
+          timeoutMultiplier: retryMeta.recommendedBudgetMultiplier ?? 2,
+        }),
+      });
+      const payload = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(payload?.message || payload?.reason || payload?.error || 'Coverage retry failed');
+      }
+      setMessage(payload?.attempt?.message || 'Coverage retry completed.');
+      await onRefresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: -6 }}
+      animate={{ opacity: 1, y: 0 }}
+      className="glass-card rounded-2xl overflow-hidden border border-amber-500/25 bg-amber-500/[0.035]"
+    >
+      <div className="px-5 py-4 border-b border-amber-500/15 flex items-start justify-between gap-3">
+        <div className="flex items-start gap-3 min-w-0">
+          <div className="w-9 h-9 rounded-lg bg-amber-500/15 border border-amber-500/30 flex items-center justify-center flex-shrink-0 mt-0.5">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#FBBF24" strokeWidth="2.2">
+              <path d="M21 12a9 9 0 0 1-9 9 9 9 0 0 1-7.5-4" />
+              <path d="M3 12a9 9 0 0 1 9-9 9 9 0 0 1 7.5 4" />
+              <path d="M3 16h5v5" />
+              <path d="M21 8h-5V3" />
+            </svg>
+          </div>
+          <div className="min-w-0">
+            <div className="text-[#FDE68A] font-semibold text-[15px]">Coverage top-up can be retried</div>
+            <div className="text-[#F0F6FF]/85 text-sm mt-0.5">
+              Healix kept the valid suite and quarantined unsafe specs. Retry adds append-only tests for uncovered routes or workflows with a larger budget.
+            </div>
+            <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+              {retryMeta.topUpStatus && (
+                <span className="px-2 py-0.5 rounded-md bg-amber-500/10 border border-amber-500/25 text-[#FCD34D] text-[11px] font-mono">
+                  top-up: {retryMeta.topUpStatus}
+                </span>
+              )}
+              {retained && (
+                <span className="px-2 py-0.5 rounded-md bg-white/5 border border-white/10 text-[#D8E8FF]/70 text-[11px] font-mono">
+                  retained: {retained.postRecoveryRunnableTests ?? '?'} / floor {retained.effectiveRunnableFloor ?? '?'}
+                </span>
+              )}
+              {typeof retained?.qualityRecoveryCoverageLoss === 'number' && retained.qualityRecoveryCoverageLoss > 0 && (
+                <span className="px-2 py-0.5 rounded-md bg-white/5 border border-white/10 text-[#D8E8FF]/70 text-[11px] font-mono">
+                  quarantined loss: {retained.qualityRecoveryCoverageLoss}
+                </span>
+              )}
+              {timeoutMinutes && (
+                <span className="px-2 py-0.5 rounded-md bg-white/5 border border-white/10 text-[#D8E8FF]/70 text-[11px] font-mono">
+                  retry budget: ~{timeoutMinutes}m
+                </span>
+              )}
+              {lastAttempt?.status && (
+                <span className="px-2 py-0.5 rounded-md bg-white/5 border border-white/10 text-[#D8E8FF]/70 text-[11px] font-mono">
+                  last: {lastAttempt.status}
+                </span>
+              )}
+            </div>
+          </div>
+        </div>
+        <button
+          onClick={runRetry}
+          disabled={submitting || !canRetry}
+          className="px-3 py-1.5 rounded-lg bg-amber-500/15 hover:bg-amber-500/25 disabled:opacity-50 disabled:cursor-not-allowed border border-amber-500/30 text-[#FDE68A] text-xs font-semibold transition-colors flex-shrink-0"
+        >
+          {submitting ? 'Retrying…' : 'Retry coverage top-up'}
+        </button>
+      </div>
+      {(message || error || !canRetry) && (
+        <div className="px-5 py-3 text-[12.5px] border-t border-amber-500/10">
+          {message && <div className="text-emerald-300/90">{message}</div>}
+          {error && <div className="text-[#FCA5A5]">{error}</div>}
+          {!canRetry && (
+            <div className="text-[#D8E8FF]/75">
+              This historical run does not include the saved suite manifest required for one-click coverage retry.
+            </div>
+          )}
+          {Array.isArray(lastAttempt?.generatedFiles) && lastAttempt.generatedFiles.length > 0 && (
+            <div className="mt-2 text-[#D8E8FF]/70 font-mono text-[11px]">
+              {lastAttempt.generatedFiles.slice(0, 4).join(', ')}
+              {lastAttempt.generatedFiles.length > 4 ? ` +${lastAttempt.generatedFiles.length - 4} more` : ''}
+            </div>
+          )}
+        </div>
+      )}
+    </motion.div>
+  );
+}
+
 interface SuggestedFixStep {
   action: string;
   detail?: string;
@@ -1975,6 +2917,22 @@ function buildSuggestedFix(error: PipelineErrorShape): SuggestedFix | null {
     };
   }
 
+  if (code === 'TARGET_PORT_IN_USE_NOT_READY') {
+    return {
+      title: 'Suggested fix — target port is occupied but not reachable',
+      steps: [
+        {
+          action: 'Use the already-running app',
+          detail: 'Start the target app yourself, confirm its baseURL opens in the browser, then set Healix baseURL to that exact URL. Healix will attach instead of starting a duplicate stack.',
+        },
+        {
+          action: 'Or free the configured port',
+          detail: 'Stop the process holding the configured port and rerun. Healix avoids silently moving multi-service apps to a fallback port because fixed backend services can fail to bind and auth can target the wrong origin.',
+        },
+      ],
+    };
+  }
+
   if (code === 'FIXTURE_MODULE_TYPE_MISMATCH') {
     return {
       title: 'Suggested fix — fixture ESM/CJS mismatch',
@@ -1999,6 +2957,27 @@ function buildSuggestedFix(error: PipelineErrorShape): SuggestedFix | null {
       steps: [
         { action: 'Enable "Generate tests" in the config form', detail: 'The specs on disk are generic Healix fallback probes from a prior failed generation — not AC-traced tests. Toggle generation ON before re-submitting.' },
         { action: 'Optional — clear the stale fallbacks first', code: 'rm tests/generated/fallback-*.spec.*' },
+      ],
+    };
+  }
+
+  if (code === 'HARDCODED_BASE_URL_MISMATCH') {
+    return {
+      title: 'Suggested fix — generated tests targeted the wrong origin',
+      steps: [
+        { action: 'Regenerate source-grounded tests', detail: 'The suite contained absolute URLs outside the configured baseURL. Healix should regenerate tests that use observed routes from the target app only.' },
+        { action: 'Use relative navigation in generated specs', code: "await page.goto('/actual-route-from-context');" },
+        { action: 'Do not use placeholder hosts', detail: 'Generated tests must not call `https://example.com`, guessed localhost ports, or any origin other than the configured baseURL unless the target app source explicitly defines that external API contract.' },
+      ],
+    };
+  }
+
+  if (code === 'INSUFFICIENT_RUNNABLE_COVERAGE' || code === 'INSUFFICIENT_RETAINED_RUNNABLE_COVERAGE' || code === 'MIN_TEST_COUNT_NOT_MET') {
+    return {
+      title: 'Suggested fix — add focused runnable coverage',
+      steps: [
+        { action: 'Regenerate with source-grounded coverage top-up', detail: 'Healix should add focused tests for uncovered routes/workflows rather than padding with page-load checks.' },
+        { action: 'Keep the target, but execute useful suites', detail: '`minGeneratedTests` is a target. Valid suites that meet the minimum useful runnable floor should run and show a warning instead of failing.' },
       ],
     };
   }
@@ -2140,9 +3119,62 @@ function PipelineErrorBanner({ error, runId }: { error: PipelineErrorShape; runI
   const [specOpen, setSpecOpen] = useState(false);
   const [copied, setCopied] = useState(false);
 
-  const stage = error.stage || 'unknown';
-  const reason = error.reason || 'unknown_reason';
   const code = error.errorCode || null;
+  const isHardcodedBaseUrlMismatch = code === 'HARDCODED_BASE_URL_MISMATCH'
+    || /Generated suite hardcoded a different app origin than baseURL|hardcoded a different app origin/i.test(
+      `${error.userFacingMessage ?? ''} ${error.stderr ?? ''} ${error.reason ?? ''}`
+    );
+  const isMinCountIssue = code === 'MIN_TEST_COUNT_NOT_MET'
+    || code === 'INSUFFICIENT_RUNNABLE_COVERAGE'
+    || code === 'INSUFFICIENT_RETAINED_RUNNABLE_COVERAGE'
+    || /MIN_TEST_COUNT_NOT_MET|Generated tests \d+ below minimum|below (?:adaptive|minimum useful) floor/i.test(
+      `${error.userFacingMessage ?? ''} ${error.stderr ?? ''} ${error.reason ?? ''}`
+    );
+  const isInsufficientRunnableCoverage = code === 'INSUFFICIENT_RUNNABLE_COVERAGE';
+  const isInsufficientRetainedCoverage = code === 'INSUFFICIENT_RETAINED_RUNNABLE_COVERAGE';
+  const generatedFromQuality = error.generationQuality?.generatedTestsActual
+    ?? error.generationQuality?.totalTests
+    ?? null;
+  const runnableFromQuality = error.generationQuality?.runnableTestsActual
+    ?? error.generationQuality?.runnableTests
+    ?? null;
+  const salvagedOriginalSpecCount = typeof error.validationSalvage?.originalSpecCount === 'number'
+    ? error.validationSalvage.originalSpecCount
+    : null;
+  const salvagedKeptSpecCount = Array.isArray(error.validationSalvage?.keptSpecFiles)
+    ? error.validationSalvage.keptSpecFiles.length
+    : null;
+  const salvagedQuarantinedSpecCount = Array.isArray(error.validationSalvage?.quarantinedSpecFiles)
+    ? error.validationSalvage.quarantinedSpecFiles.length
+    : null;
+  const salvageTotalSpecCount = typeof salvagedKeptSpecCount === 'number' || typeof salvagedQuarantinedSpecCount === 'number'
+    ? (salvagedKeptSpecCount || 0) + (salvagedQuarantinedSpecCount || 0)
+    : null;
+  const positiveCount = (...counts: Array<number | null | undefined>) =>
+    counts.find((count) => typeof count === 'number' && Number.isFinite(count) && count > 0) ?? null;
+  const displayedGeneratedSpecCount = positiveCount(
+    error.generatedSpecCount,
+    salvagedOriginalSpecCount,
+    salvageTotalSpecCount,
+    generatedFromQuality,
+    runnableFromQuality,
+  ) ?? (typeof error.generatedSpecCount === 'number' ? error.generatedSpecCount : null);
+  const keptSpecCount = positiveCount(error.keptSpecCount, salvagedKeptSpecCount)
+    ?? (typeof error.keptSpecCount === 'number' ? error.keptSpecCount : salvagedKeptSpecCount);
+  const quarantinedSpecCount = positiveCount(error.quarantinedSpecCount, salvagedQuarantinedSpecCount)
+    ?? (typeof error.quarantinedSpecCount === 'number' ? error.quarantinedSpecCount : salvagedQuarantinedSpecCount);
+  const usefulFloor = error.generationQuality?.minimumUsefulRunnableFloor
+    ?? error.generationQuality?.adaptiveRunnableFloor
+    ?? null;
+  const stage = isHardcodedBaseUrlMismatch || isMinCountIssue ? 'generation' : (error.stage || 'unknown');
+  const reason = isHardcodedBaseUrlMismatch
+    ? 'hardcoded_base_url_mismatch'
+    : (isMinCountIssue ? (isInsufficientRetainedCoverage ? 'insufficient_retained_runnable_coverage' : (isInsufficientRunnableCoverage ? 'insufficient_runnable_coverage' : 'min_test_count_not_met')) : (error.reason || 'unknown_reason'));
+  const displayMessage = isHardcodedBaseUrlMismatch && !error.userFacingMessage
+    ? 'Generated tests used an absolute URL outside the configured baseURL. Healix blocked execution so results do not come from the wrong target app.'
+    : (isMinCountIssue && !error.userFacingMessage
+      ? 'Generated tests were below the target count. Current runs execute when valid runnable tests meet the minimum useful floor; otherwise Healix reports insufficient runnable coverage.'
+      : error.userFacingMessage);
 
   const errorBlob = `${code ?? ''} ${error.userFacingMessage ?? ''} ${error.stderr ?? ''} ${reason}`;
   const isCreditsError = /INSUFFICIENT_CREDITS|No credits remaining|Insufficient credits/i.test(errorBlob);
@@ -2151,6 +3183,11 @@ function PipelineErrorBanner({ error, runId }: { error: PipelineErrorShape; runI
   }
 
   const stageLabel =
+    code === 'HARDCODED_BASE_URL_MISMATCH' ? 'Generated tests targeted the wrong app origin' :
+    code === 'TARGET_PORT_IN_USE_NOT_READY' ? 'Target port is occupied but not reachable' :
+    isInsufficientRetainedCoverage ? 'Too few retained tests after quarantine' :
+    isInsufficientRunnableCoverage ? 'Generated fewer runnable tests than the useful minimum' :
+    isMinCountIssue ? 'Generated fewer tests than target' :
     stage === 'validation' ? 'Generated tests failed Playwright validation' :
     stage === 'generation' ? 'Test generation failed' :
     stage === 'server_start' ? 'Dev server failed to start' :
@@ -2159,9 +3196,9 @@ function PipelineErrorBanner({ error, runId }: { error: PipelineErrorShape; runI
 
   const promptForAgent = [
     `Healix pipeline failed at stage: ${stage} (${reason}${code ? ' · ' + code : ''}).`,
-    error.userFacingMessage ? `Summary: ${error.userFacingMessage}` : '',
+    displayMessage ? `Summary: ${displayMessage}` : '',
     '',
-    'Playwright stderr:',
+    stage === 'execution' ? 'Playwright stderr:' : 'Pipeline diagnostics:',
     '```',
     (error.stderr || '(none)').slice(0, 3000),
     '```',
@@ -2213,9 +3250,29 @@ function PipelineErrorBanner({ error, runId }: { error: PipelineErrorShape; runI
                   {code}
                 </span>
               )}
-              {typeof error.generatedSpecCount === 'number' && (
+              {typeof displayedGeneratedSpecCount === 'number' && (
                 <span className="px-2 py-0.5 rounded-md bg-white/5 border border-white/10 text-[#D8E8FF]/70 text-[11px] font-mono">
-                  generated: {error.generatedSpecCount} spec{error.generatedSpecCount === 1 ? '' : 's'}
+                  generated: {displayedGeneratedSpecCount} spec{displayedGeneratedSpecCount === 1 ? '' : 's'}
+                </span>
+              )}
+              {typeof keptSpecCount === 'number' && keptSpecCount > 0 && (
+                <span className="px-2 py-0.5 rounded-md bg-emerald-500/10 border border-emerald-500/25 text-[#86EFAC] text-[11px] font-mono">
+                  kept: {keptSpecCount}
+                </span>
+              )}
+              {typeof quarantinedSpecCount === 'number' && quarantinedSpecCount > 0 && (
+                <span className="px-2 py-0.5 rounded-md bg-amber-500/10 border border-amber-500/25 text-[#FDE68A] text-[11px] font-mono">
+                  quarantined: {quarantinedSpecCount}
+                </span>
+              )}
+              {typeof runnableFromQuality === 'number' && (
+                <span className="px-2 py-0.5 rounded-md bg-white/5 border border-white/10 text-[#D8E8FF]/70 text-[11px] font-mono">
+                  runnable: {runnableFromQuality}
+                </span>
+              )}
+              {typeof usefulFloor === 'number' && (
+                <span className="px-2 py-0.5 rounded-md bg-white/5 border border-white/10 text-[#D8E8FF]/70 text-[11px] font-mono">
+                  floor: {usefulFloor}
                 </span>
               )}
             </div>
@@ -2229,9 +3286,9 @@ function PipelineErrorBanner({ error, runId }: { error: PipelineErrorShape; runI
         </button>
       </div>
 
-      {error.userFacingMessage && (
+      {displayMessage && (
         <div className="px-5 py-3 text-[13px] text-[#D8E8FF]/85 border-b border-red-500/10 leading-relaxed">
-          {error.userFacingMessage}
+          {displayMessage}
         </div>
       )}
 
@@ -2252,7 +3309,7 @@ function PipelineErrorBanner({ error, runId }: { error: PipelineErrorShape; runI
             onClick={() => setStderrOpen(o => !o)}
             className="w-full px-5 py-2.5 text-left text-[11px] uppercase tracking-wider text-[#FCA5A5] font-semibold flex items-center justify-between hover:bg-white/[0.02] transition-colors"
           >
-            <span>Playwright stderr</span>
+            <span>{stage === 'execution' ? 'Playwright stderr' : 'Pipeline diagnostics'}</span>
             <span className="text-[#FCA5A5]/70">{stderrOpen ? '▾' : '▸'}</span>
           </button>
           {stderrOpen && (
@@ -2335,6 +3392,30 @@ export default function TestRunDetailPage() {
       'tests_complete',
     ].includes(phase);
   }, []);
+
+  const refreshRun = useCallback(async () => {
+    if (!id) return;
+    const res = await fetch(`/api/test-runs/${id}`, { cache: 'no-store' });
+    if (!res.ok) return;
+    const json = await res.json();
+    if (!json?.data) return;
+    const nextRun = json.data as TestRun;
+    lastRunSignatureRef.current = JSON.stringify({
+      id: nextRun?.id,
+      status: nextRun?.status,
+      updated_at: nextRun?.updated_at,
+      current_phase: nextRun?.current_phase,
+      error_code: nextRun?.error_code,
+      total_tests: nextRun?.total_tests,
+      passed_tests: nextRun?.passed_tests,
+      failed_tests: nextRun?.failed_tests,
+      skipped_tests: nextRun?.skipped_tests,
+    });
+    setTestRun(nextRun);
+    setGenerationJob(
+      (json.data as { generationJob?: GenerationJobSnapshot | null }).generationJob ?? null
+    );
+  }, [id]);
 
   useEffect(() => {
     if (!id || !isLiveDetailId) return;
@@ -2442,7 +3523,7 @@ export default function TestRunDetailPage() {
       evtSource.close();
       evtSourceRef.current = null;
     };
-  }, [id, isLiveDetailId]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [id, isLiveDetailId]);
 
   useEffect(() => {
     if (!id) return;
@@ -2640,9 +3721,22 @@ export default function TestRunDetailPage() {
   const generationMeta = (report?.metadata?.generationMeta ?? null) as GenerationMetaShape | null;
   const partialWarning = generationMeta?.partialGenerationWarning ?? null;
   const qualityWarning = generationMeta?.qualityWarning ?? null;
+  const coverageTopUps = Array.isArray(generationMeta?.coverageTopUps)
+    ? generationMeta!.coverageTopUps
+    : [];
+  const shouldShowCoverageTopUpBanner = !pipelineError && coverageTopUps.some((event) => {
+    const status = String(event.status || '').toLowerCase();
+    return status === 'failed' || status === 'no_new_valid_delta' || status.startsWith('skipped');
+  });
   const agentFailuresFromMeta: AgentFailure[] = Array.isArray(generationMeta?.agentFailures)
     ? (generationMeta!.agentFailures as AgentFailure[])
     : [];
+  const agentFailuresFromJob: AgentFailure[] = generationJob?.agentsCompleted
+    ?.filter((agent) => agent && agent.ok === false)
+    .map((agent) => ({ agent: agent.agent, code: agent.errorCode || 'AGENT_FAILED', message: '' })) ?? [];
+  const visibleAgentFailures: AgentFailure[] = agentFailuresFromMeta.length > 0
+    ? agentFailuresFromMeta
+    : agentFailuresFromJob;
   const agentsCompletedFromMeta: string[] = Array.isArray(generationMeta?.agentsCompleted)
     ? (generationMeta!.agentsCompleted as string[])
     : [];
@@ -2656,7 +3750,7 @@ export default function TestRunDetailPage() {
     !pipelineError &&
     !!generationMeta &&
     (!!partialWarning ||
-      (agentFailuresFromMeta.length > 0 && agentsCompletedFromMeta.length > 0));
+      (visibleAgentFailures.length > 0 && agentsCompletedFromMeta.length > 0));
   const effectiveWarning: PartialGenerationWarning | null = partialWarning
     ? partialWarning
     : shouldShowPartialBanner
@@ -2770,12 +3864,7 @@ export default function TestRunDetailPage() {
     Array.isArray(aiRaw)
       ? aiRaw
       : (Array.isArray(aiRaw?.analyses) ? aiRaw.analyses : Array.isArray(aiRaw?.items) ? aiRaw.items : [])
-  ).filter((item: AiAnalysisItem) => (
-    !!safeString(item?.testName ?? item?.test ?? item?.test_name)
-    || !!safeString(item?.analysis)
-    || !!safeString(item?.rootCause ?? item?.root_cause)
-    || !!safeString(item?.suggestedFix ?? item?.suggested_fix ?? item?.fix)
-  ));
+  ).filter((item: AiAnalysisItem) => hasMeaningfulAiAnalysis(item));
 
   // Failure triage state — merge server rows with optimistic overrides
   const rawFailures: TestFailure[] = Array.isArray(testRun.test_failures) ? testRun.test_failures : [];
@@ -2796,6 +3885,8 @@ export default function TestRunDetailPage() {
       .filter(([, members]) => members.length >= 3)
       .map(([clusterId, members]) => ({ clusterId, members }));
   })();
+  const qaFindings: QaFinding[] = Array.isArray(testRun.qa_findings) ? testRun.qa_findings : [];
+  const findingSummary = normalizeFindingSummary(testRun.finding_summary, qaFindings);
 
   const handleOverride = (failureId: string, verdict: FailureVerdict) => {
     setOverrides((prev) => ({ ...prev, [failureId]: verdict }));
@@ -2827,13 +3918,8 @@ export default function TestRunDetailPage() {
                 {testRun.source}
               </span>
             )}
-            <span className={`px-3 py-1 rounded-full text-xs font-semibold ${
-              testRun.status === 'passed' ? 'bg-emerald-500/10 border border-emerald-500/20 text-emerald-400'
-              : testRun.status === 'failed' ? 'bg-red-500/10 border border-red-500/20 text-red-400'
-              : testRun.status === 'running' ? 'bg-blue-500/10 border border-blue-500/20 text-blue-400'
-              : 'bg-amber-500/10 border border-amber-500/20 text-amber-400'
-            }`}>
-              {testRun.status}
+            <span className={`px-3 py-1 rounded-full text-xs font-semibold ${runStatusClass(testRun.status)}`}>
+              {runStatusLabel(testRun.status)}
             </span>
           </div>
         </div>
@@ -2843,17 +3929,46 @@ export default function TestRunDetailPage() {
         <PipelineErrorBanner error={pipelineError as PipelineErrorShape} runId={testRun.id} />
       )}
 
+      {visibleAgentFailures.length > 0 && (
+        <FailedAgentRetryPanel
+          runId={testRun.id}
+          generationMeta={generationMeta}
+          agentFailures={visibleAgentFailures}
+          agentsCompleted={agentsCompletedFromMeta}
+          agentsRequested={agentsRequestedFromMeta}
+          onRefresh={refreshRun}
+        />
+      )}
+
+      {generationMeta?.coverageRetry && (
+        <CoverageRetryPanel
+          runId={testRun.id}
+          generationMeta={generationMeta}
+          onRefresh={refreshRun}
+        />
+      )}
+
       {shouldShowPartialBanner && effectiveWarning && (
         <PartialGenerationBanner
           warning={effectiveWarning}
-          agentFailures={agentFailuresFromMeta}
+          agentFailures={visibleAgentFailures}
           agentsCompleted={agentsCompletedFromMeta}
           agentsRequested={agentsRequestedFromMeta}
         />
       )}
 
-      {!pipelineError && qualityWarning && qualityWarning.suggestions?.length > 0 && (
+      {!pipelineError && qualityWarning && (
+        (qualityWarning.suggestions?.length || 0) > 0 || (qualityWarning.qualityWarnings?.length || 0) > 0
+      ) && (
         <QualityWarningBanner warning={qualityWarning} />
+      )}
+
+      {!pipelineError && generationMeta && Array.isArray(generationMeta.qaContractQuestions) && generationMeta.qaContractQuestions.length > 0 && (
+        <QaContractAdvisoryBanner generationMeta={generationMeta} />
+      )}
+
+      {shouldShowCoverageTopUpBanner && (
+        <CoverageTopUpAdvisoryBanner topUps={coverageTopUps} />
       )}
 
       {Array.isArray(generationMeta?.agentMeta) && generationMeta!.agentMeta!.length > 0 && (
@@ -3038,6 +4153,8 @@ export default function TestRunDetailPage() {
           </div>
         </div>
       )}
+
+      <QaFindingsSection summary={findingSummary} findings={qaFindings} />
 
       {/* Results by Section */}
       {totalTests > 0 && (() => {

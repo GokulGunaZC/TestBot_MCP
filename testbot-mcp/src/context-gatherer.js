@@ -8,6 +8,7 @@
 const fs = require('fs');
 const path = require('path');
 const Logger = require('./logger');
+const { extractQaContracts } = require('./qa-contracts');
 
 class ContextGatherer {
   constructor(config = {}) {
@@ -31,6 +32,11 @@ class ContextGatherer {
       'out',
       'vendor',
       'target',
+      'public',
+      'static',
+      'assets',
+      'generated',
+      'gen',
     ]);
   }
 
@@ -68,7 +74,7 @@ class ContextGatherer {
   /**
    * Get source file extensions based on project language
    */
-  getSourceExtensions() {
+  getSourceExtensions(language = this.config.language) {
     const extensionMap = {
       javascript: ['.js', '.jsx', '.ts', '.tsx', '.mjs'],
       python: ['.py'],
@@ -83,7 +89,7 @@ class ContextGatherer {
       swift: ['.swift'],
       unknown: ['.js', '.jsx', '.ts', '.tsx', '.py', '.java', '.go', '.rb', '.php'],
     };
-    return extensionMap[this.config.language] || extensionMap.unknown;
+    return extensionMap[language] || extensionMap.unknown;
   }
 
   /**
@@ -103,6 +109,7 @@ class ContextGatherer {
       forms: [],
       dataModels: [],
       authPatterns: [],
+      qaContracts: null,
       projectStructure: {},
     };
     
@@ -132,6 +139,9 @@ class ContextGatherer {
     // Identify common workflows from routes
     context.workflows = this.inferWorkflows(context.pages, context.apiEndpoints, context.forms);
     Logger.info('ContextGatherer', `Inferred workflows`, { count: context.workflows.length });
+
+    context.qaContracts = this.extractQaContracts(projectPath, context);
+    Logger.info('ContextGatherer', 'Derived QA contracts', context.qaContracts?.summary || {});
     
     return context;
   }
@@ -198,6 +208,7 @@ class ContextGatherer {
       richContext.forms
     );
     richContext.sourceContext = this.extractSourceContext(projectPath, richContext.pages);
+    richContext.qaContracts = this.extractQaContracts(projectPath, richContext);
     richContext.extractionConfidence = {
       selectorHints: richContext.selectorHints.length > 0 ? 0.9 : 0.5,
       navigationGraph: (richContext.navigationGraph.edges || []).length > 0 ? 0.85 : 0.4,
@@ -211,9 +222,18 @@ class ContextGatherer {
       forms: 'jsx-tsx-form-parsing',
       apiContracts: 'endpoint-handler-parsing',
       sourceContext: 'route-source-and-component-literal-parsing',
+      qaContracts: 'source-derived-filter-delete-form-contracts',
     };
     
     return richContext;
+  }
+
+  extractQaContracts(projectPath, context) {
+    return extractQaContracts({
+      projectPath,
+      context,
+      readFile: (filePath, options) => this.readFileCached(filePath, options),
+    });
   }
 
   /**
@@ -246,13 +266,48 @@ class ContextGatherer {
     const forms = [];
     
     // Detect form elements
-    const formMatches = content.match(/<form[^>]*>[\s\S]*?<\/form>/gi) || [];
-    const formHookMatches = content.match(/useForm\s*\([^)]*\)/gi) || [];
+    const formMatchRecords = Array.from(content.matchAll(/<form[^>]*>[\s\S]*?<\/form>/gi));
+    const formMatches = formMatchRecords.map((match) => match[0]);
+    const formHookMatchRecords = Array.from(content.matchAll(/useForm\s*\([^)]*\)/gi));
+    const formHookMatches = formHookMatchRecords.map((match) => match[0]);
     const labelsMap = new Map();
 
-    const labelMatches = content.matchAll(/<label[^>]*(?:for=["']([^"']+)["'])?[^>]*>([\s\S]*?)<\/label>/gi);
+    const attrValue = (tag, attrName) => {
+      const match = String(tag || '').match(new RegExp(`\\b${attrName}=["']([^"']*)["']`, 'i'));
+      return match?.[1] || null;
+    };
+    const fieldRequiredByValidation = (fieldName, tag = '') => {
+      const name = String(fieldName || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const rawTag = String(tag || '');
+      if (/\brequired(?:\s*=\s*(?:\{?\s*true\s*\}?|["']true["']))?\b/i.test(rawTag)) return true;
+      if (/\baria-required\s*=\s*(?:["']true["']|\{\s*true\s*\})/i.test(rawTag)) return true;
+      if (/\brules\s*=\s*\{\s*\{[\s\S]{0,180}\brequired\b/i.test(rawTag)) return true;
+      if (!name) return false;
+      const registerPattern = new RegExp(`\\bregister\\s*\\(\\s*['"\`]${name}['"\`]\\s*,\\s*\\{[\\s\\S]{0,240}\\brequired\\b`, 'i');
+      if (registerPattern.test(content)) return true;
+      const controllerPattern = new RegExp(`\\bname\\s*=\\s*['"\`]${name}['"\`][\\s\\S]{0,320}\\brules\\s*=\\s*\\{\\s*\\{[\\s\\S]{0,180}\\brequired\\b`, 'i');
+      if (controllerPattern.test(content)) return true;
+      const zodPattern = new RegExp(`\\b${name}\\s*:\\s*z\\.(?:string|number|coerce\\.number)\\s*\\([^)]*\\)(?:\\s*\\.\\s*(?:min\\s*\\(\\s*1\\b|nonempty\\s*\\(|email\\s*\\())`, 'i');
+      return zodPattern.test(content);
+    };
+    const upsertField = (field) => {
+      const key = String(field.name || field.id || '').trim();
+      if (!key) return;
+      const existing = fields.find((item) => item.name === key);
+      if (existing) {
+        existing.required = Boolean(existing.required || field.required);
+        existing.label = existing.label || field.label || null;
+        existing.placeholder = existing.placeholder || field.placeholder || null;
+        existing.testId = existing.testId || field.testId || null;
+        existing.ariaLabel = existing.ariaLabel || field.ariaLabel || null;
+        return;
+      }
+      fields.push(field);
+    };
+
+    const labelMatches = content.matchAll(/<label\b([^>]*)>([\s\S]*?)<\/label>/gi);
     for (const match of labelMatches) {
-      const targetId = String(match[1] || '').trim();
+      const targetId = String(attrValue(match[1], 'htmlFor') || attrValue(match[1], 'for') || '').trim();
       const labelText = String(match[2] || '').replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim();
       if (targetId && labelText) {
         labelsMap.set(targetId, labelText);
@@ -263,63 +318,128 @@ class ContextGatherer {
     const fields = [];
     
     // Input fields
-    const inputMatches = content.matchAll(/<(?:input|Input)[^>]*(?:name|id)=["']([^"']+)["'][^>]*(?:type=["']([^"']+)["'])?[^>]*>/gi);
+    const inputMatches = content.matchAll(/<(?:input|Input)\b[^>]*>/gi);
     for (const match of inputMatches) {
       const tag = match[0];
-      const idMatch = tag.match(/\bid=["']([^"']+)["']/i);
-      const placeholderMatch = tag.match(/\bplaceholder=["']([^"']+)["']/i);
-      const testIdMatch = tag.match(/\bdata-testid=["']([^"']+)["']/i);
-      const ariaLabelMatch = tag.match(/\baria-label=["']([^"']+)["']/i);
-      fields.push({
-        name: match[1],
-        type: match[2] || 'text',
-        required: tag.includes('required'),
-        id: idMatch?.[1] || null,
-        label: labelsMap.get(idMatch?.[1] || '') || null,
-        placeholder: placeholderMatch?.[1] || null,
-        testId: testIdMatch?.[1] || null,
-        ariaLabel: ariaLabelMatch?.[1] || null,
+      const name = attrValue(tag, 'name') || attrValue(tag, 'id');
+      if (!name) continue;
+      const id = attrValue(tag, 'id');
+      const type = attrValue(tag, 'type') || 'text';
+      const placeholder = attrValue(tag, 'placeholder');
+      const testId = attrValue(tag, 'data-testid');
+      const ariaLabel = attrValue(tag, 'aria-label');
+      upsertField({
+        name,
+        type,
+        required: fieldRequiredByValidation(name, tag),
+        id: id || null,
+        label: labelsMap.get(id || '') || null,
+        placeholder: placeholder || null,
+        testId: testId || null,
+        ariaLabel: ariaLabel || null,
         role: 'textbox',
       });
     }
     
     // Select fields
-    const selectMatches = content.matchAll(/<(?:select|Select)[^>]*(?:name|id)=["']([^"']+)["']/gi);
+    const selectMatches = content.matchAll(/<(?:select|Select)\b[^>]*>/gi);
     for (const match of selectMatches) {
       const tag = match[0];
-      const idMatch = tag.match(/\bid=["']([^"']+)["']/i);
-      const testIdMatch = tag.match(/\bdata-testid=["']([^"']+)["']/i);
-      const ariaLabelMatch = tag.match(/\baria-label=["']([^"']+)["']/i);
-      fields.push({
-        name: match[1],
+      const name = attrValue(tag, 'name') || attrValue(tag, 'id');
+      if (!name) continue;
+      const id = attrValue(tag, 'id');
+      const testId = attrValue(tag, 'data-testid');
+      const ariaLabel = attrValue(tag, 'aria-label');
+      upsertField({
+        name,
         type: 'select',
-        required: tag.includes('required'),
-        id: idMatch?.[1] || null,
-        label: labelsMap.get(idMatch?.[1] || '') || null,
+        required: fieldRequiredByValidation(name, tag),
+        id: id || null,
+        label: labelsMap.get(id || '') || null,
         placeholder: null,
-        testId: testIdMatch?.[1] || null,
-        ariaLabel: ariaLabelMatch?.[1] || null,
+        testId: testId || null,
+        ariaLabel: ariaLabel || null,
         role: 'combobox',
       });
     }
     
     // Textarea
-    const textareaMatches = content.matchAll(/<(?:textarea|Textarea)[^>]*(?:name|id)=["']([^"']+)["']/gi);
+    const textareaMatches = content.matchAll(/<(?:textarea|Textarea)\b[^>]*>/gi);
     for (const match of textareaMatches) {
       const tag = match[0];
-      const idMatch = tag.match(/\bid=["']([^"']+)["']/i);
-      const placeholderMatch = tag.match(/\bplaceholder=["']([^"']+)["']/i);
-      const testIdMatch = tag.match(/\bdata-testid=["']([^"']+)["']/i);
-      const ariaLabelMatch = tag.match(/\baria-label=["']([^"']+)["']/i);
-      fields.push({
-        name: match[1],
+      const name = attrValue(tag, 'name') || attrValue(tag, 'id');
+      if (!name) continue;
+      const id = attrValue(tag, 'id');
+      const placeholder = attrValue(tag, 'placeholder');
+      const testId = attrValue(tag, 'data-testid');
+      const ariaLabel = attrValue(tag, 'aria-label');
+      upsertField({
+        name,
         type: 'textarea',
-        required: tag.includes('required'),
-        id: idMatch?.[1] || null,
-        label: labelsMap.get(idMatch?.[1] || '') || null,
-        placeholder: placeholderMatch?.[1] || null,
-        testId: testIdMatch?.[1] || null,
-        ariaLabel: ariaLabelMatch?.[1] || null,
+        required: fieldRequiredByValidation(name, tag),
+        id: id || null,
+        label: labelsMap.get(id || '') || null,
+        placeholder: placeholder || null,
+        testId: testId || null,
+        ariaLabel: ariaLabel || null,
+        role: 'textbox',
+      });
+    }
+
+    const genericFieldMatches = content.matchAll(/<(?:Controller|FormField|Field|TextField|Input|Textarea|Select)\b[^>]*\bname=["']([^"']+)["'][^>]*>/gi);
+    for (const match of genericFieldMatches) {
+      const tag = match[0];
+      const name = String(match[1] || '').trim();
+      if (!name) continue;
+      const id = attrValue(tag, 'id');
+      const placeholder = attrValue(tag, 'placeholder');
+      const testId = attrValue(tag, 'data-testid');
+      const ariaLabel = attrValue(tag, 'aria-label');
+      upsertField({
+        name,
+        type: /Select/i.test(tag) ? 'select' : (/Textarea/i.test(tag) ? 'textarea' : 'text'),
+        required: fieldRequiredByValidation(name, tag),
+        id: id || null,
+        label: labelsMap.get(id || '') || null,
+        placeholder: placeholder || null,
+        testId: testId || null,
+        ariaLabel: ariaLabel || null,
+        role: /Select/i.test(tag) ? 'combobox' : 'textbox',
+      });
+    }
+
+    const registerMatches = content.matchAll(/\bregister\s*\(\s*['"`]([^'"`]+)['"`](?:\s*,\s*\{([\s\S]{0,300}?)\})?/gi);
+    for (const match of registerMatches) {
+      const name = String(match[1] || '').trim();
+      if (!name) continue;
+      const options = String(match[2] || '');
+      upsertField({
+        name,
+        type: /email/i.test(name) ? 'email' : 'text',
+        required: /\brequired\b/i.test(options) || fieldRequiredByValidation(name),
+        id: null,
+        label: null,
+        placeholder: null,
+        testId: null,
+        ariaLabel: null,
+        role: 'textbox',
+      });
+    }
+
+    const zodFieldMatches = content.matchAll(/\b([A-Za-z_][\w]*)\s*:\s*z\.(?:string|number|coerce\.number)\s*\([^)]*\)((?:\s*\.\s*\w+\s*\([^)]*\))*)/g);
+    for (const match of zodFieldMatches) {
+      const name = String(match[1] || '').trim();
+      const chain = String(match[2] || '');
+      if (!name || !/(?:\.min\s*\(\s*1\b|\.nonempty\s*\(|\.email\s*\()/i.test(chain)) continue;
+      upsertField({
+        name,
+        type: /\.email\s*\(/i.test(chain) || /email/i.test(name) ? 'email' : 'text',
+        required: true,
+        id: null,
+        label: null,
+        placeholder: null,
+        testId: null,
+        ariaLabel: null,
         role: 'textbox',
       });
     }
@@ -352,9 +472,13 @@ class ContextGatherer {
     if (content.includes('email')) validationPatterns.push('email');
     
     if (fields.length > 0 || formMatches.length > 0 || formHookMatches.length > 0) {
+      const primaryFormIndex = Number.isFinite(formMatchRecords[0]?.index)
+        ? formMatchRecords[0].index
+        : (Number.isFinite(formHookMatchRecords[0]?.index) ? formHookMatchRecords[0].index : 0);
       const formTag = formMatches[0] || '';
       const actionMatch = formTag.match(/\baction=["']([^"']+)["']/i);
       const methodMatch = formTag.match(/\bmethod=["']([^"']+)["']/i);
+      const componentName = this.extractNearestComponentName(content, primaryFormIndex);
       const selectorHints = fields
         .flatMap((field) => [field.testId, field.label, field.placeholder, field.name])
         .filter(Boolean)
@@ -370,6 +494,7 @@ class ContextGatherer {
         submitButtons: submitButtons.slice(0, 10),
         action: actionMatch?.[1] || null,
         method: (methodMatch?.[1] || 'POST').toUpperCase(),
+        componentName,
         selectorHints,
       });
     }
@@ -920,6 +1045,12 @@ class ContextGatherer {
         pages.push(...appPages);
       }
     }
+
+    for (const appDir of this.findNestedFrameworkDirs(projectPath, ['app', path.join('src', 'app')])) {
+      if (appDir === nextAppDir || appDir === srcAppDir) continue;
+      const appPages = this.scanNextAppDir(appDir, '');
+      pages.push(...appPages);
+    }
     
     // React Router - scan for route definitions
     const routerPages = await this.findReactRouterRoutes(projectPath);
@@ -1064,6 +1195,7 @@ class ContextGatherer {
     const pages = [];
     const routePatterns = [
       /path=["'`]([^"'`]+)["'`]/g,
+      /path\s*:\s*["'`]([^"'`]+)["'`]/g,
       /Route\s+path=["'`]([^"'`]+)["'`]/g,
       /<Route[^>]+path=["'`]([^"'`]+)["'`]/g,
     ];
@@ -1079,7 +1211,8 @@ class ContextGatherer {
         for (const pattern of routePatterns) {
           let match;
           while ((match = pattern.exec(content)) !== null) {
-            const routePath = match[1];
+            const rawRoutePath = match[1];
+            const routePath = rawRoutePath === '' ? '/' : (rawRoutePath.startsWith('/') ? rawRoutePath : `/${rawRoutePath}`);
             if (routePath && !routePath.includes('*') && !pages.some(p => p.path === routePath)) {
               const uiHints = this.extractPageUIHints(file);
               pages.push({
@@ -1170,6 +1303,16 @@ class ContextGatherer {
         endpoints.push(...apiEndpoints);
       }
     }
+
+    for (const apiDir of this.findNestedFrameworkDirs(projectPath, [
+      path.join('pages', 'api'),
+      path.join('src', 'pages', 'api'),
+      path.join('app', 'api'),
+      path.join('src', 'app', 'api'),
+    ])) {
+      if (apiDirs.includes(apiDir)) continue;
+      endpoints.push(...this.scanAPIRoutes(apiDir, '/api'));
+    }
     
     // Express/Node.js routes
     const expressEndpoints = await this.findExpressRoutes(projectPath);
@@ -1209,11 +1352,21 @@ class ContextGatherer {
         const fullPath = path.join(dir, entry.name);
         
         if (entry.isDirectory()) {
-          const routePart = entry.name.startsWith('[')
-            ? `:${entry.name.replace(/[\[\]]/g, '')}`
-            : entry.name;
+          const optionalCatchAll = entry.name.match(/^\[\[\.\.\.([^\]]+)\]\]$/);
+          const catchAll = entry.name.match(/^\[\.\.\.([^\]]+)\]$/);
+          const dynamicSegment = entry.name.match(/^\[([^\]]+)\]$/);
+          const routePart = optionalCatchAll
+            ? ''
+            : catchAll
+              ? `:${catchAll[1]}`
+              : dynamicSegment
+                ? `:${dynamicSegment[1]}`
+                : entry.name;
           
-          const subEndpoints = this.scanAPIRoutes(fullPath, `${basePath}/${routePart}`);
+          const subEndpoints = this.scanAPIRoutes(
+            fullPath,
+            routePart ? `${basePath}/${routePart}` : basePath,
+          );
           endpoints.push(...subEndpoints);
         } else if (this.isPageFile(entry.name)) {
           const routeName = entry.name.replace(/\.(js|jsx|ts|tsx)$/, '');
@@ -1367,13 +1520,8 @@ class ContextGatherer {
    */
   async findMultiLangEndpoints(projectPath) {
     const endpoints = [];
-    const lang = this.config.language;
-    if (lang === 'javascript') return endpoints; // Already handled
-
-    const extensions = this.getSourceExtensions();
     const srcDir = path.join(projectPath, 'src');
     const searchDir = fs.existsSync(srcDir) ? srcDir : projectPath;
-    const files = this.findFiles(searchDir, extensions);
 
     const endpointPatterns = {
       python: [
@@ -1399,56 +1547,107 @@ class ContextGatherer {
       php: [
         { regex: /Route::(get|post|put|patch|delete)\s*\(\s*["']([^"']+)["']/gi, methodIdx: 1, pathIdx: 2 },
       ],
+      csharp: [
+        { regex: /\[HttpGet(?:\(\s*["']([^"']*)["']\s*\))?\][\s\S]{0,600}?\[Route\s*\(\s*["']([^"']+)["']\s*\)\]/gi, method: 'GET', pathIdx: 2, optionalPathIdx: 1 },
+        { regex: /\[Route\s*\(\s*["']([^"']+)["']\s*\)\][\s\S]{0,600}?\[HttpGet(?:\(\s*["']([^"']*)["']\s*\))?\]/gi, method: 'GET', pathIdx: 1, optionalPathIdx: 2 },
+        { regex: /\[HttpPost(?:\(\s*["']([^"']*)["']\s*\))?\][\s\S]{0,600}?\[Route\s*\(\s*["']([^"']+)["']\s*\)\]/gi, method: 'POST', pathIdx: 2, optionalPathIdx: 1 },
+        { regex: /\[Route\s*\(\s*["']([^"']+)["']\s*\)\][\s\S]{0,600}?\[HttpPost(?:\(\s*["']([^"']*)["']\s*\))?\]/gi, method: 'POST', pathIdx: 1, optionalPathIdx: 2 },
+        { regex: /app\.Map(Get|Post|Put|Delete|Patch)\s*\(\s*["']([^"']+)["']/gi, methodIdx: 1, pathIdx: 2 },
+      ],
     };
 
-    const patterns = endpointPatterns[lang] || [];
-    if (patterns.length === 0) return endpoints;
+    const configuredLanguage = this.config.language || 'javascript';
+    const languages = configuredLanguage === 'javascript'
+      ? ['python', 'java', 'go', 'ruby', 'php', 'csharp']
+      : [configuredLanguage];
 
-    for (const file of files.slice(0, this.config.maxFiles)) {
-      if (file.includes('node_modules') || file.includes('test') || file.includes('spec') || file.includes('migration')) continue;
-      try {
-        const content = this.readFileCached(file);
-        if (!content) continue;
-        const hasAuth = content.includes('auth') || content.includes('token') || content.includes('permission');
+    const joinRoutePaths = (base, child) => {
+      const left = String(base || '').trim();
+      const right = String(child || '').trim();
+      const joined = `${left ? `/${left.replace(/^\/+|\/+$/g, '')}` : ''}${right ? `/${right.replace(/^\/+/, '')}` : ''}`;
+      return joined.replace(/\/+/g, '/') || '/';
+    };
 
-        for (const patternDef of patterns) {
-          let match;
-          patternDef.regex.lastIndex = 0;
-          while ((match = patternDef.regex.exec(content)) !== null) {
-            let method = patternDef.method || match[patternDef.methodIdx].toUpperCase();
-            const routePath = match[patternDef.pathIdx];
+    for (const lang of languages) {
+      const patterns = endpointPatterns[lang] || [];
+      if (patterns.length === 0) continue;
 
-            if (patternDef.parseMethodList) {
-              // Parse methods=['GET', 'POST'] style
-              const methods = routePath; // In this pattern pathIdx=1, methodIdx=2
-              const methodList = match[patternDef.methodIdx].replace(/["'\s]/g, '').split(',');
-              for (const m of methodList) {
-                if (!endpoints.some(e => e.method === m.toUpperCase() && e.path === match[patternDef.pathIdx])) {
-                  endpoints.push({
-                    method: m.toUpperCase(),
-                    path: match[patternDef.pathIdx],
-                    description: `${m.toUpperCase()} ${match[patternDef.pathIdx]}`,
-                    requiresAuth: hasAuth,
-                    source: path.relative(projectPath, file),
-                  });
-                }
+      const extensions = this.getSourceExtensions(lang);
+      const files = this.findFiles(searchDir, extensions);
+
+      for (const file of files.slice(0, this.config.maxFiles)) {
+        if (file.includes('node_modules') || file.includes('test') || file.includes('spec') || file.includes('migration')) continue;
+        try {
+          const content = this.readFileCached(file);
+          if (!content) continue;
+          const hasAuth = content.includes('auth') || content.includes('token') || content.includes('permission');
+
+          if (lang === 'java') {
+            const baseMatch = content.match(/@RequestMapping\s*\(\s*(?:value\s*=\s*)?["']([^"']+)["']/i);
+            const classBasePath = baseMatch?.[1] || '';
+            const springMethodPattern = /@(Get|Post|Put|Delete|Patch)Mapping(?:\s*\(\s*(?:value\s*=\s*)?["']([^"']*)["'][^)]*\))?/gi;
+            for (const match of content.matchAll(springMethodPattern)) {
+              const method = match[1].toUpperCase();
+              const localPath = match[2] || '';
+              const fullPath = joinRoutePaths(classBasePath, localPath);
+              if (!endpoints.some(e => e.method === method && e.path === fullPath)) {
+                endpoints.push({
+                  method,
+                  path: fullPath,
+                  description: `${method} ${fullPath}`,
+                  requiresAuth: hasAuth,
+                  source: path.relative(projectPath, file),
+                  sourceRoutePath: localPath,
+                  sourceRouteBase: classBasePath,
+                });
               }
-              continue;
             }
+            continue;
+          }
 
-            const fullPath = routePath.startsWith('/') ? routePath : `/${routePath}`;
-            if (!endpoints.some(e => e.method === method && e.path === fullPath)) {
-              endpoints.push({
-                method,
-                path: fullPath,
-                description: `${method} ${fullPath}`,
-                requiresAuth: hasAuth,
-                source: path.relative(projectPath, file),
-              });
+          for (const patternDef of patterns) {
+            let match;
+            patternDef.regex.lastIndex = 0;
+            while ((match = patternDef.regex.exec(content)) !== null) {
+              let method = patternDef.method || match[patternDef.methodIdx].toUpperCase();
+              const basePath = match[patternDef.pathIdx];
+              const optionalPath = patternDef.optionalPathIdx ? match[patternDef.optionalPathIdx] : '';
+              const routePath = optionalPath
+                ? `${String(basePath || '').replace(/\/$/, '')}/${String(optionalPath).replace(/^\//, '')}`
+                : basePath;
+
+              if (patternDef.parseMethodList) {
+                // Parse methods=['GET', 'POST'] style
+                const methods = routePath; // In this pattern pathIdx=1, methodIdx=2
+                const methodList = match[patternDef.methodIdx].replace(/["'\s]/g, '').split(',');
+                for (const m of methodList) {
+                  if (!endpoints.some(e => e.method === m.toUpperCase() && e.path === match[patternDef.pathIdx])) {
+                    endpoints.push({
+                      method: m.toUpperCase(),
+                      path: match[patternDef.pathIdx],
+                      description: `${m.toUpperCase()} ${match[patternDef.pathIdx]}`,
+                      requiresAuth: hasAuth,
+                      source: path.relative(projectPath, file),
+                    });
+                  }
+                }
+                continue;
+              }
+
+              const fullPath = routePath.startsWith('/') ? routePath : `/${routePath}`;
+              if (!endpoints.some(e => e.method === method && e.path === fullPath)) {
+                endpoints.push({
+                  method,
+                  path: fullPath,
+                  description: `${method} ${fullPath}`,
+                  requiresAuth: hasAuth,
+                  source: path.relative(projectPath, file),
+                });
+              }
             }
           }
-        }
-      } catch (e) { /* ignore */ }
+        } catch (e) { /* ignore */ }
+      }
     }
 
     return endpoints;
@@ -1616,7 +1815,39 @@ class ContextGatherer {
    * Helper: Check if file is a page file
    */
   isPageFile(filename) {
-    return /\.(js|jsx|ts|tsx)$/.test(filename) && !filename.includes('.test.') && !filename.includes('.spec.');
+    return /\.(js|jsx|ts|tsx)$/.test(filename)
+      && !/\.d\.ts$/i.test(filename)
+      && !/\.(?:min|bundle|chunk|compiled)\.(?:mjs|cjs|jsx?|tsx?)$/i.test(filename)
+      && !filename.includes('.test.')
+      && !filename.includes('.spec.');
+  }
+
+  findNestedFrameworkDirs(projectPath, relativeCandidates, maxDepth = 2) {
+    const found = [];
+    const root = path.resolve(projectPath);
+    const skip = new Set([...this.skipDirs, 'tests', 'healix-reports']);
+    const walk = (dir, depth) => {
+      if (depth > maxDepth) return;
+      let entries = [];
+      try {
+        entries = fs.readdirSync(dir, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const entry of entries) {
+        if (!entry.isDirectory() || entry.name.startsWith('.') || skip.has(entry.name)) continue;
+        const child = path.join(dir, entry.name);
+        for (const rel of relativeCandidates) {
+          const candidate = path.join(child, rel);
+          if (fs.existsSync(candidate) && fs.statSync(candidate).isDirectory()) {
+            found.push(candidate);
+          }
+        }
+        walk(child, depth + 1);
+      }
+    };
+    walk(root, 1);
+    return [...new Set(found)];
   }
 
   /**
@@ -1783,14 +2014,33 @@ class ContextGatherer {
   }
 
   extractRouteComponentName(content, matchIndex = 0) {
-    const window = String(content || '').slice(Math.max(0, matchIndex - 200), matchIndex + 500);
-    const elementMatch = window.match(/element=\{\s*<([A-Z][A-Za-z0-9_]*)\b/);
+    const afterRoutePath = String(content || '').slice(Math.max(0, matchIndex), matchIndex + 700);
+    const elementMatch = afterRoutePath.match(/(?:element\s*=\s*\{\s*<|element\s*:\s*<)([A-Z][A-Za-z0-9_]*)\b/);
     if (elementMatch) return elementMatch[1];
 
-    const componentMatch = window.match(/component=\{\s*([A-Z][A-Za-z0-9_]*)\s*\}/);
+    const componentMatch = afterRoutePath.match(/(?:component|Component)\s*=\s*\{\s*([A-Z][A-Za-z0-9_]*)\s*\}/);
     if (componentMatch) return componentMatch[1];
 
+    const objectComponentMatch = afterRoutePath.match(/(?:component|Component)\s*:\s*([A-Z][A-Za-z0-9_]*)\b/);
+    if (objectComponentMatch) return objectComponentMatch[1];
+
     return null;
+  }
+
+  extractNearestComponentName(content, targetIndex = 0) {
+    const text = String(content || '');
+    const index = Math.max(0, Number.isFinite(targetIndex) ? targetIndex : 0);
+    const componentPattern = /(?:export\s+default\s+)?function\s+([A-Z][A-Za-z0-9_]*)\s*\(|(?:export\s+)?(?:const|let|var)\s+([A-Z][A-Za-z0-9_]*)\s*=\s*(?:\([^)]*\)|[A-Za-z0-9_]+)?\s*=>|(?:export\s+)?(?:const|let|var)\s+([A-Z][A-Za-z0-9_]*)\s*=\s*function\b/g;
+    let match;
+    let nearest = null;
+    while ((match = componentPattern.exec(text)) !== null) {
+      if (match.index > index) break;
+      nearest = {
+        name: match[1] || match[2] || match[3],
+        index: match.index,
+      };
+    }
+    return nearest?.name || null;
   }
 
   normalizeSourceLiteral(value) {
@@ -1915,6 +2165,7 @@ class ContextGatherer {
     const testIds = new Set();
     const assertableText = new Set();
     const files = [];
+    let hashRoutingDetected = false;
 
     for (const filePath of [...candidates].slice(0, 120)) {
       const content = this.readFileCached(filePath, { allowLarge: true, maxBytes: 500000 });
@@ -1923,12 +2174,16 @@ class ContextGatherer {
       const relativePath = path.relative(projectPath, filePath);
       const fileRoutePaths = new Set();
       const fileTestIds = new Set();
+      if (/withHashLocation\s*\(|HashLocationStrategy|useHash\s*:\s*true/i.test(content)) {
+        hashRoutingDetected = true;
+      }
 
       for (const match of content.matchAll(/\b(?:path|to|href)=["'`]([^"'`]+)["'`]/g)) {
         const routePath = String(match[1] || '').trim();
         if (routePath.startsWith('/')) {
           routePaths.add(routePath);
           fileRoutePaths.add(routePath);
+          if (routePath.includes('#/')) hashRoutingDetected = true;
         }
       }
       for (const match of content.matchAll(/(?:router\.push|navigate)\(\s*["'`]([^"'`]+)["'`]\s*\)/g)) {
@@ -1936,6 +2191,7 @@ class ContextGatherer {
         if (routePath.startsWith('/')) {
           routePaths.add(routePath);
           fileRoutePaths.add(routePath);
+          if (routePath.includes('#/')) hashRoutingDetected = true;
         }
       }
       for (const match of content.matchAll(/data-testid=["'`]([^"'`]+)["'`]/g)) {
@@ -1981,6 +2237,7 @@ class ContextGatherer {
       routePaths: [...routePaths].slice(0, 120),
       testIds: [...testIds].slice(0, 120),
       sourceFilesAnalyzed: files.length,
+      routingMode: hashRoutingDetected ? 'hash' : 'path',
     };
   }
 

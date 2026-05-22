@@ -53,6 +53,7 @@ export interface SourceContext {
   routePaths?: string[]
   testIds?: string[]
   sourceFilesAnalyzed?: number
+  routingMode?: 'hash' | 'path' | string | null
 }
 
 export interface ApiEndpoint {
@@ -129,8 +130,117 @@ export interface AuthPattern {
 export interface MockableApiContract {
   method: string
   path: string
+  sourceFile?: string | null
   request?: { fields?: string[] }
   responses?: number[]
+}
+
+export interface QaFilterContract {
+  id: string
+  type: 'filter'
+  method: string
+  path: string
+  queryParam: string
+  responseField: string
+  operator?: 'equals' | string
+  sourceFile?: string | null
+  requiresAuth?: boolean
+  runnable?: boolean
+  marker?: string
+}
+
+export interface QaDeleteStatusContract {
+  id: string
+  type: 'delete_status'
+  method: string
+  path: string
+  sourceFile?: string | null
+  explicitStatuses?: number[]
+  noBody?: boolean
+  expectedStatus?: number | null
+  advisory?: boolean
+  requiresConfirmation?: boolean
+  runnable?: boolean
+  marker?: string
+  question?: string | null
+}
+
+export interface QaFormValidationContract {
+  id: string
+  type: 'form_validation'
+  route: string
+  sourceFile?: string | null
+  requiredFields: Array<{ name: string; label?: string | null; placeholder?: string | null; testId?: string | null; role?: string | null }>
+  submitButtons?: Array<{ text?: string; type?: string; testId?: string | null; ariaLabel?: string | null }>
+  selectorHints?: string[]
+  requiresAuth?: boolean
+  runnable?: boolean
+  marker?: string
+}
+
+export interface QaA11yContract {
+  id: string
+  type: 'a11y_interactive_name'
+  route: string
+  sourceFile?: string | null
+  requiresAuth?: boolean
+  runnable?: boolean
+  marker?: string
+}
+
+export interface QaStatusCodeContract {
+  id: string
+  type: 'http_status_consistency'
+  method: string
+  path: string
+  sourceFile?: string | null
+  requiredFields?: Array<{ name: string; type?: string }>
+  expectedStatuses?: number[]
+  explicitStatuses?: number[]
+  reason?: string | null
+  requiresAuth?: boolean
+  runnable?: boolean
+  marker?: string
+}
+
+export interface QaBoundaryValidationContract {
+  id: string
+  type: 'boundary_validation'
+  method: string
+  path: string
+  sourceFile?: string | null
+  requiredFields?: Array<{ name: string; type?: string }>
+  invalidCases?: string[]
+  expectedStatuses?: number[]
+  requiresAuth?: boolean
+  runnable?: boolean
+  marker?: string
+}
+
+export interface QaRbacContract {
+  id: string
+  type: 'rbac_matrix'
+  method: string
+  path: string
+  sourceFile?: string | null
+  expectedAnonymousStatuses?: number[]
+  expectedRoleStatuses?: Record<string, number[]>
+  adminOnly?: boolean
+  requiresAuth?: boolean
+  runnable?: boolean
+  marker?: string
+}
+
+export interface QaContracts {
+  filterContracts?: QaFilterContract[]
+  deleteStatusContracts?: QaDeleteStatusContract[]
+  formValidationContracts?: QaFormValidationContract[]
+  a11yContracts?: QaA11yContract[]
+  statusCodeContracts?: QaStatusCodeContract[]
+  boundaryValidationContracts?: QaBoundaryValidationContract[]
+  rbacContracts?: QaRbacContract[]
+  summary?: Record<string, number>
+  questions?: Array<Record<string, unknown>>
 }
 
 export interface NavigationGraph {
@@ -149,6 +259,7 @@ export interface CapturedContext {
   navigationGraph?: NavigationGraph
   selectorHints?: string[]
   mockableApiContracts?: MockableApiContract[]
+  qaContracts?: QaContracts
   dataModels?: unknown[]
   fileContents?: Record<string, string>
   sourceContext?: SourceContext
@@ -159,6 +270,7 @@ export interface CapturedContext {
   frontendInteractions?: unknown[]
   testDataSuggestions?: unknown
   generationFeedback?: {
+    mode?: string | null
     attempt?: number
     previousFailureCode?: string | null
     previousFailureMessage?: string | null
@@ -171,6 +283,7 @@ export interface CapturedContext {
       errors?: string[]
     }
     routeAccessSummary?: unknown
+    existingSuiteManifest?: unknown
     instructions?: string[]
   }
   projectStructure?: {
@@ -215,13 +328,28 @@ export interface GenerationQuality {
   valid: boolean
   errorCode: string | null
   errors: string[]
+  qualityWarnings?: Array<{
+    code: string
+    message: string
+    actual?: number
+    expected?: number
+    severity: string
+  }>
+  qualityGateStatus?: 'passed' | 'warning' | 'failed'
   totalTests: number
   skippedTests?: number
   runnableTests?: number
   runnableRatio?: number
   minGeneratedTests: number
+  minGeneratedTestsTarget?: number
+  minimumUsefulRunnableFloor?: number
+  adaptiveRunnableFloor?: number
+  generatedTestsActual?: number
+  runnableTestsActual?: number
+  executionAllowedDespiteWarnings?: boolean
   minRunnableRatio?: number
   coverageProfile: string
+  agentScope?: string
   minCategoryHits: number
   requiredCategories: string[]
   missingCategories: string[]
@@ -297,8 +425,13 @@ export interface ParsedPRD {
 
 export interface Role {
   name: string                 // e.g. "admin", "user"
+  role?: string                // MCP credential injector historically emits this alias
   storageStatePath?: string    // path to Playwright storageState JSON for this role
   loginVerified?: boolean
+  username?: string            // optional test credential fixture supplied by MCP
+  password?: string            // optional test credential fixture supplied by MCP
+  credentialSource?: string
+  originalCredentialRole?: string | null
 }
 
 export interface ObservedLabel {

@@ -6,6 +6,7 @@
 
 const path = require('path');
 const fs = require('fs');
+const crypto = require('crypto');
 const { spawn, execSync, spawnSync } = require('child_process');
 
 // Load environment variables from multiple paths
@@ -33,8 +34,15 @@ const DashboardLauncher = require('./dashboard-launcher');
 const AIAnalyzer = require('./ai-providers/index');
 const WebappClient = require('./webapp-client');
 const { startSecondaryServices, stopSecondaryServices, probeHttpReady, waitForServiceReady } = require('./multi-service-starter');
-const { runExplorationPhase, EMPTY_ARTIFACT } = require('./exploration-phase');
-const { injectCredentials } = require('./credentials-injector');
+const { runExplorationPhase, EMPTY_ARTIFACT, artifactHasUsefulContext } = require('./exploration-phase');
+const { injectCredentials, normalizeRoleLabel } = require('./credentials-injector');
+const { isUnsafeAuthFlow, sanitizeAuthFlow } = require('./auth-flow-utils');
+const {
+  ensureQaContractSpec,
+  auditQaContractCoverage,
+  summarizeQaContracts,
+  buildQaContractQuestions,
+} = require('./qa-contracts');
 const Logger = require('./logger');
 const MCPTelemetryReporter = require('./mcp-telemetry');
 
@@ -82,6 +90,9 @@ const STRICT_AI_REQUIRED_CATEGORIES = [
   'api_negative',
   'api_stress',
 ];
+
+const GENERATED_SPEC_FILE_PATTERN = /\.(?:spec|test)\.(?:ts|js|mts|mjs|cts|cjs)$/i;
+const GENERATED_SPEC_FILENAME_PATTERN = /[A-Za-z0-9_.-]+\.(?:spec|test)\.(?:ts|js|mts|mjs|cts|cjs)\b/g;
 
 const CURSOR_FIXTURE_BASENAME = '__healix-fixture';
 const CURSOR_OVERLAY_INIT_SCRIPT = `
@@ -447,6 +458,24 @@ function countSkippedTestsInContent(content) {
   return declarationMatches.length + runtimeSkips;
 }
 
+function countSkippedTestDeclarationsInContent(content) {
+  if (!content) return 0;
+  const text = String(content);
+  const skipDeclarationPattern = /\b(?:test|it)\.skip\s*\(\s*(['"`])[\s\S]*?\1\s*,\s*(?:async\s*)?(?:\(|function\b)/g;
+  return (text.match(skipDeclarationPattern) || []).length;
+}
+
+function countSkippedTestsForGeneratedFile(content, filename = '') {
+  // Deterministic contract specs use runtime test.skip(...) guards when a live
+  // sample or concrete route is unavailable. Those guards are valid runtime
+  // behavior, not skipped declarations, and must not tank the generation
+  // runnable-ratio gate before Playwright has a chance to execute the suite.
+  if (/healix-qa-contracts\.spec\.[cm]?[jt]s$/i.test(String(filename || ''))) {
+    return countSkippedTestDeclarationsInContent(content);
+  }
+  return countSkippedTestsInContent(content);
+}
+
 function buildRouteAccessSummary(explorationArtifact) {
   const routes = Array.isArray(explorationArtifact?.routes) ? explorationArtifact.routes : [];
   const publicRoutes = routes
@@ -463,7 +492,206 @@ function buildRouteAccessSummary(explorationArtifact) {
     publicRoutes: [...new Set(publicRoutes)],
     protectedRoutes: [...new Set(protectedRoutes)],
     totalObservedRoutes: routes.length,
+    authFlowRejected: explorationArtifact?.authFlowRejected || null,
   };
+}
+
+function synthesizeExplorationArtifactFromContext(context = {}, previousArtifact = null) {
+  const pages = Array.isArray(context?.pages) ? context.pages : [];
+  const existingRoutes = Array.isArray(previousArtifact?.routes) ? previousArtifact.routes : [];
+  const seen = new Set(existingRoutes.map((route) => String(route?.path || route?.url || '')).filter(Boolean));
+  const routes = [...existingRoutes];
+
+  for (const page of pages) {
+    const rawPath = String(page?.path || page?.route || page?.url || '').trim();
+    if (!rawPath || !rawPath.startsWith('/') || rawPath.includes('*') || seen.has(rawPath)) continue;
+    const requiresAuth = page?.requiresAuth === true || page?.authRequired === true || page?.protected === true;
+    seen.add(rawPath);
+    routes.push({
+      path: rawPath,
+      requiresAuth,
+      source: 'static_context',
+      sourceFile: page?.sourceFile || page?.file || null,
+      elements: Array.isArray(page?.uiHints?.elements) ? page.uiHints.elements.slice(0, 8) : [],
+      headings: Array.isArray(page?.headings) ? page.headings.slice(0, 8) : [],
+      buttons: Array.isArray(page?.buttons) ? page.buttons.slice(0, 8) : [],
+      links: Array.isArray(page?.links) ? page.links.slice(0, 8) : [],
+      testIds: Array.isArray(page?.testIds) ? page.testIds.slice(0, 8) : [],
+      selectorHints: Array.isArray(page?.selectorHints) ? page.selectorHints.slice(0, 8) : [],
+    });
+  }
+
+  const forms = Array.isArray(previousArtifact?.forms) ? [...previousArtifact.forms] : [];
+  if (forms.length === 0 && Array.isArray(context?.forms)) {
+    for (const form of context.forms.slice(0, 20)) {
+      forms.push({
+        source: 'static_context',
+        path: form?.path || form?.route || null,
+        sourceFile: form?.sourceFile || form?.file || null,
+        fields: Array.isArray(form?.fields) ? form.fields.slice(0, 12) : [],
+        buttons: Array.isArray(form?.buttons) ? form.buttons.slice(0, 8) : [],
+        validationRules: Array.isArray(form?.validationRules) ? form.validationRules.slice(0, 12) : [],
+      });
+    }
+  }
+
+  const keyFlows = Array.isArray(previousArtifact?.keyFlows) ? [...previousArtifact.keyFlows] : [];
+  if (keyFlows.length === 0 && Array.isArray(context?.workflows)) {
+    for (const workflow of context.workflows.slice(0, 12)) {
+      keyFlows.push({
+        source: 'static_context',
+        name: workflow?.name || workflow?.description || 'source workflow',
+        steps: Array.isArray(workflow?.steps) ? workflow.steps.slice(0, 12) : [],
+        routes: Array.isArray(workflow?.routes) ? workflow.routes.slice(0, 12) : [],
+      });
+    }
+  }
+
+  const observedErrors = [
+    ...(Array.isArray(previousArtifact?.observedErrors) ? previousArtifact.observedErrors : []),
+  ];
+  if (routes.length > existingRoutes.length || forms.length > (previousArtifact?.forms?.length || 0) || keyFlows.length > (previousArtifact?.keyFlows?.length || 0)) {
+    observedErrors.push('exploration fallback: synthesized route/form/workflow access from static code context');
+  }
+
+  return {
+    routes,
+    forms,
+    authFlow: previousArtifact?.authFlow || null,
+    keyFlows,
+    observedErrors,
+    errorProbe: previousArtifact?.errorProbe || null,
+    authFlowRejected: previousArtifact?.authFlowRejected || null,
+  };
+}
+
+function roleKeyForAuth(role) {
+  return normalizeRoleLabel(role?.role || role?.name || role || 'user');
+}
+
+function hasVerifiedStorageState(role) {
+  return !!(
+    role &&
+    role.loginVerified &&
+    role.storageStatePath &&
+    fs.existsSync(role.storageStatePath)
+  );
+}
+
+function allCredentialsCoveredByPreAuth(credentials = [], preAuthRoles = []) {
+  if (!Array.isArray(credentials) || credentials.length === 0) return false;
+  return Array.isArray(preAuthRoles) && preAuthRoles.length > 0 && credentials.every((cred) => {
+    const key = roleKeyForAuth(cred);
+    return preAuthRoles.some((role) => roleKeyForAuth(role) === key && hasVerifiedStorageState(role));
+  });
+}
+
+function shouldTrustDiscoveredAuthFlow(authFlow = null) {
+  if (!authFlow) return false;
+  if (isUnsafeAuthFlow(authFlow)) return false;
+  return !!sanitizeAuthFlow(authFlow);
+}
+
+function mergeCredentialInjectionRoles({ freshRoles = [], preAuthRoles = [] } = {}) {
+  const byRole = new Map();
+  const reusedPreAuthRoles = [];
+  const failedFreshRoles = [];
+
+  for (const role of Array.isArray(preAuthRoles) ? preAuthRoles : []) {
+    const key = roleKeyForAuth(role);
+    if (!byRole.has(key)) {
+      byRole.set(key, {
+        ...role,
+        role: key,
+        name: key,
+        reusedFromPreAuth: false,
+      });
+    }
+  }
+
+  for (const fresh of Array.isArray(freshRoles) ? freshRoles : []) {
+    const key = roleKeyForAuth(fresh);
+    if (hasVerifiedStorageState(fresh)) {
+      byRole.set(key, {
+        ...fresh,
+        role: key,
+        name: key,
+        reusedFromPreAuth: false,
+      });
+      continue;
+    }
+
+    failedFreshRoles.push({
+      role: key,
+      reason: fresh?.reason || 'fresh_auth_failed',
+    });
+    const preAuth = (Array.isArray(preAuthRoles) ? preAuthRoles : [])
+      .find((role) => roleKeyForAuth(role) === key && hasVerifiedStorageState(role));
+    if (preAuth) {
+      byRole.set(key, {
+        ...preAuth,
+        role: key,
+        name: key,
+        loginVerified: true,
+        reusedFromPreAuth: true,
+        reinjectionFailureReason: fresh?.reason || null,
+      });
+      reusedPreAuthRoles.push(key);
+    } else {
+      byRole.set(key, {
+        ...fresh,
+        role: key,
+        name: key,
+        loginVerified: false,
+        storageStatePath: null,
+        reusedFromPreAuth: false,
+      });
+    }
+  }
+
+  const roles = Array.from(byRole.values());
+  return {
+    roles,
+    reusedPreAuthRoles: [...new Set(reusedPreAuthRoles)],
+    failedFreshRoles,
+  };
+}
+
+function summarizeAuthRoles(roles = []) {
+  return (Array.isArray(roles) ? roles : []).map((role) => ({
+    role: roleKeyForAuth(role),
+    loginVerified: !!role?.loginVerified,
+    reason: role?.reason || role?.reinjectionFailureReason || null,
+    reusedFromPreAuth: !!role?.reusedFromPreAuth,
+  }));
+}
+
+function attachCredentialFixturesToRoles(roles = [], credentials = []) {
+  if (!Array.isArray(roles) || roles.length === 0 || !Array.isArray(credentials) || credentials.length === 0) {
+    return Array.isArray(roles) ? roles : [];
+  }
+
+  const credentialsByRole = new Map();
+  for (const credential of credentials) {
+    if (!credential?.username || !credential?.password) continue;
+    const key = normalizeRoleLabel(credential.role || credential.name || 'user');
+    if (!credentialsByRole.has(key)) {
+      credentialsByRole.set(key, credential);
+    }
+  }
+
+  return roles.map((role) => {
+    const key = roleKeyForAuth(role);
+    const credential = credentialsByRole.get(key);
+    if (!credential) return role;
+    return {
+      ...role,
+      username: credential.username,
+      password: credential.password,
+      credentialSource: 'user_supplied',
+      originalCredentialRole: credential.role || credential.name || null,
+    };
+  });
 }
 
 function hasBackendService(projectInfo = {}) {
@@ -502,15 +730,559 @@ function listGeneratedTestFiles(projectPath) {
   }
 
   return fs.readdirSync(generatedDir)
-    .filter((name) => /\.spec\.(ts|js)$/i.test(name))
+    .filter((name) => GENERATED_SPEC_FILE_PATTERN.test(name))
     .map((name) => path.join(generatedDir, name));
+}
+
+function extractBracketMarkers(text, prefix) {
+  const markers = [];
+  const pattern = new RegExp(`\\[${prefix}:([^\\]]+)\\]`, 'gi');
+  for (const match of String(text || '').matchAll(pattern)) {
+    const value = String(match[1] || '').trim();
+    if (value) markers.push(value);
+  }
+  return [...new Set(markers)];
+}
+
+function normalizeGeneratedRoute(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return null;
+  const withoutTemplateBase = raw
+    .replace(/^\$\{\s*(?:BASE|baseURL|baseUrl|BASE_URL|rootURL|rootUrl|origin|appUrl|APP_URL)\s*\}/, '')
+    .replace(/^\$\{\s*[^}]*base[^}]*\}/i, '');
+  if (withoutTemplateBase !== raw) {
+    if (withoutTemplateBase.startsWith('/')) {
+      return normalizeGeneratedRoute(withoutTemplateBase);
+    }
+    if (/^\$\{[^}]+\}/.test(withoutTemplateBase)) {
+      return null;
+    }
+  }
+  try {
+    const parsed = new URL(raw, 'http://healix.local');
+    return `${parsed.pathname}${parsed.search || ''}${parsed.hash || ''}` || '/';
+  } catch {
+    if (!raw.startsWith('/')) return null;
+    return raw;
+  }
+}
+
+function normalizeApiPathForAudit(value) {
+  const route = normalizeGeneratedRoute(value);
+  if (!route) return null;
+  const withoutHash = String(route).split('#')[0];
+  const withoutQuery = withoutHash.split('?')[0] || '/';
+  try {
+    return decodeURIComponent(withoutQuery).replace(/\/+$/, '') || '/';
+  } catch {
+    return withoutQuery.replace(/\/+$/, '') || '/';
+  }
+}
+
+function normalizeGeneratedRouteFamily(value) {
+  const normalized = normalizeGeneratedRoute(value);
+  if (!normalized) return null;
+  const withoutQuery = String(normalized).split('?')[0] || '/';
+  const withoutTrailingSlash = withoutQuery.length > 1
+    ? withoutQuery.replace(/\/+$/, '')
+    : withoutQuery;
+  const uuidPattern = /\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b/gi;
+  const objectIdPattern = /\b[0-9a-f]{24}\b/gi;
+  return withoutTrailingSlash
+    .split('/')
+    .map((segment) => {
+      const replaced = segment
+        .replace(uuidPattern, ':id')
+        .replace(objectIdPattern, ':id');
+      if (/^\d+$/.test(replaced)) return ':id';
+      if (/^[A-Za-z0-9_-]{18,}$/.test(replaced) && /\d/.test(replaced)) return ':id';
+      return replaced;
+    })
+    .join('/') || '/';
+}
+
+function routePriorityScore(route) {
+  const text = String(route || '').toLowerCase();
+  if (text === '/' || text === '') return 0;
+  if (/checkout|cart/.test(text)) return 1;
+  if (/login|signin|signup|register|auth/.test(text)) return 2;
+  if (/admin/.test(text)) return 3;
+  if (/contact|about|lookbook/.test(text)) return 4;
+  if (/:id|\[[^\]]+\]/.test(text)) return 8;
+  return 6;
+}
+
+function summarizeMissingRoutesByFamily(routeCandidates = [], coveredRoutes = [], limit = 30) {
+  const coveredFamilies = new Set(
+    (coveredRoutes || [])
+      .map(normalizeGeneratedRouteFamily)
+      .filter(Boolean)
+  );
+  const byFamily = new Map();
+  for (const rawRoute of routeCandidates || []) {
+    const route = normalizeGeneratedRoute(rawRoute);
+    if (!route) continue;
+    const family = normalizeGeneratedRouteFamily(route);
+    if (!family || coveredFamilies.has(family)) continue;
+    if (!byFamily.has(family)) {
+      byFamily.set(family, { family, examples: [], priority: routePriorityScore(family) });
+    }
+    const entry = byFamily.get(family);
+    if (entry.examples.length < 5 && !entry.examples.includes(route)) {
+      entry.examples.push(route);
+    }
+  }
+  const groups = [...byFamily.values()]
+    .sort((a, b) => a.priority - b.priority || a.family.localeCompare(b.family))
+    .slice(0, limit);
+  return {
+    routes: groups.map((entry) => entry.examples[0]).filter(Boolean),
+    routeFamilies: groups.map((entry) => entry.family),
+    routeExamples: groups.map((entry) => ({
+      family: entry.family,
+      examples: entry.examples,
+    })),
+  };
+}
+
+function apiPathPatternToRegex(pathValue) {
+  const normalized = normalizeApiPathForAudit(pathValue);
+  if (!normalized) return null;
+  const escaped = normalized
+    .replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    .replace(/\\\{[A-Za-z_][\w-]*\\\}/g, '[^/]+')
+    .replace(/:[A-Za-z_][\w-]*/g, '[^/]+')
+    .replace(/\\\[[^\]]+\\\]/g, '[^/]+');
+  return new RegExp(`^${escaped}$`, 'i');
+}
+
+function buildKnownApiEndpointMatchers(context = {}) {
+  return effectiveApiEndpoints(context)
+    .map((endpoint) => {
+      const method = String(endpoint?.method || 'GET').toUpperCase();
+      const normalizedPath = normalizeApiPathForAudit(endpoint?.path || '/');
+      const regex = apiPathPatternToRegex(normalizedPath);
+      if (!normalizedPath || !regex) return null;
+      return { method, path: normalizedPath, regex };
+    })
+    .filter(Boolean);
+}
+
+function apiRequestMatchesKnownEndpoint(signature, matchers = []) {
+  const [rawMethod, ...routeParts] = String(signature || '').split(/\s+/);
+  const method = String(rawMethod || 'GET').toUpperCase();
+  const route = normalizeApiPathForAudit(routeParts.join(' '));
+  if (!route) return false;
+  return matchers.some((matcher) => {
+    const methodMatches = method === 'FETCH' || matcher.method === method;
+    return methodMatches && matcher.regex.test(route);
+  });
+}
+
+function isIntentionalUnknownApiProbe(signature, content) {
+  const [rawMethod, ...routeParts] = String(signature || '').split(/\s+/);
+  const method = String(rawMethod || 'GET').toUpperCase();
+  const route = normalizeApiPathForAudit(routeParts.join(' ')) || '';
+  if (method !== 'GET') return false;
+  const text = String(content || '');
+  if (/@api_auth|api_auth/i.test(text)) return false;
+  const mentionsMissingRoute = /unknown route|missing route|not found|404|nonexistent|does not exist|should-not-exist|random-missing/i.test(text);
+  const routeLooksIntentionallyMissing = /does-not-exist|should-not-exist|missing|unknown|nonexistent|random/i.test(route);
+  return mentionsMissingRoute || routeLooksIntentionallyMissing;
+}
+
+function findUngroundedApiRequests(content, context = {}) {
+  const matchers = buildKnownApiEndpointMatchers(context);
+  const signals = extractSpecSignals(content);
+  return (signals.apiEndpoints || [])
+    .filter((signature) => !apiRequestMatchesKnownEndpoint(signature, matchers))
+    .filter((signature) => !isIntentionalUnknownApiProbe(signature, content));
+}
+
+function extractGeneratedTestTitles(content) {
+  const titles = [];
+  const pattern = /\btest(?:\.(?:only|fixme|fail|slow|skip))?\s*\(\s*(['"`])([\s\S]*?)\1/g;
+  for (const match of String(content || '').matchAll(pattern)) {
+    const title = String(match[2] || '').replace(/\s+/g, ' ').trim();
+    if (title) titles.push(title);
+  }
+  return [...new Set(titles)];
+}
+
+function extractSpecSignals(content, filename = null) {
+  const text = String(content || '');
+  const routes = [];
+  const apiEndpoints = [];
+
+  for (const match of text.matchAll(/\bpage\.goto\s*\(\s*(['"`])([^'"`]+)\1/g)) {
+    const route = normalizeGeneratedRoute(match[2]);
+    if (route) routes.push(route);
+  }
+
+  for (const match of text.matchAll(/\brequest\.(get|post|put|patch|delete|fetch)\s*\(\s*(['"`])([^'"`]+)\2/gi)) {
+    const method = String(match[1] || 'GET').toUpperCase();
+    const route = normalizeGeneratedRoute(match[3]);
+    if (route) apiEndpoints.push(`${method} ${route}`);
+  }
+
+  const totalTests = countTestsInContent(text);
+  const skippedTests = countSkippedTestsForGeneratedFile(text, filename);
+  return {
+    filename,
+    testTitles: extractGeneratedTestTitles(text),
+    reqMarkers: extractBracketMarkers(text, 'REQ'),
+    qacMarkers: extractBracketMarkers(text, 'QAC'),
+    catMarkers: extractBracketMarkers(text, 'CAT'),
+    routes: [...new Set(routes)],
+    apiEndpoints: [...new Set(apiEndpoints)],
+    sourceRefs: extractBracketMarkers(text, 'SRC'),
+    authTagged: /@auth|@tierB/i.test(text),
+    totalTests,
+    skippedTests,
+    runnableTests: Math.max(0, totalTests - skippedTests),
+  };
+}
+
+function buildExistingSuiteManifest({
+  projectPath,
+  context = {},
+  roles = [],
+  testType = 'both',
+  quality = null,
+  routeAccessSummary = null,
+} = {}) {
+  const files = listGeneratedTestFiles(projectPath);
+  const contents = [];
+  const fileManifests = [];
+  const covered = {
+    testTitles: new Set(),
+    reqMarkers: new Set(),
+    qacMarkers: new Set(),
+    catMarkers: new Set(),
+    routes: new Set(),
+    apiEndpoints: new Set(),
+    sourceRefs: new Set(),
+  };
+
+  for (const filePath of files) {
+    let content = '';
+    try {
+      content = fs.readFileSync(filePath, 'utf-8');
+    } catch {
+      continue;
+    }
+    contents.push(content);
+    const signals = extractSpecSignals(content, path.basename(filePath));
+    fileManifests.push(signals);
+    for (const key of Object.keys(covered)) {
+      for (const value of signals[key] || []) covered[key].add(value);
+    }
+  }
+
+  const qaCoverage = auditQaContractCoverage({
+    context,
+    roles,
+    contents,
+    testType,
+  });
+
+  const routeCandidates = [
+    ...(Array.isArray(routeAccessSummary?.publicRoutes) ? routeAccessSummary.publicRoutes : []),
+    ...(Array.isArray(routeAccessSummary?.protectedRoutes) ? routeAccessSummary.protectedRoutes : []),
+    ...(Array.isArray(context.pages) ? context.pages.map((page) => page?.path).filter(Boolean) : []),
+  ]
+    .map(normalizeGeneratedRoute)
+    .filter(Boolean)
+    .filter((route) => !/\[[^\]]+\]/.test(route));
+
+  const apiCandidates = effectiveApiEndpoints(context)
+    .map((endpoint) => `${String(endpoint.method || 'GET').toUpperCase()} ${normalizeGeneratedRoute(endpoint.path || '/') || '/'}`);
+
+  const requiredCategories = requiredCategoriesForRun({ testType, context });
+  const routeSummary = summarizeMissingRoutesByFamily(
+    [...new Set(routeCandidates)],
+    [...covered.routes],
+    30,
+  );
+  const missing = {
+    routes: routeSummary.routes,
+    routeFamilies: routeSummary.routeFamilies,
+    routeExamples: routeSummary.routeExamples,
+    apiEndpoints: [...new Set(apiCandidates)].filter((endpoint) => !covered.apiEndpoints.has(endpoint)).slice(0, 30),
+    categories: requiredCategories.filter((category) => !covered.catMarkers.has(category)).slice(0, 20),
+    qaContracts: (qaCoverage.missing || []).slice(0, 50),
+  };
+
+  const totals = quality || collectGenerationQuality(projectPath, {});
+  return {
+    files: fileManifests.map((file) => ({
+      filename: file.filename,
+      testTitles: file.testTitles.slice(0, 40),
+      reqMarkers: file.reqMarkers.slice(0, 30),
+      qacMarkers: file.qacMarkers.slice(0, 30),
+      catMarkers: file.catMarkers.slice(0, 20),
+      routes: file.routes.slice(0, 30),
+      apiEndpoints: file.apiEndpoints.slice(0, 30),
+      sourceRefs: file.sourceRefs.slice(0, 30),
+      authTagged: file.authTagged,
+      totalTests: file.totalTests,
+      skippedTests: file.skippedTests,
+      runnableTests: file.runnableTests,
+    })),
+    totals: {
+      totalFiles: totals.totalFiles ?? files.length,
+      totalTests: totals.totalTests ?? 0,
+      skippedTests: totals.skippedTests ?? 0,
+      runnableTests: totals.runnableTests ?? 0,
+      runnableRatio: totals.runnableRatio ?? 0,
+    },
+    covered: {
+      testTitles: [...covered.testTitles].slice(0, 120),
+      reqMarkers: [...covered.reqMarkers].slice(0, 120),
+      qacMarkers: [...covered.qacMarkers].slice(0, 120),
+      catMarkers: [...covered.catMarkers].slice(0, 60),
+      routes: [...covered.routes].slice(0, 120),
+      routeFamilies: [...new Set([...covered.routes].map(normalizeGeneratedRouteFamily).filter(Boolean))].slice(0, 120),
+      apiEndpoints: [...covered.apiEndpoints].slice(0, 120),
+      sourceRefs: [...covered.sourceRefs].slice(0, 120),
+    },
+    missing,
+    qaContractCoverage: qaCoverage,
+  };
+}
+
+function sanitizeRetryRoles(roles = []) {
+  return (Array.isArray(roles) ? roles : [])
+    .filter(Boolean)
+    .map((role) => ({
+      name: role.name || role.role || 'user',
+      role: role.role || role.name || 'user',
+      loginVerified: Boolean(role.loginVerified),
+      storageStatePath: role.storageStatePath || null,
+      credentialSource: role.credentialSource || null,
+      originalCredentialRole: role.originalCredentialRole || null,
+    }));
+}
+
+function sanitizeRetryPayloadValue(value, depth = 0) {
+  if (value == null || depth > 8) return value;
+  if (Array.isArray(value)) {
+    return value.map((item) => sanitizeRetryPayloadValue(item, depth + 1));
+  }
+  if (typeof value !== 'object') return value;
+
+  const out = {};
+  for (const [key, inner] of Object.entries(value)) {
+    if (/password|passwd|secret|token|api[-_]?key|authorization|cookie|session|username|email/i.test(key)) {
+      out[key] = '[redacted]';
+    } else {
+      out[key] = sanitizeRetryPayloadValue(inner, depth + 1);
+    }
+  }
+  return out;
+}
+
+function buildFailedAgentRetryMetadata({
+  agentFailures = [],
+  agentsRequested = [],
+  agentsCompleted = [],
+  sharedPayload = {},
+  config = {},
+  runId = null,
+  existingSuiteManifest = null,
+  agentTransportTimeoutMs = null,
+  reason = 'agent_failures',
+} = {}) {
+  const failedAgents = [...new Set((agentFailures || [])
+    .map((failure) => String(failure?.agent || '').trim())
+    .filter(Boolean)
+    .filter((agent) => agent !== 'unknown'))];
+  if (failedAgents.length === 0) return null;
+
+  const currentTimeoutMs = Number.isFinite(Number(agentTransportTimeoutMs))
+    ? Number(agentTransportTimeoutMs)
+    : Number(process.env.HEALIX_OPENAI_TIMEOUT_MS || 540000);
+  const recommendedTimeoutMs = Math.max(
+    300000,
+    Math.min(1800000, Math.ceil(currentTimeoutMs * 1.75)),
+  );
+  const context = sharedPayload.context || {};
+  const safeContext = sanitizeRetryPayloadValue(context) || {};
+  const safeExplorationArtifact = sanitizeRetryPayloadValue(sharedPayload.explorationArtifact || null);
+  const safeProjectInfo = sanitizeRetryPayloadValue(sharedPayload.projectInfo || {});
+  const manifest = existingSuiteManifest || (config.projectPath
+    ? buildExistingSuiteManifest({
+        projectPath: config.projectPath,
+        context,
+        roles: sharedPayload.roles || [],
+        testType: sharedPayload.testType || config.testType || 'both',
+        routeAccessSummary: buildRouteAccessSummary(sharedPayload.explorationArtifact || null),
+      })
+    : null);
+
+  return {
+    available: true,
+    status: 'available',
+    reason,
+    runId,
+    agents: failedAgents,
+    agentsRequested: (agentsRequested || []).filter(Boolean),
+    agentsCompleted: (agentsCompleted || []).filter(Boolean),
+    recommendedTimeoutMs,
+    recommendedBudgetMultiplier: 2,
+    mode: 'failed_agent_retry_delta',
+    canRunFromDashboard: true,
+    existingSuiteManifest: manifest,
+    request: {
+      agents: failedAgents,
+      context: {
+        ...safeContext,
+        generationFeedback: {
+          ...(safeContext.generationFeedback || {}),
+          mode: 'failed_agent_retry_delta',
+          previousFailureCode: 'AGENT_FAILED',
+          existingSuiteManifest: manifest,
+          instructions: [
+            'Generate append-only top-up specs only for failed generation agents.',
+            'Do not replace, rewrite, or duplicate existing tests in the suite manifest.',
+            'Target only missing routes, QA contracts, requirements, workflows, or API endpoints listed as missing.',
+            'Prefer fewer source-grounded tests over broad route-only padding.',
+          ],
+        },
+      },
+      prd: sharedPayload.prd || '',
+      parsedPRD: sharedPayload.parsedPRD || null,
+      explorationArtifact: safeExplorationArtifact,
+      roles: sanitizeRetryRoles(sharedPayload.roles || []),
+      testType: sharedPayload.testType || config.testType || 'both',
+      projectInfo: safeProjectInfo,
+      options: {
+        ...(sharedPayload.options || {}),
+        maxExpansionAttempts: 0,
+        coverageProfile: sharedPayload.options?.coverageProfile || config.coverageProfile || 'qa-max',
+        minGeneratedTests: Math.max(5, Math.min(20, Math.ceil(Number(sharedPayload.options?.minGeneratedTests || config.minGeneratedTests || 50) / 4))),
+      },
+    },
+  };
+}
+
+function effectiveRetainedRunnableFloor({ originalFloor, preRecoveryRunnableTests } = {}) {
+  const original = Math.max(1, Number.isFinite(Number(originalFloor)) ? Number(originalFloor) : 1);
+  const preRecovery = Number(preRecoveryRunnableTests);
+  if (!Number.isFinite(preRecovery) || preRecovery <= 0) return original;
+  return Math.min(original, Math.max(5, Math.ceil(preRecovery * 0.4)));
+}
+
+function buildRetainedSuiteRecoveryMeta({
+  config = {},
+  beforeQuality = {},
+  afterQuality = {},
+  recovery = {},
+} = {}) {
+  const target = toFiniteNumber(config.minGeneratedTests, 50);
+  const originalFloor = minimumUsefulRunnableFloor(target);
+  const preRecoveryRunnableTests = Number(beforeQuality.runnableTests || 0);
+  const postRecoveryRunnableTests = Number(afterQuality.runnableTests || 0);
+  const effectiveFloor = effectiveRetainedRunnableFloor({
+    originalFloor,
+    preRecoveryRunnableTests,
+  });
+  const coverageLoss = Math.max(0, preRecoveryRunnableTests - postRecoveryRunnableTests);
+  const quarantinedFileReasons = (recovery.quarantinedFiles || []).map((file) => ({
+    filename: file.filename || path.basename(file.path || ''),
+    path: file.path || null,
+    reason: 'hard_quality_blocker',
+  }));
+
+  return {
+    type: 'retained_suite_after_hard_quarantine',
+    preRecoveryRunnableTests,
+    postRecoveryRunnableTests,
+    originalRunnableFloor: originalFloor,
+    effectiveRunnableFloor: effectiveFloor,
+    qualityRecoveryCoverageLoss: coverageLoss,
+    quarantinedFileReasons,
+    executionAllowedAfterHardQuarantine: postRecoveryRunnableTests >= effectiveFloor && postRecoveryRunnableTests > 0,
+  };
+}
+
+function buildCoverageRetryMetadata({
+  sharedPayload = {},
+  config = {},
+  runId = null,
+  reason = 'coverage_top_up',
+  existingSuiteManifest = null,
+  topUpEvent = null,
+  retainedSuite = null,
+} = {}) {
+  const context = sharedPayload.context || {};
+  const safeContext = sanitizeRetryPayloadValue(context) || {};
+  const safeExplorationArtifact = sanitizeRetryPayloadValue(sharedPayload.explorationArtifact || null);
+  const safeProjectInfo = sanitizeRetryPayloadValue(sharedPayload.projectInfo || {});
+  const manifest = existingSuiteManifest || topUpEvent?.existingSuiteManifest || (config.projectPath
+    ? buildExistingSuiteManifest({
+        projectPath: config.projectPath,
+        context,
+        roles: sharedPayload.roles || [],
+        testType: sharedPayload.testType || config.testType || 'both',
+        routeAccessSummary: buildRouteAccessSummary(sharedPayload.explorationArtifact || null),
+      })
+    : null);
+  const currentTimeoutMs = Number(process.env.HEALIX_OPENAI_TIMEOUT_MS || 540000);
+  const recommendedTimeoutMs = Math.max(300000, Math.min(1800000, Math.ceil(currentTimeoutMs * 1.5)));
+
+  return {
+    available: true,
+    status: 'available',
+    reason,
+    runId,
+    mode: 'coverage_top_up_retry_delta',
+    canRunFromDashboard: true,
+    recommendedTimeoutMs,
+    recommendedBudgetMultiplier: 2,
+    topUpStatus: topUpEvent?.topUpStatus || topUpEvent?.status || null,
+    topUpErrorCode: topUpEvent?.topUpErrorCode || topUpEvent?.error?.code || null,
+    retainedSuite: retainedSuite || null,
+    existingSuiteManifest: manifest,
+    request: {
+      agents: ['expansion'],
+      context: {
+        ...safeContext,
+        generationFeedback: {
+          ...(safeContext.generationFeedback || {}),
+          mode: 'coverage_top_up_retry_delta',
+          previousFailureCode: topUpEvent?.topUpErrorCode || topUpEvent?.status || reason,
+          existingSuiteManifest: manifest,
+          retainedSuite: retainedSuite || null,
+          instructions: [
+            'Generate append-only coverage top-up specs only.',
+            'Do not replace, rewrite, or duplicate existing tests in the suite manifest.',
+            'Target only listed missing routes, route families, forms, QA contracts, requirements, workflows, or API endpoints.',
+            'Prefer source-backed routes with headings, labels, buttons, test IDs, or observed text. Skip ambiguous or protected routes.',
+          ],
+        },
+      },
+      prd: sharedPayload.prd || '',
+      parsedPRD: sharedPayload.parsedPRD || null,
+      explorationArtifact: safeExplorationArtifact,
+      roles: sanitizeRetryRoles(sharedPayload.roles || []),
+      testType: sharedPayload.testType || config.testType || 'both',
+      projectInfo: safeProjectInfo,
+      options: {
+        ...(sharedPayload.options || {}),
+        maxExpansionAttempts: 1,
+        coverageProfile: sharedPayload.options?.coverageProfile || config.coverageProfile || 'qa-max',
+        minGeneratedTests: Math.max(5, Math.min(20, Math.ceil(Number(sharedPayload.options?.minGeneratedTests || config.minGeneratedTests || 50) / 3))),
+      },
+    },
+  };
 }
 
 function extractQualityFailureFileNames(qualityAudit = {}) {
   const names = new Set();
   const add = (value) => {
     if (!value) return;
-    const matches = String(value).match(/[A-Za-z0-9_.-]+\.spec\.(?:ts|js)\b/g) || [];
+    const matches = String(value).match(GENERATED_SPEC_FILENAME_PATTERN) || [];
     for (const match of matches) {
       names.add(path.basename(match));
     }
@@ -521,6 +1293,11 @@ function extractQualityFailureFileNames(qualityAudit = {}) {
   for (const value of qualityAudit.ungroundedUiFiles || []) add(value);
   for (const value of qualityAudit.brittlePatternFiles || []) add(value);
   for (const value of qualityAudit.riskyFiles || []) add(value);
+  for (const value of qualityAudit.sourceMismatchFiles || []) add(value);
+  for (const value of qualityAudit.authGatingFiles || []) add(value);
+  for (const item of qualityAudit.ungroundedApiEndpointFiles || []) {
+    add(typeof item === 'string' ? item : item?.file);
+  }
 
   for (const item of qualityAudit.ungroundedSelectorFiles || []) {
     add(typeof item === 'string' ? item : item?.file);
@@ -533,6 +1310,147 @@ function extractQualityFailureFileNames(qualityAudit = {}) {
   }
 
   return [...names];
+}
+
+function isHardQualityAuditError(error) {
+  const text = String(error || '');
+  return /^(?:generated_tests_missing|no_generated_tests|zero_runnable_tests|runnable_coverage_too_low|fallback_or_template_spec|hardcoded_unverified_credentials|ungrounded_api_endpoint|hash_route_without_hash_fragment|unblocked_protected_route_without_credentials|protected_route_missing_auth_tag|auth_gated_review_form_without_auth_tag|missing_qa_contract_coverage|missing_api_test_files)(?::|$)/i.test(text);
+}
+
+function qualityAuditHasHardErrors(qualityAudit = {}) {
+  return (qualityAudit.errors || []).some(isHardQualityAuditError);
+}
+
+function fileContainsOnlyBrittleTests(projectPath, filename) {
+  const filePath = path.join(projectPath, 'tests', 'generated', path.basename(filename || ''));
+  if (!fs.existsSync(filePath)) return false;
+  let content = '';
+  try {
+    content = fs.readFileSync(filePath, 'utf-8');
+  } catch {
+    return false;
+  }
+  const blocks = findGeneratedTestBlocks(content);
+  return blocks.length > 0 && blocks.every((block) => isBrittleGeneratedTestBlock(block.content));
+}
+
+function extractHardQualityFailureFileNames(qualityAudit = {}, { projectPath = null } = {}) {
+  const names = new Set();
+  const add = (value) => {
+    if (!value) return;
+    const matches = String(value).match(GENERATED_SPEC_FILENAME_PATTERN) || [];
+    for (const match of matches) names.add(path.basename(match));
+  };
+
+  for (const error of qualityAudit.errors || []) {
+    if (isHardQualityAuditError(error)) add(error);
+  }
+  for (const item of qualityAudit.ungroundedApiEndpointFiles || []) {
+    add(typeof item === 'string' ? item : item?.file);
+  }
+  for (const value of qualityAudit.authGatingFiles || []) add(value);
+  if (projectPath) {
+    for (const value of qualityAudit.brittlePatternFiles || []) {
+      if (fileContainsOnlyBrittleTests(projectPath, value)) add(value);
+    }
+  }
+
+  return [...names];
+}
+
+function demoteSoftQualityAuditErrors(qualityAudit = {}, reason = 'soft_quality_warnings_only') {
+  const softErrors = (qualityAudit.errors || []).filter((error) => !isHardQualityAuditError(error));
+  return {
+    ...qualityAudit,
+    valid: true,
+    errors: (qualityAudit.errors || []).filter(isHardQualityAuditError),
+    warnings: [
+      ...(qualityAudit.warnings || []),
+      ...softErrors.map((error) => `soft_quality_warning:${error}`),
+      reason,
+    ],
+    softQualityWarnings: softErrors,
+  };
+}
+
+function snapshotGeneratedSpecFiles(projectPath) {
+  const generatedDir = path.join(projectPath, 'tests', 'generated');
+  const snapshot = {
+    generatedDir,
+    files: [],
+  };
+  if (!fs.existsSync(generatedDir)) return snapshot;
+  for (const filePath of listGeneratedTestFiles(projectPath)) {
+    try {
+      snapshot.files.push({
+        filename: path.basename(filePath),
+        content: fs.readFileSync(filePath, 'utf-8'),
+      });
+    } catch {
+      // best effort snapshot; unreadable files will be handled by validation
+    }
+  }
+  return snapshot;
+}
+
+function restoreGeneratedSpecSnapshot(projectPath, snapshot = {}) {
+  const generatedDir = snapshot.generatedDir || path.join(projectPath, 'tests', 'generated');
+  ensureDir(generatedDir);
+  for (const filePath of listGeneratedTestFiles(projectPath)) {
+    try {
+      fs.rmSync(filePath, { force: true });
+    } catch {
+      // best effort cleanup before restore
+    }
+  }
+  for (const file of snapshot.files || []) {
+    fs.writeFileSync(path.join(generatedDir, file.filename), file.content, 'utf-8');
+  }
+  return {
+    restoredFiles: (snapshot.files || []).map((file) => file.filename),
+  };
+}
+
+function missingCategoriesForQuality({ config = {}, context = {}, quality = {} } = {}) {
+  const requiredCategories = requiredCategoriesForRun({
+    testType: config.testType,
+    context,
+  });
+  const profile = toCoverageProfile(config.coverageProfile);
+  const minHits = minimumCategoryHitsByProfile(profile);
+  return requiredCategories.filter((category) => (quality.categories?.[category] || 0) < minHits);
+}
+
+function assessQualityRecoveryNetBenefit({
+  config = {},
+  context = {},
+  beforeQuality = {},
+  afterQuality = {},
+  hardRecovery = false,
+} = {}) {
+  if (hardRecovery) return { keep: true, reason: 'hard_quality_recovery' };
+  const target = toFiniteNumber(config.minGeneratedTests, 50);
+  const floor = minimumUsefulRunnableFloor(target);
+  if ((beforeQuality.runnableTests || 0) >= floor && (afterQuality.runnableTests || 0) < floor) {
+    return {
+      keep: false,
+      reason: 'would_drop_below_minimum_useful_floor',
+      floor,
+      beforeRunnableTests: beforeQuality.runnableTests || 0,
+      afterRunnableTests: afterQuality.runnableTests || 0,
+    };
+  }
+  const beforeMissing = missingCategoriesForQuality({ config, context, quality: beforeQuality });
+  const afterMissing = missingCategoriesForQuality({ config, context, quality: afterQuality });
+  if (beforeMissing.length === 0 && afterMissing.length > 0) {
+    return {
+      keep: false,
+      reason: 'would_remove_required_category_coverage',
+      beforeMissingCategories: beforeMissing,
+      afterMissingCategories: afterMissing,
+    };
+  }
+  return { keep: true, reason: 'net_benefit_preserved' };
 }
 
 function findGeneratedTestBlocks(content) {
@@ -635,9 +1553,20 @@ function isBrittleGeneratedTestBlock(blockContent) {
     /getByRole\(\s*['"`]button['"`]\s*,\s*\{[^}]*name\s*:\s*['"`](?:Next Month|Previous Month)['"`][^}]*\}\s*\)\.click\(\)[\s\S]{0,1400}(?:getByRole\(\s*['"`]heading['"`][\s\S]{0,300}name\s*:\s*['"`](?:May 2026|Showing May 2026|May 2026\s*—\s*Monthly View)['"`]|toHaveText\(\s*['"`](?:May 2026|Showing May 2026|May 2026\s*—\s*Monthly View)['"`])/i,
     /getByRole\(\s*['"`]button['"`]\s*,\s*\{[^}]*name\s*:\s*['"`]Reset Layout['"`][^}]*\}\s*\)\.click\(\)[\s\S]{0,800}getByRole\(\s*['"`]button['"`]\s*,\s*\{[^}]*name\s*:\s*['"`]Add widget['"`][^}]*\}\s*\)/i,
     /getByText\(\s*['"`]Due:\s*(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\b[^'"`]*['"`]/i,
-    /getByText\(\s*['"`](?:Standup|Planning|Review)['"`]\s*\)/i,
+    /getByText\(\s*['"`](?:All|Standup|Planning|Review)['"`]\s*\)/i,
+    /expect\(\s*\w*(?:console)?errors\w*\s*\)\.toEqual\(\s*\[\s*\]\s*\)/i,
+    /page\.on\(\s*['"`]console['"`][\s\S]{0,600}msg\.type\(\)\s*={2,3}\s*['"`]error['"`][\s\S]{0,1000}expect\.poll\(\s*\(\)\s*=>\s*\w*(?:errors?)\w*\.length[\s\S]{0,180}\)\.toBe\(\s*0\s*\)/i,
+    /locator\(\s*(['"`])(?:(?!\1)[\s\S]){0,220}href\*=["']\/(?:shop|products?|items?|posts?|articles?|orders?)\/(?:(?!\1)[\s\S]){0,220}\1\s*\)\.first\(\)[\s\S]{0,700}(?:toHaveAttribute|getAttribute|click)\s*\(/i,
+    /(?:\bmain\b|page\.locator\(\s*['"`]main['"`]\s*\))[\s\S]{0,700}getByRole\(\s*['"`]heading['"`]\s*,\s*\{[\s\S]{0,240}\bname\s*:\s*['"`][A-Z][A-Z0-9 _&.-]{2,}['"`]/i,
+    /(?:\bmain\b|page\.locator\(\s*['"`]main['"`]\s*\))[\s\S]{0,700}\.toContainText\(\s*['"`][A-Z][A-Z0-9 _&.-]{2,}['"`]\s*\)/i,
   ];
   if (brittlePatterns.some((pattern) => pattern.test(text))) return true;
+  if (looksLikeCartAssertionWithoutSetup(text)) return true;
+  if (looksLikeAuthGatedReviewWithoutAuth(text)) return true;
+  if (looksLikeAuthStateNavMismatch(text)) return true;
+  if (looksLikeExactCartAccessibleNameAssertion(text)) return true;
+  if (looksLikeCompressedHeadingWhitespaceAssertion(text)) return true;
+  if (looksLikeIncompleteProductCreateSuccessAssertion(text)) return true;
 
   for (const match of text.matchAll(/getByRole\(\s*['"`][^'"`]+['"`]\s*,\s*\{[\s\S]{0,320}?\bname\s*:\s*(['"`])([\s\S]*?)\1/gi)) {
     if (looksLikeConcatenatedGeneratedName(match[2])) return true;
@@ -670,7 +1599,10 @@ function pruneGeneratedTestsByQuality({ projectPath, qualityAudit = {}, reason =
     const content = fs.readFileSync(filePath, 'utf-8');
     const blocks = findGeneratedTestBlocks(content);
     if (blocks.length <= 1) continue;
-    const badBlocks = blocks.filter((block) => isBrittleGeneratedTestBlock(block.content));
+    const badBlocks = blocks.filter((block) =>
+      isBrittleGeneratedTestBlock(block.content) ||
+      findContextualSelectorIssues({ projectPath, blockContent: block.content }).length > 0
+    );
     if (badBlocks.length === 0 || badBlocks.length >= blocks.length) continue;
 
     ensureDir(quarantineDir);
@@ -700,19 +1632,25 @@ function pruneGeneratedTestsByQuality({ projectPath, qualityAudit = {}, reason =
   };
 }
 
-function quarantineGeneratedSpecFiles({ projectPath, qualityAudit = {}, reason = 'quality_audit' } = {}) {
+function quarantineGeneratedSpecFiles({ projectPath, qualityAudit = {}, reason = 'quality_audit', hardOnly = false } = {}) {
   const generatedDir = path.join(projectPath, 'tests', 'generated');
   if (!fs.existsSync(generatedDir)) {
     return { applied: false, reason: 'generated_dir_missing', quarantinedFiles: [] };
   }
 
   const allFiles = fs.readdirSync(generatedDir)
-    .filter((name) => /\.spec\.(ts|js)$/i.test(name));
-  const candidates = extractQualityFailureFileNames(qualityAudit)
+    .filter((name) => GENERATED_SPEC_FILE_PATTERN.test(name));
+  const candidates = (hardOnly
+    ? extractHardQualityFailureFileNames(qualityAudit, { projectPath })
+    : extractQualityFailureFileNames(qualityAudit))
     .filter((name) => allFiles.includes(name));
 
   if (candidates.length === 0) {
-    return { applied: false, reason: 'no_file_specific_failures', quarantinedFiles: [] };
+    return {
+      applied: false,
+      reason: hardOnly ? 'no_hard_file_specific_failures' : 'no_file_specific_failures',
+      quarantinedFiles: [],
+    };
   }
   if (candidates.length >= allFiles.length) {
     return {
@@ -735,7 +1673,7 @@ function quarantineGeneratedSpecFiles({ projectPath, qualityAudit = {}, reason =
     let target = path.join(quarantineDir, name);
     let suffix = 1;
     while (fs.existsSync(target)) {
-      target = path.join(quarantineDir, name.replace(/\.spec\.(ts|js)$/i, `-${suffix}.spec.ts`));
+      target = path.join(quarantineDir, name.replace(GENERATED_SPEC_FILE_PATTERN, `-${suffix}.spec.ts`));
       suffix += 1;
     }
     fs.renameSync(source, target);
@@ -746,6 +1684,7 @@ function quarantineGeneratedSpecFiles({ projectPath, qualityAudit = {}, reason =
     applied: quarantinedFiles.length > 0,
     reason,
     quarantineDir,
+    hardOnly,
     quarantinedFiles,
     remainingFiles: Math.max(0, allFiles.length - quarantinedFiles.length),
   };
@@ -945,6 +1884,49 @@ function rewriteStartCommandForPort(startCommand, port, projectPath) {
   return `${command} ${flag}`;
 }
 
+function shouldAutoSwitchPortForConflict(config = {}) {
+  if (config.disablePortFallback === true) return false;
+  if (config.allowPortFallback === true) return true;
+  if (Array.isArray(config.services) && config.services.length > 1) return false;
+
+  const command = String(config.startCommand || '').toLowerCase();
+  if (
+    /\b(docker\s+compose|docker-compose|compose|concurrently|turbo|nx|lerna|mvn|gradle|java|dotnet|spring-boot)\b/.test(command)
+  ) {
+    return false;
+  }
+
+  const framework = detectProjectStartFramework(config.projectPath);
+  return ['vite', 'next', 'cra', 'nuxt', 'sveltekit', 'remix'].includes(framework);
+}
+
+function buildTargetPortInUseError({ config = {}, configuredPort, reason = 'target_port_in_use_not_ready' } = {}) {
+  const baseURL = config.baseURL || `http://localhost:${configuredPort}`;
+  const err = new Error(
+    `Configured target port ${configuredPort} is already in use, but ${baseURL} is not HTTP-ready. ` +
+    'Healix will not start a duplicate multi-service stack on a fallback port because that can break fixed backend ports and make auth/execution target the wrong origin. ' +
+    'Stop the process holding the port, or start the target app yourself and set baseURL to its reachable URL.'
+  );
+  err.code = 'TARGET_PORT_IN_USE_NOT_READY';
+  err.diagnostics = {
+    stage: 'server_start',
+    reason,
+    errorCode: err.code,
+    configuredPort,
+    baseURL,
+    startCommand: config.startCommand || null,
+    services: Array.isArray(config.services)
+      ? config.services.map((svc) => ({
+          role: svc.role || null,
+          port: svc.port || null,
+          baseURL: svc.baseURL || null,
+        }))
+      : [],
+    userFacingMessage: err.message,
+  };
+  return err;
+}
+
 function toCoverageProfile(value) {
   const normalized = String(value || 'qa-max').toLowerCase();
   if (normalized === 'balanced' || normalized === 'exhaustive') {
@@ -1072,7 +2054,7 @@ function collectGenerationQuality(projectPath, options = {}) {
     }
 
     totalTests += countTestsInContent(content);
-    skippedTests += countSkippedTestsInContent(content);
+    skippedTests += countSkippedTestsForGeneratedFile(content, path.basename(filePath));
     const detected = detectCoverageCategoriesFromContent(content, path.basename(filePath));
     for (const category of detected) {
       categories[category] = (categories[category] || 0) + 1;
@@ -1086,22 +2068,25 @@ function collectGenerationQuality(projectPath, options = {}) {
       }
     }
 
-    if (expectedOrigin) {
-      const hardcodedUrlMatches = content.matchAll(/(['"`])(https?:\/\/[^'"`\s]+)\1/g);
-      const seenUrls = new Set();
-      for (const match of hardcodedUrlMatches) {
-        const url = match[2];
-        if (seenUrls.has(url)) continue;
-        seenUrls.add(url);
-        const actualOrigin = originFromUrl(url);
-        if (actualOrigin && actualOrigin !== expectedOrigin) {
-          hardcodedBaseUrlMismatches.push({
-            file: path.basename(filePath),
-            url,
-            expectedOrigin,
-            actualOrigin,
-          });
-        }
+    const hardcodedUrlMatches = content.matchAll(/(['"`])(https?:\/\/[^'"`\s]+)\1/g);
+    const seenUrls = new Set();
+    for (const match of hardcodedUrlMatches) {
+      const url = match[2];
+      if (seenUrls.has(url)) continue;
+      seenUrls.add(url);
+      const actualOrigin = originFromUrl(url);
+      const isPlaceholderExternalUrl = /https?:\/\/(?:www\.)?(?:example\.(?:com|org|net)|httpbin\.org|jsonplaceholder\.typicode\.com|reqres\.in)\b/i.test(url);
+      if (
+        isPlaceholderExternalUrl ||
+        (actualOrigin && expectedOrigin && actualOrigin !== expectedOrigin)
+      ) {
+        hardcodedBaseUrlMismatches.push({
+          file: path.basename(filePath),
+          url,
+          expectedOrigin: expectedOrigin || 'configured baseURL',
+          actualOrigin,
+          placeholderExternalUrl: isPlaceholderExternalUrl,
+        });
       }
     }
   }
@@ -1246,6 +2231,32 @@ function minimumCategoryHitsByProfile(profile) {
   return 1;
 }
 
+function minimumUsefulRunnableFloor(minGeneratedTests) {
+  const target = Math.max(0, toFiniteNumber(minGeneratedTests, 50));
+  if (target <= 0) return 1;
+  if (target <= 20) return Math.max(4, Math.ceil(target * 0.4));
+  return Math.max(8, Math.min(25, Math.ceil(target * 0.24)));
+}
+
+function adaptiveRunnableFloor(minGeneratedTests) {
+  return minimumUsefulRunnableFloor(minGeneratedTests);
+}
+
+function shouldAttemptCoverageTopUp({ config = {}, quality = null } = {}) {
+  const target = toFiniteNumber(config.minGeneratedTests, 50);
+  const floor = minimumUsefulRunnableFloor(target);
+  if (config.coverageTopUp === false || config.disableCoverageTopUp === true) {
+    return { attempt: false, reason: 'disabled', target, minimumUsefulRunnableFloor: floor };
+  }
+  if (!quality || quality.totalTests <= 0 || quality.runnableTests <= 0) {
+    return { attempt: false, reason: 'no_runnable_tests', target, minimumUsefulRunnableFloor: floor };
+  }
+  if (quality.totalTests >= target) {
+    return { attempt: false, reason: 'target_met', target, minimumUsefulRunnableFloor: floor };
+  }
+  return { attempt: true, reason: 'below_target', target, minimumUsefulRunnableFloor: floor };
+}
+
 // Compute a 0-100 quality score and a list of "if you do X, quality can
 // improve by Y%" suggestions. Heuristic on purpose — the dashboard banner
 // isn't a scientific rubric, it's a nudge that tells users WHY we couldn't
@@ -1364,21 +2375,47 @@ function evaluateGenerationQualityGates({ config, context, quality, prdContent, 
   const missingCategories = requiredCategories.filter((category) => (quality.categories[category] || 0) < minHits);
 
   const minGeneratedTests = toFiniteNumber(config.minGeneratedTests, 50);
+  const originalUsefulFloor = minimumUsefulRunnableFloor(minGeneratedTests);
+  const retainedSuite = quality.retainedSuite && typeof quality.retainedSuite === 'object'
+    ? quality.retainedSuite
+    : null;
+  const retainedEffectiveFloor = Number(retainedSuite?.effectiveRunnableFloor);
+  const usefulFloor = Number.isFinite(retainedEffectiveFloor) && retainedEffectiveFloor > 0
+    ? Math.min(originalUsefulFloor, retainedEffectiveFloor)
+    : originalUsefulFloor;
   const minSelectorQuality = profile === 'balanced' ? 0.35 : (profile === 'exhaustive' ? 0.6 : 0.5);
   const minRunnableRatio = profile === 'balanced' ? 0.25 : 0.5;
+  const buildQualityEnvelope = (status, extra = {}) => ({
+    ...quality,
+    minGeneratedTests,
+    minGeneratedTestsTarget: minGeneratedTests,
+    minimumUsefulRunnableFloor: usefulFloor,
+    adaptiveRunnableFloor: usefulFloor,
+    originalMinimumUsefulRunnableFloor: originalUsefulFloor,
+    effectiveRunnableFloor: usefulFloor,
+    retainedSuite: retainedSuite || quality.retainedSuite || null,
+    generatedTestsActual: quality.totalTests,
+    runnableTestsActual: quality.runnableTests,
+    qualityGateStatus: status,
+    requiredCategories,
+    missingCategories,
+    minSelectorQuality,
+    minRunnableRatio,
+    coverageProfile: profile,
+    ...extra,
+  });
 
   if (quality.totalTests > 0 && quality.runnableTests === 0) {
     const error = new Error(`Generated suite has zero runnable tests (${quality.skippedTests}/${quality.totalTests} skipped).`);
     error.code = 'ZERO_RUNNABLE_TESTS';
-    error.generationQuality = {
-      ...quality,
-      minGeneratedTests,
-      requiredCategories,
-      missingCategories,
-      minSelectorQuality,
-      minRunnableRatio,
-      coverageProfile: profile,
-    };
+    error.generationQuality = buildQualityEnvelope('failed');
+    error.diagnostics = buildPipelineDiagnostics({
+      projectPath: config.projectPath,
+      stage: 'generation',
+      reason: 'zero_runnable_tests',
+      stderr: error.message,
+      qualityAudit: { errors: ['zero_runnable_tests'], ...quality },
+    });
     return { ok: false, error };
   }
 
@@ -1389,59 +2426,82 @@ function evaluateGenerationQualityGates({ config, context, quality, prdContent, 
       .join(', ');
     const error = new Error(`Generated suite hardcoded a different app origin than baseURL (${sample}).`);
     error.code = 'HARDCODED_BASE_URL_MISMATCH';
-    error.generationQuality = {
-      ...quality,
-      minGeneratedTests,
-      requiredCategories,
-      missingCategories,
-      minSelectorQuality,
-      minRunnableRatio,
-      coverageProfile: profile,
-    };
+    error.generationQuality = buildQualityEnvelope('failed');
+    error.diagnostics = buildPipelineDiagnostics({
+      projectPath: config.projectPath,
+      stage: 'generation',
+      reason: 'hardcoded_base_url_mismatch',
+      stderr: error.message,
+      qualityAudit: {
+        errors: [`hardcoded_base_url_mismatch:${sample}`],
+        hardcodedBaseUrlMismatches: quality.hardcodedBaseUrlMismatches,
+      },
+    });
     return { ok: false, error };
   }
 
   if (quality.totalTests > 0 && quality.runnableRatio < minRunnableRatio) {
     const error = new Error(`Generated suite runnable coverage too low (${quality.runnableTests}/${quality.totalTests} runnable, minimum ratio ${minRunnableRatio}).`);
     error.code = 'RUNNABLE_COVERAGE_TOO_LOW';
-    error.generationQuality = {
-      ...quality,
-      minGeneratedTests,
-      requiredCategories,
-      missingCategories,
-      minSelectorQuality,
-      minRunnableRatio,
-      coverageProfile: profile,
-    };
+    error.generationQuality = buildQualityEnvelope('failed');
+    error.diagnostics = buildPipelineDiagnostics({
+      projectPath: config.projectPath,
+      stage: 'generation',
+      reason: 'runnable_coverage_too_low',
+      stderr: error.message,
+      qualityAudit: { errors: ['runnable_coverage_too_low'], ...quality },
+    });
     return { ok: false, error };
   }
 
-  // Hard-fail when running under a strict coverage profile (qa-max / exhaustive)
-  // with strictAIGeneration enabled. Non-strict profiles (balanced) retain the
-  // legacy warn-and-continue behavior so dev-loop runs still produce artifacts
-  // even when generation undershoots.
+  const qualityWarnings = [];
   if (quality.totalTests < minGeneratedTests) {
-    const strictCoverage = profile === 'qa-max' || profile === 'exhaustive';
-    if (strictAIEnabled(config) && strictCoverage) {
+    const meetsUsefulFloor = quality.runnableTests >= usefulFloor;
+    const minCountWarning = {
+      code: 'MIN_TEST_COUNT_NOT_MET',
+      message: meetsUsefulFloor
+        ? `Generated ${quality.totalTests} tests below target ${minGeneratedTests}; executing because the runnable suite meets the ${retainedSuite ? 'retained-suite ' : ''}minimum useful floor.`
+        : `Generated ${quality.totalTests} tests below target ${minGeneratedTests}; runnable tests ${quality.runnableTests} are below the minimum useful floor ${usefulFloor}.`,
+      actual: quality.totalTests,
+      expected: minGeneratedTests,
+      severity: 'warning',
+    };
+
+    if (!meetsUsefulFloor) {
+      const insufficientCode = retainedSuite ? 'INSUFFICIENT_RETAINED_RUNNABLE_COVERAGE' : 'INSUFFICIENT_RUNNABLE_COVERAGE';
       const error = new Error(
-        `Generated tests ${quality.totalTests} below minimum ${minGeneratedTests} for strict profile ${profile}`
+        retainedSuite
+          ? `Retained runnable tests ${quality.runnableTests} below recovery-adjusted useful floor ${usefulFloor} after hard quality quarantine (pre-recovery ${retainedSuite.preRecoveryRunnableTests || 0}).`
+          : `Generated runnable tests ${quality.runnableTests} below minimum useful floor ${usefulFloor} for target ${minGeneratedTests}.`
       );
-      error.code = 'MIN_TEST_COUNT_NOT_MET';
-      error.generationQuality = {
-        ...quality,
-        minGeneratedTests,
-        requiredCategories,
-        missingCategories,
-        minSelectorQuality,
-        minRunnableRatio,
-        coverageProfile: profile,
-      };
+      error.code = insufficientCode;
+      error.generationQuality = buildQualityEnvelope('failed', {
+        qualityWarnings: [minCountWarning],
+      });
+      error.diagnostics = buildPipelineDiagnostics({
+        projectPath: config.projectPath,
+        stage: 'generation',
+        reason: retainedSuite ? 'insufficient_retained_runnable_coverage' : 'insufficient_runnable_coverage',
+        stderr: error.message,
+        qualityAudit: { errors: [retainedSuite ? 'insufficient_retained_runnable_coverage' : 'insufficient_runnable_coverage'], ...quality },
+      });
       return { ok: false, error };
     }
-    Logger.warn('PipelineWorker', `Generated tests ${quality.totalTests} below minimum ${minGeneratedTests}, but continuing pipeline`);
+
+    qualityWarnings.push(minCountWarning);
+    if (retainedSuite) {
+      qualityWarnings.push({
+        code: 'RETAINED_SUITE_AFTER_HARD_QUARANTINE',
+        message: `Invalid generated specs were quarantined; retained ${quality.runnableTests} runnable test(s) meet recovery-adjusted floor ${usefulFloor} (original floor ${originalUsefulFloor}).`,
+        actual: quality.runnableTests,
+        expected: usefulFloor,
+        severity: 'warning',
+      });
+    }
+    Logger.warn('PipelineWorker', `Generated tests ${quality.totalTests} below target ${minGeneratedTests}, but continuing because runnable tests ${quality.runnableTests} meet minimum useful floor ${usefulFloor}`);
   }
 
-  const warnings = [];
+  const warnings = qualityWarnings.map((warning) => warning.message);
   if (missingCategories.length > 0) {
     warnings.push(`missing categories: ${missingCategories.join(', ')}`);
   }
@@ -1458,15 +2518,7 @@ function evaluateGenerationQualityGates({ config, context, quality, prdContent, 
   if (warnings.length > 0 && quality.totalTests === 0) {
     const error = new Error(`Coverage gates failed with zero tests generated. ${warnings.join('; ')}`);
     error.code = 'COVERAGE_GATES_FAILED';
-    error.generationQuality = {
-      ...quality,
-      minGeneratedTests,
-      requiredCategories,
-      missingCategories,
-      minSelectorQuality,
-      minRunnableRatio,
-      coverageProfile: profile,
-    };
+    error.generationQuality = buildQualityEnvelope('failed', { qualityWarnings });
     return { ok: false, error };
   }
 
@@ -1490,32 +2542,27 @@ function evaluateGenerationQualityGates({ config, context, quality, prdContent, 
 
   return {
     ok: true,
-    result: {
-      ...quality,
-      minGeneratedTests,
-      requiredCategories,
-      missingCategories,
-      minSelectorQuality,
-      minRunnableRatio,
-      coverageProfile: profile,
+    result: buildQualityEnvelope(qualityWarnings.length > 0 || warnings.length > 0 ? 'warning' : 'passed', {
       warnings,
+      qualityWarnings,
+      executionAllowedDespiteWarnings: qualityWarnings.length > 0 || warnings.length > 0,
       qualityScore: scoreBundle.qualityScore,
       potentialImprovement: scoreBundle.totalPotentialImprovement,
       improvementSuggestions: scoreBundle.suggestions,
-    },
+    }),
   };
 }
 
 function isRepairableGenerationFailure(error) {
   const code = error?.code || classifyErrorCode(error);
+  const message = normalizeErrorText(error?.message);
+  if (code === 'AI_GENERATION_INSUFFICIENT') {
+    return /no valid files|no usable files|zero tests|produced no valid|produced no files/i.test(message);
+  }
   return [
-    'ZERO_RUNNABLE_TESTS',
-    'RUNNABLE_COVERAGE_TOO_LOW',
-    'MIN_TEST_COUNT_NOT_MET',
-    'COVERAGE_GATES_FAILED',
-    'GENERATION_VALIDATION_FAILED',
-    'AI_GENERATION_INSUFFICIENT',
-    'HARDCODED_BASE_URL_MISMATCH',
+    'AGENTS_RETURNED_ZERO_TESTS',
+    'ALL_AGENTS_FAILED',
+    'GENERATION_FAILED',
   ].includes(code);
 }
 
@@ -1534,6 +2581,8 @@ function buildGenerationRepairContext({
   routeAccessSummary,
   attempt,
   testType,
+  existingSuiteManifest = null,
+  mode = null,
 }) {
   const base = context && typeof context === 'object' ? { ...context } : {};
   const code = error?.code || classifyErrorCode(error);
@@ -1554,6 +2603,11 @@ function buildGenerationRepairContext({
     'Use the previous generation failure as feedback and generate a materially different suite.',
     'Every runnable test must assert real target-app behavior, not just page load or status code.',
   ];
+  if (mode === 'coverage_top_up_delta' && existingSuiteManifest) {
+    instructions.push('This is an append-only coverage top-up. Do not regenerate, replace, or restate tests already present in existingSuiteManifest.');
+    instructions.push('Return only new delta spec files named healix-topup-*.spec.ts. Do not reuse existing test titles, [REQ:*] markers, routes, or API endpoints unless the same test also covers a listed missing target.');
+    instructions.push('Do not generate [QAC:*] tests; Healix emits deterministic QA-contract specs separately. Focus on missing routes, API endpoints, categories, requirements, and workflows from existingSuiteManifest.missing.');
+  }
   if (publicRoutes.length > 0) {
     instructions.push(`Generate runnable public-route tests for: ${publicRoutes.slice(0, 12).join(', ')}.`);
     instructions.push('Do not add credential-driven skips to public routes; only protected routes may be skipped.');
@@ -1563,6 +2617,15 @@ function buildGenerationRepairContext({
   }
   if (missingCategories.length > 0) {
     instructions.push(`Close missing coverage categories: ${missingCategories.join(', ')}.`);
+  }
+  if (code === 'INSUFFICIENT_RUNNABLE_COVERAGE' || code === 'INSUFFICIENT_RETAINED_RUNNABLE_COVERAGE' || code === 'MIN_TEST_COUNT_NOT_MET') {
+    const floor = quality?.minimumUsefulRunnableFloor ?? quality?.adaptiveRunnableFloor;
+    const actual = quality?.runnableTests ?? quality?.totalTests;
+    const target = quality?.minGeneratedTestsTarget ?? quality?.minGeneratedTests;
+    instructions.push(
+      `Add focused runnable tests for uncovered high-value routes/workflows until runnable count clears the minimum useful floor${floor ? ` (${floor})` : ''}${target ? ` while still aiming for target ${target}` : ''}. Current runnable/total count: ${actual ?? 'unknown'}/${quality?.totalTests ?? 'unknown'}.`
+    );
+    instructions.push('Do not pad with page-load-only tests; add source-grounded assertions for distinct visible behavior, forms, navigation, validation, or real API contracts.');
   }
   if (code === 'HARDCODED_BASE_URL_MISMATCH') {
     const mismatches = Array.isArray(quality?.hardcodedBaseUrlMismatches)
@@ -1580,6 +2643,10 @@ function buildGenerationRepairContext({
     instructions.push('Remove brittle generated assertions: no DOM checkValidity(), no raw getComputedStyle assertions, no exact concatenated card accessible names, and no toContainText([...]) on a single container. Replace them with user-visible behavior assertions grounded in source text.');
     instructions.push('For cards with multiple text nodes, locate by the stable title text and assert metadata with toContainText() inside the card/container.');
     instructions.push('Do not assert dialogs, month-specific event chips, selected option labels, or invented formatted labels unless the exact behavior/text is proven by route/source context.');
+    instructions.push('Keep auth state consistent: @auth/@tierB tests must not assert Login/Sign up links, and public unauthenticated tests must not assert Logout/account chrome unless they first establish auth.');
+    instructions.push('Cart filled-state tests must add an item or seed cart state before asserting subtotal, checkout, or line items. Do not open /cart directly and expect items.');
+    instructions.push('For headings split across markup or line breaks, use whitespace-tolerant regex such as /One storefront,\\s*four stacks\\./ instead of a compressed exact string.');
+    instructions.push('API create/update success tests must send source-required fields; incomplete validation payloads belong in negative tests that expect 4xx.');
   }
   if (errors.some((item) => /source_reference|ungrounded_selector_text|ungrounded_route|ungrounded_ui_files/.test(String(item)))) {
     instructions.push('Regenerate from source evidence: every UI test must include a // [SRC:<relative-source-file>] comment naming a file from context.sourceContext.files.');
@@ -1607,6 +2674,22 @@ function buildGenerationRepairContext({
         errors,
       },
       routeAccessSummary: routeAccessSummary || null,
+      mode: mode || null,
+      existingSuiteManifest: existingSuiteManifest ? {
+        totals: existingSuiteManifest.totals || null,
+        covered: existingSuiteManifest.covered || null,
+        missing: existingSuiteManifest.missing || null,
+        files: (existingSuiteManifest.files || []).slice(0, 25).map((file) => ({
+          filename: file.filename,
+          testTitles: (file.testTitles || []).slice(0, 20),
+          reqMarkers: (file.reqMarkers || []).slice(0, 20),
+          qacMarkers: (file.qacMarkers || []).slice(0, 20),
+          catMarkers: (file.catMarkers || []).slice(0, 12),
+          routes: (file.routes || []).slice(0, 20),
+          apiEndpoints: (file.apiEndpoints || []).slice(0, 20),
+          authTagged: file.authTagged,
+        })),
+      } : null,
       instructions,
     },
   };
@@ -1720,6 +2803,261 @@ function emitPipelineTelemetry(reporter, payload) {
   });
 }
 
+const PIPELINE_DECISION_LOG = 'pipeline-events.jsonl';
+const MAX_DECISION_STRING = 1200;
+const MAX_DECISION_TEXT_PREVIEW = 600;
+const MAX_DECISION_ARRAY_ITEMS = 60;
+const MAX_DECISION_OBJECT_KEYS = 80;
+const MAX_DECISION_METADATA_BYTES = 24000;
+const SECRET_DECISION_KEY_RE = /(?:password|passwd|pwd|secret|api[_-]?key|authorization|cookie|session|token|credential|storage[_-]?state|supabase.*key|anon[_-]?key)/i;
+const LARGE_TEXT_KEY_RE = /(?:content|source|code|lines|spec|preview|stdout|stderr|stack|body|html)/i;
+
+function hashDecisionText(value) {
+  return crypto.createHash('sha256').update(String(value)).digest('hex').slice(0, 16);
+}
+
+function truncateDecisionString(value, max = MAX_DECISION_STRING) {
+  const str = String(value);
+  if (str.length <= max) return str;
+  return `${str.slice(0, max)}...[truncated ${str.length - max} chars]`;
+}
+
+function summarizeDecisionText(value, max = MAX_DECISION_TEXT_PREVIEW) {
+  const str = String(value);
+  return {
+    sha256: hashDecisionText(str),
+    length: str.length,
+    preview: truncateDecisionString(str, max),
+  };
+}
+
+function sanitizeDecisionValue(value, key = '', depth = 0, seen = new WeakSet()) {
+  if (value === null || value === undefined) return value;
+  if (SECRET_DECISION_KEY_RE.test(String(key))) return '[REDACTED]';
+  if (typeof value === 'bigint') return value.toString();
+  if (typeof value === 'function') return undefined;
+  if (Buffer.isBuffer(value)) return `[Buffer(${value.length})]`;
+  if (value instanceof Error) {
+    return {
+      name: value.name,
+      code: value.code || undefined,
+      message: truncateDecisionString(value.message || ''),
+    };
+  }
+  if (typeof value === 'string') {
+    if (LARGE_TEXT_KEY_RE.test(String(key)) && value.length > MAX_DECISION_TEXT_PREVIEW) {
+      return summarizeDecisionText(value);
+    }
+    return truncateDecisionString(value);
+  }
+  if (typeof value !== 'object') return value;
+  if (seen.has(value)) return '[Circular]';
+  seen.add(value);
+  if (depth >= 5) return '[MaxDepth]';
+  if (Array.isArray(value)) {
+    const arr = value.slice(0, MAX_DECISION_ARRAY_ITEMS)
+      .map((item, index) => sanitizeDecisionValue(item, `${key}[${index}]`, depth + 1, seen))
+      .filter((item) => item !== undefined);
+    if (value.length > MAX_DECISION_ARRAY_ITEMS) {
+      arr.push(`[truncated ${value.length - MAX_DECISION_ARRAY_ITEMS} item(s)]`);
+    }
+    return arr;
+  }
+  const out = {};
+  const entries = Object.entries(value).slice(0, MAX_DECISION_OBJECT_KEYS);
+  for (const [childKey, childValue] of entries) {
+    const sanitized = sanitizeDecisionValue(childValue, childKey, depth + 1, seen);
+    if (sanitized !== undefined) out[childKey] = sanitized;
+  }
+  const totalKeys = Object.keys(value).length;
+  if (totalKeys > MAX_DECISION_OBJECT_KEYS) {
+    out.__truncatedKeys = totalKeys - MAX_DECISION_OBJECT_KEYS;
+  }
+  return out;
+}
+
+function boundDecisionMetadata(metadata = {}) {
+  const sanitized = sanitizeDecisionValue(metadata) || {};
+  try {
+    const serialized = JSON.stringify(sanitized);
+    if (serialized.length <= MAX_DECISION_METADATA_BYTES) return sanitized;
+    return {
+      __truncated: true,
+      sha256: hashDecisionText(serialized),
+      preview: serialized.slice(0, MAX_DECISION_METADATA_BYTES),
+    };
+  } catch {
+    return { __serializationError: true };
+  }
+}
+
+function normalizeDecisionStatus(status) {
+  const normalized = String(status || '').toLowerCase();
+  if (['error', 'failed', 'failure'].includes(normalized)) return 'error';
+  if (['warn', 'warning', 'blocked'].includes(normalized)) return 'warning';
+  if (['success', 'passed', 'ok', 'complete', 'completed'].includes(normalized)) return 'success';
+  return 'info';
+}
+
+function inferDecisionStatus(decisionType, metadata = {}, status) {
+  if (status) return normalizeDecisionStatus(status);
+  if (metadata.errorCode || metadata.error || metadata.failed === true) return 'error';
+  if (
+    metadata.warning ||
+    metadata.warn ||
+    metadata.topUpStatus === 'no_new_valid_delta' ||
+    metadata.continuedWithPreTopUpSuite ||
+    Number(metadata.quarantinedSpecCount || metadata.quarantinedFiles?.length || 0) > 0 ||
+    String(decisionType || '').includes('quality_recovery')
+  ) {
+    return 'warning';
+  }
+  return 'info';
+}
+
+function decisionLogPathFor(statusDir) {
+  return statusDir ? path.join(statusDir, PIPELINE_DECISION_LOG) : null;
+}
+
+function recordRunDecision(statusDir, telemetryReporter, event = {}) {
+  if (!statusDir || !event) return null;
+  const decisionType = String(event.decisionType || event.type || 'pipeline_decision');
+  const metadata = boundDecisionMetadata(event.metadata || {});
+  const status = inferDecisionStatus(decisionType, metadata, event.status);
+  const runId = event.runId || path.basename(statusDir);
+  const payload = {
+    schemaVersion: 1,
+    eventType: 'pipeline_decision',
+    decisionType,
+    runId,
+    phase: event.phase || decisionType,
+    status,
+    timestamp: event.timestamp || new Date().toISOString(),
+    message: truncateDecisionString(event.message || decisionType, 2000),
+    errorCode: event.errorCode || metadata.errorCode || null,
+    reason: event.reason || metadata.reason || null,
+    metadata,
+  };
+
+  try {
+    fs.mkdirSync(statusDir, { recursive: true });
+    fs.appendFileSync(decisionLogPathFor(statusDir), `${JSON.stringify(payload)}\n`, 'utf-8');
+  } catch (err) {
+    Logger.warn('PipelineWorker', 'Failed to append pipeline decision log', {
+      decisionType,
+      reason: err?.message,
+    });
+  }
+
+  try {
+    if (telemetryReporter && telemetryReporter.isEnabled()) {
+      telemetryReporter.emitBackground({
+        toolName: 'healix_test_my_app',
+        eventType: 'pipeline_decision',
+        runId,
+        phase: payload.phase,
+        status,
+        success: status !== 'error',
+        errorCode: payload.errorCode || undefined,
+        reason: payload.reason || undefined,
+        message: payload.message,
+        metadata: {
+          decisionType,
+          ...metadata,
+        },
+      });
+    }
+  } catch {
+    // telemetry is best-effort
+  }
+  return payload;
+}
+
+function readRunDecisionEvents(statusDir) {
+  const logPath = decisionLogPathFor(statusDir);
+  if (!logPath || !fs.existsSync(logPath)) return [];
+  try {
+    return fs.readFileSync(logPath, 'utf-8')
+      .split(/\r?\n/)
+      .filter(Boolean)
+      .map((line) => {
+        try { return JSON.parse(line); } catch { return null; }
+      })
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function buildPipelineDecisionSummary(statusDir) {
+  const events = readRunDecisionEvents(statusDir);
+  const byType = {};
+  const byStatus = {};
+  for (const event of events) {
+    byType[event.decisionType] = (byType[event.decisionType] || 0) + 1;
+    byStatus[event.status] = (byStatus[event.status] || 0) + 1;
+  }
+  const notable = events
+    .filter((event) => ['error', 'warning'].includes(event.status))
+    .slice(-10);
+  const latest = events.slice(-12);
+  const finalGating = [...events].reverse().find((event) => event.decisionType === 'final_gating_decision') || null;
+  return {
+    total: events.length,
+    byType,
+    byStatus,
+    finalGating,
+    notable,
+    latest,
+    logPath: decisionLogPathFor(statusDir),
+  };
+}
+
+function attachPipelineDecisionSummary(target, statusDir) {
+  if (!target || typeof target !== 'object') return target;
+  const summary = buildPipelineDecisionSummary(statusDir);
+  target.pipelineDecisionSummary = summary;
+  target.pipelineDecisionLogPath = summary.logPath;
+  return target;
+}
+
+function patchReportWithPipelineDecisionSummary(reportPath, statusDir) {
+  if (!reportPath || !fs.existsSync(reportPath)) return null;
+  const summary = buildPipelineDecisionSummary(statusDir);
+  const patchOne = (targetPath) => {
+    if (!targetPath || !fs.existsSync(targetPath)) return;
+    try {
+      const report = JSON.parse(fs.readFileSync(targetPath, 'utf-8'));
+      report.metadata = {
+        ...(report.metadata || {}),
+        pipelineDecisionSummary: summary,
+        pipelineDecisionLogPath: summary.logPath,
+        generationMeta: {
+          ...((report.metadata || {}).generationMeta || {}),
+          pipelineDecisionSummary: summary,
+          pipelineDecisionLogPath: summary.logPath,
+        },
+      };
+      if (report.pipelineError) {
+        report.pipelineError = {
+          ...report.pipelineError,
+          pipelineDecisionSummary: summary,
+          pipelineDecisionHighlights: summary.notable,
+        };
+      }
+      fs.writeFileSync(targetPath, JSON.stringify(report, null, 2), 'utf-8');
+    } catch (err) {
+      Logger.warn('PipelineWorker', 'Failed to patch report with pipeline decision summary', {
+        reportPath: targetPath,
+        reason: err?.message,
+      });
+    }
+  };
+  patchOne(reportPath);
+  patchOne(path.join(path.dirname(reportPath), 'latest.json'));
+  return summary;
+}
+
 // Optional fire-and-forget durable phase reporter. Populates
 // `test_runs.current_phase + current_phase_at` so a crashed run's dashboard can
 // show "last seen at tier-B auth probe 3 minutes ago".
@@ -1820,14 +3158,23 @@ function classifyErrorCode(error) {
   if (message.includes('minimum') && message.includes('generated')) {
     return 'MIN_TEST_COUNT_NOT_MET';
   }
+  if (message.includes('adaptive floor') || message.includes('minimum useful floor') || message.includes('insufficient_runnable_coverage')) {
+    return 'INSUFFICIENT_RUNNABLE_COVERAGE';
+  }
   if (message.includes('zero runnable') || message.includes('all were skipped')) {
     return 'ZERO_RUNNABLE_TESTS';
   }
   if (message.includes('runnable coverage too low')) {
     return 'RUNNABLE_COVERAGE_TOO_LOW';
   }
+  if (message.includes('hardcoded a different app origin') || message.includes('hardcoded_base_url_mismatch')) {
+    return 'HARDCODED_BASE_URL_MISMATCH';
+  }
   if (message.includes('all observed routes require authentication')) {
     return 'AUTH_REQUIRED_NO_CREDENTIALS';
+  }
+  if (message.includes('tier_b_auth_config_no_test_files') || message.includes('supplemental auth pass')) {
+    return 'TIER_B_AUTH_PASS_FAILED';
   }
   if (message.includes('coverage gates')) {
     return 'COVERAGE_GATES_FAILED';
@@ -1928,8 +3275,32 @@ function buildUserFacingPipelineError(errorCode, error) {
     return `Healix generated too many skipped tests for the available app surface. ${normalizedMessage}`;
   }
 
+  if (errorCode === 'INSUFFICIENT_RETAINED_RUNNABLE_COVERAGE') {
+    return `Healix quarantined invalid generated specs, but too few retained runnable tests remained after the recovery-adjusted floor was applied. ${normalizedMessage}`;
+  }
+
+  if (errorCode === 'INSUFFICIENT_RUNNABLE_COVERAGE') {
+    return `Healix generated too few runnable tests to produce a useful execution result after a bounded coverage top-up. ${normalizedMessage}`;
+  }
+
+  if (errorCode === 'HARDCODED_BASE_URL_MISMATCH') {
+    return `Generated tests used an absolute URL outside the configured baseURL. Healix blocked execution so results do not come from the wrong target app. ${normalizedMessage}`;
+  }
+
   if (errorCode === 'AUTH_REQUIRED_NO_CREDENTIALS') {
     return 'All observed app routes require authentication, but no verified credentials were available. Provide working role credentials or expose a public health/smoke route before running Healix.';
+  }
+
+  if (errorCode === 'TIER_B_AUTH_CONFIG_NO_TEST_FILES') {
+    return 'Healix generated authenticated tests, but the supplemental auth Playwright config did not discover the generated spec files. This is a pipeline configuration failure, not a target-app bug.';
+  }
+
+  if (errorCode === 'TIER_B_AUTH_NO_MATCHING_TESTS') {
+    return 'Healix generated authenticated tests, but the Tier B auth pass matched zero tests. Auth-scoped specs must be tagged @auth or @tierB and included by the current-run auth config.';
+  }
+
+  if (errorCode === 'TIER_B_AUTH_PASS_FAILED') {
+    return `Healix could not complete the supplemental authenticated Playwright pass. Public tests may have run, but authenticated coverage is incomplete. ${normalizedMessage}`;
   }
 
   return normalizedMessage;
@@ -2081,7 +3452,7 @@ function getCursorFixtureContent(serializedInitScript, moduleType = 'commonjs', 
   let authBlock = '';
   if (verifiedRoles.length > 0) {
     const stateMapEntries = verifiedRoles
-      .map((r) => `  ${JSON.stringify(String(r.role))}: ${JSON.stringify(r.storageStatePath)}`)
+      .map((r) => `  ${JSON.stringify(normalizeRoleLabel(r.role || r.name || 'user'))}: ${JSON.stringify(r.storageStatePath)}`)
       .join(',\n');
     // ESM/TS: top-level import + named reference in helper
     authPreamble =
@@ -2096,10 +3467,13 @@ function getCursorFixtureContent(serializedInitScript, moduleType = 'commonjs', 
       `function _healixLoadState(p) {\n` +
       `  try { return JSON.parse(require('fs').readFileSync(p, 'utf-8')); } catch { return null; }\n` +
       `}\n\n`;
+    const defaultRole = normalizeRoleLabel(verifiedRoles[0].role || verifiedRoles[0].name || 'user');
     authBlock =
       `    const _roleMatch = testInfo.project.name.match(/^tierB-auth-(.+)$/);\n` +
-      `    if (_roleMatch) {\n` +
-      `      const _statePath = _HEALIX_ROLE_STATES[_roleMatch[1]];\n` +
+      `    const _isAuthTagged = !_roleMatch && (testInfo.title.includes('@auth') || testInfo.title.includes('@tierB'));\n` +
+      `    const _effectiveRole = _roleMatch ? _roleMatch[1] : (_isAuthTagged ? ${JSON.stringify(defaultRole)} : null);\n` +
+      `    if (_effectiveRole) {\n` +
+      `      const _statePath = _HEALIX_ROLE_STATES[_effectiveRole];\n` +
       `      if (_statePath) {\n` +
       `        const _state = _healixLoadState(_statePath);\n` +
       `        if (_state && Array.isArray(_state.cookies) && _state.cookies.length > 0) {\n` +
@@ -2203,7 +3577,7 @@ function ensureHealixFixtureImports({ projectPath, roles = [] }) {
   }
 
   const testFiles = fs.readdirSync(generatedDir)
-    .filter((name) => /\.spec\.(ts|js)$/i.test(name))
+    .filter((name) => GENERATED_SPEC_FILE_PATTERN.test(name))
     .map((name) => path.join(generatedDir, name));
 
   if (testFiles.length === 0) {
@@ -2300,7 +3674,7 @@ function rescuePartialGeneration({ projectPath, generatorName, error, startedAt,
   }
 
   const files = entries
-    .filter((e) => e.isFile() && /\.spec\.(ts|js)$/i.test(e.name))
+    .filter((e) => e.isFile() && GENERATED_SPEC_FILE_PATTERN.test(e.name))
     .map((e) => ({
       path: path.join(testsDir, e.name),
       filename: e.name,
@@ -2339,7 +3713,7 @@ function sanitizeGeneratedFilename(rawFilename, fallbackPrefix, index) {
     return defaultName;
   }
 
-  if (!/\.spec\.(ts|js)$/i.test(base)) {
+  if (!GENERATED_SPEC_FILE_PATTERN.test(base)) {
     if (/\.(ts|js)$/i.test(base)) {
       base = base.replace(/\.(ts|js)$/i, '.spec.ts');
     } else {
@@ -2364,7 +3738,7 @@ function safeWriteGeneratedTest(testsDir, test, index, fallbackPrefix, usedFilen
   let safeFilename = filename;
   let suffix = 1;
   while (usedFilenames.has(safeFilename.toLowerCase())) {
-    safeFilename = filename.replace(/\.spec\.(ts|js)$/i, `-${suffix}.spec.ts`);
+    safeFilename = filename.replace(GENERATED_SPEC_FILE_PATTERN, `-${suffix}.spec.ts`);
     suffix += 1;
   }
   usedFilenames.add(safeFilename.toLowerCase());
@@ -2375,17 +3749,184 @@ function safeWriteGeneratedTest(testsDir, test, index, fallbackPrefix, usedFilen
     throw new Error(`Unsafe generated filename rejected: ${safeFilename}`);
   }
 
-  fs.writeFileSync(targetPath, content, 'utf-8');
+  fs.mkdirSync(resolvedTestsDir, { recursive: true });
+  try {
+    fs.writeFileSync(targetPath, content, 'utf-8');
+  } catch (err) {
+    if (err?.code !== 'ENOENT') throw err;
+    fs.mkdirSync(resolvedTestsDir, { recursive: true });
+    fs.writeFileSync(targetPath, content, 'utf-8');
+  }
   return {
     path: targetPath,
     filename: safeFilename,
   };
 }
 
+function buildTopUpTargetHits(signals, manifest = {}) {
+  const missing = manifest.missing || {};
+  const covered = manifest.covered || {};
+  const hits = [];
+
+  const missingRoutes = new Set(missing.routes || []);
+  const missingRouteFamilies = new Set(
+    (missing.routeFamilies || (missing.routes || []).map(normalizeGeneratedRouteFamily)).filter(Boolean)
+  );
+  const missingApis = new Set(missing.apiEndpoints || []);
+  const missingCategories = new Set(missing.categories || []);
+  const coveredReqs = new Set(covered.reqMarkers || []);
+
+  for (const route of signals.routes || []) {
+    const family = normalizeGeneratedRouteFamily(route);
+    if (missingRoutes.has(route) || (family && missingRouteFamilies.has(family))) {
+      hits.push(`route:${family || route}`);
+    }
+  }
+  for (const endpoint of signals.apiEndpoints || []) {
+    if (missingApis.has(endpoint)) hits.push(`api:${endpoint}`);
+  }
+  for (const category of signals.catMarkers || []) {
+    if (missingCategories.has(category)) hits.push(`category:${category}`);
+  }
+  for (const req of signals.reqMarkers || []) {
+    if (!coveredReqs.has(req)) hits.push(`requirement:${req}`);
+  }
+
+  return [...new Set(hits)];
+}
+
+function normalizeTopUpFilename(test, index) {
+  const raw = sanitizeGeneratedFilename(test?.filename, 'healix-topup', index);
+  const withoutSpec = raw.replace(GENERATED_SPEC_FILE_PATTERN, '');
+  const suffix = withoutSpec.replace(/^healix-topup-?/i, '').replace(/[^a-zA-Z0-9_-]+/g, '-');
+  return sanitizeGeneratedFilename(`healix-topup-${suffix || index + 1}.spec.ts`, 'healix-topup', index);
+}
+
+function filterDeltaTopUpTests({ incoming = [], existingSuiteManifest = {}, usedFilenames = new Set() } = {}) {
+  const covered = existingSuiteManifest.covered || {};
+  const existingTitles = new Set(covered.testTitles || []);
+  const existingReqs = new Set(covered.reqMarkers || []);
+  const existingQacs = new Set(covered.qacMarkers || []);
+  const existingRoutes = new Set(covered.routes || []);
+  const existingRouteFamilies = new Set(
+    (covered.routeFamilies || (covered.routes || []).map(normalizeGeneratedRouteFamily)).filter(Boolean)
+  );
+  const existingApis = new Set(covered.apiEndpoints || []);
+  const accepted = [];
+  const rejected = [];
+  const acceptedTitles = new Set();
+  const acceptedReqs = new Set();
+  const acceptedQacs = new Set();
+  const acceptedFiles = new Set();
+
+  for (const [index, test] of incoming.entries()) {
+    const content = String(test?.content || '').trim();
+    const rawFilename = sanitizeGeneratedFilename(test?.filename, 'healix-topup', index);
+    const filename = normalizeTopUpFilename(test, index);
+    const lowerFilename = filename.toLowerCase();
+    const signals = extractSpecSignals(content, filename);
+    const reject = (reason, details = {}) => {
+      rejected.push({
+        filename: test?.filename || filename,
+        normalizedFilename: filename,
+        reason,
+        ...details,
+      });
+    };
+
+    if (!content || signals.totalTests <= 0) {
+      reject('no_discoverable_tests');
+      continue;
+    }
+    if (usedFilenames.has(String(rawFilename).toLowerCase())) {
+      reject('duplicate_filename');
+      continue;
+    }
+    if (usedFilenames.has(lowerFilename) || acceptedFiles.has(lowerFilename)) {
+      reject('duplicate_filename');
+      continue;
+    }
+
+    const duplicateTitles = signals.testTitles.filter((title) =>
+      existingTitles.has(title) || acceptedTitles.has(title)
+    );
+    if (duplicateTitles.length > 0) {
+      reject('duplicate_test_title', { duplicateTitles: duplicateTitles.slice(0, 5) });
+      continue;
+    }
+
+    const duplicateReqs = signals.reqMarkers.filter((marker) =>
+      existingReqs.has(marker) || acceptedReqs.has(marker)
+    );
+    const duplicateQacs = signals.qacMarkers.filter((marker) =>
+      existingQacs.has(marker) || acceptedQacs.has(marker)
+    );
+    if (duplicateQacs.length > 0 || signals.qacMarkers.length > 0) {
+      reject('qa_contracts_owned_by_deterministic_pack', {
+        duplicateQacs: duplicateQacs.slice(0, 5),
+        qacMarkers: signals.qacMarkers.slice(0, 5),
+      });
+      continue;
+    }
+    if (duplicateReqs.length > 0 && duplicateReqs.length === signals.reqMarkers.length) {
+      reject('duplicate_requirement_markers', { duplicateReqs: duplicateReqs.slice(0, 5) });
+      continue;
+    }
+
+    const targetHits = buildTopUpTargetHits(signals, existingSuiteManifest);
+    const addsNewRoute = (signals.routes || []).some((route) => {
+      const family = normalizeGeneratedRouteFamily(route);
+      return !existingRoutes.has(route) && (!family || !existingRouteFamilies.has(family));
+    });
+    const addsNewApi = (signals.apiEndpoints || []).some((endpoint) => !existingApis.has(endpoint));
+    if (targetHits.length === 0 && !addsNewRoute && !addsNewApi) {
+      reject('no_missing_surface_targeted');
+      continue;
+    }
+
+    accepted.push({
+      ...test,
+      filename,
+      content,
+      deltaTargets: targetHits,
+    });
+    acceptedFiles.add(lowerFilename);
+    for (const title of signals.testTitles) acceptedTitles.add(title);
+    for (const marker of signals.reqMarkers) acceptedReqs.add(marker);
+    for (const marker of signals.qacMarkers) acceptedQacs.add(marker);
+  }
+
+  return { accepted, rejected };
+}
+
+function removeHealixOwnedSupplementalAuthConfig(projectPath, reason = 'stale') {
+  const authConfigPath = path.join(projectPath, 'playwright.auth.config.ts');
+  if (!fs.existsSync(authConfigPath)) return { removed: false, reason: 'missing' };
+  try {
+    const content = fs.readFileSync(authConfigPath, 'utf-8');
+    const healixOwned = /Generated by Healix/i.test(content) && /tierB-auth-/i.test(content);
+    if (!healixOwned) {
+      return { removed: false, reason: 'not_healix_owned', path: authConfigPath };
+    }
+    fs.rmSync(authConfigPath, { force: true });
+    Logger.info('PipelineWorker', 'Removed stale Healix supplemental auth config', {
+      path: authConfigPath,
+      reason,
+    });
+    return { removed: true, reason, path: authConfigPath };
+  } catch (err) {
+    Logger.warn('PipelineWorker', 'Failed to remove stale supplemental auth config', {
+      path: authConfigPath,
+      reason: err.message,
+    });
+    return { removed: false, reason: 'remove_failed', error: err.message, path: authConfigPath };
+  }
+}
+
 function writeSupplementalAuthConfig(projectPath, baseURL, verifiedRoles) {
   if (!verifiedRoles || verifiedRoles.length === 0) return null;
   const tierBProjects = verifiedRoles.map((r) => `    {
-      name: 'tierB-auth-${String(r.role || 'user').replace(/[^a-zA-Z0-9_-]/g, '_')}',
+      name: 'tierB-auth-${normalizeRoleLabel(r.role || r.name || 'user')}',
       grep: /@auth|@tierB/,
       retries: 2,
       use: {
@@ -2396,12 +3937,16 @@ function writeSupplementalAuthConfig(projectPath, baseURL, verifiedRoles) {
 
   const body = `// Generated by Healix — supplemental Playwright config for the tierB-auth projects.
 // Your own playwright.config.* remains the source of truth for the default run.
-// Use \`npx playwright test --config=playwright.auth.config.ts\` to exercise
-// @auth-tagged tests with pre-loaded storageState for each verified role.
+// Healix runs this config automatically after the public/default pass whenever
+// current-run generated specs contain @auth or @tierB tests.
 import { defineConfig, devices } from '@playwright/test';
 
 export default defineConfig({
   testDir: './tests/generated',
+  testMatch: [
+    '**/*.spec.{ts,js,mts,mjs,cts,cjs}',
+    '**/*.test.{ts,js,mts,mjs,cts,cjs}',
+  ],
   timeout: 60000,
   fullyParallel: true,
   forbidOnly: !!process.env.CI,
@@ -2428,7 +3973,7 @@ ${tierBProjects}
     fs.writeFileSync(authConfigPath, body, 'utf-8');
     Logger.info('PipelineWorker', 'Emitted supplemental playwright.auth.config.ts', {
       path: authConfigPath,
-      tierBRoles: verifiedRoles.map((r) => r.role),
+      tierBRoles: verifiedRoles.map((r) => normalizeRoleLabel(r.role || r.name || 'user')),
     });
     return authConfigPath;
   } catch (err) {
@@ -2452,7 +3997,11 @@ function ensurePlaywrightConfig(projectPath, projectInfo = {}, roles = []) {
   // log can tell the user exactly what tier-aware config they're missing.
   const verifiedRolesSummary = (roles || [])
     .filter((r) => r && r.loginVerified && r.storageStatePath)
-    .map((r) => r.role || 'user');
+    .map((r) => normalizeRoleLabel(r.role || r.name || 'user'));
+
+  if (verifiedRolesSummary.length === 0) {
+    removeHealixOwnedSupplementalAuthConfig(projectPath, 'no_verified_roles_for_current_run');
+  }
 
   // Check if config already exists
   for (const name of candidates) {
@@ -2460,27 +4009,21 @@ function ensurePlaywrightConfig(projectPath, projectInfo = {}, roles = []) {
     if (fs.existsSync(candidate)) {
       // When the user has their own config we don't touch it. But if we have
       // verified roles we still need tierB-auth projects to exist somewhere, so
-      // emit a SIBLING `playwright.auth.config.ts` that the runner (and user)
-      // can opt-in via `--config=playwright.auth.config.ts`. The sibling never
-      // runs implicitly — it's an additive artifact that preserves the user's
-      // primary config as the single source of truth for their normal workflow.
+      // emit a current-run sibling `playwright.auth.config.ts`. The runner will
+      // execute it automatically for @auth/@tierB generated specs.
       let supplementalAuthConfigPath = null;
       if (verifiedRolesSummary.length > 0) {
         const verifiedRoles = (roles || []).filter((r) => r && r.loginVerified && r.storageStatePath);
         const baseURL = projectInfo.baseURL || 'http://localhost:3000';
         supplementalAuthConfigPath = writeSupplementalAuthConfig(projectPath, baseURL, verifiedRoles);
       }
-      // INFO (not debug): the user needs to see this because any tierB-auth
-      // projects we would have wired up are being skipped — their @auth-tagged
-      // tests will execute against tierA without a storageState and hit the
-      // login wall. See P0-2b for the supplemental-config follow-up.
       Logger.info('PipelineWorker', 'Existing Playwright config detected — skipping tier-aware config generation', {
         path: candidate,
         skippedTierBRoles: verifiedRolesSummary,
         supplementalAuthConfigPath,
         hint: verifiedRolesSummary.length > 0
           ? (supplementalAuthConfigPath
-              ? `User config preserved; @auth tier lives in ${path.basename(supplementalAuthConfigPath)} — run with --config=${path.basename(supplementalAuthConfigPath)} to exercise tierB-auth projects`
+              ? `User config preserved; Healix will run ${path.basename(supplementalAuthConfigPath)} automatically for @auth/@tierB tests`
               : 'User config will not auto-include storageState for verified roles; @auth tests may hit login redirects')
           : null,
       });
@@ -2495,6 +4038,7 @@ function ensurePlaywrightConfig(projectPath, projectInfo = {}, roles = []) {
   }
 
   // Generate playwright.config.ts
+  removeHealixOwnedSupplementalAuthConfig(projectPath, 'primary_tier_config_generated_for_current_run');
   const baseURL = projectInfo.baseURL || 'http://localhost:3000';
 
   // Phase D: emit tier-aware projects.
@@ -2511,7 +4055,7 @@ function ensurePlaywrightConfig(projectPath, projectInfo = {}, roles = []) {
   // as hard failures and so tierC (backend) doesn't waste budget on retryable HTTP
   // assertion bugs that are genuinely deterministic.
   const tierBProjects = verifiedRoles.map((r) => `    {
-      name: 'tierB-auth-${String(r.role || 'user').replace(/[^a-zA-Z0-9_-]/g, '_')}',
+      name: 'tierB-auth-${normalizeRoleLabel(r.role || r.name || 'user')}',
       grep: /@auth|@tierB/,
       retries: 2,
       use: {
@@ -2567,13 +4111,13 @@ ${projectsBlock}
   fs.writeFileSync(configPath, config, 'utf-8');
   Logger.info('PipelineWorker', 'Created playwright.config.ts', {
     path: configPath,
-    tierBRoles: verifiedRoles.map((r) => r.role),
+    tierBRoles: verifiedRoles.map((r) => normalizeRoleLabel(r.role || r.name || 'user')),
   });
   return {
     applied: true,
     reason: 'generated',
     configPath,
-    tierBRoles: verifiedRoles.map((r) => r.role),
+    tierBRoles: verifiedRoles.map((r) => normalizeRoleLabel(r.role || r.name || 'user')),
   };
 }
 
@@ -2734,7 +4278,63 @@ function buildPlaywrightEnv(projectPath, cliPath = null) {
   };
 }
 
-async function validateGeneratedTestsWithList({ projectPath, validateGeneratedTests = true, timeoutMs = 90000 }) {
+function escapeRegExp(value) {
+  return String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function ensureHealixValidationConfig({ projectPath, targetFilename = null } = {}) {
+  const generatedDir = path.join(projectPath, 'tests', 'generated');
+  const validationDir = path.join(projectPath, 'tests', '.healix-validation');
+  ensureDir(validationDir);
+
+  const safeTarget = targetFilename && GENERATED_SPEC_FILE_PATTERN.test(path.basename(targetFilename))
+    ? path.basename(targetFilename)
+    : null;
+  const configName = safeTarget
+    ? `playwright.validation.${safeTarget.replace(/[^a-zA-Z0-9_.-]/g, '_')}.cjs`
+    : 'playwright.validation.all.cjs';
+  const configPath = path.join(validationDir, configName);
+  const testMatch = safeTarget
+    ? `[new RegExp(${JSON.stringify(`${escapeRegExp(safeTarget)}$`)})]`
+    : `[new RegExp(${JSON.stringify('\\.(?:spec|test)\\.(?:ts|js|mts|mjs|cts|cjs)$')})]`;
+
+  const body = `// Generated by Healix for pre-run validation only.
+// It intentionally does not modify or depend on the user's Playwright config.
+module.exports = {
+  testDir: ${JSON.stringify(generatedDir)},
+  testMatch: ${testMatch},
+  timeout: 60000,
+  fullyParallel: false,
+  forbidOnly: false,
+  retries: 0,
+  workers: 1,
+  reporter: [['list']],
+  use: {
+    baseURL: process.env.HEALIX_TARGET_BASE_URL || process.env.PLAYWRIGHT_BASE_URL || 'http://localhost:3000',
+    trace: 'off',
+    screenshot: 'off',
+    video: 'off',
+  },
+};
+`;
+  fs.writeFileSync(configPath, body, 'utf-8');
+  return {
+    configPath,
+    targetFilename: safeTarget,
+    generatedDir,
+  };
+}
+
+function normalizeValidationTarget(testTarget) {
+  const raw = String(testTarget || '').trim();
+  if (!raw || raw === 'tests/generated' || raw === './tests/generated') {
+    return null;
+  }
+  const filename = path.basename(raw);
+  return GENERATED_SPEC_FILE_PATTERN.test(filename) ? filename : null;
+}
+
+async function validateGeneratedTestsWithList({ projectPath, validateGeneratedTests = true, timeoutMs = 90000, testTarget = 'tests/generated' }) {
   if (!validateGeneratedTests) {
     return { valid: true, skipped: true, listedCount: 0 };
   }
@@ -2745,18 +4345,16 @@ async function validateGeneratedTestsWithList({ projectPath, validateGeneratedTe
   }
 
   const testFiles = fs.readdirSync(generatedDir)
-    .filter((name) => /\.spec\.(ts|js)$/i.test(name));
+    .filter((name) => GENERATED_SPEC_FILE_PATTERN.test(name));
 
   if (testFiles.length === 0) {
     return { valid: false, reason: 'no_generated_tests' };
   }
 
   return new Promise((resolve) => {
-    const testArgs = ['test', 'tests/generated', '--list'];
-    const configPath = resolvePlaywrightConfig(projectPath);
-    if (configPath) {
-      testArgs.push('--config', configPath);
-    }
+    const targetFilename = normalizeValidationTarget(testTarget);
+    const validationConfig = ensureHealixValidationConfig({ projectPath, targetFilename });
+    const testArgs = ['test', '--list', '--config', validationConfig.configPath];
     const command = buildPlaywrightCommand(projectPath, testArgs);
 
     const child = spawn(command.command, command.args, {
@@ -2785,10 +4383,15 @@ async function validateGeneratedTestsWithList({ projectPath, validateGeneratedTe
       clearTimeout(timer);
       const normalizedStdout = stdout.replace(/\u001b\[[0-9;]*m/g, '');
       const listLineMatches = normalizedStdout.match(/^[\s\S]*?$/gm) || [];
-      const listedCount = listLineMatches.filter((line) => /\b›\b|\b\.spec\.(ts|js)\b|\btest\(/i.test(line)).length;
+      const listedCount = listLineMatches.filter((line) => /\b›\b|\b\.(?:spec|test)\.(?:ts|js|mts|mjs|cts|cjs)\b|\btest\(/i.test(line)).length;
 
       if (code === 0 && listedCount > 0) {
-        resolve({ valid: true, listedCount });
+        resolve({
+          valid: true,
+          listedCount,
+          validationConfigPath: validationConfig.configPath,
+          targetFilename,
+        });
         return;
       }
 
@@ -2797,14 +4400,179 @@ async function validateGeneratedTestsWithList({ projectPath, validateGeneratedTe
         reason: code !== 0 ? 'playwright_list_failed' : 'no_tests_listed',
         stdout: normalizedStdout.slice(0, 4000),
         stderr: stderr.replace(/\u001b\[[0-9;]*m/g, '').slice(0, 4000),
+        validationConfigPath: validationConfig.configPath,
+        targetFilename,
       });
     });
 
     child.on('error', (error) => {
       clearTimeout(timer);
-      resolve({ valid: false, reason: 'validation_spawn_failed', stderr: error.message });
+      resolve({
+        valid: false,
+        reason: 'validation_spawn_failed',
+        stderr: error.message,
+        validationConfigPath: validationConfig.configPath,
+        targetFilename,
+      });
     });
   });
+}
+
+function validationCanBeSalvaged(validation = {}) {
+  const reason = String(validation?.reason || '');
+  const stderr = String(validation?.stderr || '');
+  const stdout = String(validation?.stdout || '');
+  return [
+    'playwright_list_failed',
+    'no_tests_listed',
+    'no_tests_loaded',
+    'validation_spawn_failed',
+  ].includes(reason) || /No tests found|No tests loaded/i.test(`${stderr}\n${stdout}`);
+}
+
+function quarantineGeneratedSpecFilesByName({ projectPath, files = [], reason = 'validation_salvage' } = {}) {
+  const generatedDir = path.join(projectPath, 'tests', 'generated');
+  if (!fs.existsSync(generatedDir)) {
+    return { applied: false, reason: 'generated_dir_missing', quarantinedFiles: [] };
+  }
+  const safeReason = String(reason || 'validation_salvage').replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 80);
+  const quarantineDir = path.join(projectPath, 'tests', '.healix-quarantine', `${Date.now()}-${safeReason}`);
+  const quarantinedFiles = [];
+  for (const file of files) {
+    const filename = path.basename(file?.filename || file);
+    if (!GENERATED_SPEC_FILE_PATTERN.test(filename)) continue;
+    const source = path.join(generatedDir, filename);
+    if (!fs.existsSync(source)) continue;
+    ensureDir(quarantineDir);
+    let target = path.join(quarantineDir, filename);
+    let suffix = 1;
+    while (fs.existsSync(target)) {
+      target = path.join(quarantineDir, filename.replace(GENERATED_SPEC_FILE_PATTERN, `-${suffix}.spec.ts`));
+      suffix += 1;
+    }
+    fs.renameSync(source, target);
+    quarantinedFiles.push({
+      filename,
+      path: target,
+      reason: file?.reason || 'validation_failed',
+      stderr: file?.stderr || null,
+      stdout: file?.stdout || null,
+    });
+  }
+  return {
+    applied: quarantinedFiles.length > 0,
+    reason,
+    quarantineDir: quarantinedFiles.length > 0 ? quarantineDir : null,
+    quarantinedFiles,
+  };
+}
+
+async function salvageGeneratedTestValidation({
+  projectPath,
+  originalValidation = {},
+  validateGeneratedTests = true,
+  timeoutMs = 90000,
+  validator = validateGeneratedTestsWithList,
+  protectedSpecFiles = [],
+} = {}) {
+  const specFiles = listGeneratedTestFiles(projectPath);
+  const protectedSet = new Set((protectedSpecFiles || []).map((file) => path.basename(file)).filter(Boolean));
+  const event = {
+    attempted: false,
+    recovered: false,
+    status: 'not_attempted',
+    originalReason: originalValidation?.reason || null,
+    originalSpecCount: specFiles.length,
+    keptSpecFiles: [],
+    quarantinedSpecFiles: [],
+    invalidSpecFiles: [],
+    protectedSpecFiles: Array.from(protectedSet),
+    finalValidation: null,
+  };
+
+  if (!validateGeneratedTests || specFiles.length === 0 || !validationCanBeSalvaged(originalValidation)) {
+    return event;
+  }
+
+  event.attempted = true;
+  event.status = 'scanning_specs';
+  const perFileTimeout = Math.max(5000, Math.min(20000, Math.floor(timeoutMs / Math.max(1, specFiles.length))));
+  for (const filePath of specFiles) {
+    const filename = path.basename(filePath);
+    const relTarget = path.relative(projectPath, filePath).replace(/\\/g, '/');
+    const validation = await validator({
+      projectPath,
+      validateGeneratedTests,
+      timeoutMs: perFileTimeout,
+      testTarget: relTarget,
+    });
+    if (validation?.valid && Number(validation.listedCount || 0) > 0) {
+      event.keptSpecFiles.push({
+        filename,
+        listedCount: validation.listedCount || 0,
+      });
+    } else if (protectedSet.has(filename)) {
+      event.keptSpecFiles.push({
+        filename,
+        listedCount: 0,
+        protected: true,
+        validationWarning: {
+          reason: validation?.reason || 'validation_failed',
+          stderr: validation?.stderr || null,
+          stdout: validation?.stdout || null,
+        },
+      });
+    } else {
+      event.invalidSpecFiles.push({
+        filename,
+        reason: validation?.reason || 'validation_failed',
+        stderr: validation?.stderr || null,
+        stdout: validation?.stdout || null,
+      });
+    }
+  }
+
+  if (event.invalidSpecFiles.length === 0) {
+    const finalValidation = await validator({
+      projectPath,
+      validateGeneratedTests,
+      timeoutMs: Math.max(5000, timeoutMs),
+    });
+    event.finalValidation = finalValidation;
+    if (finalValidation?.valid) {
+      event.status = 'recovered';
+      event.recovered = true;
+    } else {
+      event.status = 'all_specs_valid_individually_but_batch_failed';
+    }
+    return event;
+  }
+
+  const quarantine = quarantineGeneratedSpecFilesByName({
+    projectPath,
+    files: event.invalidSpecFiles,
+    reason: 'validation_salvage',
+  });
+  event.quarantinedSpecFiles = quarantine.quarantinedFiles || [];
+
+  if (event.keptSpecFiles.length === 0) {
+    event.status = 'no_valid_specs_remaining';
+    return event;
+  }
+
+  const finalValidation = await validator({
+    projectPath,
+    validateGeneratedTests,
+    timeoutMs: Math.max(5000, timeoutMs),
+  });
+  event.finalValidation = finalValidation;
+  if (finalValidation?.valid) {
+    event.status = 'recovered';
+    event.recovered = true;
+  } else {
+    event.status = 'post_salvage_validation_failed';
+  }
+  return event;
 }
 
 /**
@@ -2816,14 +4584,14 @@ async function validateGeneratedTestsWithList({ projectPath, validateGeneratedTe
  * user sees only the generic "usually caused by missing test runner
  * dependencies" message with no way to diagnose further.
  */
-function buildPipelineDiagnostics({ projectPath, stage, reason, stderr, stdout, qualityAudit } = {}) {
-  const generatedDir = path.join(projectPath, 'tests', 'generated');
+function buildPipelineDiagnostics({ projectPath, stage, reason, stderr, stdout, qualityAudit, validationSalvage = null } = {}) {
+  const generatedDir = projectPath ? path.join(projectPath, 'tests', 'generated') : null;
   let firstSpecPreview = null;
   let generatedSpecCount = 0;
 
   try {
-    if (fs.existsSync(generatedDir)) {
-      const files = fs.readdirSync(generatedDir).filter((name) => /\.spec\.(ts|js)$/i.test(name));
+    if (generatedDir && fs.existsSync(generatedDir)) {
+      const files = fs.readdirSync(generatedDir).filter((name) => GENERATED_SPEC_FILE_PATTERN.test(name));
       generatedSpecCount = files.length;
       if (files.length > 0) {
         const firstPath = path.join(generatedDir, files[0]);
@@ -2855,8 +4623,12 @@ function buildPipelineDiagnostics({ projectPath, stage, reason, stderr, stdout, 
     stderr: truncate(stderr, 4000),
     stdout: truncate(stdout, 4000),
     firstSpecPreview,
-    generatedSpecCount,
+    generatedSpecCount: validationSalvage?.originalSpecCount || generatedSpecCount,
+    keptSpecCount: Array.isArray(validationSalvage?.keptSpecFiles) ? validationSalvage.keptSpecFiles.length : null,
+    quarantinedSpecCount: Array.isArray(validationSalvage?.quarantinedSpecFiles) ? validationSalvage.quarantinedSpecFiles.length : null,
+    validationSalvage,
     qualityAuditErrors: qualityAudit?.errors || null,
+    generationQuality: qualityAudit || null,
   };
 }
 
@@ -3066,16 +4838,190 @@ function extractGotoRoutes(content) {
   return routes.filter(Boolean);
 }
 
+function extractRouteForHashAudit(route) {
+  if (!route) return null;
+  try {
+    const parsed = new URL(route);
+    const raw = `${parsed.pathname || '/'}${parsed.hash || ''}`;
+    return raw || '/';
+  } catch {
+    const text = String(route).trim();
+    if (!text.startsWith('/')) return null;
+    return text.split('?')[0] || '/';
+  }
+}
+
 function normalizeRouteForAudit(route) {
   if (!route) return null;
   try {
     const parsed = new URL(route);
+    if (parsed.hash && parsed.hash.startsWith('#/')) {
+      return `${parsed.pathname || '/'}${parsed.hash.split('?')[0]}`;
+    }
     return parsed.pathname || '/';
   } catch {
     const text = String(route).trim();
     if (!text.startsWith('/')) return null;
-    return text.split(/[?#]/)[0] || '/';
+    const noQuery = text.split('?')[0] || '/';
+    if (noQuery.includes('#/')) return noQuery;
+    return noQuery.split('#')[0] || '/';
   }
+}
+
+function sourceLooksLikeAngularHashRouting(projectPath) {
+  const roots = ['src', 'app', 'client'];
+  const extensions = /\.(ts|tsx|js|jsx|mjs|cjs)$/i;
+  const ignored = new Set(['node_modules', 'dist', 'build', '.next', '.git', 'coverage']);
+  let scanned = 0;
+  const maxFiles = 500;
+
+  const walk = (dir) => {
+    if (scanned >= maxFiles) return false;
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return false; }
+    for (const entry of entries) {
+      if (scanned >= maxFiles) return false;
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (ignored.has(entry.name)) continue;
+        if (walk(full)) return true;
+      } else if (entry.isFile() && extensions.test(entry.name)) {
+        scanned += 1;
+        let content = '';
+        try { content = fs.readFileSync(full, 'utf-8'); } catch { continue; }
+        if (/withHashLocation\s*\(|HashLocationStrategy|useHash\s*:\s*true/i.test(content)) {
+          return true;
+        }
+      }
+    }
+    return false;
+  };
+
+  for (const root of roots) {
+    const full = path.join(projectPath, root);
+    if (fs.existsSync(full) && walk(full)) return true;
+  }
+  return false;
+}
+
+function projectSourceMatches(projectPath, pattern) {
+  if (!projectPath || !pattern) return false;
+  const roots = ['src', 'app', 'pages', 'components', 'client'];
+  const extensions = /\.(ts|tsx|js|jsx|vue|svelte|html)$/i;
+  const ignored = new Set(['node_modules', 'dist', 'build', '.next', '.git', 'coverage']);
+  let scanned = 0;
+  const maxFiles = 500;
+
+  const walk = (dir) => {
+    if (scanned >= maxFiles) return false;
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return false; }
+    for (const entry of entries) {
+      if (scanned >= maxFiles) return false;
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (ignored.has(entry.name)) continue;
+        if (walk(full)) return true;
+      } else if (entry.isFile() && extensions.test(entry.name)) {
+        scanned += 1;
+        let content = '';
+        try { content = fs.readFileSync(full, 'utf-8'); } catch { continue; }
+        if (pattern.test(content)) return true;
+      }
+    }
+    return false;
+  };
+
+  for (const root of roots) {
+    const full = path.join(projectPath, root);
+    if (fs.existsSync(full) && walk(full)) return true;
+  }
+  return false;
+}
+
+function extractLiteralEmailStrings(content) {
+  const emails = [];
+  for (const match of String(content || '').matchAll(/['"`]([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})['"`]/gi)) {
+    emails.push(match[1]);
+  }
+  return [...new Set(emails)];
+}
+
+function buildAllowedCredentialLiteralSets(roles = []) {
+  const emails = new Set();
+  const passwords = new Set();
+  for (const role of Array.isArray(roles) ? roles : []) {
+    if (role?.username) emails.add(String(role.username).toLowerCase());
+    if (role?.password) passwords.add(String(role.password));
+  }
+  return { emails, passwords };
+}
+
+function hasAuthTag(content) {
+  return /@auth|@tierB/i.test(String(content || ''));
+}
+
+function looksLikeCartAssertionWithoutSetup(blockContent) {
+  const text = String(blockContent || '');
+  const goesDirectlyToCart = /page\.goto\(\s*['"`][^'"`]*\/cart(?:[?#][^'"`]*)?['"`]\s*\)/i.test(text);
+  const assertsFilledCart = /subtotal|order\s+total|checkout|line\s+item|cart\s+total/i.test(text);
+  const hasSetup = /add\s+to\s+cart|cart\/items|\/api\/cart|request\.(?:post|put|patch)\(|localStorage\.setItem|sessionStorage\.setItem/i.test(text);
+  return goesDirectlyToCart && assertsFilledCart && !hasSetup;
+}
+
+function looksLikeAuthGatedReviewWithoutAuth(blockContent) {
+  const text = String(blockContent || '');
+  if (hasAuthTag(text)) return false;
+  return /#rating|getByLabel\([^)]*rating|getByRole\([^)]*(?:review|rating)|leave\s+a\s+review|submit\s+review/i.test(text);
+}
+
+function looksLikeAuthStateNavMismatch(blockContent) {
+  const text = String(blockContent || '');
+  const assertsUnauthedNav =
+    /getByRole\(\s*['"`](?:link|button)['"`]\s*,\s*\{[^}]*name\s*:\s*(?:\/[^/]*(?:log\s*in|login|sign\s*up|signup|create\s+account)[^/]*\/[a-z]*|['"`][^'"`]*(?:log\s*in|login|sign\s*up|signup|create\s+account)[^'"`]*['"`])/i.test(text);
+  if (hasAuthTag(text) && assertsUnauthedNav) return true;
+
+  const assertsAuthedNav =
+    /getByRole\(\s*['"`](?:link|button)['"`]\s*,\s*\{[^}]*name\s*:\s*(?:\/[^/]*(?:logout|log\s*out|sign\s*out)[^/]*\/[a-z]*|['"`][^'"`]*(?:logout|log\s*out|sign\s*out)[^'"`]*['"`])/i.test(text);
+  const establishesAuth =
+    hasAuthTag(text) ||
+    /storageState|\/api\/(?:auth\/)?(?:login|signin|session)|getByRole\([^)]*(?:log\s*in|login|sign\s*in)[\s\S]{0,260}\.click\(/i.test(text);
+  return assertsAuthedNav && !establishesAuth;
+}
+
+function looksLikeExactCartAccessibleNameAssertion(blockContent) {
+  const text = String(blockContent || '');
+  return /getByRole\(\s*['"`]link['"`]\s*,\s*\{[^}]*name\s*:\s*['"`]Cart['"`][^}]*\bexact\s*:\s*true/i.test(text);
+}
+
+function looksLikeCompressedHeadingWhitespaceAssertion(blockContent) {
+  const text = String(blockContent || '');
+  for (const match of text.matchAll(/getByRole\(\s*['"`]heading['"`]\s*,\s*\{[\s\S]{0,240}\bname\s*:\s*(['"`])([^'"`]+)\1/gi)) {
+    const name = match[2] || '';
+    if (/,[A-Za-z0-9]/.test(name)) return true;
+  }
+  return false;
+}
+
+function looksLikeIncompleteProductCreateSuccessAssertion(blockContent) {
+  const text = String(blockContent || '');
+  if (!/request\.post\(\s*['"`][^'"`]*\/api\/products(?:[/?#][^'"`]*)?['"`]/i.test(text)) return false;
+  if (!/(?:expect\(\s*\[\s*200\s*,\s*201\s*\]\s*\)\.toContain|toBe\(\s*20[01]\s*\)|toBeOK\(\s*\))/i.test(text)) return false;
+  const hasRequiredProductFields =
+    /\btitle\s*:/i.test(text) &&
+    /\bdescription\s*:/i.test(text) &&
+    /\bcategory\s*:/i.test(text) &&
+    /\bpriceCents\s*:/i.test(text);
+  return !hasRequiredProductFields;
+}
+
+function looksLikeUnprovenMissingCollectionError(content) {
+  const text = String(content || '');
+  const targetsMissingCollection =
+    /request\.get\(\s*['"`][^'"`]*\/api\/[a-z0-9_-]+s\/(?:nonexistent|missing|unknown|invalid|does-not-exist|999999|000000)/i.test(text) ||
+    /request\.get\(\s*`[^`]*\/api\/[a-z0-9_-]+s\/\$\{[^}]*nonexistent[^}]*\}[^`]*`/i.test(text);
+  const requires4xx = /toBeGreaterThanOrEqual\(\s*400\s*\)|toBeLessThan\(\s*500\s*\)|toBe\(\s*(?:400|404|422)\s*\)|status\(\)\)\.not\.toBe\(\s*200\s*\)/i.test(text);
+  return targetsMissingCollection && requires4xx;
 }
 
 function isIntentionalUnknownRouteTest(content, fileName) {
@@ -3083,7 +5029,155 @@ function isIntentionalUnknownRouteTest(content, fileName) {
   return /\b(not[- ]?found|404|invalid route|unknown route|error state|cat:error)\b/.test(text);
 }
 
-function auditGeneratedTestQuality({ projectPath, testType, context, explorationArtifact = null }) {
+function extractSourceRefsFromContent(content) {
+  const refs = [];
+  for (const match of String(content || '').matchAll(/\[SRC:([^\]]+)\]/gi)) {
+    const ref = String(match[1] || '').trim();
+    if (ref) refs.push(ref);
+  }
+  return [...new Set(refs)];
+}
+
+function extractAssertedLiteralText(content) {
+  const text = String(content || '');
+  const values = [];
+  const patterns = [
+    /getByRole\(\s*['"`][^'"`]+['"`]\s*,\s*\{[\s\S]{0,320}?\bname\s*:\s*(['"`])([^'"`\n]{2,160})\1/gi,
+    /getByText\(\s*(['"`])([^'"`\n]{2,160})\1/gi,
+    /getByLabel\(\s*(['"`])([^'"`\n]{2,160})\1/gi,
+    /getByPlaceholder\(\s*(['"`])([^'"`\n]{2,160})\1/gi,
+  ];
+  for (const pattern of patterns) {
+    for (const match of text.matchAll(pattern)) {
+      const value = String(match[2] || '').replace(/\s+/g, ' ').trim();
+      if (value) values.push(value);
+    }
+  }
+  return [...new Set(values)];
+}
+
+function sourceFileContainsLiteral(projectPath, sourceRef, literal) {
+  try {
+    const cleanRef = String(sourceRef || '').replace(/^\/+/, '');
+    const sourcePath = path.resolve(projectPath, cleanRef);
+    if (!sourcePath.startsWith(path.resolve(projectPath))) return false;
+    if (!fs.existsSync(sourcePath) || !fs.statSync(sourcePath).isFile()) return false;
+    const content = fs.readFileSync(sourcePath, 'utf-8');
+    return normalizeTextForAudit(content).includes(normalizeTextForAudit(literal));
+  } catch {
+    return false;
+  }
+}
+
+function readSourceReferenceContents(projectPath, sourceRefs = []) {
+  const contents = [];
+  const root = path.resolve(projectPath || '.');
+  for (const sourceRef of sourceRefs || []) {
+    try {
+      const cleanRef = String(sourceRef || '').replace(/^\/+/, '');
+      if (!cleanRef) continue;
+      const sourcePath = path.resolve(root, cleanRef);
+      if (!sourcePath.startsWith(root)) continue;
+      if (!fs.existsSync(sourcePath) || !fs.statSync(sourcePath).isFile()) continue;
+      contents.push(fs.readFileSync(sourcePath, 'utf-8'));
+    } catch {
+      // best-effort source grounding
+    }
+  }
+  return contents;
+}
+
+function sourceHasRoleName(projectPath, sourceRefs = [], role, literal) {
+  const normalizedRole = String(role || '').toLowerCase();
+  const text = String(literal || '').replace(/\s+/g, ' ').trim();
+  if (!normalizedRole || !text) return true;
+  const contents = readSourceReferenceContents(projectPath, sourceRefs);
+  if (contents.length === 0) return true;
+  const escaped = escapeRegExp(text);
+  const roleTags = {
+    link: ['a', 'Link'],
+    button: ['button', 'Button'],
+    heading: ['h1', 'h2', 'h3', 'h4', 'h5', 'h6'],
+  }[normalizedRole];
+  if (!roleTags) return true;
+
+  for (const content of contents) {
+    for (const tag of roleTags) {
+      const elementWithLiteral = new RegExp(`<${tag}\\b[\\s\\S]{0,600}(?:aria-label\\s*=\\s*["'\`]${escaped}["'\`]|>[\\s\\S]{0,500}${escaped}[\\s\\S]{0,120}<\\/${tag}>)`, 'i');
+      if (elementWithLiteral.test(content)) return true;
+      const dynamicElement = new RegExp(`<${tag}\\b[\\s\\S]{0,500}>[\\s\\S]{0,500}\\{[^}]+\\}[\\s\\S]{0,160}<\\/${tag}>`, 'i');
+      if (dynamicElement.test(content) && normalizeTextForAudit(content).includes(normalizeTextForAudit(text))) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function extractCssSelectorStrings(content) {
+  const selectors = [];
+  for (const match of String(content || '').matchAll(/(?:\bpage|\bform|[A-Za-z_$][\w$]*)\.locator\(\s*(['"`])([^'"`]{1,220})\1/g)) {
+    const selector = String(match[2] || '').trim();
+    if (selector) selectors.push(selector);
+  }
+  return selectors;
+}
+
+function sourceHasCssSelectorToken(projectPath, sourceRefs = [], tokenType, token) {
+  const text = String(token || '').trim();
+  if (!text) return true;
+  const contents = readSourceReferenceContents(projectPath, sourceRefs);
+  if (contents.length === 0) return true;
+  const escaped = escapeRegExp(text);
+  for (const content of contents) {
+    if (tokenType === 'id') {
+      if (new RegExp(`\\bid\\s*=\\s*["'\`]${escaped}["'\`]`, 'i').test(content)) return true;
+      if (new RegExp(`\\bhtmlFor\\s*=\\s*["'\`]${escaped}["'\`]`, 'i').test(content)) return true;
+    }
+    if (tokenType === 'class') {
+      if (new RegExp(`\\b(?:className|class)\\s*=\\s*["'\`][^"'\`]*\\b${escaped}\\b`, 'i').test(content)) return true;
+      if (new RegExp(`\\b(?:className|class)\\s*=\\s*\\{[^}]*["'\`][^"'\`]*\\b${escaped}\\b`, 'i').test(content)) return true;
+    }
+  }
+  return false;
+}
+
+function findContextualSelectorIssues({ projectPath, blockContent } = {}) {
+  const block = String(blockContent || '');
+  const sourceRefs = extractSourceRefsFromContent(block);
+  if (sourceRefs.length === 0) return [];
+  const issues = [];
+
+  for (const match of block.matchAll(/getByRole\(\s*['"`]([^'"`]+)['"`]\s*,\s*\{[\s\S]{0,320}?\bname\s*:\s*(['"`])([^'"`\n]{2,160})\2/gi)) {
+    const role = match[1];
+    const name = match[3];
+    if (!sourceHasRoleName(projectPath, sourceRefs, role, name)) {
+      issues.push(`role:${role}:${name}`);
+    }
+  }
+
+  for (const selector of extractCssSelectorStrings(block)) {
+    if (/^\s*(?:form|main|nav|body|html|section|article|header|footer|button|input|select|textarea)(?:\b|$)/i.test(selector) && !/[.#]/.test(selector)) {
+      continue;
+    }
+    for (const idMatch of selector.matchAll(/#([A-Za-z_][\w-]*)/g)) {
+      const id = idMatch[1];
+      if (!sourceHasCssSelectorToken(projectPath, sourceRefs, 'id', id)) {
+        issues.push(`css-id:#${id}`);
+      }
+    }
+    for (const classMatch of selector.matchAll(/\.([A-Za-z_][\w-]*)/g)) {
+      const className = classMatch[1];
+      if (!sourceHasCssSelectorToken(projectPath, sourceRefs, 'class', className)) {
+        issues.push(`css-class:.${className}`);
+      }
+    }
+  }
+
+  return [...new Set(issues)];
+}
+
+function auditGeneratedTestQuality({ projectPath, testType, context, explorationArtifact = null, roles = [] }) {
   const generatedDir = path.join(projectPath, 'tests', 'generated');
   const apiEndpointCount = effectiveApiEndpoints(context).length;
   Logger.info('PipelineWorker', `[QUALITY AUDIT] Starting audit — testType=${testType} apiEndpoints=${apiEndpointCount} dir=${generatedDir}`);
@@ -3106,7 +5200,14 @@ function auditGeneratedTestQuality({ projectPath, testType, context, exploration
     invalidSourceReferenceFiles: [],
     ungroundedSelectorFiles: [],
     ungroundedRouteFiles: [],
+    ungroundedApiEndpointFiles: [],
     brittlePatternFiles: [],
+    sourceMismatchFiles: [],
+    authGatingFiles: [],
+    qaContractSummary: summarizeQaContracts(context?.qaContracts || {}),
+    qaContractCoverage: null,
+    qaContractWarnings: [],
+    qaContractQuestions: buildQaContractQuestions(context?.qaContracts || {}),
     errors: [],
     warnings: [],
   };
@@ -3117,7 +5218,7 @@ function auditGeneratedTestQuality({ projectPath, testType, context, exploration
     return { valid: false, ...summary };
   }
 
-  const files = fs.readdirSync(generatedDir).filter((name) => /\.spec\.(ts|js)$/i.test(name));
+  const files = fs.readdirSync(generatedDir).filter((name) => GENERATED_SPEC_FILE_PATTERN.test(name));
   summary.totalFiles = files.length;
   Logger.info('PipelineWorker', `[QUALITY AUDIT] Found ${files.length} spec file(s): ${files.join(', ') || '(none)'}`);
 
@@ -3140,14 +5241,24 @@ function auditGeneratedTestQuality({ projectPath, testType, context, exploration
   const staleMonthAfterNavigationPattern = /getByRole\(\s*['"`]button['"`]\s*,\s*\{[^}]*name\s*:\s*['"`](?:Next Month|Previous Month)['"`][^}]*\}\s*\)\.click\(\)[\s\S]{0,1400}(?:getByRole\(\s*['"`]heading['"`][\s\S]{0,300}name\s*:\s*['"`](?:May 2026|Showing May 2026|May 2026\s*—\s*Monthly View)['"`]|toHaveText\(\s*['"`](?:May 2026|Showing May 2026|May 2026\s*—\s*Monthly View)['"`])/i;
   const resetThenAddWidgetPattern = /getByRole\(\s*['"`]button['"`]\s*,\s*\{[^}]*name\s*:\s*['"`]Reset Layout['"`][^}]*\}\s*\)\.click\(\)[\s\S]{0,800}getByRole\(\s*['"`]button['"`]\s*,\s*\{[^}]*name\s*:\s*['"`]Add widget['"`][^}]*\}\s*\)/i;
   const inventedDueLabelPattern = /getByText\(\s*['"`]Due:\s*(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\b[^'"`]*['"`]/i;
-  const ambiguousSingleWordTextPattern = /getByText\(\s*['"`](?:Standup|Planning|Review)['"`]\s*\)/i;
+  const ambiguousSingleWordTextPattern = /getByText\(\s*['"`](?:All|Standup|Planning|Review)['"`]\s*\)/i;
   const roleNameRegexPattern = /getByRole\(\s*['"`][^'"`]+['"`]\s*,\s*\{[\s\S]{0,320}?\bname\s*:\s*\/([^/\n]{12,220})\/[a-z]*/gi;
+  const logoutAsLinkPattern = /getByRole\(\s*['"`]link['"`]\s*,\s*\{[^}]*name\s*:\s*(?:['"`]Logout['"`]|\/logout\/i?)\s*[^}]*\}/i;
+  const hardcodedPasswordLiteralPattern = /(?:password|passwd|pwd)\s*:\s*['"`]([^'"`]{4,})['"`]|getBy(?:Label|Placeholder|Role)\([^)]*(?:password|passwd|pwd)[^)]*\)\s*\.\s*(?:fill|type)\(\s*['"`]([^'"`]{4,})['"`]\s*\)/gi;
   const riskyUiPattern = /page\.pause\(/i;
   const riskyPhrasesPattern = /(invalid credentials|email is required|password is required|network error|try again|not found|does not exist|cannot find)/gi;
+  const strictConsoleErrorsPattern = /expect\(\s*\w*(?:console)?errors\w*\s*\)\.toEqual\(\s*\[\s*\]\s*\)/i;
+  const strictConsolePollPattern = /page\.on\(\s*['"`]console['"`][\s\S]{0,600}msg\.type\(\)\s*={2,3}\s*['"`]error['"`][\s\S]{0,1000}expect\.poll\(\s*\(\)\s*=>\s*\w*(?:errors?)\w*\.length[\s\S]{0,180}\)\.toBe\(\s*0\s*\)/i;
+  const dynamicDetailLinkPattern = /locator\(\s*(['"`])(?:(?!\1)[\s\S]){0,220}href\*=["']\/(shop|products?|items?|posts?|articles?|orders?)\/(?:(?!\1)[\s\S]){0,220}\1\s*\)\.first\(\)[\s\S]{0,700}(?:toHaveAttribute|getAttribute|click)\s*\(/i;
   const enforcePhraseRiskGates = String(process.env.HEALIX_ENFORCE_PHRASE_RISK_GATES || '').toLowerCase() === 'true';
   const knownCorpus = new Set();
   const sourceCorpus = extractSourceLiteralCorpus(projectPath);
   const { corpus: knownUiCorpus, sourceFiles } = buildKnownUiCorpus({ projectPath, context, explorationArtifact });
+  const hashRoutingDetected =
+    sourceLooksLikeAngularHashRouting(projectPath) ||
+    Boolean(context?.sourceContext?.routingMode === 'hash') ||
+    [...(context?.sourceContext?.routePaths || [])].some((route) => String(route).includes('#/'));
+  const allowedCredentialLiterals = buildAllowedCredentialLiteralSets(roles);
   const knownRoutes = new Set(['/']);
   for (const route of explorationArtifact?.routes || context?.routes || []) {
     const normalizedRoute = normalizeRouteForAudit(route?.path);
@@ -3161,6 +5272,16 @@ function auditGeneratedTestQuality({ projectPath, testType, context, exploration
     const normalizedRoute = normalizeRouteForAudit(routePath);
     if (normalizedRoute) knownRoutes.add(normalizedRoute);
   }
+  const protectedRoutes = new Set();
+  const observedConcreteRoutes = new Set();
+  for (const route of explorationArtifact?.routes || []) {
+    const normalizedRoute = normalizeRouteForAudit(route?.path);
+    if (normalizedRoute && !/[:[]/.test(normalizedRoute)) observedConcreteRoutes.add(normalizedRoute);
+    if (route?.requiresAuth === true) {
+      if (normalizedRoute) protectedRoutes.add(normalizedRoute);
+    }
+  }
+  const verifiedRoleCount = (roles || []).filter((r) => r && r.loginVerified && r.storageStatePath).length;
 
   const recordBrittlePattern = (type, name) => {
     summary.brittlePatternFiles.push(name);
@@ -3221,6 +5342,7 @@ function auditGeneratedTestQuality({ projectPath, testType, context, exploration
   (context?.selectorHints || []).forEach(collectKnownText);
 
   let uiFilesWithPreferredSelectors = 0;
+  const generatedContents = [];
 
   for (const name of files) {
     const fullPath = path.join(generatedDir, name);
@@ -3231,13 +5353,79 @@ function auditGeneratedTestQuality({ projectPath, testType, context, exploration
       summary.warnings.push(`failed_to_read:${name}`);
       continue;
     }
+    generatedContents.push(content);
+
+    if (/^fallback-|^template-/i.test(name) || /Fallback (frontend|workflow|API|checks)|fallbackReason|template fallback/i.test(content)) {
+      summary.errors.push(`fallback_or_template_spec:${name}`);
+    }
 
     const fileTests = countTestsInContent(content);
-    const fileSkippedTests = Math.min(countSkippedTestsInContent(content), fileTests);
+    const fileSkippedTests = Math.min(countSkippedTestsForGeneratedFile(content, name), fileTests);
     summary.totalTests += fileTests;
     summary.skippedTests += fileSkippedTests;
 
     const isApiFile = /request\.(get|post|put|patch|delete|fetch)\(/i.test(content) || /api/i.test(name);
+    const literalEmails = extractLiteralEmailStrings(content)
+      .filter((email) => !/example\.invalid$/i.test(email))
+      .filter((email) => !allowedCredentialLiterals.emails.has(String(email).toLowerCase()));
+    const literalPasswords = [];
+    for (const match of content.matchAll(hardcodedPasswordLiteralPattern)) {
+      const password = match[1] || match[2];
+      if (!password) continue;
+      if (allowedCredentialLiterals.passwords.has(String(password))) continue;
+      if (/invalid|wrong|bad|fake|placeholder|not-real/i.test(password)) continue;
+      literalPasswords.push(password);
+    }
+    if (
+      literalEmails.length > 0 &&
+      (
+        literalPasswords.length > 0 ||
+        /\/api\/(?:auth\/)?(?:login|signin|session)|getByRole\([^)]*(?:login|log in|sign in)|password/i.test(content)
+      )
+    ) {
+      summary.errors.push(`hardcoded_unverified_credentials:${name}:${literalEmails.slice(0, 3).join('|')}`);
+      summary.riskyFiles.push(name);
+    }
+
+    const isDeterministicQaContractFile = name === 'healix-qa-contracts.spec.ts' || /\[QAC:[^\]]+\]/.test(content);
+    const generatedBlocks = findGeneratedTestBlocks(content);
+    const contextualSelectorIssueBlocks = generatedBlocks
+      .map((block) => ({
+        block,
+        issues: findContextualSelectorIssues({ projectPath, blockContent: block.content }),
+      }))
+      .filter((entry) => entry.issues.length > 0);
+    if (contextualSelectorIssueBlocks.length > 0) {
+      recordBrittlePattern('brittle_source_selector_mismatch', name);
+      summary.errors.push(
+        `brittle_source_selector_mismatch:${name}:${contextualSelectorIssueBlocks
+          .flatMap((entry) => entry.issues)
+          .slice(0, 4)
+          .join('|')}`
+      );
+    }
+
+    if (generatedBlocks.some((block) => looksLikeCartAssertionWithoutSetup(block.content))) {
+      recordBrittlePattern('brittle_cart_state_without_add_item_setup', name);
+    }
+
+    if (generatedBlocks.some((block) => looksLikeAuthGatedReviewWithoutAuth(block.content))) {
+      summary.authGatingFiles.push(name);
+      summary.errors.push(`auth_gated_review_form_without_auth_tag:${name}`);
+    }
+
+    if (generatedBlocks.some((block) => looksLikeAuthStateNavMismatch(block.content))) {
+      recordBrittlePattern('brittle_auth_state_nav_mismatch', name);
+    }
+
+    if (generatedBlocks.some((block) => looksLikeExactCartAccessibleNameAssertion(block.content))) {
+      recordBrittlePattern('brittle_exact_cart_accessible_name', name);
+    }
+
+    if (generatedBlocks.some((block) => looksLikeCompressedHeadingWhitespaceAssertion(block.content))) {
+      recordBrittlePattern('brittle_compressed_heading_whitespace', name);
+    }
+
     if (isApiFile) {
       summary.apiFiles += 1;
       const burstMatch = /Promise\.all|HEALIX_API_STRESS_BURST|burst|p95|percentile/i.test(content);
@@ -3246,6 +5434,23 @@ function auditGeneratedTestQuality({ projectPath, testType, context, exploration
         Logger.info('PipelineWorker', `[QUALITY AUDIT]   ${name} → API file ✅ burst coverage detected`);
       } else {
         Logger.warn('PipelineWorker', `[QUALITY AUDIT]   ${name} → API file ⚠️  NO burst coverage (need Promise.all|HEALIX_API_STRESS_BURST|burst|p95|percentile)`);
+      }
+      if (looksLikeUnprovenMissingCollectionError(content)) {
+        recordBrittlePattern('brittle_unproven_collection_missing_id_status', name);
+      }
+      const ungroundedApiEndpoints = findUngroundedApiRequests(content, context);
+      if (ungroundedApiEndpoints.length > 0) {
+        summary.ungroundedApiEndpointFiles.push({
+          file: name,
+          endpoints: ungroundedApiEndpoints.slice(0, 8),
+        });
+        summary.errors.push(`ungrounded_api_endpoint:${name}:${ungroundedApiEndpoints.slice(0, 4).join('|')}`);
+      }
+      if (
+        generatedBlocks.some((block) => looksLikeIncompleteProductCreateSuccessAssertion(block.content)) &&
+        projectSourceMatches(projectPath, /missing_fields[\s\S]{0,800}(title|description|category|priceCents)|priceCents[\s\S]{0,800}missing_fields/i)
+      ) {
+        recordBrittlePattern('brittle_incomplete_product_create_payload', name);
       }
     } else {
       summary.uiFiles += 1;
@@ -3262,7 +5467,7 @@ function auditGeneratedTestQuality({ projectPath, testType, context, exploration
             if (sourceHits >= 2) break;
           }
         }
-        if (sourceHits === 0 && fileTests > 0) {
+        if (sourceHits === 0 && fileTests > 0 && !isDeterministicQaContractFile) {
           summary.ungroundedUiFiles.push(name);
         }
       }
@@ -3309,8 +5514,83 @@ function auditGeneratedTestQuality({ projectPath, testType, context, exploration
         summary.errors.push(`ungrounded_route:${name}:${[...new Set(unknownRoutes)].slice(0, 3).join('|')}`);
       }
 
+      if (hashRoutingDetected) {
+        const hashRouteErrors = extractGotoRoutes(content)
+          .map((route) => ({ raw: extractRouteForHashAudit(route), normalized: normalizeRouteForAudit(route) }))
+          .filter((entry) =>
+            entry.raw &&
+            entry.normalized &&
+            /^\/admin\//i.test(entry.raw) &&
+            !entry.raw.includes('#/') &&
+            entry.normalized !== '/admin/login'
+          );
+        if (hashRouteErrors.length > 0) {
+          summary.ungroundedRouteFiles.push({
+            file: name,
+            routes: hashRouteErrors.map((entry) => entry.raw).slice(0, 5),
+          });
+          summary.errors.push(`hash_route_without_hash_fragment:${name}:${hashRouteErrors.map((entry) => entry.raw).slice(0, 3).join('|')}`);
+        }
+      }
+
       if (routeMockPattern.test(content)) {
         summary.warnings.push(`uses_route_mocking:${name}`);
+      }
+
+      if (strictConsoleErrorsPattern.test(content) || strictConsolePollPattern.test(content)) {
+        recordBrittlePattern('brittle_strict_console_errors_assertion', name);
+      }
+
+      const dynamicDetailMatch = content.match(dynamicDetailLinkPattern);
+      if (dynamicDetailMatch) {
+        const rawPrefix = String(dynamicDetailMatch[2] || '').replace(/\?$/, '');
+        const prefix = `/${rawPrefix}/`;
+        const hasObservedDetailRoute = [...observedConcreteRoutes].some((route) => route.startsWith(prefix) && route.length > prefix.length);
+        if (!hasObservedDetailRoute) {
+          recordBrittlePattern('brittle_unobserved_dynamic_detail_link_assertion', name);
+        }
+      }
+
+      if (protectedRoutes.size > 0 && verifiedRoleCount === 0) {
+        const unsafeBlocks = findGeneratedTestBlocks(content).filter((block) => {
+          const blockRoutes = extractGotoRoutes(block.content)
+            .map(normalizeRouteForAudit)
+            .filter(Boolean);
+          if (!blockRoutes.some((route) => protectedRoutes.has(route))) return false;
+          if (/\btest\.skip\s*\(/.test(block.content) || /@auth|@tierB/i.test(block.content)) return false;
+          const expectsProtectedDestination = [...protectedRoutes].some((route) => {
+            const escaped = route.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\\\/$/, '');
+            return new RegExp(`toHaveURL\\([\\s\\S]{0,160}${escaped}`, 'i').test(block.content);
+          });
+          const claimsAuthenticatedSuccess = /\b(positive\s+auth|authenticated|signed[- ]?in|admin\s+(?:dashboard|panel)|role[- ]?based\s+redirect)/i.test(block.content);
+          return expectsProtectedDestination || claimsAuthenticatedSuccess;
+        });
+        if (unsafeBlocks.length > 0) {
+          summary.authGatingFiles.push(name);
+          summary.errors.push(`unblocked_protected_route_without_credentials:${name}:${unsafeBlocks.length}`);
+        }
+      }
+
+      if (protectedRoutes.size > 0 && verifiedRoleCount > 0) {
+        const untaggedAuthBlocks = findGeneratedTestBlocks(content).filter((block) => {
+          const blockRoutes = extractGotoRoutes(block.content)
+            .map(normalizeRouteForAudit)
+            .filter(Boolean);
+          if (!blockRoutes.some((route) => protectedRoutes.has(route))) return false;
+          if (hasAuthTag(block.content) || /\btest\.skip\s*\(/.test(block.content)) return false;
+          return true;
+        });
+        if (untaggedAuthBlocks.length > 0) {
+          summary.authGatingFiles.push(name);
+          summary.errors.push(`protected_route_missing_auth_tag:${name}:${untaggedAuthBlocks.length}`);
+        }
+      }
+
+      if (
+        logoutAsLinkPattern.test(content) &&
+        projectSourceMatches(projectPath, /<button[\s\S]{0,300}Logout|button[\s\S]{0,160}Logout|Logout[\s\S]{0,160}<\/button>/i)
+      ) {
+        recordBrittlePattern('brittle_logout_role_mismatch_link_vs_button', name);
       }
 
       if (checkValidityPattern.test(content)) {
@@ -3351,6 +5631,21 @@ function auditGeneratedTestQuality({ projectPath, testType, context, exploration
 
       if (ambiguousSingleWordTextPattern.test(content)) {
         recordBrittlePattern('brittle_ambiguous_single_word_text', name);
+      }
+
+      for (const block of findGeneratedTestBlocks(content)) {
+        if (!/(?:\bmain\b|page\.locator\(\s*['"`]main['"`]\s*\))/.test(block.content)) continue;
+        const sourceRefs = extractSourceRefsFromContent(block.content);
+        if (sourceRefs.length === 0) continue;
+        const mismatched = extractAssertedLiteralText(block.content)
+          .filter((literal) => literal.length >= 3)
+          .filter((literal) => /^[A-Z][A-Z0-9 _&.-]{2,}$/.test(literal))
+          .filter((literal) => !sourceRefs.some((sourceRef) => sourceFileContainsLiteral(projectPath, sourceRef, literal)));
+        if (mismatched.length > 0) {
+          summary.sourceMismatchFiles.push(name);
+          summary.errors.push(`assertion_not_in_declared_source:${name}:${mismatched.slice(0, 3).join('|')}`);
+          break;
+        }
       }
 
       const exactCountMatches = [...content.matchAll(exactCountPattern)];
@@ -3458,6 +5753,23 @@ function auditGeneratedTestQuality({ projectPath, testType, context, exploration
     summary.errors.push(`ungrounded_ui_files:${summary.ungroundedUiFiles.slice(0, 5).join(',')}`);
   }
 
+  const qaCoverage = auditQaContractCoverage({
+    context,
+    roles,
+    contents: generatedContents,
+    testType,
+  });
+  summary.qaContractSummary = qaCoverage.summary;
+  summary.qaContractCoverage = qaCoverage;
+  summary.qaContractWarnings = qaCoverage.warnings || [];
+  summary.qaContractQuestions = qaCoverage.questions || [];
+  for (const warning of summary.qaContractWarnings) {
+    summary.warnings.push(`${warning.code}:${warning.contractId}`);
+  }
+  for (const missingContractId of qaCoverage.missing || []) {
+    summary.errors.push(`missing_qa_contract_coverage:${missingContractId}`);
+  }
+
   summary.riskyFiles = [...new Set(summary.riskyFiles)];
   summary.ungroundedUiFiles = [...new Set(summary.ungroundedUiFiles)];
   summary.missingSourceReferenceFiles = [...new Set(summary.missingSourceReferenceFiles)];
@@ -3491,7 +5803,7 @@ function installMissingDependencies(projectPath, testsDir) {
   };
 
   // Scan generated test files for imports
-  const testFiles = fs.readdirSync(testsDir).filter(f => /\.spec\.(ts|js)$/i.test(f));
+  const testFiles = fs.readdirSync(testsDir).filter(f => GENERATED_SPEC_FILE_PATTERN.test(f));
   const missingDeps = new Set();
 
   testFiles.forEach(file => {
@@ -3812,6 +6124,335 @@ async function maybeGenerateViaSaaS({
   });
 }
 
+async function maybeRunCoverageTopUp({
+  client,
+  sharedPayload,
+  testsDir,
+  usedFilenames,
+  files,
+  config,
+  runBudget = null,
+  statusDir = null,
+  runId = null,
+  telemetryReporter = null,
+  sourceTag = 'saas-topup',
+}) {
+  const before = collectGenerationQuality(config.projectPath, {
+    baseURL: config.baseURL || sharedPayload?.projectInfo?.baseURL,
+  });
+  const decision = shouldAttemptCoverageTopUp({ config, quality: before });
+  if (!decision.attempt) return null;
+
+  const remainingMs = getStageBudgetRemainingMs(runBudget, 'generation');
+  if (Number.isFinite(remainingMs) && remainingMs < 90_000) {
+    return {
+      attempted: false,
+      status: 'skipped_budget',
+      topUpStatus: 'skipped_budget',
+      reason: 'generation_budget_too_low',
+      before,
+      target: decision.target,
+      minimumUsefulRunnableFloor: decision.minimumUsefulRunnableFloor,
+    };
+  }
+
+  const requestedAdditional = Math.max(
+    5,
+    Math.min(20, decision.target - before.totalTests),
+  );
+  const routeAccessSummary = buildRouteAccessSummary(sharedPayload?.explorationArtifact || null);
+  const existingSuiteManifest = buildExistingSuiteManifest({
+    projectPath: config.projectPath,
+    context: sharedPayload?.context || {},
+    roles: sharedPayload?.roles || [],
+    testType: sharedPayload?.testType || config.testType,
+    quality: before,
+    routeAccessSummary,
+  });
+  let preTopUpAudit = null;
+  try {
+    preTopUpAudit = auditGeneratedTestQuality({
+      projectPath: config.projectPath,
+      testType: config.testType,
+      context: sharedPayload?.context || {},
+      explorationArtifact: sharedPayload?.explorationArtifact || null,
+      roles: sharedPayload?.roles || [],
+    });
+  } catch (auditErr) {
+    Logger.warn('PipelineWorker', 'Pre-top-up quality audit failed (non-fatal)', {
+      reason: auditErr?.message,
+    });
+  }
+  const feedbackContext = buildGenerationRepairContext({
+    context: sharedPayload?.context || {},
+    error: {
+      code: 'MIN_TEST_COUNT_NOT_MET',
+      message: `Generated ${before.totalTests} tests below target ${decision.target}; running one bounded coverage top-up.`,
+    },
+    quality: {
+      ...before,
+      minGeneratedTestsTarget: decision.target,
+      minGeneratedTests: decision.target,
+      minimumUsefulRunnableFloor: decision.minimumUsefulRunnableFloor,
+      adaptiveRunnableFloor: decision.minimumUsefulRunnableFloor,
+      missingCategories: preTopUpAudit?.missingCategories || before.missingCategories || [],
+      errors: [
+        ...(Array.isArray(preTopUpAudit?.errors) ? preTopUpAudit.errors : []),
+        ...(Array.isArray(preTopUpAudit?.warnings) ? preTopUpAudit.warnings : []),
+      ],
+    },
+    routeAccessSummary,
+    attempt: 1,
+    testType: sharedPayload?.testType,
+    existingSuiteManifest,
+    mode: 'coverage_top_up_delta',
+  });
+
+  if (statusDir) {
+    updateStatus(statusDir, 'generation_top_up', {
+      runId,
+      message: `Generated ${before.runnableTests}/${decision.target} runnable tests; requesting one focused coverage top-up...`,
+      target: decision.target,
+      minimumUsefulRunnableFloor: decision.minimumUsefulRunnableFloor,
+      runnableTests: before.runnableTests,
+      totalTests: before.totalTests,
+      missingTargets: existingSuiteManifest.missing,
+    }, telemetryReporter);
+  }
+
+  const event = {
+    attempted: true,
+    status: 'started',
+    reason: decision.reason,
+    requestedAdditional,
+    before,
+    target: decision.target,
+    minimumUsefulRunnableFloor: decision.minimumUsefulRunnableFloor,
+    addedFiles: [],
+    rejectedFiles: [],
+    topUpMode: 'coverage_top_up_delta',
+    existingSuiteManifest,
+    error: null,
+  };
+
+  try {
+    const timeoutMs = Math.max(
+      60_000,
+      Math.min(
+        computeGenerationAgentTimeoutMs({
+          config,
+          runBudget,
+          agents: ['expansion'],
+          concurrency: 1,
+          context: feedbackContext,
+          parsedPRD: sharedPayload?.parsedPRD || {},
+          projectInfo: sharedPayload?.projectInfo || {},
+        }),
+        Number.isFinite(remainingMs) ? Math.max(60_000, remainingMs - 30_000) : 600_000,
+      ),
+    );
+    const retryBudgetMs = Number.isFinite(remainingMs)
+      ? Math.max(15_000, Math.min(90_000, remainingMs - timeoutMs - 15_000))
+      : 90_000;
+    const payload = await client.generateTestsForAgent({
+      agent: 'expansion',
+      ...sharedPayload,
+      context: feedbackContext,
+      transportTimeoutMs: timeoutMs,
+      transportRetryDelaysMs: [0, 1000, 3000, 8000, 15000, 30000],
+      transportRetryMaxElapsedMs: retryBudgetMs,
+      options: {
+        ...(sharedPayload?.options || {}),
+        minGeneratedTests: requestedAdditional,
+        maxExpansionAttempts: 1,
+      },
+    });
+
+    const incoming = Array.isArray(payload?.tests) ? payload.tests : [];
+    const delta = filterDeltaTopUpTests({
+      incoming,
+      existingSuiteManifest,
+      usedFilenames,
+    });
+    event.rejectedFiles = delta.rejected;
+    const beforeFileCount = files.length;
+    for (const test of delta.accepted) {
+      try {
+        const written = safeWriteGeneratedTest(
+          testsDir,
+          test,
+          files.length,
+          sourceTag,
+          usedFilenames,
+        );
+        files.push({ ...written, type: test.type || 'expansion', agent: 'expansion' });
+        event.addedFiles.push(written.filename);
+      } catch (writeErr) {
+        Logger.warn('PipelineWorker', 'safeWriteGeneratedTest failed for coverage top-up', {
+          filename: test?.filename,
+          reason: writeErr?.message,
+        });
+      }
+    }
+
+    const after = collectGenerationQuality(config.projectPath, {
+      baseURL: config.baseURL || sharedPayload?.projectInfo?.baseURL,
+    });
+    event.after = after;
+    event.status = after.runnableTests > before.runnableTests
+      ? 'added'
+      : (files.length > beforeFileCount ? 'added_files_pending_quality' : 'no_new_valid_delta');
+    event.topUpStatus = event.status;
+    event.topUpErrorCode = null;
+    event.continuedWithPreTopUpSuite = event.status !== 'added';
+    if (event.continuedWithPreTopUpSuite) {
+      event.coverageRetry = buildCoverageRetryMetadata({
+        sharedPayload,
+        config,
+        runId,
+        reason: event.status,
+        existingSuiteManifest,
+        topUpEvent: event,
+      });
+    }
+
+    if (statusDir) {
+      updateStatus(statusDir, 'generation_top_up_complete', {
+        runId,
+        message: event.status === 'added'
+          ? `Coverage top-up added ${after.runnableTests - before.runnableTests} runnable test(s).`
+          : 'Coverage top-up completed without increasing runnable tests; continuing with the best valid suite.',
+        status: event.status,
+        addedFiles: event.addedFiles,
+        rejectedFiles: event.rejectedFiles,
+        before: {
+          totalTests: before.totalTests,
+          runnableTests: before.runnableTests,
+        },
+        after: {
+          totalTests: after.totalTests,
+          runnableTests: after.runnableTests,
+        },
+      }, telemetryReporter);
+      recordRunDecision(statusDir, telemetryReporter, {
+        runId,
+        decisionType: 'top_up_decision',
+        phase: 'generation_top_up_complete',
+        status: event.status === 'added' ? 'success' : 'warning',
+        message: event.status === 'added'
+          ? 'Coverage top-up added runnable tests.'
+          : 'Coverage top-up produced no new valid delta; pre-top-up suite remains eligible.',
+        metadata: {
+          target: decision.target,
+          minimumUsefulRunnableFloor: decision.minimumUsefulRunnableFloor,
+          requestedAdditional,
+          topUpStatus: event.status,
+          continuedWithPreTopUpSuite: event.continuedWithPreTopUpSuite,
+          before: {
+            totalTests: before.totalTests,
+            runnableTests: before.runnableTests,
+            categories: before.categories,
+          },
+          after: {
+            totalTests: after.totalTests,
+            runnableTests: after.runnableTests,
+            categories: after.categories,
+          },
+          addedFiles: event.addedFiles,
+          rejectedFiles: event.rejectedFiles,
+          missingTargets: existingSuiteManifest.missing,
+          retryAvailable: Boolean(event.coverageRetry?.available),
+        },
+      });
+    }
+
+    if (telemetryReporter && telemetryReporter.isEnabled() && event.addedFiles.length > 0) {
+      telemetryReporter.emitBackground({
+        toolName: 'healix_test_my_app',
+        eventType: 'tests_generated',
+        runId,
+        phase: 'generation_top_up_complete',
+        status: 'info',
+        success: true,
+        message: `Coverage top-up generated ${event.addedFiles.length} spec file${event.addedFiles.length === 1 ? '' : 's'}`,
+        metadata: {
+          files: event.addedFiles,
+            generatedCount: files.length,
+            target: decision.target,
+            minimumUsefulRunnableFloor: decision.minimumUsefulRunnableFloor,
+            topUpMode: event.topUpMode,
+            rejectedFiles: event.rejectedFiles,
+          },
+        });
+      }
+
+    return event;
+  } catch (err) {
+    event.status = 'failed';
+    event.error = {
+      code: err?.code || classifyErrorCode(err),
+      message: err?.message || String(err),
+    };
+    event.topUpStatus = event.status;
+    event.topUpErrorCode = event.error.code;
+    event.continuedWithPreTopUpSuite = before.runnableTests >= decision.minimumUsefulRunnableFloor;
+    event.nonFatal = event.continuedWithPreTopUpSuite;
+    if (event.continuedWithPreTopUpSuite) {
+      event.coverageRetry = buildCoverageRetryMetadata({
+        sharedPayload,
+        config,
+        runId,
+        reason: event.error.code || 'top_up_failed',
+        existingSuiteManifest,
+        topUpEvent: event,
+      });
+    }
+    Logger.warn('PipelineWorker', 'Coverage top-up failed; continuing with generated suite', event.error);
+    if (statusDir) {
+      updateStatus(statusDir, 'generation_top_up_failed', {
+        runId,
+        message: 'Coverage top-up failed; continuing with the best valid generated suite.',
+        errorCode: event.error.code,
+        reason: event.error.message,
+        continuedWithPreTopUpSuite: event.continuedWithPreTopUpSuite,
+        before: {
+          totalTests: before.totalTests,
+          runnableTests: before.runnableTests,
+        },
+        target: decision.target,
+        minimumUsefulRunnableFloor: decision.minimumUsefulRunnableFloor,
+      }, telemetryReporter);
+      recordRunDecision(statusDir, telemetryReporter, {
+        runId,
+        decisionType: 'top_up_decision',
+        phase: 'generation_top_up_failed',
+        status: event.continuedWithPreTopUpSuite ? 'warning' : 'error',
+        errorCode: event.error.code,
+        reason: event.error.message,
+        message: event.continuedWithPreTopUpSuite
+          ? 'Coverage top-up failed; continuing with the pre-top-up suite.'
+          : 'Coverage top-up failed and the pre-top-up suite is below the useful floor.',
+        metadata: {
+          target: decision.target,
+          minimumUsefulRunnableFloor: decision.minimumUsefulRunnableFloor,
+          requestedAdditional,
+          topUpStatus: event.status,
+          topUpErrorCode: event.error.code,
+          continuedWithPreTopUpSuite: event.continuedWithPreTopUpSuite,
+          before: {
+            totalTests: before.totalTests,
+            runnableTests: before.runnableTests,
+            categories: before.categories,
+          },
+          missingTargets: existingSuiteManifest.missing,
+          retryAvailable: Boolean(event.coverageRetry?.available),
+        },
+      });
+    }
+    return event;
+  }
+}
+
 /**
  * P1 per-agent parallel fan-out — one generateTestsForAgent call per agent,
  * all in flight simultaneously. A rejection in one agent cannot cancel the
@@ -3842,6 +6483,7 @@ async function runPhase1FanOut({
   const agentsCompleted = [];
   const agentMeta = [];
   const allTokenRuns = [];
+  const coverageTopUps = [];
   let doneCount = 0;
 
   // Dispatch agents through a bounded pool. The per-agent transport timeout is
@@ -4001,6 +6643,26 @@ async function runPhase1FanOut({
           },
         });
       }
+      if (statusDir) {
+        recordRunDecision(statusDir, telemetryReporter, {
+          runId,
+          decisionType: 'generation_agent_result',
+          phase: 'generating_tests',
+          status: 'success',
+          message: `${agent} generation completed`,
+          metadata: {
+            agent,
+            generatedFiles: agentFiles,
+            agentGeneratedCount: agentFiles.length,
+            totalGeneratedFiles: files.length,
+            agentsCompleted: doneCount,
+            totalAgents: agents.length,
+            attempts: payload?.generationMeta?.attempts || [],
+            rejections: payload?.generationMeta?.rejections || [],
+            generationQuality: payload?.generationMeta?.generationQuality || null,
+          },
+        });
+      }
       return { agent, count: tests.length };
     } catch (err) {
       agentFailures.push({
@@ -4008,6 +6670,23 @@ async function runPhase1FanOut({
         code: err?.code || 'AGENT_FAILED',
         message: err?.message || String(err),
       });
+      if (statusDir) {
+        recordRunDecision(statusDir, telemetryReporter, {
+          runId,
+          decisionType: 'generation_agent_result',
+          phase: 'generating_tests',
+          status: 'error',
+          errorCode: err?.code || 'AGENT_FAILED',
+          reason: err?.message || String(err),
+          message: `${agent} generation failed`,
+          metadata: {
+            agent,
+            agentsCompleted: doneCount,
+            totalAgents: agents.length,
+            generatedCount: files.length,
+          },
+        });
+      }
       throw err;
     }
   }
@@ -4106,6 +6785,8 @@ async function runPhase1FanOut({
     );
     err.code = firstFailure?.code || 'GENERATION_FAILED';
     err.agentFailures = agentFailures;
+    err.agentsRequested = agents;
+    err.agentsCompleted = agentsCompleted;
     throw err;
   }
 
@@ -4126,9 +6807,43 @@ async function runPhase1FanOut({
         (emptyAgents.length > 0 ? ` (empty: ${emptyAgents.join(', ')})` : ''),
     );
     err.code = 'AGENTS_RETURNED_ZERO_TESTS';
-    err.agentFailures = agentFailures;
+    err.agentFailures = (emptyAgents.length > 0 ? emptyAgents : agents).map((agent) => ({
+      agent,
+      code: 'AGENTS_RETURNED_ZERO_TESTS',
+      message: 'Agent completed without returning runnable tests',
+    }));
+    err.agentsRequested = agents;
+    err.agentsCompleted = [];
     throw err;
   }
+
+  const topUpEvent = await maybeRunCoverageTopUp({
+    client,
+    sharedPayload,
+    testsDir,
+    usedFilenames: used,
+    files,
+    config,
+    runBudget,
+    statusDir,
+    runId,
+    telemetryReporter,
+    sourceTag: 'saas-topup',
+  });
+  if (topUpEvent) {
+    coverageTopUps.push(topUpEvent);
+  }
+  const failedAgentRetry = buildFailedAgentRetryMetadata({
+    agentFailures,
+    agentsRequested: agents,
+    agentsCompleted,
+    sharedPayload,
+    config,
+    runId,
+    existingSuiteManifest: topUpEvent?.existingSuiteManifest || null,
+    agentTransportTimeoutMs,
+  });
+  const coverageRetry = topUpEvent?.coverageRetry || null;
 
   // Deps must be installed once, after all writes are done (dedupes axios/etc.
   // across agents — installing during the Promise.allSettled loop would race).
@@ -4150,6 +6865,9 @@ async function runPhase1FanOut({
       agentConcurrency: AGENT_CONCURRENCY,
       agentTransportTimeoutMs,
       agentMeta,
+      coverageTopUps,
+      coverageRetry,
+      failedAgentRetry,
     },
   };
 }
@@ -4240,6 +6958,24 @@ async function runAsyncGenerationPath({
         throw err;
       }
 
+      const coverageTopUps = [];
+      const topUpEvent = await maybeRunCoverageTopUp({
+        client,
+        sharedPayload,
+        testsDir,
+        usedFilenames: used,
+        files,
+        config,
+        runBudget,
+        statusDir,
+        runId,
+        telemetryReporter,
+        sourceTag: 'saas-sync-topup',
+      });
+      if (topUpEvent) {
+        coverageTopUps.push(topUpEvent);
+      }
+
       installMissingDependencies(config.projectPath, testsDir);
 
       return {
@@ -4256,6 +6992,8 @@ async function runAsyncGenerationPath({
           planStatus: planMeta?.status || null,
           backendGenerationSkippedReason,
           ...(syncPayload.generationMeta || {}),
+          coverageTopUps,
+          coverageRetry: topUpEvent?.coverageRetry || null,
         },
       };
     }
@@ -4399,11 +7137,37 @@ async function runAsyncGenerationPath({
       }))
     : [];
 
+  const failedAgentNames = new Set(agentFailures.map((failure) => failure.agent).filter(Boolean));
   const agentsCompletedList = Array.isArray(finalResp?.agentsCompleted)
     ? finalResp.agentsCompleted
+        .filter((a) => !(typeof a === 'object' && a?.ok === false))
         .map((a) => (typeof a === 'string' ? a : a?.agent))
+        .filter((agent) => agent && !failedAgentNames.has(agent))
         .filter(Boolean)
     : [];
+
+  if (statusDir) {
+    for (const agent of agentsRequestedList) {
+      const failure = agentFailures.find((item) => item.agent === agent);
+      recordRunDecision(statusDir, telemetryReporter, {
+        runId,
+        decisionType: 'generation_agent_result',
+        phase: 'generation_async_progress',
+        status: failure ? 'error' : (agentsCompletedList.includes(agent) ? 'success' : 'warning'),
+        errorCode: failure?.code || null,
+        reason: failure?.message || null,
+        message: failure ? `${agent} async generation failed` : `${agent} async generation completed`,
+        metadata: {
+          agent,
+          jobId,
+          finalStatus: finalResp?.status || 'unknown',
+          generatedCount: files.length,
+          agentsCompleted: agentsCompletedList,
+          totalAgents: agentsRequestedList.length,
+        },
+      });
+    }
+  }
 
   // Hard fail only if the orchestrator says failed AND nothing landed on
   // disk. Matches Phase-1 behavior: any partial survives; only an empty
@@ -4418,9 +7182,40 @@ async function runAsyncGenerationPath({
     err.agentFailures = agentFailures.length > 0
       ? agentFailures
       : [{ agent: 'unknown', code: 'ALL_AGENTS_FAILED', message: err.message }];
+    err.agentsRequested = agentsRequestedList;
+    err.agentsCompleted = agentsCompletedList;
     err.jobId = jobId;
     throw err;
   }
+
+  const coverageTopUps = [];
+  const topUpEvent = await maybeRunCoverageTopUp({
+    client,
+    sharedPayload,
+    testsDir,
+    usedFilenames: used,
+    files,
+    config,
+    runBudget,
+    statusDir,
+    runId,
+    telemetryReporter,
+    sourceTag: 'saas-async-topup',
+  });
+  if (topUpEvent) {
+    coverageTopUps.push(topUpEvent);
+  }
+  const failedAgentRetry = buildFailedAgentRetryMetadata({
+    agentFailures,
+    agentsRequested: agentsRequestedList,
+    agentsCompleted: agentsCompletedList,
+    sharedPayload,
+    config,
+    runId,
+    existingSuiteManifest: topUpEvent?.existingSuiteManifest || null,
+    reason: 'async_agent_failures',
+  });
+  const coverageRetry = topUpEvent?.coverageRetry || null;
 
   // Deps install once after all writes (dedupes axios/etc. across agents).
   installMissingDependencies(config.projectPath, testsDir);
@@ -4441,6 +7236,9 @@ async function runAsyncGenerationPath({
       planStatus: planMeta?.status || null,
       backendGenerationSkippedReason,
       ...(finalResp?.generationMeta || {}),
+      coverageTopUps,
+      coverageRetry,
+      failedAgentRetry,
     },
   };
 }
@@ -4459,26 +7257,220 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
 
   const validateGeneratedTests = config.validateGeneratedTests !== false;
   const qualityRecoveryEvents = [];
+  let deterministicTier0Pack = null;
 
   const runValidation = async (generator) => withStageBudget(runBudget, 'validation', async () => {
-    let validation = await validateGeneratedTestsWithList({
-      projectPath: config.projectPath,
-      validateGeneratedTests,
-      timeoutMs: Math.min(getBudgetRemainingMs(runBudget), runBudget.stageCaps.validation),
-    });
+    const protectedSpecFiles = [];
+    const validationTimeoutMs = () => Math.min(getBudgetRemainingMs(runBudget), runBudget.stageCaps.validation);
+    const recordValidationSalvage = (salvage) => {
+      generationMeta.validationSalvage = salvage;
+      generationMeta.validationSalvageHistory = Array.isArray(generationMeta.validationSalvageHistory)
+        ? [...generationMeta.validationSalvageHistory, salvage]
+        : [salvage];
+    };
+    const validateSuiteOrSalvage = async ({ stage = 'validation', qualityAudit = null, qualityRecovery = null } = {}) => {
+      let validation = await validateGeneratedTestsWithList({
+        projectPath: config.projectPath,
+        validateGeneratedTests,
+        timeoutMs: validationTimeoutMs(),
+      });
 
-    if (!validation.valid) {
-      const error = new Error(`${generator} generation failed validation: ${validation.reason || 'unknown'}`);
+      if (!validation.valid) {
+        const salvage = await salvageGeneratedTestValidation({
+          projectPath: config.projectPath,
+          originalValidation: validation,
+          validateGeneratedTests,
+          timeoutMs: validationTimeoutMs(),
+          protectedSpecFiles,
+        });
+        recordValidationSalvage(salvage);
+        if (statusDir) {
+          recordRunDecision(statusDir, telemetryReporter, {
+            runId,
+            decisionType: 'validation_salvage_decision',
+            phase: stage,
+            status: salvage.recovered ? 'warning' : 'error',
+            errorCode: validation?.errorCode || validation?.code || null,
+            reason: validation?.reason || null,
+            message: salvage.recovered
+              ? 'Validation salvage kept listable specs and quarantined invalid specs.'
+              : 'Validation salvage could not find any listable generated specs.',
+            metadata: {
+              stage,
+              originalSpecCount: salvage.originalSpecCount,
+              keptSpecCount: Array.isArray(salvage.keptSpecFiles) ? salvage.keptSpecFiles.length : 0,
+              quarantinedSpecCount: Array.isArray(salvage.quarantinedSpecFiles) ? salvage.quarantinedSpecFiles.length : 0,
+              keptSpecFiles: salvage.keptSpecFiles,
+              quarantinedSpecFiles: salvage.quarantinedSpecFiles,
+              finalValidation: salvage.finalValidation ? {
+                valid: salvage.finalValidation.valid,
+                listedCount: salvage.finalValidation.listedCount,
+                reason: salvage.finalValidation.reason,
+                stderr: salvage.finalValidation.stderr,
+              } : null,
+              originalValidation: {
+                valid: validation?.valid,
+                reason: validation?.reason,
+                stderr: validation?.stderr,
+              },
+            },
+          });
+        }
+        validation = {
+          ...validation,
+          validationSalvage: salvage,
+          qualityAudit: qualityAudit || undefined,
+          qualityRecovery: qualityRecovery || undefined,
+        };
+        if (salvage.recovered && salvage.finalValidation?.valid) {
+          validation = {
+            ...salvage.finalValidation,
+            validationSalvage: salvage,
+            qualityAudit: qualityAudit || undefined,
+            qualityRecovery: qualityRecovery || undefined,
+          };
+          qualityRecoveryEvents.push({
+            type: 'validation_salvage',
+            stage,
+            ...salvage,
+          });
+          Logger.warn('PipelineWorker', 'Recovered generated suite after Playwright list validation failure', {
+            generator,
+            stage,
+            keptSpecFiles: salvage.keptSpecFiles.map((file) => file.filename),
+            quarantinedSpecFiles: salvage.quarantinedSpecFiles.map((file) => file.filename),
+          });
+          if (statusDir) {
+            updateStatus(statusDir, 'generation_quality_recovered', {
+              runId,
+              message: `Generated specs failed validation; kept ${salvage.keptSpecFiles.length} valid spec(s) and quarantined ${salvage.quarantinedSpecFiles.length} invalid spec(s).`,
+              validationSalvage: salvage,
+            }, telemetryReporter);
+          }
+        }
+      }
+
+      return validation;
+    };
+    const throwValidationFailure = ({ validation, stage = 'validation', qualityAudit = null, qualityRecovery = null, messageSuffix = '' } = {}) => {
+      const reason = validation?.reason || 'unknown';
+      const error = new Error(`${generator} generation failed validation${messageSuffix}: ${reason}`);
       error.code = 'GENERATION_VALIDATION_FAILED';
-      error.validation = validation;
+      error.validation = {
+        ...validation,
+        qualityAudit: qualityAudit || validation?.qualityAudit,
+        qualityRecovery: qualityRecovery || validation?.qualityRecovery,
+      };
+      error.validationSalvage = validation?.validationSalvage || generationMeta.validationSalvage || null;
       error.diagnostics = buildPipelineDiagnostics({
         projectPath: config.projectPath,
-        stage: 'validation',
-        reason: validation.reason,
-        stderr: validation.stderr,
-        stdout: validation.stdout,
+        stage,
+        reason,
+        stderr: validation?.stderr,
+        stdout: validation?.stdout,
+        qualityAudit,
+        validationSalvage: error.validationSalvage,
       });
       throw error;
+    };
+
+    const qaContractPack = ensureQaContractSpec({
+      projectPath: config.projectPath,
+      context,
+      roles,
+      testType: config.testType,
+    });
+    if (qaContractPack.written) {
+      Logger.info('PipelineWorker', 'Wrote deterministic QA contract spec', {
+        filename: qaContractPack.filename,
+        generatedTests: qaContractPack.generatedTests,
+        qaContractSummary: qaContractPack.qaContractSummary,
+      });
+      try {
+        const verifiedRoles = (roles || []).filter((role) => role && role.loginVerified && role.storageStatePath);
+        qaContractPack.fixtureWiring = ensureHealixFixtureImports({
+          projectPath: config.projectPath,
+          roles: verifiedRoles,
+        });
+      } catch (fixtureError) {
+        qaContractPack.fixtureWiring = {
+          applied: false,
+          reason: 'qa_contract_fixture_patch_failed',
+          error: fixtureError.message,
+        };
+        Logger.warn('PipelineWorker', 'Failed to wire Healix fixture after QA contract generation', {
+          generator,
+          reason: fixtureError.message,
+        });
+      }
+      if (statusDir) {
+        updateStatus(statusDir, 'generation_quality_recovered', {
+          runId,
+          message: `Added ${qaContractPack.generatedTests} source-derived QA contract test(s).`,
+          qaContractSummary: qaContractPack.qaContractSummary,
+          qaContractQuestions: qaContractPack.qaContractQuestions,
+        }, telemetryReporter);
+      }
+      const qaContractValidation = await validateGeneratedTestsWithList({
+        projectPath: config.projectPath,
+        validateGeneratedTests,
+        timeoutMs: validationTimeoutMs(),
+        testTarget: qaContractPack.filename,
+      });
+      qaContractPack.listValidation = qaContractValidation;
+      generationMeta.qaContractPackListStatus = qaContractValidation.valid ? 'listed' : 'failed';
+      generationMeta.qaContractPackListError = qaContractValidation.valid
+        ? null
+        : {
+            reason: qaContractValidation.reason || 'validation_failed',
+            stderr: qaContractValidation.stderr || null,
+            stdout: qaContractValidation.stdout || null,
+          };
+      if (qaContractValidation.valid) {
+        protectedSpecFiles.push(qaContractPack.filename);
+      } else {
+        const quarantine = quarantineGeneratedSpecFilesByName({
+          projectPath: config.projectPath,
+          files: [{
+            filename: qaContractPack.filename,
+            reason: qaContractValidation.reason || 'qa_contract_validation_failed',
+            stderr: qaContractValidation.stderr || null,
+            stdout: qaContractValidation.stdout || null,
+          }],
+          reason: 'qa_contract_validation_failed',
+        });
+        qaContractPack.quarantine = quarantine;
+        qualityRecoveryEvents.push({
+          type: 'qa_contract_validation_quarantine',
+          ...quarantine,
+        });
+        Logger.warn('PipelineWorker', 'Quarantined invalid deterministic QA contract spec', {
+          generator,
+          filename: qaContractPack.filename,
+          reason: qaContractValidation.reason,
+        });
+        if (statusDir) {
+          updateStatus(statusDir, 'generation_quality_recovered', {
+            runId,
+            message: `Deterministic QA contract spec failed validation and was quarantined: ${qaContractPack.filename}.`,
+            qaContractPackListStatus: 'failed',
+            qaContractPackListError: generationMeta.qaContractPackListError,
+          }, telemetryReporter);
+        }
+      }
+    }
+    generationMeta.qaContractPack = qaContractPack;
+    generationMeta.qaContractSummary = qaContractPack.qaContractSummary;
+    generationMeta.qaContractQuestions = qaContractPack.qaContractQuestions;
+    generationMeta.qaContractWarnings = qaContractPack.qaContractWarnings;
+    generationMeta.qaContractPackListedTests = qaContractPack.listValidation?.valid
+      ? qaContractPack.listValidation.listedCount || qaContractPack.generatedTests
+      : 0;
+
+    let validation = await validateSuiteOrSalvage({ stage: 'validation' });
+
+    if (!validation.valid) {
+      throwValidationFailure({ validation, stage: 'validation' });
     }
 
     let qualityAudit = auditGeneratedTestQuality({
@@ -4486,6 +7478,7 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
       testType: config.testType,
       context,
       explorationArtifact,
+      roles,
     });
 
     Logger.info('PipelineWorker', '[QUALITY GATE] auditGeneratedTestQuality result', {
@@ -4497,9 +7490,70 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
       hasApiBurstCoverage: qualityAudit.hasApiBurstCoverage,
       selectorCoverageRatio: qualityAudit.selectorCoverageRatio,
       totalFiles: qualityAudit.totalFiles,
+      qaContractCoverage: qualityAudit.qaContractCoverage,
     });
+    generationMeta.qaContractCoverage = qualityAudit.qaContractCoverage || null;
+    generationMeta.qaContractSummary = qualityAudit.qaContractSummary || generationMeta.qaContractSummary || null;
+    generationMeta.qaContractWarnings = qualityAudit.qaContractWarnings || [];
+    generationMeta.qaContractQuestions = qualityAudit.qaContractQuestions || generationMeta.qaContractQuestions || [];
 
     if (!qualityAudit.valid) {
+      const qualityAuditBeforeRecovery = qualityAudit;
+      const validationBeforeQualityRecovery = validation;
+      const beforeRecoveryQuality = collectGenerationQuality(config.projectPath, {
+        baseURL: config.baseURL || projectInfo?.baseURL,
+      });
+      const beforeRecoverySnapshot = snapshotGeneratedSpecFiles(config.projectPath);
+      const rollbackQualityRecovery = ({ recovery, assessment, demoteIfSoft = true } = {}) => {
+        const restore = restoreGeneratedSpecSnapshot(config.projectPath, beforeRecoverySnapshot);
+        const rollbackEvent = {
+          type: 'quality_recovery_rollback',
+          reason: assessment?.reason || 'no_net_benefit',
+          recovery,
+          assessment,
+          restoredFiles: restore.restoredFiles,
+        };
+        qualityRecoveryEvents.push(rollbackEvent);
+        Logger.warn('PipelineWorker', 'Rolled back quality recovery because it reduced useful runnable coverage', {
+          generator,
+          reason: rollbackEvent.reason,
+          restoredFiles: restore.restoredFiles,
+        });
+        if (statusDir) {
+          updateStatus(statusDir, 'generation_quality_recovery_rolled_back', {
+            runId,
+            message: 'Quality recovery would have removed too much runnable coverage; restored the best valid generated suite.',
+            reason: rollbackEvent.reason,
+            restoredFiles: restore.restoredFiles,
+            assessment,
+          }, telemetryReporter);
+          recordRunDecision(statusDir, telemetryReporter, {
+            runId,
+            decisionType: 'quality_recovery_decision',
+            phase: 'generation_quality_recovery_rolled_back',
+            status: 'warning',
+            reason: rollbackEvent.reason,
+            message: 'Quality recovery was rolled back because it did not improve the retained suite.',
+            metadata: {
+              recoveryType: recovery?.type || recovery?.reason || 'unknown',
+              restoredFiles: restore.restoredFiles,
+              assessment,
+            },
+          });
+        }
+        if (demoteIfSoft && !qualityAuditHasHardErrors(qualityAuditBeforeRecovery)) {
+          const demotedAudit = demoteSoftQualityAuditErrors(qualityAuditBeforeRecovery, 'soft_quality_warnings_after_recovery_rollback');
+          demotedAudit.qualityRecovery = rollbackEvent;
+          return {
+            ...validationBeforeQualityRecovery,
+            qualityAudit: demotedAudit,
+            qualityRecovery: rollbackEvent,
+          };
+        }
+        validation = validationBeforeQualityRecovery;
+        return null;
+      };
+
       const pruning = pruneGeneratedTestsByQuality({
         projectPath: config.projectPath,
         qualityAudit,
@@ -4518,30 +7572,37 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
             message: `Removed ${pruning.prunedFiles.reduce((sum, file) => sum + file.removedTests, 0)} brittle generated test(s); validating remaining suite...`,
             prunedFiles: pruning.prunedFiles,
           }, telemetryReporter);
+          recordRunDecision(statusDir, telemetryReporter, {
+            runId,
+            decisionType: 'quality_recovery_decision',
+            phase: 'generation_quality_recovered',
+            status: 'warning',
+            message: 'Brittle generated test blocks were pruned before execution.',
+            metadata: {
+              recoveryType: 'prune_test_blocks',
+              prunedFiles: pruning.prunedFiles,
+              quarantineDir: pruning.quarantineDir,
+              before: {
+                totalTests: beforeRecoveryQuality.totalTests,
+                runnableTests: beforeRecoveryQuality.runnableTests,
+              },
+            },
+          });
         }
 
-        validation = await validateGeneratedTestsWithList({
-          projectPath: config.projectPath,
-          validateGeneratedTests,
-          timeoutMs: Math.min(getBudgetRemainingMs(runBudget), runBudget.stageCaps.validation),
+        validation = await validateSuiteOrSalvage({
+          stage: 'validation_after_quality_pruning',
+          qualityAudit,
+          qualityRecovery: pruning,
         });
         if (!validation.valid) {
-          const error = new Error(`${generator} generation failed validation after brittle-test pruning: ${validation.reason || 'unknown'}`);
-          error.code = 'GENERATION_VALIDATION_FAILED';
-          error.validation = {
-            ...validation,
+          throwValidationFailure({
+            validation,
+            stage: 'validation_after_quality_pruning',
             qualityAudit,
             qualityRecovery: pruning,
-          };
-          error.diagnostics = buildPipelineDiagnostics({
-            projectPath: config.projectPath,
-            stage: 'validation_after_quality_pruning',
-            reason: validation.reason,
-            stderr: validation.stderr,
-            stdout: validation.stdout,
-            qualityAudit,
+            messageSuffix: ' after brittle-test pruning',
           });
-          throw error;
         }
 
         qualityAudit = auditGeneratedTestQuality({
@@ -4549,6 +7610,7 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
           testType: config.testType,
           context,
           explorationArtifact,
+          roles,
         });
         qualityAudit.qualityRecovery = pruning;
         Logger.info('PipelineWorker', '[QUALITY GATE] post-pruning auditGeneratedTestQuality result', {
@@ -4559,6 +7621,30 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
           totalTests: qualityAudit.totalTests,
           runnableTests: qualityAudit.runnableTests,
         });
+        const afterPruningQuality = collectGenerationQuality(config.projectPath, {
+          baseURL: config.baseURL || projectInfo?.baseURL,
+        });
+        const pruningAssessment = assessQualityRecoveryNetBenefit({
+          config,
+          context,
+          beforeQuality: beforeRecoveryQuality,
+          afterQuality: afterPruningQuality,
+          hardRecovery: false,
+        });
+        if (!pruningAssessment.keep) {
+          const rollbackResult = rollbackQualityRecovery({
+            recovery: pruning,
+            assessment: pruningAssessment,
+          });
+          if (rollbackResult) return rollbackResult;
+          qualityAudit = auditGeneratedTestQuality({
+            projectPath: config.projectPath,
+            testType: config.testType,
+            context,
+            explorationArtifact,
+            roles,
+          });
+        }
         if (qualityAudit.valid) {
           return {
             ...validation,
@@ -4572,6 +7658,7 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
         projectPath: config.projectPath,
         qualityAudit,
         reason: `${generator}_quality_audit`,
+        hardOnly: true,
       });
       if (quarantine.applied) {
         qualityRecoveryEvents.push(quarantine);
@@ -4588,30 +7675,38 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
             quarantinedFiles: quarantine.quarantinedFiles.map((file) => file.filename),
             remainingFiles: quarantine.remainingFiles,
           }, telemetryReporter);
+          recordRunDecision(statusDir, telemetryReporter, {
+            runId,
+            decisionType: 'quality_recovery_decision',
+            phase: 'generation_quality_recovered',
+            status: 'warning',
+            message: 'Hard quality blocker specs were quarantined before execution.',
+            metadata: {
+              recoveryType: 'hard_file_quarantine',
+              hardOnly: true,
+              quarantinedFiles: quarantine.quarantinedFiles,
+              remainingFiles: quarantine.remainingFiles,
+              before: {
+                totalTests: beforeRecoveryQuality.totalTests,
+                runnableTests: beforeRecoveryQuality.runnableTests,
+              },
+            },
+          });
         }
 
-        validation = await validateGeneratedTestsWithList({
-          projectPath: config.projectPath,
-          validateGeneratedTests,
-          timeoutMs: Math.min(getBudgetRemainingMs(runBudget), runBudget.stageCaps.validation),
+        validation = await validateSuiteOrSalvage({
+          stage: 'validation_after_quality_quarantine',
+          qualityAudit,
+          qualityRecovery: quarantine,
         });
         if (!validation.valid) {
-          const error = new Error(`${generator} generation failed validation after quality quarantine: ${validation.reason || 'unknown'}`);
-          error.code = 'GENERATION_VALIDATION_FAILED';
-          error.validation = {
-            ...validation,
+          throwValidationFailure({
+            validation,
+            stage: 'validation_after_quality_quarantine',
             qualityAudit,
             qualityRecovery: quarantine,
-          };
-          error.diagnostics = buildPipelineDiagnostics({
-            projectPath: config.projectPath,
-            stage: 'validation_after_quality_quarantine',
-            reason: validation.reason,
-            stderr: validation.stderr,
-            stdout: validation.stdout,
-            qualityAudit,
+            messageSuffix: ' after quality quarantine',
           });
-          throw error;
         }
 
         qualityAudit = auditGeneratedTestQuality({
@@ -4619,8 +7714,94 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
           testType: config.testType,
           context,
           explorationArtifact,
+          roles,
         });
         qualityAudit.qualityRecovery = quarantine;
+        const afterQuarantineQuality = collectGenerationQuality(config.projectPath, {
+          baseURL: config.baseURL || projectInfo?.baseURL,
+        });
+        const retainedSuite = buildRetainedSuiteRecoveryMeta({
+          config,
+          beforeQuality: beforeRecoveryQuality,
+          afterQuality: afterQuarantineQuality,
+          recovery: quarantine,
+        });
+        quarantine.retainedSuite = retainedSuite;
+        quarantine.preRecoveryRunnableTests = retainedSuite.preRecoveryRunnableTests;
+        quarantine.postRecoveryRunnableTests = retainedSuite.postRecoveryRunnableTests;
+        quarantine.effectiveRunnableFloor = retainedSuite.effectiveRunnableFloor;
+        quarantine.originalRunnableFloor = retainedSuite.originalRunnableFloor;
+        quarantine.qualityRecoveryCoverageLoss = retainedSuite.qualityRecoveryCoverageLoss;
+        quarantine.executionAllowedAfterHardQuarantine = retainedSuite.executionAllowedAfterHardQuarantine;
+        quarantine.quarantinedFileReasons = retainedSuite.quarantinedFileReasons;
+        qualityAudit.retainedSuite = retainedSuite;
+        generationMeta.retainedSuite = retainedSuite;
+        const retainedSuiteManifest = buildExistingSuiteManifest({
+          projectPath: config.projectPath,
+          context,
+          roles,
+          testType: config.testType,
+          quality: afterQuarantineQuality,
+          routeAccessSummary: buildRouteAccessSummary(explorationArtifact || null),
+        });
+        if (generationMeta.coverageRetry) {
+          const previousRequest = generationMeta.coverageRetry.request || {};
+          const previousContext = previousRequest.context && typeof previousRequest.context === 'object'
+            ? previousRequest.context
+            : {};
+          const previousFeedback = previousContext.generationFeedback && typeof previousContext.generationFeedback === 'object'
+            ? previousContext.generationFeedback
+            : {};
+          generationMeta.coverageRetry = {
+            ...generationMeta.coverageRetry,
+            retainedSuite,
+            existingSuiteManifest: retainedSuiteManifest,
+            reason: generationMeta.coverageRetry.reason || 'retained_suite_after_hard_quarantine',
+            request: {
+              ...previousRequest,
+              context: {
+                ...previousContext,
+                generationFeedback: {
+                  ...previousFeedback,
+                  mode: 'coverage_top_up_retry_delta',
+                  existingSuiteManifest: retainedSuiteManifest,
+                  retainedSuite,
+                },
+              },
+            },
+          };
+        } else {
+          generationMeta.coverageRetry = buildCoverageRetryMetadata({
+            sharedPayload: buildRetrySharedPayload(),
+            config,
+            runId,
+            reason: 'retained_suite_after_hard_quarantine',
+            existingSuiteManifest: retainedSuiteManifest,
+            retainedSuite,
+          });
+        }
+        if (statusDir) {
+          recordRunDecision(statusDir, telemetryReporter, {
+            runId,
+            decisionType: 'quality_recovery_decision',
+            phase: 'generation_quality_recovered',
+            status: retainedSuite.executionAllowedAfterHardQuarantine ? 'warning' : 'error',
+            message: retainedSuite.executionAllowedAfterHardQuarantine
+              ? 'Hard-blocker specs quarantined; retained suite remains executable.'
+              : 'Hard-blocker specs quarantined; retained suite is below the recovery-adjusted floor.',
+            metadata: {
+              recoveryType: 'retained_suite_after_hard_quarantine',
+              retainedSuite,
+              quarantinedFileReasons: retainedSuite.quarantinedFileReasons,
+              coverageRetryAvailable: Boolean(generationMeta.coverageRetry?.available),
+              postQuarantineQuality: {
+                totalTests: afterQuarantineQuality.totalTests,
+                runnableTests: afterQuarantineQuality.runnableTests,
+                categories: afterQuarantineQuality.categories,
+              },
+            },
+          });
+        }
 
         Logger.info('PipelineWorker', '[QUALITY GATE] post-quarantine auditGeneratedTestQuality result', {
           valid: qualityAudit.valid,
@@ -4629,6 +7810,7 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
           totalFiles: qualityAudit.totalFiles,
           totalTests: qualityAudit.totalTests,
           runnableTests: qualityAudit.runnableTests,
+          retainedSuite,
         });
 
         if (qualityAudit.valid) {
@@ -4638,6 +7820,174 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
             qualityRecovery: quarantine,
           };
         }
+      }
+
+      const remainingErrors = Array.isArray(qualityAudit.errors) ? qualityAudit.errors : [];
+      const onlyMissingQaContractCoverage =
+        remainingErrors.length > 0 &&
+        remainingErrors.every((error) => /^missing_qa_contract_coverage:/i.test(String(error || '')));
+      if (onlyMissingQaContractCoverage) {
+        const qaContractRecovery = {
+          type: 'qa_contract_recovery',
+          reason: 'missing_qa_contract_coverage',
+          missing: remainingErrors.map((error) => String(error).replace(/^missing_qa_contract_coverage:/i, '')),
+          status: 'started',
+        };
+        try {
+          const recoveredPack = ensureQaContractSpec({
+            projectPath: config.projectPath,
+            context,
+            roles,
+            testType: config.testType,
+          });
+          qaContractRecovery.qaContractPack = {
+            written: recoveredPack.written,
+            filename: recoveredPack.filename,
+            generatedTests: recoveredPack.generatedTests,
+            generatedContracts: recoveredPack.generatedContracts,
+          };
+          generationMeta.qaContractPack = recoveredPack;
+          generationMeta.qaContractSummary = recoveredPack.qaContractSummary;
+          generationMeta.qaContractQuestions = recoveredPack.qaContractQuestions;
+          generationMeta.qaContractWarnings = recoveredPack.qaContractWarnings;
+
+          if (recoveredPack.written && recoveredPack.generatedTests > 0) {
+            const verifiedRoles = (roles || []).filter((role) => role && role.loginVerified && role.storageStatePath);
+            recoveredPack.fixtureWiring = ensureHealixFixtureImports({
+              projectPath: config.projectPath,
+              roles: verifiedRoles,
+            });
+            const recoveredValidation = await validateGeneratedTestsWithList({
+              projectPath: config.projectPath,
+              validateGeneratedTests,
+              timeoutMs: validationTimeoutMs(),
+              testTarget: recoveredPack.filename,
+            });
+            recoveredPack.listValidation = recoveredValidation;
+            generationMeta.qaContractPackListStatus = recoveredValidation.valid ? 'listed' : 'failed';
+            generationMeta.qaContractPackListError = recoveredValidation.valid
+              ? null
+              : {
+                  reason: recoveredValidation.reason || 'validation_failed',
+                  stderr: recoveredValidation.stderr || null,
+                  stdout: recoveredValidation.stdout || null,
+                };
+            generationMeta.qaContractPackListedTests = recoveredValidation.valid
+              ? recoveredValidation.listedCount || recoveredPack.generatedTests
+              : 0;
+
+            if (recoveredValidation.valid) {
+              if (!protectedSpecFiles.includes(recoveredPack.filename)) {
+                protectedSpecFiles.push(recoveredPack.filename);
+              }
+              qaContractRecovery.status = 'listed';
+              qualityRecoveryEvents.push(qaContractRecovery);
+              Logger.warn('PipelineWorker', 'Recovered missing QA contract coverage with deterministic contract pack', {
+                generator,
+                filename: recoveredPack.filename,
+                generatedTests: recoveredPack.generatedTests,
+                missing: qaContractRecovery.missing,
+              });
+              if (statusDir) {
+                updateStatus(statusDir, 'generation_quality_recovered', {
+                  runId,
+                  message: `Recovered missing QA contract coverage with ${recoveredPack.generatedTests} deterministic test(s).`,
+                  qaContractPack: qaContractRecovery.qaContractPack,
+                  missingQaContracts: qaContractRecovery.missing,
+                }, telemetryReporter);
+              }
+
+              validation = await validateSuiteOrSalvage({
+                stage: 'validation_after_qa_contract_recovery',
+                qualityAudit,
+                qualityRecovery: qaContractRecovery,
+              });
+              if (!validation.valid) {
+                throwValidationFailure({
+                  validation,
+                  stage: 'validation_after_qa_contract_recovery',
+                  qualityAudit,
+                  qualityRecovery: qaContractRecovery,
+                  messageSuffix: ' after QA contract recovery',
+                });
+              }
+
+              qualityAudit = auditGeneratedTestQuality({
+                projectPath: config.projectPath,
+                testType: config.testType,
+                context,
+                explorationArtifact,
+                roles,
+              });
+              qualityAudit.qualityRecovery = qaContractRecovery;
+              generationMeta.qaContractCoverage = qualityAudit.qaContractCoverage || null;
+              generationMeta.qaContractSummary = qualityAudit.qaContractSummary || generationMeta.qaContractSummary || null;
+              generationMeta.qaContractWarnings = qualityAudit.qaContractWarnings || [];
+              generationMeta.qaContractQuestions = qualityAudit.qaContractQuestions || generationMeta.qaContractQuestions || [];
+
+              Logger.info('PipelineWorker', '[QUALITY GATE] post-QA-contract recovery auditGeneratedTestQuality result', {
+                valid: qualityAudit.valid,
+                errors: qualityAudit.errors,
+                totalFiles: qualityAudit.totalFiles,
+                totalTests: qualityAudit.totalTests,
+                runnableTests: qualityAudit.runnableTests,
+                qaContractCoverage: qualityAudit.qaContractCoverage,
+              });
+
+              if (qualityAudit.valid) {
+                return {
+                  ...validation,
+                  qualityAudit,
+                  qualityRecovery: qaContractRecovery,
+                };
+              }
+            } else {
+              qaContractRecovery.status = 'validation_failed';
+              qaContractRecovery.validation = generationMeta.qaContractPackListError;
+              qualityRecoveryEvents.push(qaContractRecovery);
+            }
+          } else {
+            qaContractRecovery.status = 'no_runnable_contract_pack';
+            qualityRecoveryEvents.push(qaContractRecovery);
+          }
+        } catch (recoveryErr) {
+          if (recoveryErr?.code === 'GENERATION_VALIDATION_FAILED') {
+            throw recoveryErr;
+          }
+          qaContractRecovery.status = 'failed';
+          qaContractRecovery.error = recoveryErr?.message || String(recoveryErr);
+          qualityRecoveryEvents.push(qaContractRecovery);
+          Logger.warn('PipelineWorker', 'Missing QA contract recovery failed', {
+            generator,
+            reason: qaContractRecovery.error,
+          });
+        }
+      }
+
+      if (!qualityAuditHasHardErrors(qualityAudit)) {
+        const demotedAudit = demoteSoftQualityAuditErrors(qualityAudit, 'soft_quality_warnings_only');
+        const softRecovery = {
+          type: 'soft_quality_warnings_only',
+          warnings: demotedAudit.softQualityWarnings || [],
+        };
+        demotedAudit.qualityRecovery = softRecovery;
+        qualityRecoveryEvents.push(softRecovery);
+        Logger.warn('PipelineWorker', 'Quality audit found only soft issues; continuing with generated suite and warnings', {
+          generator,
+          warnings: demotedAudit.softQualityWarnings,
+        });
+        if (statusDir) {
+          updateStatus(statusDir, 'generation_quality_warning', {
+            runId,
+            message: 'Generated suite has non-blocking quality warnings; continuing to execution.',
+            warnings: demotedAudit.softQualityWarnings,
+          }, telemetryReporter);
+        }
+        return {
+          ...validation,
+          qualityAudit: demotedAudit,
+          qualityRecovery: softRecovery,
+        };
       }
 
       Logger.error('PipelineWorker', `[QUALITY GATE] ❌ Quality audit FAILED for generator="${generator}" — errors: ${qualityAudit.errors.join(', ')}`, null, {
@@ -4699,11 +8049,73 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
     }
   };
 
+  const buildRetrySharedPayload = () => ({
+    context,
+    prd: prdContent || '',
+    parsedPRD: parsedPRD || null,
+    explorationArtifact: explorationArtifact || null,
+    roles: roles || [],
+    testType: config.testType,
+    projectInfo,
+    options: {
+      includeSmoke: true,
+      includeWorkflows: true,
+      includeErrorStates: true,
+      allowSyntheticErrorScenarios: false,
+      strictAIGeneration: strictAIEnabled(config),
+      coverageProfile: config.coverageProfile || 'qa-max',
+      minGeneratedTests: toFiniteNumber(config.minGeneratedTests, 50),
+      maxExpansionAttempts: 0,
+    },
+  });
+
+  const attachFailedAgentRetryFromFailures = ({
+    agentFailures = [],
+    agentsRequested = null,
+    agentsCompleted = [],
+    reason = 'agent_failures',
+    existingSuiteManifest = null,
+    agentTransportTimeoutMs = null,
+  } = {}) => {
+    if (!Array.isArray(agentFailures) || agentFailures.length === 0) return null;
+    const requestedAgents = Array.isArray(agentsRequested) && agentsRequested.length > 0
+      ? agentsRequested
+      : pickAgentsForRun(config.testType, projectInfo, context);
+    const retry = buildFailedAgentRetryMetadata({
+      agentFailures,
+      agentsRequested: requestedAgents,
+      agentsCompleted: Array.isArray(agentsCompleted) ? agentsCompleted : [],
+      sharedPayload: buildRetrySharedPayload(),
+      config,
+      runId,
+      existingSuiteManifest,
+      agentTransportTimeoutMs,
+      reason,
+    });
+    generationMeta.agentsRequested = generationMeta.agentsRequested || requestedAgents;
+    generationMeta.agentsCompleted = generationMeta.agentsCompleted || (Array.isArray(agentsCompleted) ? agentsCompleted : []);
+    generationMeta.agentFailures = agentFailures;
+    if (retry && !generationMeta.failedAgentRetry) {
+      generationMeta.failedAgentRetry = retry;
+    }
+    return retry;
+  };
+
+  const mergeGenerationMetaFromResult = (resultMeta) => {
+    if (!resultMeta || typeof resultMeta !== 'object') return;
+    if (Array.isArray(resultMeta.agentsRequested)) generationMeta.agentsRequested = resultMeta.agentsRequested;
+    if (Array.isArray(resultMeta.agentsCompleted)) generationMeta.agentsCompleted = resultMeta.agentsCompleted;
+    if (Array.isArray(resultMeta.agentFailures)) generationMeta.agentFailures = resultMeta.agentFailures;
+    if (resultMeta.failedAgentRetry) generationMeta.failedAgentRetry = resultMeta.failedAgentRetry;
+    if (resultMeta.coverageRetry) generationMeta.coverageRetry = resultMeta.coverageRetry;
+  };
+
   const tryGenerator = async (generatorName, runFn) => {
     const startedAt = Date.now();
 
     try {
       const result = await withStageBudget(runBudget, 'generation', runFn);
+      mergeGenerationMetaFromResult(result?.generationMeta);
       const fixtureWiring = applyFixtureWiring(generatorName);
       let cursorOverlay = null;
       if (config.generateTests) {
@@ -4747,6 +8159,13 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
     } catch (error) {
       const summarizedReason = summarizeGenerationAttemptError(error);
       const errorCode = error?.code ? String(error.code) : classifyErrorCode(error);
+      mergeGenerationMetaFromResult(error?.generationMeta);
+      attachFailedAgentRetryFromFailures({
+        agentFailures: error?.agentFailures || error?.generationMeta?.agentFailures || [],
+        agentsRequested: error?.agentsRequested || error?.generationMeta?.agentsRequested || null,
+        agentsCompleted: error?.agentsCompleted || error?.generationMeta?.agentsCompleted || [],
+        reason: `generation_error_${errorCode}`,
+      });
 
       // Partial-survival path: when withStageBudget trips TIME_BUDGET_EXCEEDED
       // mid-run, the per-agent Promise.allSettled inside maybeGenerateViaSaaS
@@ -4815,6 +8234,120 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
         }
       }
 
+      const qaSummary = summarizeQaContracts(context?.qaContracts || {});
+      const hasQaContracts = Boolean(deterministicTier0Pack?.written) || Object.entries(qaSummary)
+        .some(([key, value]) => key !== 'advisoryQuestions' && Number(value || 0) > 0);
+      if (hasQaContracts && !['AUTH_REQUIRED_NO_CREDENTIALS'].includes(errorCode)) {
+        try {
+          const recoveredPack = ensureQaContractSpec({
+            projectPath: config.projectPath,
+            context,
+            roles,
+            testType: config.testType,
+          });
+          generationMeta.qaContractPack = recoveredPack;
+          generationMeta.qaContractSummary = recoveredPack.qaContractSummary;
+          generationMeta.qaContractQuestions = recoveredPack.qaContractQuestions;
+          generationMeta.qaContractWarnings = recoveredPack.qaContractWarnings;
+          if (!recoveredPack.written || recoveredPack.generatedTests <= 0) {
+            throw new Error('No runnable deterministic QA contract tests were available for rescue.');
+          }
+          generationMeta.fixtureWiring = applyFixtureWiring(`${generatorName}-qa-contracts`);
+          const validation = await runValidation(`${generatorName}-qa-contracts`);
+          generationMeta.provider = generatorName;
+          generationMeta.selectedGenerator = `${generatorName}-qa-contracts`;
+          generationMeta.fallbackUsed = false;
+          generationMeta.partialGenerationWarning = {
+            reason: 'ai_generation_empty_qa_contract_rescue',
+            generator: generatorName,
+            partialsWrittenCount: validation.qualityAudit?.totalFiles || recoveredPack.generatedTests || 0,
+            message: 'AI generation returned no usable files; proceeding with deterministic Tier-0 source-derived QA contract tests.',
+          };
+          if (statusDir) {
+            recordRunDecision(statusDir, telemetryReporter, {
+              runId,
+              decisionType: 'tier0_decision',
+              phase: 'generation_tier0_rescue',
+              status: 'warning',
+              message: 'Tier-0 deterministic specs survived AI generation failure and will be used for execution.',
+              metadata: {
+                aiErrorCode: errorCode,
+                qaContractSummary: recoveredPack.qaContractSummary,
+                generatedTests: recoveredPack.generatedTests,
+                validation: {
+                  valid: validation?.valid,
+                  listedCount: validation?.listedCount,
+                  qualityAudit: validation?.qualityAudit ? {
+                    valid: validation.qualityAudit.valid,
+                    totalFiles: validation.qualityAudit.totalFiles,
+                    runnableTests: validation.qualityAudit.runnableTests,
+                    errors: validation.qualityAudit.errors,
+                  } : null,
+                },
+              },
+            });
+          }
+          if (Array.isArray(error?.agentFailures) && error.agentFailures.length > 0) {
+            const requestedAgents = pickAgentsForRun(config.testType, projectInfo, context);
+            generationMeta.agentsRequested = requestedAgents;
+            generationMeta.agentsCompleted = [];
+            generationMeta.agentFailures = error.agentFailures;
+            generationMeta.failedAgentRetry = buildFailedAgentRetryMetadata({
+              agentFailures: error.agentFailures,
+              agentsRequested: requestedAgents,
+              agentsCompleted: [],
+              sharedPayload: {
+                context,
+                prd: prdContent || '',
+                parsedPRD: parsedPRD || null,
+                explorationArtifact: explorationArtifact || null,
+                roles: roles || [],
+                testType: config.testType,
+                projectInfo,
+                options: {
+                  includeSmoke: true,
+                  includeWorkflows: true,
+                  includeErrorStates: true,
+                  allowSyntheticErrorScenarios: false,
+                  strictAIGeneration: strictAIEnabled(config),
+                  coverageProfile: config.coverageProfile || 'qa-max',
+                  minGeneratedTests: toFiniteNumber(config.minGeneratedTests, 50),
+                  maxExpansionAttempts: 0,
+                },
+              },
+              config,
+              runId,
+              reason: 'qa_contract_rescue_after_agent_failures',
+            });
+          }
+          generationMeta.attempts.push({
+            generator: generatorName,
+            status: 'partial',
+            reason: 'qa_contract_rescue',
+            rawReason: normalizeErrorText(error?.message),
+            errorCode,
+            generated: validation.qualityAudit?.totalFiles || 0,
+            validation,
+            durationMs: Date.now() - startedAt,
+          });
+          return {
+            generated: validation.qualityAudit?.totalFiles || 0,
+            files: listGeneratedTestFiles(config.projectPath).map((filePath) => ({
+              path: filePath,
+              filename: path.basename(filePath),
+              type: 'qa_contract',
+            })),
+            provider: generatorName,
+            generationMeta,
+          };
+        } catch (qaRescueErr) {
+          Logger.warn('PipelineWorker', 'QA contract rescue failed after empty AI generation', {
+            generator: generatorName,
+            reason: qaRescueErr?.message,
+          });
+        }
+      }
+
       generationMeta.attempts.push({
         generator: generatorName,
         status: 'failed',
@@ -4830,6 +8363,44 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
 
   const result = await tryGenerator('saas', async () => {
     const testsDir = resetGeneratedTestsDir(config.projectPath);
+    deterministicTier0Pack = ensureQaContractSpec({
+      projectPath: config.projectPath,
+      context,
+      roles: roles || [],
+      testType: config.testType,
+    });
+    generationMeta.tier0Deterministic = {
+      generatedBeforeAi: true,
+      ...deterministicTier0Pack,
+    };
+    if (deterministicTier0Pack.written) {
+      Logger.info('PipelineWorker', 'Generated Tier-0 deterministic QA contract pack before AI generation', {
+        filename: deterministicTier0Pack.filename,
+        generatedTests: deterministicTier0Pack.generatedTests,
+        qaContractSummary: deterministicTier0Pack.qaContractSummary,
+      });
+      if (statusDir) {
+        updateStatus(statusDir, 'generation_tier0_ready', {
+          runId,
+          message: `Generated ${deterministicTier0Pack.generatedTests} deterministic Tier-0 QA contract test(s).`,
+          qaContractSummary: deterministicTier0Pack.qaContractSummary,
+          qaContractQuestions: deterministicTier0Pack.qaContractQuestions,
+        }, telemetryReporter);
+        recordRunDecision(statusDir, telemetryReporter, {
+          runId,
+          decisionType: 'tier0_decision',
+          phase: 'generation_tier0_ready',
+          status: 'success',
+          message: 'Tier-0 deterministic QA contract pack was generated before AI agents.',
+          metadata: {
+            generatedTests: deterministicTier0Pack.generatedTests,
+            generatedContracts: deterministicTier0Pack.generatedContracts,
+            qaContractSummary: deterministicTier0Pack.qaContractSummary,
+            qaContractQuestions: deterministicTier0Pack.qaContractQuestions,
+          },
+        });
+      }
+    }
     const saasResult = await maybeGenerateViaSaaS({
       config,
       context,
@@ -4861,11 +8432,26 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
     const message = reason
       ? `Backend test generation failed: ${reason}`
       : 'Backend test generation failed. Ensure HEALIX_API_KEY is correctly configured and the backend is reachable.';
+    const primaryValidation = primaryFailure?.validation || null;
+    const validationSalvage = primaryValidation?.validationSalvage || generationMeta.validationSalvage || null;
 
     const error = new Error(message);
     error.code = errorCode;
     error.generationMeta = generationMeta;
     error.primaryFailure = primaryFailure;
+    error.validation = primaryValidation;
+    error.validationSalvage = validationSalvage;
+    if (primaryValidation || validationSalvage) {
+      error.diagnostics = buildPipelineDiagnostics({
+        projectPath: config.projectPath,
+        stage: 'validation',
+        reason: primaryValidation?.reason || primaryFailure?.errorCode || errorCode,
+        stderr: primaryValidation?.stderr || null,
+        stdout: primaryValidation?.stdout || null,
+        qualityAudit: primaryValidation?.qualityAudit || null,
+        validationSalvage,
+      });
+    }
     throw error;
   }
 
@@ -4877,11 +8463,33 @@ async function generateWithFallbackChain({ config, context, prdContent, runBudge
 
 async function maybeRunFailureTriage({ config, testResults, runBudget, runId }) {
   if (config.aiFailureAnalysis === false) {
-    return { analysis: null, evidenceBundles: [], verdicts: [], clusters: [] };
+    return {
+      analysis: null,
+      evidenceBundles: [],
+      verdicts: [],
+      clusters: [],
+      triage: {
+        aiTriageStatus: 'skipped_disabled',
+        aiTriageReason: 'AI failure analysis disabled by run config',
+        aiEligibleFailures: 0,
+        deterministicVerdicts: 0,
+      },
+    };
   }
 
   if (!testResults?.failures?.length) {
-    return { analysis: null, evidenceBundles: [], verdicts: [], clusters: [] };
+    return {
+      analysis: null,
+      evidenceBundles: [],
+      verdicts: [],
+      clusters: [],
+      triage: {
+        aiTriageStatus: 'skipped_no_failures',
+        aiTriageReason: 'No failed tests to analyze',
+        aiEligibleFailures: 0,
+        deterministicVerdicts: 0,
+      },
+    };
   }
 
   const limit = toFiniteNumber(config.aiFailureLimit || process.env.HEALIX_AI_TRIAGE_LIMIT, 8);
@@ -4937,6 +8545,14 @@ async function maybeRunFailureTriage({ config, testResults, runBudget, runId }) 
       evidenceBundles: bundleResult.bundles,
       verdicts: classifierResult.verdicts,
       clusters: classifierResult.clusters,
+      triage: {
+        aiTriageStatus: providerConfig.reason.includes('HEALIX_API_KEY')
+          ? 'skipped_missing_key'
+          : 'skipped_disabled',
+        aiTriageReason: providerConfig.reason,
+        aiEligibleFailures: classifierResult.aiEligibleIndexes.length,
+        deterministicVerdicts: classifierResult.verdicts.filter(Boolean).length,
+      },
     };
   }
 
@@ -4952,6 +8568,12 @@ async function maybeRunFailureTriage({ config, testResults, runBudget, runId }) 
       evidenceBundles: bundleResult.bundles,
       verdicts: classifierResult.verdicts,
       clusters: classifierResult.clusters,
+      triage: {
+        aiTriageStatus: 'skipped_deterministic',
+        aiTriageReason: 'All failures were classified deterministically',
+        aiEligibleFailures: 0,
+        deterministicVerdicts: classifierResult.verdicts.filter(Boolean).length,
+      },
     };
   }
 
@@ -4974,6 +8596,12 @@ async function maybeRunFailureTriage({ config, testResults, runBudget, runId }) 
       evidenceBundles: bundleResult.bundles,
       verdicts: classifierResult.verdicts,
       clusters: classifierResult.clusters,
+      triage: {
+        aiTriageStatus: 'completed',
+        aiTriageReason: null,
+        aiEligibleFailures: aiPayload.length,
+        deterministicVerdicts: classifierResult.verdicts.filter(Boolean).length,
+      },
     };
   });
 }
@@ -5067,39 +8695,78 @@ async function runPipeline(config, runId) {
         const portInUse = await _tempPI.probeTcpPort('127.0.0.1', configuredPort, 500)
           || await _tempPI.probeTcpPort('localhost', configuredPort, 500);
         if (portInUse) {
-          const freePort = await _tempPI.findFreePort(configuredPort + 1);
-          Logger.warn('PipelineWorker', `Port ${configuredPort} is already in use — switching dev server to port ${freePort}`, {
-            originalPort: configuredPort,
-            newPort: freePort,
-          });
-          // Clean up Next.js dev lock file — the existing server holds it and
-          // SIGKILL won't release it, so the new instance would fail to start.
-          const nextDevLock = path.join(config.projectPath, '.next', 'dev', 'lock');
-          try {
-            if (fs.existsSync(nextDevLock)) {
-              fs.unlinkSync(nextDevLock);
-              Logger.info('PipelineWorker', 'Removed stale Next.js dev lock file', { lockFile: nextDevLock });
+          const existingAppReady = config.baseURL
+            ? await probeHttpReady(config.baseURL, { controllerTimeoutMs: 1500 })
+            : false;
+          if (existingAppReady) {
+            Logger.info('PipelineWorker', 'Configured target port is already serving the app — reusing existing server', {
+              port: configuredPort,
+              baseURL: config.baseURL,
+            });
+            config = {
+              ...config,
+              _primaryAppPreStarted: true,
+              _healixReusedExistingServer: true,
+            };
+            updateStatus(statusDir, 'dev_server_reused', {
+              runId,
+              message: `Reusing existing target app at ${config.baseURL}; no duplicate dev server will be started.`,
+              project: config.projectName,
+              port: configuredPort,
+              baseURL: config.baseURL,
+              aiOnlyEnforced,
+            }, telemetryReporter);
+          } else {
+            if (!shouldAutoSwitchPortForConflict(config)) {
+              const err = buildTargetPortInUseError({ config, configuredPort });
+              updateStatus(statusDir, 'server_start_blocked', {
+                runId,
+                message: err.message,
+                project: config.projectName,
+                port: configuredPort,
+                baseURL: config.baseURL,
+                startCommand: config.startCommand,
+                services: err.diagnostics.services,
+                aiOnlyEnforced,
+              }, telemetryReporter);
+              throw err;
             }
-          } catch {
-            // non-fatal — best effort
+
+            const freePort = await _tempPI.findFreePort(configuredPort + 1);
+            Logger.warn('PipelineWorker', `Port ${configuredPort} is already in use — switching dev server to port ${freePort}`, {
+              originalPort: configuredPort,
+              newPort: freePort,
+              reason: 'single_service_port_fallback',
+            });
+            // Clean up Next.js dev lock file — the existing server holds it and
+            // SIGKILL won't release it, so the new instance would fail to start.
+            const nextDevLock = path.join(config.projectPath, '.next', 'dev', 'lock');
+            try {
+              if (fs.existsSync(nextDevLock)) {
+                fs.unlinkSync(nextDevLock);
+                Logger.info('PipelineWorker', 'Removed stale Next.js dev lock file', { lockFile: nextDevLock });
+              }
+            } catch {
+              // non-fatal — best effort
+            }
+            const rewrittenStartCommand = rewriteStartCommandForPort(config.startCommand, freePort, config.projectPath);
+            try {
+              const parsedBase = new URL(config.baseURL);
+              parsedBase.port = String(freePort);
+              config = { ...config, port: freePort, baseURL: parsedBase.toString().replace(/\/$/, ''), startCommand: rewrittenStartCommand };
+            } catch {
+              config = { ...config, port: freePort, baseURL: `http://localhost:${freePort}`, startCommand: rewrittenStartCommand };
+            }
+            updateStatus(statusDir, 'port_conflict', {
+              runId,
+              message: `Port ${configuredPort} is already in use. Dev server will start on port ${freePort} instead.`,
+              project: config.projectName,
+              originalPort: configuredPort,
+              newPort: freePort,
+              startCommand: rewrittenStartCommand,
+              aiOnlyEnforced,
+            }, telemetryReporter);
           }
-          const rewrittenStartCommand = rewriteStartCommandForPort(config.startCommand, freePort, config.projectPath);
-          try {
-            const parsedBase = new URL(config.baseURL);
-            parsedBase.port = String(freePort);
-            config = { ...config, port: freePort, baseURL: parsedBase.toString().replace(/\/$/, ''), startCommand: rewrittenStartCommand };
-          } catch {
-            config = { ...config, port: freePort, baseURL: `http://localhost:${freePort}`, startCommand: rewrittenStartCommand };
-          }
-          updateStatus(statusDir, 'port_conflict', {
-            runId,
-            message: `Port ${configuredPort} is already in use. Dev server will start on port ${freePort} instead.`,
-            project: config.projectName,
-            originalPort: configuredPort,
-            newPort: freePort,
-            startCommand: rewrittenStartCommand,
-            aiOnlyEnforced,
-          }, telemetryReporter);
         }
       }
     }
@@ -5426,6 +9093,19 @@ async function runPipeline(config, runId) {
           totalTimeoutMs: 120_000,
         });
         explorationArtifact = result.artifact;
+        let explorationSource = result.source;
+        let explorationReason = result.reason || null;
+        if (!artifactHasUsefulContext(explorationArtifact) && Array.isArray(codebaseContext?.pages) && codebaseContext.pages.length > 0) {
+          explorationArtifact = synthesizeExplorationArtifactFromContext(codebaseContext, explorationArtifact);
+          explorationSource = `${result.source || 'unknown'}+static-context`;
+          explorationReason = explorationReason || 'browser exploration returned no useful app context';
+          Logger.warn('PipelineWorker', 'Exploration returned no useful app context; synthesized route/form context from static code analysis', {
+            originalSource: result.source,
+            routeCount: (explorationArtifact?.routes || []).length,
+            formCount: (explorationArtifact?.forms || []).length,
+            keyFlowCount: (explorationArtifact?.keyFlows || []).length,
+          });
+        }
         routeAccessSummary = buildRouteAccessSummary(explorationArtifact);
         // preAuthRoles carries the storageState files written during the
         // exploration pre-auth pass — used in step 3c to skip redundant logins.
@@ -5434,15 +9114,32 @@ async function runPipeline(config, runId) {
         }
         updateStatus(statusDir, 'explored', {
           runId,
-          message: `Exploration ${result.source}${result.reason ? ` (${result.reason})` : ''}`,
-          source: result.source,
-          reason: result.reason || null,
-          routeCount: (result.artifact?.routes || []).length,
-          keyFlowCount: (result.artifact?.keyFlows || []).length,
+          message: `Exploration ${explorationSource}${explorationReason ? ` (${explorationReason})` : ''}`,
+          source: explorationSource,
+          reason: explorationReason,
+          routeCount: (explorationArtifact?.routes || []).length,
+          keyFlowCount: (explorationArtifact?.keyFlows || []).length,
+          formCount: (explorationArtifact?.forms || []).length,
           routeAccessSummary,
+          authFlowRejected: explorationArtifact?.authFlowRejected || null,
         }, telemetryReporter);
       } catch (explErr) {
         Logger.warn('PipelineWorker', 'Exploration phase failed (best-effort)', { reason: explErr.message });
+        if (Array.isArray(codebaseContext?.pages) && codebaseContext.pages.length > 0) {
+          explorationArtifact = synthesizeExplorationArtifactFromContext(codebaseContext, explorationArtifact);
+          routeAccessSummary = buildRouteAccessSummary(explorationArtifact);
+          updateStatus(statusDir, 'explored', {
+            runId,
+            message: `Exploration failed; using static code context (${explErr.message})`,
+            source: 'failed+static-context',
+            reason: explErr.message,
+            routeCount: (explorationArtifact?.routes || []).length,
+            keyFlowCount: (explorationArtifact?.keyFlows || []).length,
+            formCount: (explorationArtifact?.forms || []).length,
+            routeAccessSummary,
+            authFlowRejected: explorationArtifact?.authFlowRejected || null,
+          }, telemetryReporter);
+        }
       }
     }
 
@@ -5462,51 +9159,104 @@ async function runPipeline(config, runId) {
     let roles = [];
     if (Array.isArray(config.testCredentials) && config.testCredentials.length > 0) {
       const preAuthRoles = Array.isArray(config._preAuthRoles) ? config._preAuthRoles : [];
-      const allPreAuthVerified = preAuthRoles.length > 0
-        && config.testCredentials.every((cred) => {
-          const role = cred.role || 'user';
-          return preAuthRoles.some((r) => r.role === role && r.loginVerified);
-        });
-      const hasAuthFlow = !!(explorationArtifact?.authFlow);
+      const allPreAuthVerified = allCredentialsCoveredByPreAuth(config.testCredentials, preAuthRoles);
+      const hasTrustedAuthFlow = shouldTrustDiscoveredAuthFlow(explorationArtifact?.authFlow);
 
-      if (allPreAuthVerified && !hasAuthFlow) {
+      if (allPreAuthVerified && !hasTrustedAuthFlow) {
         // Pre-auth storageStates are sufficient and there is no better authFlow
         // from exploration — skip the redundant login round-trip.
-        roles = preAuthRoles;
+        roles = preAuthRoles.map((role) => ({ ...role, reusedFromPreAuth: true }));
         Logger.info('PipelineWorker', 'Reusing pre-auth storageStates — skipping duplicate credential injection', {
-          roles: roles.map((r) => r.role),
+          roles: roles.map((r) => roleKeyForAuth(r)),
+          authFlowRejected: explorationArtifact?.authFlowRejected || null,
         });
         updateStatus(statusDir, 'auth_injected', {
           runId,
           message: `${roles.filter((r) => r.loginVerified).length}/${roles.length} role login(s) verified (reused from pre-auth)`,
-          roles: roles.map((r) => ({ role: r.role, loginVerified: !!r.loginVerified, reason: r.reason || null })),
+          roles: summarizeAuthRoles(roles),
+          authFlowRejected: explorationArtifact?.authFlowRejected || null,
         }, telemetryReporter);
+        recordRunDecision(statusDir, telemetryReporter, {
+          runId,
+          decisionType: 'auth_decision',
+          phase: 'auth_injected',
+          status: 'success',
+          message: 'Pre-auth storage states reused for credential injection.',
+          metadata: {
+            authDecision: 'reuse_preauth',
+            totalCredentials: config.testCredentials.length,
+            verifiedRoles: summarizeAuthRoles(roles),
+            authFlowSource: hasTrustedAuthFlow ? 'trusted_exploration' : 'none',
+            authFlowRejected: explorationArtifact?.authFlowRejected || null,
+          },
+        });
       } else {
         // Either pre-auth failed for some roles OR exploration found a richer
         // authFlow — run a fresh injection so storageStates use the best available selectors.
         updateStatus(statusDir, 'auth_injecting', {
           runId,
-          message: hasAuthFlow
+          message: hasTrustedAuthFlow
             ? `Re-injecting credentials with discovered authFlow for ${config.testCredentials.length} role(s)...`
             : `Verifying credentials for ${config.testCredentials.length} role(s)...`,
+          authFlowRejected: explorationArtifact?.authFlowRejected || null,
         }, telemetryReporter);
         try {
-          roles = await injectCredentials({
+          const freshRoles = await injectCredentials({
             projectPath: config.projectPath,
             baseURL: config.baseURL,
             credentials: config.testCredentials,
-            authFlow: explorationArtifact?.authFlow || null,
+            authFlow: hasTrustedAuthFlow ? explorationArtifact?.authFlow : null,
           });
+          const mergedAuth = mergeCredentialInjectionRoles({ freshRoles, preAuthRoles });
+          roles = mergedAuth.roles;
           const verifiedCount = roles.filter((r) => r.loginVerified).length;
           updateStatus(statusDir, 'auth_injected', {
             runId,
-            message: `${verifiedCount}/${roles.length} role login(s) verified`,
-            roles: roles.map((r) => ({ role: r.role, loginVerified: !!r.loginVerified, reason: r.reason || null })),
+            message: mergedAuth.reusedPreAuthRoles.length > 0
+              ? `${verifiedCount}/${roles.length} role login(s) verified (${mergedAuth.reusedPreAuthRoles.length} reused from pre-auth after reinjection failure)`
+              : `${verifiedCount}/${roles.length} role login(s) verified`,
+            roles: summarizeAuthRoles(roles),
+            reusedPreAuthRoles: mergedAuth.reusedPreAuthRoles,
+            failedFreshRoles: mergedAuth.failedFreshRoles,
+            authFlowRejected: explorationArtifact?.authFlowRejected || null,
           }, telemetryReporter);
+          recordRunDecision(statusDir, telemetryReporter, {
+            runId,
+            decisionType: 'auth_decision',
+            phase: 'auth_injected',
+            status: verifiedCount > 0 ? (mergedAuth.failedFreshRoles.length > 0 ? 'warning' : 'success') : 'error',
+            message: `${verifiedCount}/${roles.length} role login(s) verified after credential injection.`,
+            metadata: {
+              authDecision: hasTrustedAuthFlow ? 'fresh_injection_with_discovered_flow' : 'fresh_injection_without_flow',
+              totalCredentials: config.testCredentials.length,
+              verifiedCount,
+              roles: summarizeAuthRoles(roles),
+              reusedPreAuthRoles: mergedAuth.reusedPreAuthRoles,
+              failedFreshRoles: mergedAuth.failedFreshRoles,
+              authFlowSource: hasTrustedAuthFlow ? 'trusted_exploration' : 'heuristic_fallback',
+              authFlowRejected: explorationArtifact?.authFlowRejected || null,
+            },
+          });
         } catch (credErr) {
           Logger.warn('PipelineWorker', 'Credential injection failed (best-effort)', { reason: credErr.message });
           // Fall back to whatever pre-auth gave us rather than leaving roles empty.
           roles = preAuthRoles.length > 0 ? preAuthRoles : [];
+          recordRunDecision(statusDir, telemetryReporter, {
+            runId,
+            decisionType: 'auth_decision',
+            phase: 'auth_injected',
+            status: roles.some(hasVerifiedStorageState) ? 'warning' : 'error',
+            errorCode: credErr?.code || 'AUTH_INJECTION_FAILED',
+            reason: credErr.message,
+            message: 'Credential injection failed; Healix will use any verified pre-auth storage states.',
+            metadata: {
+              authDecision: 'fresh_injection_failed',
+              roles: summarizeAuthRoles(roles),
+              preAuthRoleCount: preAuthRoles.length,
+              authFlowSource: hasTrustedAuthFlow ? 'trusted_exploration' : 'heuristic_fallback',
+              authFlowRejected: explorationArtifact?.authFlowRejected || null,
+            },
+          });
         }
       }
     }
@@ -5526,6 +9276,20 @@ async function runPipeline(config, runId) {
         reason: 'all_observed_routes_protected_no_verified_credentials',
         routeAccessSummary,
       };
+      recordRunDecision(statusDir, telemetryReporter, {
+        runId,
+        decisionType: 'auth_decision',
+        phase: 'auth',
+        status: 'error',
+        errorCode: authErr.code,
+        reason: authErr.diagnostics.reason,
+        message: authErr.message,
+        metadata: {
+          verifiedRoleCount,
+          routeAccessSummary,
+          roles: summarizeAuthRoles(roles),
+        },
+      });
       throw authErr;
     }
 
@@ -5533,6 +9297,7 @@ async function runPipeline(config, runId) {
     // 4. Generate tests
     // -------------------------------------------------------
     if (config.generateTests) {
+      const rolesForGeneration = attachCredentialFixturesToRoles(roles, config.testCredentials);
       const generationComplexity = maybeExpandGenerationStageBudget({
         runBudget,
         config,
@@ -5550,7 +9315,7 @@ async function runPipeline(config, runId) {
 
       const maxGenerationRepairAttempts = Math.max(
         0,
-        Math.min(2, toFiniteNumber(config.maxGenerationRepairAttempts ?? process.env.HEALIX_GENERATION_REPAIR_ATTEMPTS, 0))
+        Math.min(2, toFiniteNumber(config.maxGenerationRepairAttempts ?? process.env.HEALIX_GENERATION_REPAIR_ATTEMPTS, 1))
       );
       let activeGenerationContext = codebaseContext || {};
       let generationResult = null;
@@ -5565,7 +9330,7 @@ async function runPipeline(config, runId) {
             prdContent: combinedPrdContent,
             parsedPRD,
             explorationArtifact,
-            roles,
+            roles: rolesForGeneration,
             runBudget,
             projectInfo,
             statusDir,
@@ -5579,18 +9344,32 @@ async function runPipeline(config, runId) {
             generationMeta.routeAccessSummary = routeAccessSummary;
             generationMeta.blockedAuthRoles = roles
               .filter((r) => r && r.loginVerified === false)
-              .map((r) => ({ role: r.role || r.name || 'user', reason: r.reason || null }));
+              .map((r) => ({ role: normalizeRoleLabel(r.role || r.name || 'user'), reason: r.reason || null }));
           }
 
           // Ensure playwright.config.ts exists after test generation
           const playwrightConfigResult = ensurePlaywrightConfig(config.projectPath, projectInfo, roles);
+          const currentRunAuthConfigPath = playwrightConfigResult?.supplementalAuthConfigPath || null;
+          const currentRunTierBRoles = (playwrightConfigResult?.tierBRoles || playwrightConfigResult?.skippedTierBRoles || [])
+            .map((role) => normalizeRoleLabel(role));
+          config = {
+            ...config,
+            tierBAuthConfigPath: currentRunAuthConfigPath,
+            tierBRoles: currentRunTierBRoles,
+            playwrightConfigResult,
+          };
           if (generationMeta && playwrightConfigResult) {
             generationMeta.playwrightConfig = playwrightConfigResult;
+            generationMeta.tierBAuthConfigPath = currentRunAuthConfigPath;
+            generationMeta.tierBRoles = currentRunTierBRoles;
           }
 
           const qualityScan = collectGenerationQuality(config.projectPath, {
             baseURL: config.baseURL || projectInfo.baseURL,
           });
+          if (generationMeta?.retainedSuite) {
+            qualityScan.retainedSuite = generationMeta.retainedSuite;
+          }
           // Build requirements coverage FIRST so the gate can feed the BRD-trace
           // signal into the quality score + suggestions block.
           requirementsCoverage = buildRequirementsCoverage({
@@ -5607,10 +9386,93 @@ async function runPipeline(config, runId) {
             requirementsCoverage,
           });
           if (!qualityGate.ok) {
+            recordRunDecision(statusDir, telemetryReporter, {
+              runId,
+              decisionType: 'final_gating_decision',
+              phase: 'generation_quality_gate',
+              status: 'error',
+              errorCode: qualityGate.error?.code || 'GENERATION_QUALITY_FAILED',
+              reason: qualityGate.error?.message || null,
+              message: 'Generation quality gate blocked execution.',
+              metadata: {
+                target: config.minGeneratedTests || 50,
+                quality: qualityGate.error?.generationQuality || qualityScan,
+                retainedSuite: qualityScan.retainedSuite || null,
+                routeAccessSummary,
+                requirementsCoverage,
+              },
+            });
+            const qaContractOnlyRescue =
+              qualityScan.runnableTests > 0 &&
+              (
+                (generationMeta?.qaContractPack?.generatedTests || 0) > 0 ||
+                (generationMeta?.tier0Deterministic?.generatedTests || 0) > 0 ||
+                generationMeta?.partialGenerationWarning?.reason === 'ai_generation_empty_qa_contract_rescue'
+              ) &&
+              qualityGate.error?.code === 'INSUFFICIENT_RUNNABLE_COVERAGE';
+            if (qaContractOnlyRescue) {
+              const rescuedQuality = {
+                ...(qualityGate.error.generationQuality || qualityScan),
+                qualityGateStatus: 'warning',
+                executionAllowedDespiteWarnings: true,
+                qualityWarnings: [
+                  ...((qualityGate.error.generationQuality || {}).qualityWarnings || []),
+                  {
+                    code: 'AI_GENERATION_UNAVAILABLE_QA_CONTRACT_RESCUE',
+                    message: 'Deterministic Tier-0 source-derived QA contract tests are valid and will run even though AI coverage is below target.',
+                    actual: qualityScan.runnableTests,
+                    expected: qualityGate.error.generationQuality?.minimumUsefulRunnableFloor || null,
+                    severity: 'warning',
+                  },
+                ],
+              };
+              generationQuality = rescuedQuality;
+              codebaseContext = activeGenerationContext;
+              Logger.warn('PipelineWorker', 'Executing deterministic Tier-0 QA contract suite below normal useful floor', {
+                runId,
+                runnableTests: qualityScan.runnableTests,
+                qaContractTests: generationMeta.qaContractPack?.generatedTests || generationMeta.tier0Deterministic?.generatedTests || 0,
+              });
+              recordRunDecision(statusDir, telemetryReporter, {
+                runId,
+                decisionType: 'final_gating_decision',
+                phase: 'generation_quality_gate',
+                status: 'warning',
+                message: 'Tier-0 deterministic tests are allowed below the normal AI useful floor.',
+                metadata: {
+                  quality: rescuedQuality,
+                  qaContractTests: generationMeta.qaContractPack?.generatedTests || generationMeta.tier0Deterministic?.generatedTests || 0,
+                  tier0Deterministic: generationMeta.tier0Deterministic || null,
+                },
+              });
+              break;
+            }
             qualityGate.error.generationMeta = generationMeta;
             throw qualityGate.error;
           }
           generationQuality = qualityGate.result;
+          recordRunDecision(statusDir, telemetryReporter, {
+            runId,
+            decisionType: 'final_gating_decision',
+            phase: 'generation_quality_gate',
+            status: generationQuality.qualityGateStatus === 'warning' ? 'warning' : 'success',
+            message: generationQuality.qualityGateStatus === 'warning'
+              ? 'Generation quality gate allowed execution with warnings.'
+              : 'Generation quality gate allowed execution.',
+            metadata: {
+              target: generationQuality.minGeneratedTestsTarget || config.minGeneratedTests || 50,
+              originalMinimumUsefulRunnableFloor: generationQuality.originalMinimumUsefulRunnableFloor,
+              effectiveRunnableFloor: generationQuality.effectiveRunnableFloor || generationQuality.minimumUsefulRunnableFloor,
+              totalTests: generationQuality.totalTests,
+              runnableTests: generationQuality.runnableTests,
+              skippedTests: generationQuality.skippedTests,
+              qualityGateStatus: generationQuality.qualityGateStatus,
+              qualityWarnings: generationQuality.qualityWarnings || [],
+              retainedSuite: generationQuality.retainedSuite || null,
+              missingCategories: generationQuality.missingCategories || [],
+              requirementsCoverage,
+            },
+          });
           codebaseContext = activeGenerationContext;
           if (generationMeta && generationRepairHistory.length > 0) {
             generationMeta.repairAttempts = generationRepairHistory;
@@ -5685,14 +9547,25 @@ async function runPipeline(config, runId) {
       if (
         generationMeta &&
         generationQuality &&
-        Array.isArray(generationQuality.improvementSuggestions) &&
-        generationQuality.improvementSuggestions.length > 0
+        (
+          (Array.isArray(generationQuality.improvementSuggestions) && generationQuality.improvementSuggestions.length > 0) ||
+          (Array.isArray(generationQuality.qualityWarnings) && generationQuality.qualityWarnings.length > 0)
+        )
       ) {
         generationMeta.qualityWarning = {
           qualityScore: generationQuality.qualityScore,
           potentialImprovement: generationQuality.potentialImprovement,
-          suggestions: generationQuality.improvementSuggestions,
+          suggestions: generationQuality.improvementSuggestions || [],
           totalTests: generationQuality.totalTests,
+          minGeneratedTestsTarget: generationQuality.minGeneratedTestsTarget,
+          minimumUsefulRunnableFloor: generationQuality.minimumUsefulRunnableFloor,
+          adaptiveRunnableFloor: generationQuality.adaptiveRunnableFloor,
+          originalMinimumUsefulRunnableFloor: generationQuality.originalMinimumUsefulRunnableFloor,
+          effectiveRunnableFloor: generationQuality.effectiveRunnableFloor,
+          retainedSuite: generationQuality.retainedSuite || null,
+          runnableTestsActual: generationQuality.runnableTestsActual,
+          qualityWarnings: generationQuality.qualityWarnings || [],
+          executionAllowedDespiteWarnings: generationQuality.executionAllowedDespiteWarnings,
           selectorQuality: generationQuality.selectorQuality,
           coverageProfile: generationQuality.coverageProfile,
           missingCategories: generationQuality.missingCategories,
@@ -5846,13 +9719,16 @@ async function runPipeline(config, runId) {
           },
         });
         if (started.length > 0) {
+          const reusedCount = started.filter((s) => s.reused).length;
+          const spawnedCount = started.length - reusedCount;
           updateStatus(statusDir, 'secondary_services_started', {
             runId,
-            message: `Started ${started.length} secondary service(s)`,
+            message: `Prepared ${started.length} secondary service(s) (${spawnedCount} started, ${reusedCount} reused)`,
             services: started.map((s) => ({
               role: s.service.role,
               port: s.service.port,
               ready: s.ready,
+              reused: !!s.reused,
             })),
           }, telemetryReporter);
         }
@@ -5963,36 +9839,108 @@ async function runPipeline(config, runId) {
       process.env.PLAYWRIGHT_MCP_PARALLEL === 'true' ||
       process.env.PLAYWRIGHT_MCP_ENABLED === 'true';
 
+    recordRunDecision(statusDir, telemetryReporter, {
+      runId,
+      decisionType: 'execution_handoff',
+      phase: 'running',
+      status: 'info',
+      message: 'Handing retained generated suite to Playwright execution.',
+      metadata: {
+        configPath: config.playwrightConfigResult?.configPath || config.playwrightConfig || null,
+        tierBAuthConfigPath: config.tierBAuthConfigPath || null,
+        tierBRoles: config.tierBRoles || [],
+        testDir: path.join(config.projectPath, 'tests', 'generated'),
+        generatedSpecCount: listGeneratedTestFiles(config.projectPath).length,
+        generationQuality: generationQuality ? {
+          totalTests: generationQuality.totalTests,
+          runnableTests: generationQuality.runnableTests,
+          skippedTests: generationQuality.skippedTests,
+          qualityGateStatus: generationQuality.qualityGateStatus,
+          effectiveRunnableFloor: generationQuality.effectiveRunnableFloor || generationQuality.minimumUsefulRunnableFloor,
+          retainedSuite: generationQuality.retainedSuite || null,
+        } : null,
+        mcpParallelEnabled,
+        executionTimeout,
+      },
+    });
+
     // Re-inject credentials just before execution so storageState tokens are
     // always fresh. Generation can take >13 min and Supabase access tokens
     // expire in 1h — stale tokens cause middleware to reject the session and
     // redirect tests to /login or /signup.
     if (Array.isArray(config.testCredentials) && config.testCredentials.length > 0) {
       try {
+        const preAuthRoles = Array.isArray(config._preAuthRoles) ? config._preAuthRoles : [];
+        const hasTrustedAuthFlow = shouldTrustDiscoveredAuthFlow(explorationArtifact?.authFlow);
         updateStatus(statusDir, 'auth_refreshing', {
           runId,
           message: `Refreshing auth tokens before execution for ${config.testCredentials.length} role(s)...`,
+          authFlowRejected: explorationArtifact?.authFlowRejected || null,
         }, telemetryReporter);
         const freshRoles = await injectCredentials({
           projectPath: config.projectPath,
           baseURL: config.baseURL,
           credentials: config.testCredentials,
-          authFlow: explorationArtifact?.authFlow || null,
+          authFlow: hasTrustedAuthFlow ? explorationArtifact?.authFlow : null,
         });
-        const verifiedFresh = freshRoles.filter((r) => r.loginVerified);
-        if (verifiedFresh.length > 0) {
-          roles = freshRoles;
+        const mergedAuth = mergeCredentialInjectionRoles({
+          freshRoles,
+          preAuthRoles: roles.filter(hasVerifiedStorageState).length > 0 ? roles : preAuthRoles,
+        });
+        const verifiedFresh = freshRoles.filter(hasVerifiedStorageState);
+        const verifiedMerged = mergedAuth.roles.filter(hasVerifiedStorageState);
+        if (verifiedMerged.length > 0) {
+          roles = mergedAuth.roles;
           // Rewrite the fixture file so it embeds the freshest storageState paths
           // (paths don't change but this ensures the file exists post-generation).
-          ensureHealixFixtureImports({ projectPath: config.projectPath, roles: verifiedFresh });
+          ensureHealixFixtureImports({ projectPath: config.projectPath, roles: verifiedMerged });
         }
         Logger.info('PipelineWorker', 'Pre-execution auth refresh complete', {
           verified: verifiedFresh.length,
           total: freshRoles.length,
+          reusedPreAuthRoles: mergedAuth.reusedPreAuthRoles,
+        });
+        if (mergedAuth.reusedPreAuthRoles.length > 0) {
+          updateStatus(statusDir, 'auth_refresh_reused_preauth', {
+            runId,
+            message: `${mergedAuth.reusedPreAuthRoles.length} role(s) kept verified pre-auth storageState after refresh failed`,
+            roles: summarizeAuthRoles(roles),
+            reusedPreAuthRoles: mergedAuth.reusedPreAuthRoles,
+            failedFreshRoles: mergedAuth.failedFreshRoles,
+          }, telemetryReporter);
+        }
+        recordRunDecision(statusDir, telemetryReporter, {
+          runId,
+          decisionType: 'auth_decision',
+          phase: 'auth_refreshing',
+          status: verifiedMerged.length > 0 ? (mergedAuth.reusedPreAuthRoles.length > 0 ? 'warning' : 'success') : 'error',
+          message: `${verifiedMerged.length}/${mergedAuth.roles.length} role(s) have verified auth state before execution.`,
+          metadata: {
+            authDecision: 'pre_execution_refresh',
+            verifiedFreshCount: verifiedFresh.length,
+            verifiedMergedCount: verifiedMerged.length,
+            reusedPreAuthRoles: mergedAuth.reusedPreAuthRoles,
+            failedFreshRoles: mergedAuth.failedFreshRoles,
+            roles: summarizeAuthRoles(roles),
+            authFlowSource: hasTrustedAuthFlow ? 'trusted_exploration' : 'none',
+          },
         });
       } catch (refreshErr) {
         Logger.warn('PipelineWorker', 'Pre-execution auth refresh failed — using existing storageState', {
           reason: refreshErr.message,
+        });
+        recordRunDecision(statusDir, telemetryReporter, {
+          runId,
+          decisionType: 'auth_decision',
+          phase: 'auth_refreshing',
+          status: roles.some(hasVerifiedStorageState) ? 'warning' : 'error',
+          errorCode: refreshErr?.code || 'AUTH_REFRESH_FAILED',
+          reason: refreshErr.message,
+          message: 'Pre-execution auth refresh failed; existing storage states will be used if present.',
+          metadata: {
+            authDecision: 'pre_execution_refresh_failed',
+            roles: summarizeAuthRoles(roles),
+          },
         });
       }
     }
@@ -6054,6 +10002,9 @@ async function runPipeline(config, runId) {
       failed: testResults.failed,
     });
     phaseResults = testResults.phaseResults || null;
+    if (generationMeta && testResults.tierBAuthPass) {
+      generationMeta.tierBAuthPass = testResults.tierBAuthPass;
+    }
 
     let tierResults = null;
     try {
@@ -6140,6 +10091,7 @@ async function runPipeline(config, runId) {
     let evidenceBundles = [];
     let classifierVerdicts = [];
     let failureClusters = [];
+    let aiTriage = null;
     try {
       const triage = await maybeRunFailureTriage({
         config,
@@ -6151,12 +10103,19 @@ async function runPipeline(config, runId) {
       evidenceBundles = triage?.evidenceBundles ?? [];
       classifierVerdicts = triage?.verdicts ?? [];
       failureClusters = triage?.clusters ?? [];
+      aiTriage = triage?.triage ?? null;
     } catch (triageError) {
       Logger.warn('PipelineWorker', 'AI failure triage failed', { reason: triageError.message });
       aiAnalysis = null;
       evidenceBundles = [];
       classifierVerdicts = [];
       failureClusters = [];
+      aiTriage = {
+        aiTriageStatus: 'failed',
+        aiTriageReason: triageError.message,
+        aiEligibleFailures: 0,
+        deterministicVerdicts: 0,
+      };
     }
 
     // -------------------------------------------------------
@@ -6178,6 +10137,7 @@ async function runPipeline(config, runId) {
       const reportGen = new ReportGenerator();
       const healixApiKey = process.env.HEALIX_API_KEY;
       const healixDashboardUrl = process.env.HEALIX_DASHBOARD_URL || 'http://localhost:3000';
+      generationMeta = attachPipelineDecisionSummary(generationMeta || {}, statusDir);
 
       return reportGen.generate({
         projectPath: config.projectPath,
@@ -6197,10 +10157,27 @@ async function runPipeline(config, runId) {
         flakyCount: testResults.flaky || 0,
         classifierVerdicts,
         failureClusters,
+        aiTriage,
         api_key: healixApiKey,
         dashboard_url: healixDashboardUrl,
       });
     });
+    recordRunDecision(statusDir, telemetryReporter, {
+      runId,
+      decisionType: 'dashboard_sync_decision',
+      phase: 'reporting',
+      status: report.actualRunId || report.url ? 'success' : 'warning',
+      message: report.actualRunId
+        ? 'Report synced to dashboard.'
+        : 'Report generated locally; dashboard ingest id was not returned.',
+      metadata: {
+        reportPath: report.path,
+        dashboardUrl: report.url,
+        actualRunId: report.actualRunId || null,
+      },
+    });
+    generationMeta = attachPipelineDecisionSummary(generationMeta || {}, statusDir);
+    patchReportWithPipelineDecisionSummary(report.path, statusDir);
 
     // Use the actual run ID returned from the server (if available)
     const actualRunId = report.actualRunId || runId;
@@ -6394,6 +10371,23 @@ async function runPipeline(config, runId) {
       reason: config.generateTests === false ? 'generation_skipped_use_existing_tests' : 'generation_not_started',
     };
     const errorGenerationQuality = error.generationQuality || generationQuality;
+    recordRunDecision(statusDir, telemetryReporter, {
+      runId,
+      decisionType: 'pipeline_error_decision',
+      phase: 'error',
+      status: 'error',
+      errorCode,
+      reason: technicalError,
+      message: userFacingError,
+      metadata: {
+        errorCode,
+        stage: error.diagnostics?.stage || null,
+        reason: error.diagnostics?.reason || technicalError,
+        generationQuality: errorGenerationQuality,
+        validationSalvage: error.validationSalvage || error.diagnostics?.validationSalvage || errorGenerationMeta?.validationSalvage || null,
+      },
+    });
+    attachPipelineDecisionSummary(errorGenerationMeta, statusDir);
 
     updateStatus(statusDir, 'error', {
       runId,
@@ -6474,6 +10468,19 @@ async function runPipeline(config, runId) {
           || (errorCode === 'GENERATION_VALIDATION_FAILED' ? 'validation' : null),
       });
 
+      const metaValidationSalvage = errorGenerationMeta?.validationSalvage || null;
+      const primaryValidationSalvage = error.primaryFailure?.validation?.validationSalvage || null;
+      const validationSalvage = error.validationSalvage
+        || error.diagnostics?.validationSalvage
+        || metaValidationSalvage
+        || primaryValidationSalvage
+        || null;
+      const generatedSpecCount = Number.isFinite(Number(error.diagnostics?.generatedSpecCount))
+        ? Number(error.diagnostics.generatedSpecCount)
+        : (Number.isFinite(Number(validationSalvage?.originalSpecCount))
+            ? Number(validationSalvage.originalSpecCount)
+            : listGeneratedTestFiles(config.projectPath).length);
+      const pipelineDecisionSummary = buildPipelineDecisionSummary(statusDir);
       const pipelineError = {
         errorCode,
         stage: error.diagnostics?.stage && error.diagnostics.stage !== 'unknown'
@@ -6485,8 +10492,18 @@ async function runPipeline(config, runId) {
         stderr: error.diagnostics?.stderr || (typeof error.message === 'string' ? error.message.slice(0, 4000) : null),
         stdout: error.diagnostics?.stdout || null,
         firstSpecPreview: error.diagnostics?.firstSpecPreview || null,
-        generatedSpecCount: error.diagnostics?.generatedSpecCount || 0,
+        generatedSpecCount,
+        keptSpecCount: error.diagnostics?.keptSpecCount
+          ?? (Array.isArray(validationSalvage?.keptSpecFiles) ? validationSalvage.keptSpecFiles.length : null),
+        quarantinedSpecCount: error.diagnostics?.quarantinedSpecCount
+          ?? (Array.isArray(validationSalvage?.quarantinedSpecFiles) ? validationSalvage.quarantinedSpecFiles.length : null),
+        keptSpecFiles: Array.isArray(validationSalvage?.keptSpecFiles) ? validationSalvage.keptSpecFiles : null,
+        quarantinedSpecFiles: Array.isArray(validationSalvage?.quarantinedSpecFiles) ? validationSalvage.quarantinedSpecFiles : null,
+        validationSalvage,
         qualityAuditErrors: error.diagnostics?.qualityAuditErrors || null,
+        generationQuality: error.generationQuality || error.diagnostics?.generationQuality || null,
+        pipelineDecisionSummary,
+        pipelineDecisionHighlights: pipelineDecisionSummary.notable,
       };
       // Mark the synthetic row so the dashboard can hide it when the banner
       // carries full diagnostics — otherwise stats strip double-counts it as
@@ -6508,9 +10525,31 @@ async function runPipeline(config, runId) {
         phaseResults,
         fallbackUsed,
         pipelineError,
+        aiTriage: {
+          aiTriageStatus: 'failed',
+          aiTriageReason: 'Pipeline failed before failure triage completed',
+          aiEligibleFailures: 0,
+          deterministicVerdicts: 0,
+        },
         api_key: healixApiKey,
         dashboard_url: healixDashboardUrl,
       });
+      recordRunDecision(statusDir, telemetryReporter, {
+        runId,
+        decisionType: 'dashboard_sync_decision',
+        phase: 'error_reported',
+        status: errorReport.actualRunId || errorReport.url ? 'success' : 'warning',
+        message: errorReport.actualRunId
+          ? 'Error report synced to dashboard.'
+          : 'Error report generated locally; dashboard ingest id was not returned.',
+        metadata: {
+          reportPath: errorReport.path,
+          dashboardUrl: errorReport.url,
+          actualRunId: errorReport.actualRunId || null,
+        },
+      });
+      attachPipelineDecisionSummary(errorGenerationMeta, statusDir);
+      patchReportWithPipelineDecisionSummary(errorReport.path, statusDir);
 
       updateStatus(statusDir, 'error_reported', {
         runId,
@@ -6587,12 +10626,32 @@ module.exports = {
   countTestsInContent,
   countSkippedTestsInContent,
   buildRouteAccessSummary,
+  synthesizeExplorationArtifactFromContext,
+  allCredentialsCoveredByPreAuth,
+  mergeCredentialInjectionRoles,
+  shouldTrustDiscoveredAuthFlow,
   hasApiSurfaceForGeneration,
   effectiveApiEndpoints,
   isSyntheticHealthEndpoint,
   buildGenerationRepairContext,
+  minimumUsefulRunnableFloor,
+  adaptiveRunnableFloor,
+  effectiveRetainedRunnableFloor,
+  shouldAttemptCoverageTopUp,
   isRepairableGenerationFailure,
   collectGenerationQuality,
+  buildExistingSuiteManifest,
+  buildFailedAgentRetryMetadata,
+  buildCoverageRetryMetadata,
+  buildRetainedSuiteRecoveryMeta,
+  extractSpecSignals,
+  filterDeltaTopUpTests,
+  normalizeGeneratedRouteFamily,
+  summarizeMissingRoutesByFamily,
+  salvageGeneratedTestValidation,
+  validateGeneratedTestsWithList,
+  ensureHealixValidationConfig,
+  safeWriteGeneratedTest,
   evaluateGenerationQualityGates,
   buildRequirementsCoverage,
   auditGeneratedTestQuality,
@@ -6601,6 +10660,11 @@ module.exports = {
   isBrittleGeneratedTestBlock,
   pruneGeneratedTestsByQuality,
   quarantineGeneratedSpecFiles,
+  snapshotGeneratedSpecFiles,
+  restoreGeneratedSpecSnapshot,
+  assessQualityRecoveryNetBenefit,
+  qualityAuditHasHardErrors,
+  demoteSoftQualityAuditErrors,
   strictAIEnabled,
   classifyErrorCode,
   buildUserFacingPipelineError,
@@ -6616,10 +10680,18 @@ module.exports = {
   computeGenerationAgentTimeoutMs,
   maybeExpandGenerationStageBudget,
   resolveGenerationAgentConcurrency,
+  shouldAutoSwitchPortForConflict,
+  buildTargetPortInUseError,
   rewriteStartCommandForPort,
   DEFAULT_STAGE_CAPS_MS,
   DEFAULT_TOTAL_BUDGET_MS,
+  maybeRunFailureTriage,
   maybeGenerateViaSaaS,
+  maybeRunCoverageTopUp,
+  recordRunDecision,
+  readRunDecisionEvents,
+  buildPipelineDecisionSummary,
+  boundDecisionMetadata,
   pickAgentsForRun,
   rescuePartialGeneration,
 };

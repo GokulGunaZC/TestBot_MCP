@@ -426,11 +426,11 @@ class HealixMCPServer {
     if (!credentials) return undefined;
     
     if (Array.isArray(credentials)) {
-      const validCreds = credentials.filter(c => c.username || c.password);
+      const validCreds = credentials.filter(c => c.username && c.password);
       return validCreds.length > 0 ? validCreds : undefined;
     }
     
-    if (credentials.username || credentials.password) {
+    if (credentials.username && credentials.password) {
       return [credentials];
     }
     
@@ -1731,7 +1731,7 @@ Return the JSON structure above based on what you find in the codebase.
           ],
         };
       }
-      if (['queued','started','detecting','context','context_enrichment','jira','port_conflict','warning','parsing_prd','prd_parsed','plan_generated','exploring','explored','auth_injecting','auth_injected','generating','generation_partial','generation_async_enqueued','generation_async_progress','running','running_tests','secondary_services_started','tests_complete','reporting','uploading_artifacts','artifacts_uploaded'].includes(recent.data.phase) && ageMs < 30 * 60 * 1000) {
+      if (['queued','started','detecting','context','context_enrichment','jira','port_conflict','dev_server_reused','server_start_blocked','warning','parsing_prd','prd_parsed','plan_generated','exploring','explored','auth_injecting','auth_injected','auth_refreshing','auth_refresh_reused_preauth','generating','generation_partial','generation_async_enqueued','generation_async_progress','running','running_tests','secondary_services_started','tests_complete','reporting','uploading_artifacts','artifacts_uploaded'].includes(recent.data.phase) && ageMs < 30 * 60 * 1000) {
         return {
           content: [
             {

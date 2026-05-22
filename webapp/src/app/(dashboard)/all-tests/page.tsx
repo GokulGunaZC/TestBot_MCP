@@ -69,6 +69,19 @@ function StatusCell({ pass, total }: { pass: number; total: number }) {
   );
 }
 
+function statusBadgeClass(status: string | null | undefined) {
+  if (status === 'passed') return 'bg-emerald-500/10 text-emerald-400'
+  if (status === 'failed') return 'bg-red-500/10 text-red-400'
+  if (status === 'running') return 'bg-blue-500/10 text-blue-400'
+  if (status === 'completed_with_findings') return 'bg-amber-500/10 text-amber-300'
+  return 'bg-amber-500/10 text-amber-400'
+}
+
+function statusLabel(status: string | null | undefined) {
+  if (status === 'completed_with_findings') return 'findings'
+  return status || 'unknown'
+}
+
 function SkeletonRow() {
   return (
     <tr className="border-b border-white/5">
@@ -110,10 +123,11 @@ export default function AllTestsPage() {
   const [loading, setLoading] = useState(true);
   const [activeRunsPresent, setActiveRunsPresent] = useState(false);
   const payloadSignatureRef = useRef<string | null>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
 
   const [search, setSearch] = useState('');
   const [debouncedSearch, setDebouncedSearch] = useState('');
-  const [statusFilter, setStatusFilter] = useState<'all' | 'passed' | 'failed' | 'running'>('all');
+  const [statusFilter, setStatusFilter] = useState<'all' | 'passed' | 'failed' | 'completed_with_findings' | 'running'>('all');
   const [sortBy, setSortBy] = useState<'date' | 'name' | 'status'>('date');
   const [pageSize, setPageSize] = useState(25);
   const [page, setPage] = useState(1);
@@ -131,6 +145,18 @@ export default function AllTestsPage() {
 
   const fetchTests = useCallback(async (options: { showLoading?: boolean } = {}) => {
     const showLoading = options.showLoading === true;
+
+    // Background polls skip if a request is already in flight
+    if (!showLoading && abortControllerRef.current) return;
+
+    // User-triggered fetches abort any stale in-flight request
+    if (showLoading && abortControllerRef.current) {
+      abortControllerRef.current.abort();
+    }
+
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+
     if (showLoading) setLoading(true);
     try {
       const params = new URLSearchParams({
@@ -144,7 +170,7 @@ export default function AllTestsPage() {
         params.set('status', statusFilter);
       }
 
-      const res = await fetch(`/api/test-runs?${params.toString()}`);
+      const res = await fetch(`/api/test-runs?${params.toString()}`, { signal: controller.signal });
       if (!res.ok) throw new Error('Failed to fetch');
       const json = await res.json();
 
@@ -182,6 +208,7 @@ export default function AllTestsPage() {
       }
       setActiveRunsPresent(nextActive);
     } catch (err) {
+      if (err instanceof Error && err.name === 'AbortError') return;
       console.error('Failed to fetch test runs:', err);
       if (showLoading) {
         setTests([]);
@@ -189,7 +216,10 @@ export default function AllTestsPage() {
         setTotalPages(1);
       }
     } finally {
-      if (showLoading) setLoading(false);
+      if (abortControllerRef.current === controller) {
+        abortControllerRef.current = null;
+      }
+      if (showLoading && !controller.signal.aborted) setLoading(false);
     }
   }, [page, pageSize, sortBy, statusFilter, debouncedSearch]);
 
@@ -278,6 +308,7 @@ export default function AllTestsPage() {
               <option value="all">All Status</option>
               <option value="passed">Passed</option>
               <option value="failed">Failed</option>
+              <option value="completed_with_findings">Findings</option>
               <option value="running">Running</option>
             </select>
             <select
@@ -396,16 +427,8 @@ export default function AllTestsPage() {
                               <StatusCell pass={group.passedTests} total={group.totalTests} />
                             </td>
                             <td className="px-4 py-3.5">
-                              <span className={`px-2 py-0.5 rounded-full text-xs font-semibold ${
-                                group.latestStatus === 'passed'
-                                  ? 'bg-emerald-500/10 text-emerald-400'
-                                  : group.latestStatus === 'failed'
-                                  ? 'bg-red-500/10 text-red-400'
-                                  : group.latestStatus === 'running'
-                                  ? 'bg-blue-500/10 text-blue-400'
-                                  : 'bg-amber-500/10 text-amber-400'
-                              }`}>
-                                {group.latestStatus}
+                              <span className={`px-2 py-0.5 rounded-full text-xs font-semibold ${statusBadgeClass(group.latestStatus)}`}>
+                                {statusLabel(group.latestStatus)}
                               </span>
                             </td>
                             <td className="px-4 py-3.5">
@@ -440,16 +463,8 @@ export default function AllTestsPage() {
                                 <StatusCell pass={test.passed_tests} total={test.total_tests} />
                               </td>
                               <td className="px-4 py-3">
-                                <span className={`px-2 py-0.5 rounded-full text-xs font-semibold ${
-                                  test.status === 'passed'
-                                    ? 'bg-emerald-500/10 text-emerald-400'
-                                    : test.status === 'failed'
-                                    ? 'bg-red-500/10 text-red-400'
-                                    : test.status === 'running'
-                                    ? 'bg-blue-500/10 text-blue-400'
-                                    : 'bg-amber-500/10 text-amber-400'
-                                }`}>
-                                  {test.status}
+                                <span className={`px-2 py-0.5 rounded-full text-xs font-semibold ${statusBadgeClass(test.status)}`}>
+                                  {statusLabel(test.status)}
                                 </span>
                               </td>
                               <td className="px-4 py-3">
@@ -492,16 +507,8 @@ export default function AllTestsPage() {
                           <StatusCell pass={test.passed_tests} total={test.total_tests} />
                         </td>
                         <td className="px-4 py-4">
-                          <span className={`px-2 py-0.5 rounded-full text-xs font-semibold ${
-                            test.status === 'passed'
-                              ? 'bg-emerald-500/10 text-emerald-400'
-                              : test.status === 'failed'
-                              ? 'bg-red-500/10 text-red-400'
-                              : test.status === 'running'
-                              ? 'bg-blue-500/10 text-blue-400'
-                              : 'bg-amber-500/10 text-amber-400'
-                          }`}>
-                            {test.status}
+                          <span className={`px-2 py-0.5 rounded-full text-xs font-semibold ${statusBadgeClass(test.status)}`}>
+                            {statusLabel(test.status)}
                           </span>
                         </td>
                         <td className="px-4 py-4">

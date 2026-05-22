@@ -9,6 +9,9 @@ const net = require('net');
 const { spawn, execSync } = require('child_process');
 const Logger = require('./logger');
 
+const GENERATED_SPEC_FILE_PATTERN = /\.(?:spec|test)\.(?:ts|js|mts|mjs|cts|cjs)$/i;
+const AUTH_TAG_PATTERN = /@auth|@tierB/i;
+
 class PlaywrightIntegration {
   constructor(config = {}) {
     this.config = {
@@ -177,6 +180,54 @@ class PlaywrightIntegration {
     }
 
     return [...new Set(candidates)];
+  }
+
+  async probeHttpReady(probeUrl, timeoutMs = 1500) {
+    if (!probeUrl) return false;
+    const fetchFn = global.fetch || ((url, opts) => import('node-fetch').then((m) => m.default(url, opts)));
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      const response = await fetchFn(probeUrl, { signal: controller.signal, redirect: 'manual' });
+      clearTimeout(timer);
+      return response.status >= 200 && response.status < 500;
+    } catch {
+      return false;
+    }
+  }
+
+  async isConfiguredServerReady(timeoutMs = 1500) {
+    for (const probeUrl of this.getServerProbeUrls()) {
+      if (await this.probeHttpReady(probeUrl, timeoutMs)) {
+        return { ready: true, probeUrl };
+      }
+    }
+    return { ready: false, probeUrl: null };
+  }
+
+  shouldAutoSwitchPortForConflict() {
+    if (this.config.disablePortFallback === true) return false;
+    if (this.config.allowPortFallback === true) return true;
+    if (Array.isArray(this.config.services) && this.config.services.length > 1) return false;
+
+    const command = String(this.config.startCommand || '').toLowerCase();
+    if (
+      /\b(docker\s+compose|docker-compose|compose|concurrently|turbo|nx|lerna|mvn|gradle|java|dotnet|spring-boot)\b/.test(command)
+    ) {
+      return false;
+    }
+
+    const packageJson = this.packageJson || {};
+    const deps = { ...(packageJson.dependencies || {}), ...(packageJson.devDependencies || {}) };
+    return Boolean(
+      deps.vite ||
+      deps.next ||
+      deps['react-scripts'] ||
+      deps.nuxt ||
+      deps.nuxt3 ||
+      deps['@sveltejs/kit'] ||
+      deps['@remix-run/dev']
+    );
   }
 
   probeTcpPort(hostname, port, timeoutMs = 1200) {
@@ -764,15 +815,79 @@ module.exports = defineConfig({
     return !!commandResult.timedOut || commandResult.code !== 0 || !!commandResult.signal;
   }
 
-  countGeneratedSpecFiles() {
+  listGeneratedSpecFiles() {
     const testsDir = path.join(this.config.projectPath, 'tests', 'generated');
     try {
       return fs.readdirSync(testsDir, { withFileTypes: true })
-        .filter((entry) => entry.isFile() && /\.spec\.(ts|js|mjs|cjs)$/i.test(entry.name))
-        .length;
+        .filter((entry) => entry.isFile() && GENERATED_SPEC_FILE_PATTERN.test(entry.name))
+        .map((entry) => path.join(testsDir, entry.name));
+    } catch {
+      return [];
+    }
+  }
+
+  countGeneratedSpecFiles() {
+    try {
+      return this.listGeneratedSpecFiles().length;
     } catch {
       return 0;
     }
+  }
+
+  scanGeneratedAuthTests() {
+    const files = this.listGeneratedSpecFiles();
+    const matchingFiles = [];
+    let authTaggedTestCount = 0;
+    for (const filePath of files) {
+      let content = '';
+      try {
+        content = fs.readFileSync(filePath, 'utf-8');
+      } catch {
+        continue;
+      }
+      if (!AUTH_TAG_PATTERN.test(content)) continue;
+      matchingFiles.push(path.basename(filePath));
+      const tests = content.match(/\btest(?:\.(?:only|fixme|fail|slow))?\s*\(/g) || [];
+      authTaggedTestCount += Math.max(1, tests.length);
+    }
+    return {
+      generatedSpecCount: files.length,
+      authTaggedFileCount: matchingFiles.length,
+      authTaggedTestCount,
+      files: matchingFiles,
+      hasAuthTaggedTests: authTaggedTestCount > 0,
+    };
+  }
+
+  resolveCurrentRunAuthConfig() {
+    const configured = this.config.tierBAuthConfigPath;
+    if (!configured) return null;
+    const candidate = path.isAbsolute(configured)
+      ? configured
+      : path.join(this.config.projectPath, configured);
+    if (!fs.existsSync(candidate)) return null;
+    return candidate;
+  }
+
+  buildTierBAuthPassError(code, message, authScan = {}, cause = null) {
+    const err = new Error(message);
+    err.code = code;
+    err.diagnostics = {
+      stage: 'execution',
+      reason: code,
+      tierBAuthPass: {
+        status: 'failed',
+        code,
+        configPath: this.config.tierBAuthConfigPath || null,
+        tierBRoles: Array.isArray(this.config.tierBRoles) ? this.config.tierBRoles : [],
+        generatedSpecCount: authScan.generatedSpecCount || 0,
+        authTaggedFileCount: authScan.authTaggedFileCount || 0,
+        authTaggedTestCount: authScan.authTaggedTestCount || 0,
+        files: authScan.files || [],
+      },
+      cause: cause ? { code: cause.code || null, message: cause.message || String(cause) } : null,
+    };
+    return err;
   }
 
   looksLikeNoTestsOutput(text) {
@@ -1269,7 +1384,7 @@ module.exports = defineConfig({
         return false;
       }
 
-      const files = fs.readdirSync(generatedDir).filter((name) => /\.spec\.(ts|js)$/i.test(name));
+      const files = fs.readdirSync(generatedDir).filter((name) => GENERATED_SPEC_FILE_PATTERN.test(name));
       const phaseTwoTagPattern = /@phase2|@deep|@stress|@matrix|@load|@api-stress|@api-negative|@api-auth|@api-contract/i;
 
       for (const file of files) {
@@ -1523,34 +1638,88 @@ test.describe('${this.sanitizeString(scenario.name)}', () => {
       await this.startServer();
     }
 
-    // When the user has their own playwright.config.* Healix writes a supplemental
-    // playwright.auth.config.ts that carries storageState for each verified role.
-    // The main config has no storageState, so @auth tests would redirect to /login
-    // and timeout. Detect the supplemental config and run it as a separate pass.
-    const authConfigPath = path.join(this.config.projectPath, 'playwright.auth.config.ts');
-    const hasSupplementalAuthConfig = fs.existsSync(authConfigPath);
+    // When the user has their own playwright.config.* Healix writes a current-run
+    // supplemental config that carries storageState for each verified role. Never
+    // auto-discover a root playwright.auth.config.ts here; stale configs from older
+    // runs can silently sideline Tier B or point at the wrong testDir.
+    const authConfigPath = this.resolveCurrentRunAuthConfig();
+    const authScan = authConfigPath
+      ? this.scanGeneratedAuthTests()
+      : { generatedSpecCount: this.countGeneratedSpecFiles(), authTaggedFileCount: 0, authTaggedTestCount: 0, files: [], hasAuthTaggedTests: false };
+    const shouldRunSupplementalAuthPass = !!authConfigPath && authScan.hasAuthTaggedTests;
 
     try {
       const phaseMode = String(this.config.phaseMode || 'two-phase').toLowerCase();
       const primary = phaseMode === 'two-phase'
-        ? await this.runTwoPhaseExecution({ excludeAuthTests: hasSupplementalAuthConfig })
+        ? await this.runTwoPhaseExecution({ excludeAuthTests: shouldRunSupplementalAuthPass })
         : await this.executePlaywright({
-          grepInvert: hasSupplementalAuthConfig ? '@auth|@tierB' : undefined,
+          grepInvert: shouldRunSupplementalAuthPass ? '@auth|@tierB' : undefined,
         });
 
-      if (hasSupplementalAuthConfig) {
+      if (authConfigPath && !authScan.hasAuthTaggedTests) {
+        primary.tierBAuthPass = {
+          status: 'skipped_no_auth_tests',
+          configPath: authConfigPath,
+          tierBRoles: Array.isArray(this.config.tierBRoles) ? this.config.tierBRoles : [],
+          generatedSpecCount: authScan.generatedSpecCount,
+          authTaggedFileCount: authScan.authTaggedFileCount,
+          authTaggedTestCount: authScan.authTaggedTestCount,
+        };
+        Logger.info('PlaywrightIntegration', 'Supplemental auth pass skipped — no @auth/@tierB generated tests found', {
+          config: authConfigPath,
+          generatedSpecCount: authScan.generatedSpecCount,
+        });
+      }
+
+      if (shouldRunSupplementalAuthPass) {
         Logger.info('PlaywrightIntegration', 'Running supplemental auth pass', { config: authConfigPath });
         try {
           const authResults = await this.executePlaywright({
             configPath: authConfigPath,
             outputDir: path.join(this.config.projectPath, 'healix-reports', 'results', 'auth'),
           });
+          if (Number(authResults.total || 0) === 0) {
+            throw this.buildTierBAuthPassError(
+              'TIER_B_AUTH_NO_MATCHING_TESTS',
+              `Supplemental auth pass matched zero tests even though ${authScan.authTaggedTestCount} @auth/@tierB test(s) exist.`,
+              authScan
+            );
+          }
           this._mergeTestRuns(primary, authResults);
+          primary.tierBAuthPass = {
+            status: 'executed',
+            configPath: authConfigPath,
+            tierBRoles: Array.isArray(this.config.tierBRoles) ? this.config.tierBRoles : [],
+            generatedSpecCount: authScan.generatedSpecCount,
+            authTaggedFileCount: authScan.authTaggedFileCount,
+            authTaggedTestCount: authScan.authTaggedTestCount,
+            total: Number(authResults.total || 0),
+            passed: Number(authResults.passed || 0),
+            failed: Number(authResults.failed || 0),
+            skipped: Number(authResults.skipped || 0),
+          };
           Logger.info('PlaywrightIntegration', 'Auth pass merged', {
             passed: authResults.passed, failed: authResults.failed, total: authResults.total,
           });
         } catch (err) {
-          Logger.warn('PlaywrightIntegration', 'Supplemental auth pass failed (non-fatal)', { reason: err.message });
+          const code = err?.code === 'NO_TESTS_TO_RUN'
+            ? (authScan.generatedSpecCount > 0 ? 'TIER_B_AUTH_CONFIG_NO_TEST_FILES' : 'TIER_B_AUTH_NO_MATCHING_TESTS')
+            : (err?.code || 'TIER_B_AUTH_PASS_FAILED');
+          const authErr = err?.diagnostics?.tierBAuthPass
+            ? err
+            : this.buildTierBAuthPassError(
+              code,
+              err?.message || 'Supplemental auth pass failed.',
+              authScan,
+              err
+            );
+          authErr.code = code;
+          Logger.error('PlaywrightIntegration', 'Supplemental auth pass failed', authErr, {
+            code,
+            config: authConfigPath,
+            authTaggedTestCount: authScan.authTaggedTestCount,
+          });
+          throw authErr;
         }
       }
 
@@ -1872,10 +2041,32 @@ test.describe('${this.sanitizeString(scenario.name)}', () => {
       const portInUse = await this.probeTcpPort('127.0.0.1', configuredPort, 500)
         || await this.probeTcpPort('localhost', configuredPort, 500);
       if (portInUse) {
+        const existing = await this.isConfiguredServerReady(1500);
+        if (existing.ready) {
+          Logger.info('PlaywrightIntegration', 'Configured port is already serving the target app — reusing existing server', {
+            port: configuredPort,
+            baseURL: this.config.baseURL,
+            probeUrl: existing.probeUrl,
+          });
+          this.config._primaryAppPreStarted = true;
+          this.config._healixReusedExistingServer = true;
+          return;
+        }
+
+        if (!this.shouldAutoSwitchPortForConflict()) {
+          const err = new Error(
+            `Configured target port ${configuredPort} is already in use, but ${this.config.baseURL} is not HTTP-ready. ` +
+            'Healix will not start a duplicate multi-service stack on a fallback port because that can break fixed backend ports and make tests target the wrong origin.'
+          );
+          err.code = 'TARGET_PORT_IN_USE_NOT_READY';
+          throw err;
+        }
+
         const freePort = await this.findFreePort(configuredPort + 1);
         Logger.warn('PlaywrightIntegration', `Configured port ${configuredPort} is already in use. Switching to port ${freePort} to avoid testing the wrong server.`, {
           originalPort: configuredPort,
           newPort: freePort,
+          reason: 'single_service_port_fallback',
         });
         try {
           const parsedBase = new URL(this.config.baseURL);

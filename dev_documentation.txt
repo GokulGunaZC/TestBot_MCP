@@ -88,7 +88,7 @@ NEW FEATURES:
 -------------
 1. OpenAI Test Generation
    - Automatically generates Playwright tests when no tests exist
-   - Uses GPT-4o (configurable) for intelligent test creation
+   - Uses gpt-5.5-mini (configurable) for intelligent test creation
    - Generates smoke, frontend, backend, and workflow tests
    - Supports Product Requirements Document (PRD) input for better tests
 
@@ -183,7 +183,7 @@ CONFIGURATION:
 --------------
 Add to .env:
   OPENAI_API_KEY=sk-proj-...
-  OPENAI_MODEL=gpt-4o (optional, defaults to gpt-4o)
+  OPENAI_MODEL=gpt-5.5-mini (optional, defaults to gpt-5.5-mini)
   OPENAI_MAX_TOKENS=4000 (optional)
 
 USAGE FLOW:
@@ -673,4 +673,3 @@ Use HTTP server to avoid CORS issues. The file:// protocol will cause
 the start-dashboard-server.sh script or manually start python3 HTTP server.
 
 See DASHBOARD_ACCESS.md for complete usage instructions.
-

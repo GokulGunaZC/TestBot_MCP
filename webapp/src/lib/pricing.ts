@@ -1,3 +1,5 @@
+import { DEFAULT_OPENAI_MODEL } from './model-defaults'
+
 // Single source of truth for OpenAI per-token pricing. Used by:
 //   - tokens.ts        → recordTokenUsage() snapshots these into token_ledger
 //   - ai-guard.ts      → recordAiCall() computes cost_usd for telemetry
@@ -30,6 +32,7 @@ export const LONG_CONTEXT_THRESHOLD_TOKENS = 200_000
 //   model              input  cached_in  output            input  cached_in  output
 // ── gpt-5.x flagship ────────────────────────────────────────────────────────────
 //   gpt-5.5            5.00     0.50     30.00            10.00    1.00      45.00
+//   gpt-5.5-mini       uses provider alias gpt-5-mini
 //   gpt-5.5-pro       30.00      -      180.00            60.00     -       270.00
 //   gpt-5.4            2.50     0.25     15.00             5.00    0.50      22.50
 //   gpt-5.4-mini       0.75    0.075      4.50              -       -          -
@@ -63,6 +66,11 @@ export const MODEL_RATES: Record<string, ModelRate> = {
   'gpt-5.5': {
     short: { inputUsdPerToken:  5.00 / PER_MILLION, cachedInputUsdPerToken:  0.50 / PER_MILLION, outputUsdPerToken: 30.00 / PER_MILLION },
     long:  { inputUsdPerToken: 10.00 / PER_MILLION, cachedInputUsdPerToken:  1.00 / PER_MILLION, outputUsdPerToken: 45.00 / PER_MILLION },
+  },
+  'gpt-5.5-mini': {
+    // Healix-facing alias, forwarded to OpenAI as gpt-5-mini.
+    short: { inputUsdPerToken:  0.25  / PER_MILLION, cachedInputUsdPerToken: 0.025 / PER_MILLION, outputUsdPerToken:  2.00 / PER_MILLION },
+    long:  null,
   },
   'gpt-5.5-pro': {
     short: { inputUsdPerToken: 30.00 / PER_MILLION, cachedInputUsdPerToken: null,                outputUsdPerToken: 180.00 / PER_MILLION },
@@ -185,7 +193,7 @@ export function resolveModel(claimedModel: string | null | undefined): string {
   if (claimedModel && claimedModel.trim()) return claimedModel.trim()
   const envModel = process.env.OPENAI_MODEL?.trim()
   if (envModel) return envModel
-  throw new Error('Cannot resolve model: claimedModel is empty and OPENAI_MODEL env var is not set.')
+  return DEFAULT_OPENAI_MODEL
 }
 
 /**

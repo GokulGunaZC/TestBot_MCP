@@ -29,6 +29,42 @@
 
 const CLASSIFIERS = [
   {
+    id: 'insufficient_retained_runnable_coverage',
+    test: (s) => /INSUFFICIENT_RETAINED_RUNNABLE_COVERAGE/i.test(s)
+      || /Retained runnable tests \d+ below recovery-adjusted useful floor/i.test(s),
+    stage: 'generation',
+    errorCode: 'INSUFFICIENT_RETAINED_RUNNABLE_COVERAGE',
+    userFacingMessage: 'Healix quarantined invalid generated specs, but too few retained runnable tests remained after applying the recovery-adjusted floor. Retry a focused coverage top-up or add source-backed routes/forms to improve coverage.',
+  },
+  {
+    id: 'insufficient_runnable_coverage',
+    test: (s) => /INSUFFICIENT_RUNNABLE_COVERAGE/i.test(s)
+      || /Generated runnable tests \d+ below (?:adaptive|minimum useful) floor/i.test(s),
+    stage: 'generation',
+    errorCode: 'INSUFFICIENT_RUNNABLE_COVERAGE',
+    userFacingMessage: 'Healix generated too few runnable tests to produce a useful execution result. The suite stayed below the minimum useful runnable floor after bounded repair attempts, so execution was blocked before producing misleading results.',
+  },
+  {
+    id: 'min_test_count_not_met',
+    test: (s) => /MIN_TEST_COUNT_NOT_MET/i.test(s)
+      || /Generated tests \d+ below minimum \d+/i.test(s),
+    stage: 'generation',
+    errorCode: 'MIN_TEST_COUNT_NOT_MET',
+    userFacingMessage: 'Healix generated fewer tests than the target count. Current versions treat this as a quality warning when the runnable suite meets the minimum useful floor, not as a Playwright crash.',
+  },
+  {
+    id: 'hardcoded_base_url_mismatch',
+    // Generated specs must use Playwright's configured baseURL or relative
+    // routes. A hardcoded external origin is a generation-quality failure, not
+    // a Playwright crash or target-app failure.
+    test: (s) => /HARDCODED_BASE_URL_MISMATCH/i.test(s)
+      || /Generated suite hardcoded a different app origin than baseURL/i.test(s)
+      || /hardcoded a different app origin/i.test(s),
+    stage: 'generation',
+    errorCode: 'HARDCODED_BASE_URL_MISMATCH',
+    userFacingMessage: 'Generated tests used an absolute URL whose origin does not match the configured baseURL. Healix blocked execution because those tests would exercise the wrong app. Regenerate with source-grounded routes and relative page.goto("/route") calls.',
+  },
+  {
     id: 'fixture_module_type_mismatch',
     // The smoking gun for the pm-app regression: Node parsed the generated
     // __healix-fixture.js as ESM but the body used module.exports (CJS).
@@ -153,6 +189,14 @@ const CLASSIFIERS = [
     stage: 'execution',
     errorCode: 'PLAYWRIGHT_WEBSERVER_TIMEOUT',
     userFacingMessage: 'Playwright\'s built-in `webServer` block (in your playwright.config) timed out starting the dev server. Healix already starts the dev server itself — the duplicate attempt is fighting for the same port. Fix options: (1) remove the `webServer: {...}` block from playwright.config, or (2) align its `url`/port with the baseURL you configured in the Healix form, or (3) set `reuseExistingServer: true` AND match the port. Then re-run.',
+  },
+  {
+    id: 'target_port_in_use_not_ready',
+    test: (s) => /TARGET_PORT_IN_USE_NOT_READY/i.test(s)
+      || /Configured target port \d+ is already in use, but .* is not HTTP-ready/i.test(s),
+    stage: 'server_start',
+    errorCode: 'TARGET_PORT_IN_USE_NOT_READY',
+    userFacingMessage: 'The configured target port is occupied, but the configured baseURL is not reachable. Healix did not start a duplicate multi-service stack on a fallback port because that can break fixed backend ports and make auth/tests target the wrong origin. Stop the process holding the port, or start the app yourself and set baseURL to the reachable URL.',
   },
   {
     id: 'server_unreachable',

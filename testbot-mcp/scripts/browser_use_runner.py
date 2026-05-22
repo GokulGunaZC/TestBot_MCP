@@ -29,7 +29,7 @@ Env inputs:
     HEALIX_LOGIN_USERNAME   - optional credential
     HEALIX_LOGIN_PASSWORD   - optional credential
     HEALIX_TOTAL_TIMEOUT_S  - hard cap in seconds (default 180)
-    HEALIX_BROWSER_USE_MODEL- OpenAI model id (default "gpt-4o-mini")
+    HEALIX_BROWSER_USE_MODEL- OpenAI model id (default "gpt-5.5-mini")
 
     LLM credentials (set automatically by the Node driver):
     HEALIX_API_KEY          - routes LLM calls through the Healix webapp proxy.
@@ -71,22 +71,47 @@ _ARTIFACT_TEMPLATE = {
     "observedErrors": [],
 }
 
+_PROVIDER_MODEL_ALIASES = {
+    "gpt-5.5-mini": "gpt-5-mini",
+}
 
-def _build_task(target_url, username, password):
+
+def _provider_model(model):
+    return _PROVIDER_MODEL_ALIASES.get(model, model)
+
+
+def _build_task(target_url, username, password, preauth_verified=False):
     all_roles_raw = os.environ.get("HEALIX_ALL_ROLES", "")
     roles_note = (
         f" The app has multiple roles ({all_roles_raw}) — note any role-specific pages."
         if all_roles_raw else ""
     )
 
-    if username and password:
+    if preauth_verified:
+        login_block = (
+            f"\nSTEP 1 — AUTH CONTEXT:\n"
+            f"  Healix already verified at least one role with deterministic Playwright\n"
+            f"  storageState before this browser-use run. Do NOT submit the login form\n"
+            f"  again in browser-use. Start at {target_url}, record public routes and\n"
+            f"  any visible login form fields, then continue route mapping. Protected\n"
+            f"  routes will be explored by Healix's Playwright storageState pass.\n"
+        )
+        nav_start = "STEP 2"
+    elif username and password:
         login_block = (
             f"\nSTEP 1 — LOGIN (mandatory, do this first):\n"
             f"  Navigate to {target_url}.\n"
             f"  If you land on a login page OR get redirected to one, fill in\n"
             f"  the username/email field with {username!r} and the password field\n"
             f"  with {password!r}, then click the submit button.\n"
-            f"  Wait for the authenticated page to load before continuing.\n"
+            f"  Do NOT use register, signup, create-account, or onboarding forms\n"
+            f"  as login forms. If both /login and /register exist, loginUrl MUST\n"
+            f"  point to the sign-in/login page only.\n"
+            f"  Submit the login form at most ONE time. After submit, wait up to\n"
+            f"  5 seconds. If there is no visible invalid-credential/auth error, do\n"
+            f"  NOT retry login just because the navbar still shows Login/Sign up;\n"
+            f"  many SPAs repaint auth chrome asynchronously after cookies/session\n"
+            f"  are already set. Record the authFlow and continue route mapping.\n"
             f"  Record loginUrl, credentialFields selectors, successIndicator, failureIndicator.\n"
         )
         nav_start = "STEP 2"
@@ -98,6 +123,9 @@ def _build_task(target_url, username, password):
         f"GOAL: Rapidly map the route structure of {target_url}.\n"
         f"SPEED RULE: Spend at most 10 seconds per page. Breadth over depth.\n"
         f"OUTPUT: One JSON object only — no prose before or after.\n"
+        "STOP RULE: Use the final/done response with the JSON and then stop. "
+        "Do not write files. If a detail tool cannot extract a form, use the "
+        "visible DOM labels/names/placeholders you can see and continue.\n"
         "\nSchema:\n"
         '{"routes":[{"path":string,"requiresAuth":boolean,"elements":[{"role":string,"name":string,"selector":string}]}],'
         '"forms":[{"route":string,"fields":[{"name":string,"type":string,"required":boolean}],"submitLabel":string}],'
@@ -112,7 +140,7 @@ def _build_task(target_url, username, password):
         "  Do NOT re-visit paths already recorded.\n"
         "\nSTEP 3 — FORMS: For each page with a non-login form, record its fields.\n"
         "\nSTEP 4 — FLOWS: Identify up to 3 key user flows (e.g. create, edit, delete).\n"
-        "\nSTEP 5 — OUTPUT the JSON. Do NOT include any text outside the JSON block.\n"
+        "\nSTEP 5 — OUTPUT the JSON via final/done. Do NOT include any text outside the JSON block.\n"
         f"{roles_note}"
     )
 
@@ -159,13 +187,21 @@ def _normalize_artifact(parsed):
     return artifact
 
 
-def _build_llm():
-    """Construct the ChatOpenAI LLM instance via the Healix webapp proxy."""
-    model = os.environ.get("HEALIX_BROWSER_USE_MODEL", "gpt-4o-mini")
-    api_key = os.environ.get("HEALIX_API_KEY")
-    base_url = os.environ.get("HEALIX_LLM_PROXY_URL")
+def _build_cloud_llm():
+    for import_path, ctor in (
+        ("browser_use.llm", "ChatBrowserUse"),
+        ("browser_use", "ChatBrowserUse"),
+    ):
+        try:
+            module = __import__(import_path, fromlist=[ctor])
+            cls = getattr(module, ctor)
+            return cls()
+        except Exception:
+            continue
+    return None
 
-    # temperature=0 gives deterministic, faster responses (no sampling overhead).
+
+def _build_openai_compatible_llm(model, api_key, base_url=None):
     for import_path, ctor in (
         ("browser_use.llm", "ChatOpenAI"),
         ("browser_use", "ChatOpenAI"),
@@ -174,12 +210,68 @@ def _build_llm():
         try:
             module = __import__(import_path, fromlist=[ctor])
             cls = getattr(module, ctor)
-            llm = cls(model=model, api_key=api_key, base_url=base_url, temperature=0)
+            kwargs = {"model": model, "api_key": api_key}
+            if not str(model or "").lower().startswith(("gpt-5", "o1", "o3", "o4", "codex")):
+                kwargs["temperature"] = 0
+            if base_url:
+                kwargs["base_url"] = base_url
+            llm = cls(**kwargs)
             return llm
         except Exception:
             continue
-
     return None
+
+
+def _build_llm():
+    """Construct the browser-use LLM instance.
+
+    Prefer the Healix webapp proxy when available. Browser Use Cloud keys may
+    exist on developer machines, but some account tiers reject LLM Gateway
+    calls at runtime; the proxy path is the stable default because Healix owns
+    the server-side OpenAI configuration.
+    """
+    model = os.environ.get("HEALIX_BROWSER_USE_MODEL", "gpt-5.5-mini")
+    provider_model = _provider_model(model)
+    api_key = os.environ.get("HEALIX_API_KEY")
+    base_url = os.environ.get("HEALIX_LLM_PROXY_URL")
+    openai_api_key = os.environ.get("OPENAI_API_KEY")
+    openai_base_url = os.environ.get("OPENAI_BASE_URL") or os.environ.get("OPENAI_API_BASE")
+    provider = os.environ.get("HEALIX_BROWSER_USE_PROVIDER", "").strip().lower()
+    has_cloud_key = bool(os.environ.get("BROWSER_USE_API_KEY") or os.environ.get("HEALIX_BROWSER_USE_API_KEY"))
+    has_proxy = bool(api_key and base_url)
+    has_direct_openai = bool(openai_api_key)
+
+    if has_proxy and provider not in {"cloud", "browser-use", "browser_use"}:
+        llm = _build_openai_compatible_llm(provider_model, api_key, base_url)
+        if llm is not None:
+            return llm, "healix_proxy"
+
+    if has_direct_openai and provider in {"openai", "direct", "local"}:
+        llm = _build_openai_compatible_llm(provider_model, openai_api_key, openai_base_url)
+        if llm is not None:
+            return llm, "direct_openai"
+
+    if has_direct_openai and provider not in {"cloud", "browser-use", "browser_use"}:
+        llm = _build_openai_compatible_llm(provider_model, openai_api_key, openai_base_url)
+        if llm is not None:
+            return llm, "direct_openai"
+
+    if has_cloud_key:
+        llm = _build_cloud_llm()
+        if llm is not None:
+            return llm, "browser_use_cloud"
+
+    if has_direct_openai:
+        llm = _build_openai_compatible_llm(provider_model, openai_api_key, openai_base_url)
+        if llm is not None:
+            return llm, "direct_openai"
+
+    if has_proxy:
+        llm = _build_openai_compatible_llm(provider_model, api_key, base_url)
+        if llm is not None:
+            return llm, "healix_proxy"
+
+    return None, None
 
 
 async def _drive_agent(target_url, username, password, timeout_s):
@@ -189,14 +281,27 @@ async def _drive_agent(target_url, username, password, timeout_s):
         _emit({"type": "error", "reason": f"browser-use import failed: {exc}"})
         return None
 
-    llm = _build_llm()
+    llm, llm_provider = _build_llm()
     if llm is None:
-        _emit({"type": "error", "reason": "Could not construct LLM — check HEALIX_API_KEY and HEALIX_LLM_PROXY_URL"})
+        _emit({"type": "error", "reason": "Could not construct LLM — check BROWSER_USE_API_KEY or HEALIX_API_KEY/HEALIX_LLM_PROXY_URL"})
         return None
 
-    _emit({"type": "progress", "message": "LLM routed through Healix webapp proxy"})
+    if llm_provider == "browser_use_cloud":
+        _emit({"type": "progress", "message": "LLM routed through Browser Use Cloud"})
+    elif llm_provider == "direct_openai":
+        _emit({"type": "progress", "message": "LLM routed through direct OpenAI-compatible API"})
+    else:
+        _emit({"type": "progress", "message": "LLM routed through Healix webapp proxy"})
 
-    task = _build_task(target_url, username, password)
+    preauth_verified_raw = os.environ.get("HEALIX_PREAUTH_VERIFIED_ROLES", "0")
+    try:
+        preauth_verified = int(preauth_verified_raw) > 0
+    except ValueError:
+        preauth_verified = False
+
+    task = _build_task(target_url, username, password, preauth_verified=preauth_verified)
+    if preauth_verified:
+        _emit({"type": "progress", "message": "pre-auth storageState verified; browser-use will not retry login"})
 
     # Build Agent kwargs with speed optimisations, falling back gracefully
     # when a browser-use version doesn't support a particular parameter.
@@ -214,6 +319,20 @@ async def _drive_agent(target_url, username, password, timeout_s):
         # Allow several browser actions per LLM call — fewer round-trips = faster.
         if "max_actions_per_step" in sig_params:
             agent_kwargs["max_actions_per_step"] = 5
+        if "max_failures" in sig_params:
+            agent_kwargs["max_failures"] = 3
+        if "llm_timeout" in sig_params:
+            agent_kwargs["llm_timeout"] = 30
+        if "step_timeout" in sig_params:
+            agent_kwargs["step_timeout"] = 45
+        if "use_judge" in sig_params:
+            agent_kwargs["use_judge"] = False
+        if "enable_planning" in sig_params:
+            agent_kwargs["enable_planning"] = False
+        if "use_thinking" in sig_params:
+            agent_kwargs["use_thinking"] = False
+        if "max_history_items" in sig_params:
+            agent_kwargs["max_history_items"] = 10
 
         # Headless mode: default true so exploration runs silently in the background.
         # Set HEALIX_BROWSER_HEADLESS=false to show the browser window (debug only).
@@ -239,8 +358,14 @@ async def _drive_agent(target_url, username, password, timeout_s):
 
     _emit({"type": "progress", "message": "agent launched"})
 
+    max_steps = 10
     try:
-        result = await asyncio.wait_for(agent.run(), timeout=timeout_s)
+        max_steps = max(3, min(20, int(os.environ.get("HEALIX_BROWSER_USE_MAX_STEPS", "10"))))
+    except ValueError:
+        max_steps = 10
+
+    try:
+        result = await asyncio.wait_for(agent.run(max_steps=max_steps), timeout=timeout_s)
     except asyncio.TimeoutError:
         _emit({"type": "error", "reason": f"browser-use agent exceeded {timeout_s}s timeout"})
         return None
@@ -268,8 +393,11 @@ async def _drive_agent(target_url, username, password, timeout_s):
 
     parsed = _extract_json(text)
     if parsed is None:
-        _emit({"type": "progress", "message": "agent returned no parseable JSON — emitting empty artifact"})
-        return dict(_ARTIFACT_TEMPLATE)
+        reason = "agent returned no parseable JSON"
+        _emit({"type": "error", "reason": reason})
+        artifact = dict(_ARTIFACT_TEMPLATE)
+        artifact["observedErrors"] = [f"browser-use: {reason}"]
+        return artifact
     return _normalize_artifact(parsed)
 
 
@@ -289,11 +417,14 @@ def main():
         })
         sys.exit(2)
 
-    if not os.environ.get("HEALIX_API_KEY") or not os.environ.get("HEALIX_LLM_PROXY_URL"):
+    has_browser_use_key = os.environ.get("BROWSER_USE_API_KEY") or os.environ.get("HEALIX_BROWSER_USE_API_KEY")
+    has_healix_proxy = os.environ.get("HEALIX_API_KEY") and os.environ.get("HEALIX_LLM_PROXY_URL")
+    has_direct_openai = os.environ.get("OPENAI_API_KEY")
+    if not has_browser_use_key and not has_healix_proxy and not has_direct_openai:
         _emit({
             "type": "error",
             "reason": (
-                "HEALIX_API_KEY or HEALIX_LLM_PROXY_URL not set."
+                "BROWSER_USE_API_KEY, OPENAI_API_KEY, or HEALIX_API_KEY/HEALIX_LLM_PROXY_URL not set."
                 " The Node driver sets these automatically from your MCP config."
                 " The driver will fall back to heuristic Playwright exploration."
             ),

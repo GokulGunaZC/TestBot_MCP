@@ -1,0 +1,68 @@
+# =============================================================================
+# .dockerignore
+# Everything excluded here NEVER enters the Docker build context.
+# Critical for two reasons:
+#   1. Smaller, faster builds (no node_modules / .next copy).
+#   2. Prevents secrets and source-code-only artifacts from leaking
+#      into intermediate layers that could be inspected later.
+# =============================================================================
+
+# --- Dependencies -------------------------------------------------------------
+node_modules
+.pnp
+.pnp.*
+.yarn
+
+# --- Build output (we rebuild inside the image) ------------------------------
+.next
+out
+build
+dist
+
+# --- Local environment files (NEVER ship secrets in image) -------------------
+.env
+.env.*
+!.env.example
+!.env.docker.example
+
+# --- Source control / IDE ----------------------------------------------------
+.git
+.gitignore
+.github
+.vscode
+.idea
+.claude
+.windsurf
+.cursor
+
+# --- Tests & reports ---------------------------------------------------------
+tests
+playwright-report
+test-results
+healix-reports
+.healix
+coverage
+
+# --- TypeScript build cache --------------------------------------------------
+*.tsbuildinfo
+next-env.d.ts
+
+# --- OS junk -----------------------------------------------------------------
+.DS_Store
+Thumbs.db
+
+# --- Logs --------------------------------------------------------------------
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# --- Docker artefacts themselves ---------------------------------------------
+Dockerfile*
+docker-compose*.yml
+.dockerignore
+
+# --- Documentation that need not enter the image ----------------------------
+docs
+*.md
+!README.md

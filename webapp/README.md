@@ -37,7 +37,7 @@ Copy `../.env.example` to `webapp/.env.local` and fill in values:
 | `NEXT_PUBLIC_SUPABASE_ANON_KEY` | **Yes** | Supabase anon key (public). |
 | `SUPABASE_SERVICE_ROLE_KEY` | **Yes** | Supabase service role key — server-side only, never expose in client code. |
 | `OPENAI_API_KEY` | **Yes** | OpenAI API key — used by generation, parse-prd, analyze-failures routes. |
-| `OPENAI_MODEL` | No | Model override. Default: `gpt-4o`. |
+| `OPENAI_MODEL` | No | Model override. Default: `gpt-5.5-mini`. |
 | `HEALIX_GEN_ASYNC` | No | `true` routes test generation through Inngest background jobs. Default: `false`. |
 | `INNGEST_EVENT_KEY` | Conditional | Required when `HEALIX_GEN_ASYNC=true`. |
 | `INNGEST_SIGNING_KEY` | Conditional | Required when `HEALIX_GEN_ASYNC=true`. |

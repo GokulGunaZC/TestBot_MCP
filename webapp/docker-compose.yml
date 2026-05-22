@@ -1,0 +1,44 @@
+# =============================================================================
+# Healix Webapp — docker-compose for clients.
+#
+# Usage (after loading the image with `docker load -i healix-webapp.tar`):
+#
+#   1. Copy .env.docker.example -> .env.docker, fill in secrets.
+#   2. docker compose up -d            # start in background
+#      docker compose logs -f webapp   # tail logs
+#      docker compose down             # stop
+#
+# To apply DB migrations once (recommended) instead of on every start:
+#   docker compose run --rm migrate
+# =============================================================================
+
+services:
+  webapp:
+    # Pin to the tag you received. Override with WEBAPP_IMAGE in shell or .env.
+    image: ${WEBAPP_IMAGE:-healix-webapp:latest}
+    container_name: healix-webapp
+    restart: unless-stopped
+    env_file:
+      - .env.docker
+    ports:
+      - "${PORT:-3000}:3000"
+    # Keep migrations OFF here — run them once via the `migrate` service below.
+    environment:
+      RUN_MIGRATIONS: "false"
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://127.0.0.1:3000/',(r)=>process.exit(r.statusCode>=500?1:0)).on('error',()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  # One-shot service for applying SQL migrations. Run via:
+  #   docker compose run --rm migrate
+  migrate:
+    image: ${WEBAPP_IMAGE:-healix-webapp:latest}
+    container_name: healix-webapp-migrate
+    profiles: ["migrate"]
+    env_file:
+      - .env.docker
+    entrypoint: ["node", "/app/webapp/docker/migrate.mjs"]
+    restart: "no"

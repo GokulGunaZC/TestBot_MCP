@@ -29,6 +29,13 @@ const RUNNER_SCRIPT = path.join(__dirname, '..', 'scripts', 'browser_use_runner.
 const DEFAULT_TIMEOUT_MS = 180_000;
 
 function resolvePython() {
+  const configured = process.env.HEALIX_BROWSER_USE_PYTHON || process.env.BROWSER_USE_PYTHON;
+  if (configured) {
+    try {
+      const res = spawnSync(configured, ['--version'], { stdio: 'ignore' });
+      if (res.status === 0) return configured;
+    } catch { /* fall through to PATH candidates */ }
+  }
   const candidates = process.platform === 'win32'
     ? ['py', 'python', 'python3']
     : ['python3', 'python'];
@@ -52,6 +59,29 @@ function isBrowserUseInstalled(pythonCmd) {
   }
 }
 
+function readEnvValueFromFile(envPath, key) {
+  try {
+    if (!fs.existsSync(envPath)) return '';
+    const parsed = require('dotenv').parse(fs.readFileSync(envPath));
+    return parsed[key] || '';
+  } catch {
+    return '';
+  }
+}
+
+function resolveOpenAIKeyForRunner() {
+  if (process.env.OPENAI_API_KEY) return process.env.OPENAI_API_KEY;
+  const candidates = [
+    path.join(__dirname, '..', '..', 'webapp', '.env.local'),
+    path.join(process.cwd(), 'webapp', '.env.local'),
+  ];
+  for (const envPath of candidates) {
+    const value = readEnvValueFromFile(envPath, 'OPENAI_API_KEY');
+    if (value) return value;
+  }
+  return '';
+}
+
 /**
  * Drive the runner. `targetUrl` must be an http(s) URL.
  * Returns the raw ExplorationArtifact when the runner succeeds.
@@ -60,6 +90,7 @@ function driveExploration({
   targetUrl,
   credentials,
   allCredentials,
+  preAuthRoleCount = 0,
   totalTimeoutMs = DEFAULT_TIMEOUT_MS,
   onHeartbeat,
 } = {}) {
@@ -105,14 +136,22 @@ function driveExploration({
       HEALIX_TARGET_URL: targetUrl,
       HEALIX_LOGIN_USERNAME: credentials?.username || '',
       HEALIX_LOGIN_PASSWORD: credentials?.password || '',
+      HEALIX_PREAUTH_VERIFIED_ROLES: String(Math.max(0, Number(preAuthRoleCount) || 0)),
       HEALIX_TOTAL_TIMEOUT_S: String(Math.max(10, Math.round(totalTimeoutMs / 1000))),
       HEALIX_ALL_ROLES: allRoles,
+      BROWSER_USE_API_KEY: process.env.BROWSER_USE_API_KEY || process.env.HEALIX_BROWSER_USE_API_KEY || '',
+      HEALIX_BROWSER_USE_API_KEY: process.env.HEALIX_BROWSER_USE_API_KEY || process.env.BROWSER_USE_API_KEY || '',
       // Proxy-mode credentials — forwarded to browser_use_runner.py so it
       // authenticates LLM calls via the Healix webapp rather than a local key.
       HEALIX_LLM_PROXY_URL: llmProxyUrl,
       // HEALIX_API_KEY is already in process.env; include it explicitly so it
       // is never accidentally shadowed by a dotenv override.
       HEALIX_API_KEY: process.env.HEALIX_API_KEY || '',
+      HEALIX_BROWSER_USE_MODEL: process.env.HEALIX_BROWSER_USE_MODEL || 'gpt-5.5-mini',
+      // Direct OpenAI is the preferred local/free-tier browser-use path when
+      // the Healix proxy is not available. Browser Use Cloud remains opt-in
+      // via HEALIX_BROWSER_USE_PROVIDER=cloud or a last-resort fallback.
+      OPENAI_API_KEY: resolveOpenAIKeyForRunner(),
       // Run headless by default so exploration is silent in the background.
       // Set HEALIX_BROWSER_HEADLESS=false in the environment to open a visible
       // browser window (useful when debugging exploration failures locally).
@@ -123,6 +162,7 @@ function driveExploration({
     let artifact = null;
     let errorReason = null;
     let buffer = '';
+    const runnerErrors = [];
 
     const proc = spawn(pythonCmd, [RUNNER_SCRIPT], { env, stdio: ['ignore', 'pipe', 'pipe'] });
 
@@ -156,6 +196,7 @@ function driveExploration({
         }
         if (event?.type === 'error' && event.reason) {
           errorReason = event.reason;
+          runnerErrors.push(String(event.reason).slice(0, 240));
         }
       }
     });
@@ -166,6 +207,15 @@ function driveExploration({
 
     proc.on('close', (code) => {
       if (artifact) {
+        if (runnerErrors.length > 0) {
+          artifact = {
+            ...artifact,
+            observedErrors: [
+              ...(Array.isArray(artifact.observedErrors) ? artifact.observedErrors : []),
+              ...runnerErrors.map((reason) => `browser-use warning: ${reason}`),
+            ],
+          };
+        }
         settle({ available: true, artifact });
         return;
       }

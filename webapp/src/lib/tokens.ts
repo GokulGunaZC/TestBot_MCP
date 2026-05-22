@@ -2,14 +2,15 @@ import { db } from './db'
 import { profiles, tokenLedger } from './db/schema'
 import { eq, sql } from 'drizzle-orm'
 import { logBlockedRequest } from './security-logger'
-import { computeCost, getModelRate } from './pricing'
+import { computeCost } from './pricing'
+import { DEFAULT_OPENAI_MODEL } from './model-defaults'
 
 // Re-export per-model rates so any old caller of computeInternalCost has a
 // path forward without an import refactor.
 export { computeCost, getModelRate } from './pricing'
 
-// $12 budget at 80% input / 20% output = (0.8×$2.50 + 0.2×$15) = $5.00/1M → $12/$5 × 1M = 2,400,000 tokens
-export const TOKENS_PER_PLAN_UNIT = 2_400_000 // real tokens = $12 of OpenAI cost at GPT-5.4 blended rate
+// $12 budget at 80% input / 20% output, priced through DEFAULT_OPENAI_MODEL.
+export const TOKENS_PER_PLAN_UNIT = 2_400_000
 
 // Token budgets per operation. Derived from observed usage in
 // mcp_telemetry_events (n=990 calls, 308 runs grouped by user+minute).
@@ -94,7 +95,7 @@ export async function recordTokenUsage(params: {
   userId: string
   endpoint: string                  // '/api/generate-tests' etc.
   agent: string                     // 'smoke'|'frontend'|'api'|'workflow'|'error'|'expansion'|'planner'|'parse_prd'|'analyze_failures'
-  model: string                     // 'gpt-5.4' etc.
+  model: string
   tokensInput: number
   tokensOutput: number
   referenceType?: string | null     // 'test_run' | 'plan' | …
@@ -230,5 +231,5 @@ export async function deductTokens(params: {
  * callers (ai-guard.ts) keep compiling during the rollout.
  */
 export function computeInternalCost(promptTokens: number, completionTokens: number): number {
-  return computeCost({ model: 'gpt-5.4', tokensInput: promptTokens, tokensOutput: completionTokens }).costUsd
+  return computeCost({ model: DEFAULT_OPENAI_MODEL, tokensInput: promptTokens, tokensOutput: completionTokens }).costUsd
 }

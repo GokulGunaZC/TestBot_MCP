@@ -11,6 +11,11 @@ import { runAbuseDetection } from '@/lib/abuse-detector'
 import { trackProjectUsage } from '@/lib/project-hash'
 import { logBlockedRequest } from '@/lib/security-logger'
 import { computeCoverageMetrics } from '@/lib/coverage'
+import {
+  hasRealFindings,
+  persistPreparedQaCorpus,
+  prepareQaCorpusPayload,
+} from '@/lib/qa-corpus'
 
 const ENDPOINT = '/api/test-runs/ingest'
 
@@ -126,6 +131,29 @@ function normalizeConfidence(value: unknown): number {
   return 0
 }
 
+function hasMeaningfulText(value: unknown): boolean {
+  const text = toStringOrNull(value)
+  return !!text && text.trim().length > 0
+}
+
+function hasMeaningfulAnalysisContent(item: AiLikeItem): boolean {
+  if (hasMeaningfulText(item.analysis)) return true
+  if (hasMeaningfulText(item.rootCause ?? item.root_cause)) return true
+  if (hasMeaningfulText(item.testingRecommendations ?? item.testing_recommendations)) return true
+
+  const suggestedFix = item.suggestedFix ?? item.suggested_fix ?? item.fix
+  if (typeof suggestedFix === 'string') return suggestedFix.trim().length > 0
+  if (suggestedFix && typeof suggestedFix === 'object') {
+    const fix = suggestedFix as Record<string, unknown>
+    return hasMeaningfulText(fix.description)
+      || hasMeaningfulText(fix.summary)
+      || hasMeaningfulText(fix.patch)
+      || (Array.isArray(fix.changes) && fix.changes.length > 0)
+  }
+
+  return false
+}
+
 function normalizeAnalysisItem(item: AiLikeItem): Record<string, unknown> | null {
   const testName = toStringOrNull(item.testName ?? item.test ?? item.test_name)
   const file = toStringOrNull(item.file)
@@ -135,7 +163,7 @@ function normalizeAnalysisItem(item: AiLikeItem): Record<string, unknown> | null
   const testingRecommendations = toStringOrNull(item.testingRecommendations ?? item.testing_recommendations)
   const confidence = normalizeConfidence(item.confidence)
 
-  if (!testName && !analysis && !rootCause && !suggestedFix) {
+  if (!hasMeaningfulAnalysisContent(item)) {
     return null
   }
 
@@ -192,7 +220,7 @@ function buildAiAnalysisPayload(report: ReportPayload) {
 
   const analyses = [...dedupe.values()]
   if (analyses.length === 0) {
-    return summary || null
+    return null
   }
 
   const highConfidence = analyses.filter((item) => Number(item.confidence || 0) >= 0.8).length
@@ -222,22 +250,52 @@ export async function POST(request: NextRequest) {
       run_id,
       report,
       project_path,
+      projectFingerprint,
+      project_fingerprint,
+      projectHash,
+      project_hash,
       tier_results,
       pipeline_error,
       failures,
+      findings,
+      qa_findings,
       classifier_verdicts,
       failure_clusters,
+      test_cases,
+      testCaseRuns,
+      test_case_runs,
+      contractSnapshots,
+      contract_snapshots,
+      contractSnapshot,
+      contract_snapshot,
+      qaContracts,
+      qa_contracts,
     } = body as {
       api_key?: string
       creation_name?: string
       run_id?: string
       report?: ReportPayload
       project_path?: string
+      projectFingerprint?: unknown
+      project_fingerprint?: unknown
+      projectHash?: unknown
+      project_hash?: unknown
       tier_results?: unknown
       pipeline_error?: unknown
       failures?: unknown[]
+      findings?: unknown[]
+      qa_findings?: unknown[]
       classifier_verdicts?: unknown[]
       failure_clusters?: unknown[]
+      test_cases?: unknown[]
+      testCaseRuns?: unknown[]
+      test_case_runs?: unknown[]
+      contractSnapshots?: unknown
+      contract_snapshots?: unknown
+      contractSnapshot?: unknown
+      contract_snapshot?: unknown
+      qaContracts?: unknown
+      qa_contracts?: unknown
     }
     const finalApiKey: string = rawKey ?? api_key ?? ''
 
@@ -376,7 +434,33 @@ export async function POST(request: NextRequest) {
         ? (pipeline_error as Record<string, unknown>)
         : (report as unknown as { pipelineError?: Record<string, unknown> })?.pipelineError ?? null
 
-    const runStatus = pipelineErrorPayload ? 'error' : status
+    const qaCorpusPayload = prepareQaCorpusPayload({
+      projectFingerprint,
+      project_fingerprint,
+      projectHash,
+      project_hash,
+      projectPath: project_path,
+      report,
+      test_cases,
+      testCaseRuns,
+      test_case_runs,
+      findings,
+      qa_findings,
+      failures,
+      classifier_verdicts,
+      contractSnapshots,
+      contract_snapshots,
+      contractSnapshot,
+      contract_snapshot,
+      qaContracts,
+      qa_contracts,
+    })
+
+    const runStatus = pipelineErrorPayload
+      ? 'error'
+      : hasRealFindings(qaCorpusPayload.findingSummary)
+        ? 'completed_with_findings'
+        : status
 
     // Insert test run
     const [testRun] = await db
@@ -397,10 +481,21 @@ export async function POST(request: NextRequest) {
         coverageMetrics: coverageMetricsPayload,
         tierResults: tierResultsPayload,
         pipelineError: pipelineErrorPayload,
+        findingSummary: qaCorpusPayload.findingSummary,
         source: 'mcp',
         projectPath: project_path || null,
       })
       .returning({ id: testRuns.id })
+
+    try {
+      await persistPreparedQaCorpus({
+        userId,
+        testRunId: testRun.id,
+        prepared: qaCorpusPayload,
+      })
+    } catch (err) {
+      console.error('[Ingest] Failed to persist QA corpus rows (non-fatal)', err)
+    }
 
     // Persist test_failures rows — one per evidence bundle. Classifier
     // verdicts arrive in the same order as `failures` (pipeline-worker
